@@ -1,0 +1,19 @@
+from pathlib import Path
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
+from app.routers import sporty, sofascore
+
+app = FastAPI(title="PredictX Football Stats Agent")
+
+app.include_router(sporty.router)
+app.include_router(sofascore.router)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/contract", response_class=PlainTextResponse)
+def contract():
+    return Path("API_CONTRACT.md").read_text()
