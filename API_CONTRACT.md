@@ -23,42 +23,39 @@ Response:
 
 **GET** `/sporty/live`
 
-Description: Returns all currently live football matches from SportyBet Nigeria, including scores, match time, and all available betting markets.
+Description: Returns currently live football matches from SportyBet Nigeria using the GET feed. Includes scores, match time, and all available betting markets.
+
+Response: Same shape as endpoint #3.
+
+---
+
+## 3. SportyBet All Live & Upcoming Matches
+
+**GET** `/sporty/live/all`
+
+Description: Returns all live and upcoming matches from SportyBet Nigeria using the POST feed (`wapConfigurableEventsByOrder`). Returns more matches than `/sporty/live` including matches not yet started.
 
 Response:
 ```json
 {
   "status": "success",
-  "count": 10,
+  "count": "<total number of matches>",
   "matches": [
     {
-      "id": "sr:match:67091962",
-      "name": "Velez Sarsfield vs Union de Santa Fe",
-      "home_team": "Velez Sarsfield",
-      "away_team": "Union de Santa Fe",
-      "score": { "home": "2", "away": "1" },
-      "period_scores": ["2:1", "0:0"],
-      "period": "H2",
-      "played_seconds": "47:52",
-      "status": 1,
-      "start_time": 1777326300000,
-      "tournament": "Primera LPF",
-      "category": "Argentina",
-      "venue": "Jose Amalfitani",
-      "markets": [
-        {
-          "id": "1",
-          "name": "1X2",
-          "specifier": null,
-          "status": 0,
-          "group": "Main",
-          "selections": [
-            { "id": "1", "name": "Home", "odds": "1.29", "is_active": 1, "probability": "0.7318800000" },
-            { "id": "2", "name": "Draw", "odds": "4.10", "is_active": 1, "probability": "0.2057400000" },
-            { "id": "3", "name": "Away", "odds": "12.00", "is_active": 1, "probability": "0.0623800000" }
-          ]
-        }
-      ]
+      "id": "<sportybet event id e.g. sr:match:12345678>",
+      "name": "<home team> vs <away team>",
+      "home_team": "<home team name>",
+      "away_team": "<away team name>",
+      "score": { "home": "<goals>", "away": "<goals>" },
+      "period_scores": ["<H1 score>", "<H2 score>"],
+      "period": "<current period e.g. H1, H2, Not start>",
+      "played_seconds": "<elapsed time e.g. 47:52>",
+      "status": "<status code>",
+      "start_time": "<unix timestamp in ms>",
+      "tournament": "<tournament name>",
+      "category": "<country>",
+      "venue": "<stadium name>",
+      "markets": [ ]
     }
   ]
 }

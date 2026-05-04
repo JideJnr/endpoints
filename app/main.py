@@ -1,9 +1,17 @@
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from app.routers import sporty, sofascore
 
 app = FastAPI(title="PredictX Football Stats Agent")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(sporty.router)
 app.include_router(sofascore.router)

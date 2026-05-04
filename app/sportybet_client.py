@@ -2,11 +2,18 @@ import time
 import requests
 
 SPORTYBET_URL = "https://www.sportybet.com/api/ng/factsCenter/configurableLiveOrPrematchEvents"
+SPORTYBET_POST_URL = "https://www.sportybet.com/api/ng/factsCenter/wapConfigurableEventsByOrder"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
     "Accept": "application/json",
     "Referer": "https://www.sportybet.com/ng/sport/live",
+}
+
+POST_HEADERS = {
+    **HEADERS,
+    "Content-Type": "application/json",
+    "Origin": "https://www.sportybet.com",
 }
 
 
@@ -19,13 +26,31 @@ def fetch_live_matches() -> list[dict]:
     }
     response = requests.get(SPORTYBET_URL, params=params, headers=HEADERS, timeout=10)
     response.raise_for_status()
-
-    # data is a list of tournament groups, each with an "events" array
     groups = response.json().get("data", [])
-
     matches = []
     for group in groups:
         for event in group.get("events", []):
+            matches.append(_parse_event(event, group))
+    return matches
+
+
+def fetch_live_matches_post() -> list[dict]:
+    payload = {
+        "sportId": "sr:sport:1",
+        "isLive": True,
+        "pageSize": 300,
+        "_t": int(time.time() * 1000),
+    }
+    response = requests.post(SPORTYBET_POST_URL, json=payload, headers=POST_HEADERS, timeout=15)
+    response.raise_for_status()
+    tournaments = response.json().get("data", {}).get("tournaments", [])
+    matches = []
+    for tournament in tournaments:
+        group = {
+            "name": tournament.get("name"),
+            "categoryName": tournament.get("sport", {}).get("category", {}).get("name"),
+        }
+        for event in tournament.get("events", []):
             matches.append(_parse_event(event, group))
     return matches
 

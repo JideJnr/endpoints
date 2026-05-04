@@ -1,6 +1,12 @@
-INFO:     Started server process [5896]
+INFO:     Started server process [7220]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:58796 - "GET /sofascore/scheduled/2026-05-04/all HTTP/1.1" 200 OK
-INFO:     127.0.0.1:58803 - "GET /sofascore/event/16026959/detail?date=2026-05-04 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49612 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49709 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
+INFO:     127.0.0.1:49739 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
+INFO:     127.0.0.1:49744 - "GET /sporty/live/all HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49971 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
+INFO:     127.0.0.1:49976 - "GET /sporty/live/all HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49988 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
+INFO:     127.0.0.1:50011 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
