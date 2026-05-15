@@ -6,6 +6,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.league_memory import (
+    get_enriched_match,
+    get_enriched_matches,
     get_country_from_memory,
     get_engine_states,
     get_league_detail_from_memory,
@@ -13,13 +15,16 @@ from app.league_memory import (
     get_snapshot_memory,
     list_betbuilder_history,
     list_countries_from_memory,
+    list_duplicate_matches,
     list_memory_matches,
     list_prediction_history,
     observe_matches,
     record_prediction,
     save_betbuilder,
     set_engine_status,
+    run_memory_maintenance,
 )
+from app.ai_brain import oversee_prediction
 from app.bot2 import run_bot2
 from app.enrichment import run_enrichment
 from app.market import get_all_movements, get_movement
@@ -68,6 +73,12 @@ ENGINES = [
         "description": "Adjusts live predictions when one team has a card disadvantage.",
         "markets": ["live_goals", "match_result"],
     },
+    {
+        "id": "ai-brain",
+        "name": "AI Brain",
+        "description": "Optional local AI reviewer that oversees rule signals, H2H, league quality, and risk.",
+        "markets": ["match_result", "live_goals", "value_bets", "betbuilder"],
+    },
 ]
 
 
@@ -85,8 +96,14 @@ def get_logic():
             {
                 "id": "strength-of-schedule",
                 "name": "Strength Of Schedule",
-                "description": "Weights recent form by opponent quality so easy wins and hard losses are not misread.",
-                "signals": ["quality_wins", "soft_losses", "schedule_difficulty", "division_tier"],
+                "description": "Weights recent form by opponent quality and league strength so cross-league form is not misread.",
+                "signals": ["quality_wins", "soft_losses", "schedule_difficulty", "league_strength_edge"],
+            },
+            {
+                "id": "h2h-context",
+                "name": "Team H2H Context",
+                "description": "Adds direct team duel history when Sofascore supplies it.",
+                "signals": ["home_wins", "away_wins", "draws", "sample_size"],
             },
             {
                 "id": "league-memory",
@@ -111,6 +128,12 @@ def get_logic():
                 "name": "Red Card State",
                 "description": "Changes live confidence when a favorite or underdog receives a red card.",
                 "signals": ["home_red_cards", "away_red_cards", "score_state"],
+            },
+            {
+                "id": "ai-brain",
+                "name": "AI Brain",
+                "description": "Uses a free local Ollama model when available, otherwise uses deterministic review.",
+                "signals": ["ai_brain.status", "ai_brain.risks", "ai_brain.confidence_adjustment"],
             },
         ],
         "memory": get_snapshot_memory(min_samples=1),
@@ -143,6 +166,11 @@ def get_live_matches(limit: int = Query(default=300, ge=1, le=500)):
 @router.get("/matches/memory")
 def get_matches_memory(limit: int = Query(default=200, ge=1, le=1000), league: Optional[str] = None, source: Optional[str] = None):
     return {"status": "success", **list_memory_matches(limit=limit, league=league, source=source)}
+
+
+@router.get("/matches/duplicates")
+def get_matches_duplicates(limit: int = Query(default=200, ge=1, le=1000)):
+    return {"status": "success", **list_duplicate_matches(limit=limit)}
 
 
 @router.get("/matches/{match_id}")
@@ -359,6 +387,14 @@ def post_run_bot2(date: Optional[str] = None):
     return run_bot2(date)
 
 
+@router.post("/maintenance/memory")
+def post_maintenance_memory(
+    raw_retention_days: int = Query(default=30, ge=1, le=365),
+    odds_retention_days: int = Query(default=60, ge=1, le=365),
+):
+    return run_memory_maintenance(raw_retention_days=raw_retention_days, odds_retention_days=odds_retention_days)
+
+
 @router.get("/odds/movement/{match_id}")
 def get_odds_movement(match_id: str):
     return get_movement(match_id)
@@ -434,6 +470,9 @@ def _predict_enriched(doc: dict[str, Any]) -> dict[str, Any]:
             "category": doc.get("category"),
             "markets": doc.get("sportybet_markets", []),
         })
+    if "ai_brain" not in prediction:
+        _attach_ai_brain(prediction, detail)
+        _attach_value_fields(prediction)
     prediction["enriched"] = {
         "sportybet_id": doc.get("sportybet_id"),
         "sofascore_id": doc.get("sofascore_id"),
@@ -465,6 +504,7 @@ def _attach_deep_analysis(prediction: dict[str, Any], detail: dict[str, Any]) ->
         prediction["signals"].append({"name": "strength_of_schedule", "value": schedule.get("verdict"), "impact": 4})
     except Exception as e:
         prediction["strength_of_schedule"] = {"error": str(e)}
+    _attach_ai_brain(prediction, detail)
     _attach_value_fields(prediction)
 
 
@@ -486,6 +526,24 @@ def _attach_value_fields(prediction: dict[str, Any]) -> None:
             "odds_signal": "Market movement included when odds snapshots exist.",
         },
     }
+
+
+def _attach_ai_brain(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> None:
+    brain = oversee_prediction(prediction, detail)
+    prediction["ai_brain"] = brain
+    adjustment = _to_int(brain.get("confidence_adjustment"), 0)
+    if adjustment:
+        for pick in prediction.get("picks") or []:
+            pick["confidence"] = max(1, min(95, _to_int(pick.get("confidence"), 50) + adjustment))
+    prediction["signals"].append({
+        "name": "ai_brain_review",
+        "value": {
+            "provider": brain.get("provider"),
+            "status": brain.get("status"),
+            "risks": brain.get("risks"),
+        },
+        "impact": adjustment,
+    })
 
 
 def _is_value_prediction(prediction: dict[str, Any]) -> bool:
@@ -567,5 +625,3 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-    get_enriched_match,
-    get_enriched_matches,

@@ -4,6 +4,7 @@ from statistics import mean
 from typing import Any
 
 from app.league_memory import late_goal_memory_signal
+from app.league_strength import league_strength_edge
 
 
 HIGH_LATE_GOAL_LEAGUES = (
@@ -40,6 +41,8 @@ def predict_sofascore_event(
     home_form = _team_history_features(home.get("id"), home_history)
     away_form = _team_history_features(away.get("id"), away_history)
     form_edge = _form_edge(event, home_form, away_form, signals)
+    league_edge = _league_strength_edge(event, home_history, away_history, signals)
+    h2h_edge = _h2h_edge(event, signals)
     table_edge = _table_edge(event, signals)
     odds_edge = _odds_edge(event, signals)
 
@@ -50,7 +53,7 @@ def predict_sofascore_event(
     memory_signal = late_goal_memory_signal(event)
     memory_boost = _late_goal_memory_boost(memory_signal, signals)
 
-    home_power = form_edge + table_edge + odds_edge
+    home_power = form_edge + league_edge + h2h_edge + table_edge + odds_edge
     if abs(home_power) >= 12:
         side = home.get("name") if home_power > 0 else away.get("name")
         picks.append(_pick("match_result", f"{side} or draw protection", 58 + min(abs(home_power), 22), "stronger side with safety"))
@@ -199,6 +202,55 @@ def _form_edge(event: dict[str, Any], home_form: dict[str, Any], away_form: dict
         edge += rating_edge
         signals.append({"name": "avg_rating_edge", "value": round(rating_edge, 2), "impact": round(rating_edge, 2)})
 
+    return edge
+
+
+def _league_strength_edge(
+    event: dict[str, Any],
+    home_history: list[dict[str, Any]],
+    away_history: list[dict[str, Any]],
+    signals: list[dict[str, Any]],
+) -> float:
+    strength = league_strength_edge(event, home_history, away_history)
+    edge = strength.get("edge", 0.0)
+    signals.append({
+        "name": "league_strength_edge",
+        "value": {
+            "home_recent_avg": strength.get("home_recent_league_strength", {}).get("avg_score"),
+            "away_recent_avg": strength.get("away_recent_league_strength", {}).get("avg_score"),
+            "match_league": strength.get("match_league"),
+            "note": "higher recent league strength means the team has been tested in a stronger competition",
+        },
+        "impact": edge,
+    })
+    return edge
+
+
+def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
+    h2h = event.get("h2h") or {}
+    team_duel = h2h.get("team_duel") or h2h.get("teamDuel") or {}
+    if not isinstance(team_duel, dict):
+        return 0.0
+    home_wins = _to_int(team_duel.get("homeWins") or team_duel.get("home_wins"), 0)
+    away_wins = _to_int(team_duel.get("awayWins") or team_duel.get("away_wins"), 0)
+    draws = _to_int(team_duel.get("draws"), 0)
+    sample_size = home_wins + away_wins + draws
+    if sample_size < 2:
+        return 0.0
+    raw_edge = (home_wins - away_wins) / sample_size
+    edge = round(max(-8, min(8, raw_edge * 10)), 2)
+    if abs(edge) < 1:
+        return 0.0
+    signals.append({
+        "name": "h2h_edge",
+        "value": {
+            "home_wins": home_wins,
+            "away_wins": away_wins,
+            "draws": draws,
+            "sample_size": sample_size,
+        },
+        "impact": edge,
+    })
     return edge
 
 

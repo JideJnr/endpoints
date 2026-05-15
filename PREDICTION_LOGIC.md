@@ -60,6 +60,26 @@ Example learned stat:
 
 Memory is stored locally in `data/predictx_memory.sqlite3`.
 
+## 2c. Aggregation And Duplicate Control
+
+Raw snapshots are useful for recent inspection, but they should not grow forever. Resolved snapshots are rolled into `snapshot_aggregates`, grouped by:
+- League
+- Minute bucket
+- Score state
+- Red-card state
+- Favorite side
+
+This keeps long-term learning even after old raw snapshots are deleted.
+
+Duplicate protection:
+- Timeline snapshots dedupe by source, match id, minute bucket, score, and red-card state
+- Focused late-goal snapshots dedupe by time bucket, score total, and score difference
+- Matches get a normalized fingerprint from league, home team, away team, and start time
+- If a finished match appears live again, it is flagged as a possible replay and excluded from learning snapshots
+- If different sources report the same fixture, it is logged in `match_duplicates`
+
+Predictions and settled results should be retained longer than raw snapshots because they are the training record for model accuracy.
+
 ## 3. Red Card State
 
 A red card should change the match state immediately. The model does not simply pick against the team with the red card; it checks whether the card hit the favorite, underdog, leading team, or chasing team.
@@ -72,6 +92,45 @@ Signals used:
 Agent behavior:
 - Adds a `red_card` pick when card counts differ
 - Warns when the favorite is weakened rather than blindly backing the original favorite
+
+## 4. League Strength And Cross-League Context
+
+Recent form is not treated equally across every country or division. A first-division English result is weighted above a first-division Croatian result, and second/third divisions are reduced again. This keeps the model from thinking two similar form lines mean the same thing when the opposition level was different.
+
+Signals used:
+- Country and division from recent team history tournament names
+- Competition strength for Champions League, Europa League, Conference League, and similar cross-border cups
+- Lower-context markers like U19, reserves, SRL, women, or virtual matches
+
+Agent behavior:
+- Adds `league_strength_edge` to the home/away power score
+- Exposes home and away recent average league-strength scores in the prediction signals
+- Keeps the impact capped so league quality helps the model but does not overpower real form, odds, red cards, or live state
+
+## 5. Team H2H Context
+
+When Sofascore supplies direct H2H, the model now reads team duel wins/draws and turns that into a small edge. H2H is useful context, not a full prediction by itself.
+
+Signals used:
+- Home wins
+- Away wins
+- Draws
+- Sample size
+
+Agent behavior:
+- Adds `h2h_edge` only when at least two direct meetings are available
+- Caps H2H impact because old or tiny samples can mislead
+
+## 6. AI Brain Supervisor
+
+The AI brain sits above the rule engine and reviews the existing signals. It is not allowed to invent news or override missing data. For a free setup, it tries a local Ollama model first:
+
+- Default URL: `http://localhost:11434/api/chat`
+- Default model: `llama3.2:3b`
+- Override model with `PREDICTX_AI_MODEL`
+- Override URL with `PREDICTX_OLLAMA_URL`
+
+If Ollama is not running, the app falls back to a deterministic supervisor and still returns `ai_brain` in each prediction. The supervisor can approve, pass, or mark caution, then apply a small confidence adjustment.
 
 ## Research Sources
 

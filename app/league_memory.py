@@ -34,7 +34,7 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
         timeline_snapshot_recorded = False
         late_snapshot_recorded = False
         resolved = 0
-        if is_live:
+        if is_live and not duplicate_info.get("is_duplicate"):
             timeline_snapshot_recorded = _insert_match_snapshot(
                 conn,
                 source,
@@ -128,6 +128,7 @@ def get_snapshot_memory(
 ) -> dict[str, Any]:
     _init_db()
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
         _aggregate_resolved_snapshots(conn)
         conn.commit()
 
@@ -325,6 +326,7 @@ def get_league_detail_from_memory(league_id: str) -> dict[str, Any]:
 def run_memory_maintenance(raw_retention_days: int = 30, odds_retention_days: int = 60) -> dict[str, Any]:
     _init_db()
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
         before = conn.total_changes
         _aggregate_resolved_snapshots(conn)
         conn.execute(
@@ -859,6 +861,22 @@ def _insert_late_snapshot(
 ) -> bool:
     league_key = normalize_league(league)
     before = conn.total_changes
+    lower, upper = _bucket_bounds(_minute_bucket(minute))
+    exists = conn.execute(
+        """
+        select 1
+        from late_goal_snapshots
+        where source = ?
+          and match_id = ?
+          and minute between ? and ?
+          and score_total_at_snapshot = ?
+          and score_diff_at_snapshot = ?
+        limit 1
+        """,
+        (source, match_id, lower, upper, total_goals, score_diff),
+    ).fetchone()
+    if exists:
+        return False
     conn.execute(
         """
         insert or ignore into late_goal_snapshots (
@@ -1022,6 +1040,7 @@ def _resolve_snapshots(conn: sqlite3.Connection, source: str, match_id: str, fin
 
 
 def _aggregate_resolved_snapshots(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """
         select *
@@ -1222,6 +1241,22 @@ def _minute_bucket(minute: int) -> str:
     if minute <= 80:
         return "71-80"
     return "81-90+"
+
+
+def _bucket_bounds(bucket: str) -> tuple[int, int]:
+    if bucket == "00-15":
+        return 0, 15
+    if bucket == "16-30":
+        return 16, 30
+    if bucket == "31-45":
+        return 31, 45
+    if bucket == "46-60":
+        return 46, 60
+    if bucket == "61-70":
+        return 61, 70
+    if bucket == "71-80":
+        return 71, 80
+    return 81, 130
 
 
 def _score_state(home_goals: int, away_goals: int, favorite_side: str | None) -> str:

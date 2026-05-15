@@ -585,6 +585,20 @@ Response:
 
 ---
 
+**GET** `/agent/memory/duplicates`
+
+Description: Returns matches flagged as duplicates, cross-source duplicates, or possible SportyBet replays.
+
+**POST** `/agent/memory/maintenance`
+
+Query params:
+- `raw_retention_days` optional integer, default `30`
+- `odds_retention_days` optional integer, default `60`
+
+Description: Aggregates resolved snapshots into long-term league stats, deletes old raw snapshots/odds snapshots, and vacuums SQLite. Prediction history is not deleted.
+
+---
+
 ## 21. Prediction Agent — Memory Observation
 
 **POST** `/agent/memory/observe?source=manual`
@@ -633,6 +647,10 @@ Query params:
 - `source` optional
 
 Description: Lists matches stored in local memory.
+
+**GET** `/matches/duplicates`
+
+Description: Lists duplicate/replay detections.
 
 **GET** `/matches/{match_id}`
 
@@ -724,6 +742,12 @@ Description: Marks an engine as stopped.
 **GET** `/engines/metrics`
 
 Description: Engine analytics dashboard metrics. Win-rate fields are `null` until prediction grading is added.
+
+### Maintenance
+
+**POST** `/maintenance/memory`
+
+Description: Root alias for `/agent/memory/maintenance`.
 
 ---
 

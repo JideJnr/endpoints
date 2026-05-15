@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import date as dt
 from typing import Optional
 
@@ -11,6 +13,7 @@ from app.league_memory import (
     observe_matches,
     run_memory_maintenance,
 )
+from app.ai_brain import oversee_prediction
 from app.prediction_agent import predict_sofascore_event, predict_sporty_match
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_scheduled_events, fetch_team_history
 from app.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post, fetch_upcoming_matches_post
@@ -93,7 +96,7 @@ def post_sporty_live_memory_observation():
 def get_sporty_live_predictions():
     try:
         matches = fetch_live_matches_post()
-        predictions = [predict_sporty_match(match) for match in matches]
+        predictions = [_with_ai_brain(predict_sporty_match(match), match) for match in matches]
         return {"status": "success", "count": len(predictions), "predictions": predictions}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -103,7 +106,7 @@ def get_sporty_live_predictions():
 def get_sporty_upcoming_predictions():
     try:
         matches = fetch_upcoming_matches_post()
-        predictions = [predict_sporty_match(match) for match in matches]
+        predictions = [_with_ai_brain(predict_sporty_match(match), match) for match in matches]
         return {"status": "success", "count": len(predictions), "predictions": predictions}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -113,7 +116,7 @@ def get_sporty_upcoming_predictions():
 def get_sporty_all_predictions():
     try:
         matches = fetch_live_and_upcoming_matches_post()
-        predictions = [predict_sporty_match(match) for match in matches]
+        predictions = [_with_ai_brain(predict_sporty_match(match), match) for match in matches]
         return {"status": "success", "count": len(predictions), "predictions": predictions}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -161,5 +164,28 @@ def _predict_sofascore_with_detail(event: dict, date: str, include_history: bool
         home_history = fetch_team_history(detail["home_team"]["id"]).get("events", [])
         away_history = fetch_team_history(detail["away_team"]["id"]).get("events", [])
     prediction = predict_sofascore_event(detail, home_history, away_history)
+    _with_ai_brain(prediction, detail)
     prediction["date"] = date
     return prediction
+
+
+def _with_ai_brain(prediction: dict, detail: dict | None = None) -> dict:
+    brain = oversee_prediction(prediction, detail)
+    prediction["ai_brain"] = brain
+    adjustment = _to_int(brain.get("confidence_adjustment"), 0)
+    if adjustment:
+        for pick in prediction.get("picks") or []:
+            pick["confidence"] = max(1, min(95, _to_int(pick.get("confidence"), 50) + adjustment))
+    prediction["signals"].append({
+        "name": "ai_brain_review",
+        "value": {"provider": brain.get("provider"), "status": brain.get("status"), "risks": brain.get("risks")},
+        "impact": adjustment,
+    })
+    return prediction
+
+
+def _to_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
