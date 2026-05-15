@@ -1,5 +1,6 @@
 import time
 import requests
+from typing import Optional
 
 SPORTYBET_URL = "https://www.sportybet.com/api/ng/factsCenter/configurableLiveOrPrematchEvents"
 SPORTYBET_POST_URL = "https://www.sportybet.com/api/ng/factsCenter/wapConfigurableEventsByOrder"
@@ -34,13 +35,14 @@ def fetch_live_matches() -> list[dict]:
     return matches
 
 
-def fetch_live_matches_post() -> list[dict]:
+def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
     payload = {
         "sportId": "sr:sport:1",
-        "isLive": True,
         "pageSize": 300,
         "_t": int(time.time() * 1000),
     }
+    if is_live is not None:
+        payload["isLive"] = is_live
     response = requests.post(SPORTYBET_POST_URL, json=payload, headers=POST_HEADERS, timeout=15)
     response.raise_for_status()
     tournaments = response.json().get("data", {}).get("tournaments", [])
@@ -53,6 +55,21 @@ def fetch_live_matches_post() -> list[dict]:
         for event in tournament.get("events", []):
             matches.append(_parse_event(event, group))
     return matches
+
+
+def fetch_live_matches_post() -> list[dict]:
+    return fetch_matches_post(is_live=True)
+
+
+def fetch_upcoming_matches_post() -> list[dict]:
+    return fetch_matches_post(is_live=False)
+
+
+def fetch_live_and_upcoming_matches_post() -> list[dict]:
+    live = fetch_live_matches_post()
+    upcoming = fetch_upcoming_matches_post()
+    seen = {match.get("id") for match in live}
+    return live + [match for match in upcoming if match.get("id") not in seen]
 
 
 def _parse_event(event: dict, group: dict) -> dict:
@@ -70,6 +87,8 @@ def _parse_event(event: dict, group: dict) -> dict:
         "period": event.get("matchStatus"),
         "played_seconds": event.get("playedSeconds"),
         "status": event.get("status"),
+        "home_red_cards": _first_present(event, "homeRedCards", "homeRedCard", "homeTeamRedCards"),
+        "away_red_cards": _first_present(event, "awayRedCards", "awayRedCard", "awayTeamRedCards"),
         "start_time": event.get("estimateStartTime"),
         "tournament": group.get("name"),
         "category": group.get("categoryName"),
@@ -96,3 +115,10 @@ def _parse_market(market: dict) -> dict:
             for o in market.get("outcomes", [])
         ],
     }
+
+
+def _first_present(source: dict, *keys: str):
+    for key in keys:
+        if key in source:
+            return source[key]
+    return None

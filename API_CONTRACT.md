@@ -63,6 +63,16 @@ Response:
 
 ---
 
+## 3b. SportyBet Upcoming Matches
+
+**GET** `/sporty/upcoming`
+
+Description: Returns upcoming football matches from SportyBet Nigeria using the POST feed.
+
+Response: Same match shape as `/sporty/live/all`.
+
+---
+
 ## 3. SofaScore Scheduled Events
 
 **GET** `/sofascore/scheduled/{date}`
@@ -436,6 +446,331 @@ Response:
 Description: Returns this contract document as plain text. Always reflects the current state of all available endpoints.
 
 Response: Plain text markdown document.
+
+---
+
+## 15. Prediction Agent — SportyBet Live
+
+**GET** `/agent/sporty/live-predictions`
+
+Description: Returns live SportyBet matches with ranked prediction picks, confidence, and explainable signals.
+
+Response:
+```json
+{
+  "status": "success",
+  "count": 1,
+  "predictions": [
+    {
+      "match_id": "sr:match:123",
+      "name": "Home vs Away",
+      "source": "sportybet",
+      "minute": 72,
+      "score": { "home": "1", "away": "1" },
+      "signals": [
+        { "name": "late_goal_window", "value": "72' with 2 goals", "impact": 8 }
+      ],
+      "picks": [
+        { "type": "live_goals", "selection": "Late goal watch", "confidence": 60, "reason": "league profile and late match state" }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## 16. Prediction Agent — SportyBet Upcoming
+
+**GET** `/agent/sporty/upcoming-predictions`
+
+Description: Returns upcoming SportyBet matches with prematch prediction picks based on available odds and markets.
+
+Response: Same prediction shape as `/agent/sporty/live-predictions`.
+
+---
+
+## 17. Prediction Agent — SportyBet All
+
+**GET** `/agent/sporty/all-predictions`
+
+Description: Returns both live and upcoming SportyBet predictions.
+
+Response: Same prediction shape as `/agent/sporty/live-predictions`.
+
+---
+
+## 18. Prediction Agent — SofaScore Date
+
+**GET** `/agent/sofascore/predictions/{date}`
+
+Query params:
+- `tournament_id` optional, defaults to Premier League when `all_matches=false`
+- `all_matches` optional boolean, default `false`
+- `limit` optional integer from 1 to 100, default `20`
+- `include_history` optional boolean, default `true`
+
+Description: Returns SofaScore match predictions with recent team history, form, standings, odds, live state, and explainable signals where available.
+
+---
+
+## 19. Prediction Agent — SofaScore Event
+
+**GET** `/agent/sofascore/event/{event_id}/prediction`
+
+Query params:
+- `date` optional `YYYY-MM-DD`, defaults to today
+- `include_history` optional boolean, default `true`
+
+Description: Returns one SofaScore event prediction with ranked picks and the signals behind them.
+
+---
+
+## 20. Prediction Agent — League Memory
+
+**GET** `/agent/memory/leagues`
+
+Description: Returns all learned league late-goal memory stats.
+
+**GET** `/agent/memory/leagues/{league}`
+
+Description: Returns memory for one league, including sample count, late-goal hits, and late-goal rate.
+
+Response:
+```json
+{
+  "status": "success",
+  "memory": {
+    "league_key": "laliga",
+    "league_name": "LaLiga",
+    "samples": 13,
+    "late_goals": 8,
+    "late_goal_rate": 0.615
+  }
+}
+```
+
+---
+
+**GET** `/agent/memory/snapshots`
+
+Query params:
+- `league` optional
+- `minute_bucket` optional, e.g. `71-80`
+- `score_state` optional, e.g. `favorite_drawing`, `favorite_losing`, `favorite_leading`, `draw`
+- `min_samples` optional integer, default `1`
+
+Description: Returns full timeline memory grouped by league, minute bucket, and score state.
+
+Response:
+```json
+{
+  "status": "success",
+  "snapshots": [
+    {
+      "league_key": "laliga",
+      "league_name": "LaLiga",
+      "minute_bucket": "71-80",
+      "score_state": "favorite_drawing",
+      "samples": 20,
+      "next_goal_rate": 0.55,
+      "over_1_5_rate": 0.8,
+      "over_2_5_rate": 0.45,
+      "favorite_recovered_rate": 0.6,
+      "red_card_team_conceded_rate": null
+    }
+  ]
+}
+```
+
+---
+
+## 21. Prediction Agent — Memory Observation
+
+**POST** `/agent/memory/observe?source=manual`
+
+Description: Records one match observation. Every live observation creates a timeline snapshot. Live matches after 70 minutes with score difference <= 1 also create the focused late-goal snapshot. Finished observations resolve all existing snapshots.
+
+**POST** `/agent/memory/sofascore/{date}`
+
+Query params:
+- `tournament_id` optional, defaults to Premier League when `all_matches=false`
+- `all_matches` optional boolean, default `false`
+
+Description: Fetches SofaScore matches for a date and records them into memory.
+
+**POST** `/agent/memory/sporty/live`
+
+Description: Fetches current SportyBet live matches and records late-game snapshots into memory.
+
+---
+
+## 22. UI Platform Endpoints
+
+These root endpoints are intended for the frontend pages.
+
+### Logic
+
+**GET** `/logic`
+
+Description: Exposes all active prediction logic, signals, and current snapshot memory groups.
+
+### Matches
+
+**GET** `/matches?date=YYYY-MM-DD`
+
+Description: Date-based match browser. Uses SofaScore when available and falls back to memory.
+
+**GET** `/matches/live`
+
+Description: Live matches with score, period, markets, and memory observation side effect.
+
+**GET** `/matches/memory`
+
+Query params:
+- `limit` optional
+- `league` optional
+- `source` optional
+
+Description: Lists matches stored in local memory.
+
+**GET** `/matches/{match_id}`
+
+Description: Returns one memory match with snapshots and prediction history.
+
+### Countries & Leagues
+
+**GET** `/countries`
+
+Description: Lists countries inferred from stored leagues.
+
+**GET** `/countries/{country_id}`
+
+Description: Country detail with leagues.
+
+**GET** `/leagues/{league_id}`
+
+Description: League memory, snapshot groups, derived standings, and recent stored matches.
+
+### Teams & Players
+
+**GET** `/teams/{team_id}`
+
+Description: Team profile from SofaScore history with recent stats and matches.
+
+**GET** `/players/{player_id}`
+
+Description: Stable player profile placeholder until a player provider is wired.
+
+### Predictions
+
+**GET** `/predictions?date=YYYY-MM-DD`
+
+Description: All predictions for a day. Records prediction history.
+
+**GET** `/predictions/{match_id}`
+
+Description: Prediction for a specific match, or latest stored prediction if upstream lookup fails.
+
+**GET** `/predictions/suggestions`
+
+Description: Curated high-confidence picks.
+
+**GET** `/predictions/value-bets`
+
+Description: Picks backed by market/odds signals.
+
+**GET** `/predictions/history`
+
+Description: Prediction history stored locally.
+
+### Bet Builder
+
+**POST** `/betbuilder`
+
+Body:
+```json
+{
+  "selections": [
+    { "match_id": "123", "selection": "Over 1.5", "confidence": 70, "odds": 1.55 }
+  ]
+}
+```
+
+Description: Returns combined odds and combined confidence, then stores the built bet.
+
+**GET** `/betbuilder/history`
+
+Description: Past built bets.
+
+### Engines
+
+**GET** `/engines`
+
+Description: Lists prediction bots/engines.
+
+**GET** `/engines/{engine_id}`
+
+Description: Engine detail and recent prediction history.
+
+**POST** `/engines/{engine_id}/start`
+
+Description: Marks an engine as running.
+
+**POST** `/engines/{engine_id}/stop`
+
+Description: Marks an engine as stopped.
+
+**GET** `/engines/metrics`
+
+Description: Engine analytics dashboard metrics. Win-rate fields are `null` until prediction grading is added.
+
+---
+
+## 23. Enrichment, Models, And Odds Movement
+
+These endpoints incorporate the second project's pipeline without requiring MongoDB, Chroma, LangChain, or Groq.
+
+**POST** `/run/enrich`
+
+Query params:
+- `date` optional `YYYY-MM-DD`
+- `force` optional boolean
+- `limit` optional integer
+
+Description: Fetches SportyBet matches, fetches SofaScore fixtures, fuzzy-matches both feeds, stores enriched documents locally, and snapshots odds.
+
+**POST** `/run/predict`
+
+Query params:
+- `date` optional `YYYY-MM-DD`
+- `limit` optional integer
+
+Description: Predicts from enriched documents when available, otherwise falls back to direct SofaScore predictions. Stores prediction history.
+
+**POST** `/run/bot2`
+
+Description: Runs Bot 2 value selector over stored prediction history.
+
+**GET** `/bot2/picks`
+
+Description: Returns Bot 2's curated value picks.
+
+**GET** `/odds/movement/{match_id}`
+
+Description: Opening-vs-current odds movement and sharp-money signal from local odds snapshots.
+
+**GET** `/odds/movements`
+
+Description: Odds movement for all tracked matches, optionally filtered by `date`.
+
+**GET** `/models/poisson?home_team_id=1&away_team_id=2`
+
+Description: Runs the Poisson goal model for home/draw/away, over 2.5, BTTS, and top scorelines.
+
+**GET** `/models/schedule?home_team_id=1&away_team_id=2`
+
+Description: Compares both teams using strength-of-schedule analysis.
 
 ---
 

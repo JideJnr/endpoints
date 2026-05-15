@@ -83,6 +83,7 @@ def fetch_event_detail(event: dict) -> dict:
     }
 
 
+def _parse_standing_row(row: dict) -> dict:
     team = row.get("team", {})
     promotion = row.get("promotion", {})
     return {
@@ -258,6 +259,8 @@ def _parse_event(e: dict) -> dict:
             "description": status.get("description"),
             "type": status.get("type"),
         },
+        "home_red_cards": e.get("homeRedCards") or e.get("homeRedCard") or e.get("homeTeamRedCards"),
+        "away_red_cards": e.get("awayRedCards") or e.get("awayRedCard") or e.get("awayTeamRedCards"),
         "tournament": {
             "id": tournament.get("uniqueTournament", {}).get("id"),
             "tournament_id": tournament.get("id"),
