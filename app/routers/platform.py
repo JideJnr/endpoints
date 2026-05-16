@@ -174,18 +174,6 @@ def get_matches_duplicates(limit: int = Query(default=200, ge=1, le=1000)):
     return {"status": "success", **list_duplicate_matches(limit=limit)}
 
 
-@router.get("/matches/{match_id}")
-def get_match_detail(match_id: str, source: Optional[str] = None):
-    enriched = get_enriched_match(match_id)
-    if enriched:
-        memory = get_memory_match(match_id, source=source)
-        return {"status": "success", "match": {**enriched, "memory": memory, "odds_movement": get_movement(match_id)}}
-    match = get_memory_match(match_id, source=source)
-    if not match:
-        raise HTTPException(status_code=404, detail=f"Match {match_id} not found in memory")
-    return {"status": "success", "match": match}
-
-
 @router.get("/matches/{match_id}/prediction")
 def get_match_prediction(
     match_id: str,
@@ -199,6 +187,18 @@ def get_match_prediction(
         date=date,
         include_web_context=include_web_context,
     )
+
+
+@router.get("/matches/{match_id}")
+def get_match_detail(match_id: str, source: Optional[str] = None):
+    enriched = get_enriched_match(match_id)
+    if enriched:
+        memory = get_memory_match(match_id, source=source)
+        return {"status": "success", "match": {**enriched, "memory": memory, "odds_movement": get_movement(match_id)}}
+    match = get_memory_match(match_id, source=source)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"Match {match_id} not found in memory")
+    return {"status": "success", "match": match}
 
 
 @router.get("/countries")

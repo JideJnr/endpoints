@@ -6,8 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.config import get_settings
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "predictx_memory.sqlite3"
+
+DB_PATH = get_settings().database_path
 
 
 def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
@@ -54,11 +56,16 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
             _aggregate_resolved_snapshots(conn)
         conn.commit()
 
+    mongo_archived = False
+    if is_finished:
+        mongo_archived = _archive_finished_match(source, match, league)
+
     return {
         "recorded": True,
         "source": source,
         "match_id": match_id,
         "league": league,
+        "mongo_archived": mongo_archived,
         "snapshot_recorded": timeline_snapshot_recorded or late_snapshot_recorded,
         "timeline_snapshot_recorded": timeline_snapshot_recorded,
         "late_snapshot_recorded": late_snapshot_recorded,
@@ -72,11 +79,26 @@ def observe_matches(source: str, matches: list[dict[str, Any]]) -> dict[str, Any
     return {
         "observed": len(results),
         "recorded": sum(1 for item in results if item.get("recorded")),
+        "mongo_archived": sum(1 for item in results if item.get("mongo_archived")),
         "snapshots_recorded": sum(1 for item in results if item.get("snapshot_recorded")),
         "timeline_snapshots_recorded": sum(1 for item in results if item.get("timeline_snapshot_recorded")),
         "late_snapshots_recorded": sum(1 for item in results if item.get("late_snapshot_recorded")),
         "snapshots_resolved": sum(item.get("snapshots_resolved", 0) for item in results),
     }
+
+
+def _archive_finished_match(source: str, match: dict[str, Any], league: str) -> bool:
+    try:
+        from app.mongo_store import save_finished_match
+
+        archived = {
+            **match,
+            "league_key": normalize_league(league),
+            "league_name": league,
+        }
+        return save_finished_match(source, archived)
+    except Exception:
+        return False
 
 
 def league_memory_for_match(match: dict[str, Any]) -> dict[str, Any]:
@@ -710,6 +732,12 @@ def store_enriched_matches(documents: list[dict[str, Any]]) -> int:
                 ),
             )
         conn.commit()
+    try:
+        from app.mongo_store import store_enriched_matches as store_mongo_enriched_matches
+
+        store_mongo_enriched_matches(documents)
+    except Exception:
+        pass
     return len(documents)
 
 
@@ -732,7 +760,15 @@ def get_enriched_matches(match_date: str | None = None, limit: int = 500) -> lis
             """,
             (*params, limit),
         ).fetchall()
-    return [json.loads(row["raw_json"]) for row in rows]
+    docs = [json.loads(row["raw_json"]) for row in rows]
+    if docs:
+        return docs
+    try:
+        from app.mongo_store import get_enriched_matches as get_mongo_enriched_matches
+
+        return get_mongo_enriched_matches(match_date=match_date, limit=limit)
+    except Exception:
+        return []
 
 
 def get_enriched_match(match_id: str) -> dict[str, Any] | None:
@@ -740,7 +776,14 @@ def get_enriched_match(match_id: str) -> dict[str, Any] | None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("select raw_json from enriched_matches where match_id = ?", (str(match_id),)).fetchone()
-    return json.loads(row["raw_json"]) if row else None
+    if row:
+        return json.loads(row["raw_json"])
+    try:
+        from app.mongo_store import get_enriched_match as get_mongo_enriched_match
+
+        return get_mongo_enriched_match(match_id)
+    except Exception:
+        return None
 
 
 def late_goal_memory_signal(match: dict[str, Any]) -> dict[str, Any] | None:

@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 from urllib import error, request
 
+from app.config import get_settings
+
 
 DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
-OLLAMA_URL = os.getenv("PREDICTX_OLLAMA_URL", "http://localhost:11434/api/chat")
-HF_ROUTER_URL = os.getenv("PREDICTX_HF_URL", "https://router.huggingface.co/v1/chat/completions")
 DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 
 
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
     """Optional AI supervisor. Falls back to deterministic review when no local model is running."""
     prompt_payload = _compact_prediction(prediction, detail)
-    provider = os.getenv("PREDICTX_AI_PROVIDER", "auto").strip().lower()
+    provider = get_settings().ai_provider
     providers = ["huggingface", "ollama"] if provider == "auto" else [provider]
     for name in providers:
         ai = _provider_review(name, prompt_payload)
@@ -33,10 +32,11 @@ def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] |
 
 
 def _huggingface_review(payload: dict[str, Any]) -> dict[str, Any] | None:
+    settings = get_settings()
     token = _hf_token()
     if not token:
         return None
-    model = os.getenv("PREDICTX_HF_MODEL", DEFAULT_HF_MODEL)
+    model = settings.hf_model or DEFAULT_HF_MODEL
     body = {
         "model": model,
         "messages": _review_messages(payload),
@@ -45,12 +45,12 @@ def _huggingface_review(payload: dict[str, Any]) -> dict[str, Any] | None:
     }
     try:
         req = request.Request(
-            HF_ROUTER_URL,
+            settings.hf_url,
             data=json.dumps(body).encode("utf-8"),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
         )
-        with request.urlopen(req, timeout=15) as response:
+        with request.urlopen(req, timeout=settings.ai_timeout_seconds) as response:
             data = json.loads(response.read().decode("utf-8"))
     except (OSError, TimeoutError, ValueError, error.URLError):
         return None
@@ -64,7 +64,8 @@ def _huggingface_review(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _ollama_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    model = os.getenv("PREDICTX_AI_MODEL", DEFAULT_OLLAMA_MODEL)
+    settings = get_settings()
+    model = settings.ollama_model or DEFAULT_OLLAMA_MODEL
     body = {
         "model": model,
         "stream": False,
@@ -73,12 +74,12 @@ def _ollama_review(payload: dict[str, Any]) -> dict[str, Any] | None:
     }
     try:
         req = request.Request(
-            OLLAMA_URL,
+            settings.ollama_url,
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with request.urlopen(req, timeout=8) as response:
+        with request.urlopen(req, timeout=min(settings.ai_timeout_seconds, 8)) as response:
             data = json.loads(response.read().decode("utf-8"))
     except (OSError, TimeoutError, ValueError, error.URLError):
         return None
@@ -166,11 +167,9 @@ def _review_result(provider: str, model: str, parsed: dict[str, Any]) -> dict[st
 
 
 def _hf_token() -> str | None:
-    return (
-        os.getenv("HF_TOKEN")
-        or os.getenv("HUGGINGFACE_HUB_TOKEN")
-        or os.getenv("HUGGING_FACE_HUB_TOKEN")
-    )
+    import os
+
+    return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

@@ -1,6 +1,10 @@
 fastapi
 uvicorn[standard]
 requests
+httpx
 curl_cffi
 ddgs
 trafilatura
+pymongo[srv]
+apscheduler
+rapidfuzz

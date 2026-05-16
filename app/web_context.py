@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
-
-MAX_RESULTS = 3
-MAX_CHARS = 1500
-SEARCH_TIMEOUT = 4
-SCRAPE_TIMEOUT = 6
-SEARCH_BACKENDS = os.getenv("PREDICTX_SEARCH_BACKENDS", "duckduckgo")
+from app.config import get_settings
 
 
 def search_match_context(home: str, away: str, tournament: str = "") -> dict[str, Any]:
@@ -16,9 +10,13 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
     query = f"{home} vs {away} prediction preview {tournament}".strip()
     snippets: list[dict[str, str]] = []
     scraped: list[str] = []
+    settings = get_settings()
+
+    if not settings.web_search_enabled:
+        return {"query": query, "snippets": [], "scraped": [], "disabled": True}
 
     try:
-        results = _search(query)
+        results = _search(query, settings.web_search_max_results)
 
         for result in results:
             url = result.get("href", "")
@@ -36,14 +34,15 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
     return {"query": query, "snippets": snippets, "scraped": scraped}
 
 
-def _search(query: str) -> list[dict[str, Any]]:
+def _search(query: str, max_results: int) -> list[dict[str, Any]]:
     from ddgs import DDGS
 
+    settings = get_settings()
     last_error: Exception | None = None
-    for backend in [item.strip() for item in SEARCH_BACKENDS.split(",") if item.strip()]:
+    for backend in settings.web_search_backends:
         try:
-            with DDGS(timeout=SEARCH_TIMEOUT) as ddgs:
-                results = list(ddgs.text(query, max_results=MAX_RESULTS, backend=backend))
+            with DDGS(timeout=settings.web_search_timeout_seconds) as ddgs:
+                results = list(ddgs.text(query, max_results=max_results, backend=backend))
             if results:
                 return results
         except Exception as exc:
@@ -71,12 +70,12 @@ def _scrape(url: str) -> str:
         response = requests.get(
             url,
             headers={"User-Agent": "Mozilla/5.0 PredictX/1.0"},
-            timeout=SCRAPE_TIMEOUT,
+            timeout=get_settings().web_scrape_timeout_seconds,
         )
         response.raise_for_status()
         text = trafilatura.extract(response.text, include_comments=False, include_tables=False)
         if text:
-            return _ascii(text)[:MAX_CHARS]
+            return _ascii(text)[: get_settings().web_scrape_max_chars]
     except Exception:
         pass
     return ""

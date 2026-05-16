@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 data/*.sqlite3
+.env
+_migrated_predictz/.env
+_migrated_predictz/.git/
+_migrated_predictz/__pycache__/

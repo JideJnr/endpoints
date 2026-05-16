@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from fractions import Fraction
 from typing import Any
 
@@ -63,6 +64,24 @@ def snapshot_odds(doc: dict[str, Any]) -> bool:
             ),
         )
         conn.commit()
+    try:
+        from app.mongo_store import save_odds_snapshot
+
+        save_odds_snapshot({
+            "sportybet_id": match_id,
+            "match": doc.get("sportybet_name") or doc.get("name"),
+            "match_date": doc.get("match_date"),
+            "snapshot_time": datetime.now(timezone.utc).isoformat(),
+            "home_odds": odds.get("home"),
+            "draw_odds": odds.get("draw"),
+            "away_odds": odds.get("away"),
+            "home_implied": _implied(odds.get("home")),
+            "draw_implied": _implied(odds.get("draw")),
+            "away_implied": _implied(odds.get("away")),
+            "source": source,
+        })
+    except Exception:
+        pass
     return True
 
 
