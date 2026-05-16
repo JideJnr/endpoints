@@ -17,7 +17,7 @@ import json
 from datetime import date as dt, datetime, timezone
 from typing import Any
 
-from app.league_memory import record_prediction, store_enriched_matches
+from app.league_memory import record_prediction
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
@@ -9,7 +10,17 @@ from app.scheduler import start_scheduler
 
 settings = get_settings()
 
-app = FastAPI(title=settings.app_name)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _init_db()
+    if settings.environment != "test":
+        start_scheduler()
+        _run_initial_enrichment()
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,14 +35,6 @@ app.include_router(agent.router)
 app.include_router(frontend.router)
 app.include_router(platform.router)
 app.include_router(mongo.router)
-
-
-@app.on_event("startup")
-def startup():
-    _init_db()
-    if settings.environment != "test":
-        start_scheduler()
-        _run_initial_enrichment()
 
 
 def _run_initial_enrichment():

@@ -842,35 +842,6 @@ def get_live_matches_from_buffer(limit: int = 200) -> list[dict[str, Any]]:
     return [json.loads(row["raw_json"]) for row in rows]
 
 
-def get_buffer_stats() -> dict[str, Any]:
-    """Returns counts of live, upcoming, and total matches in the buffer."""
-    _init_db()
-    today = __import__("datetime").date.today().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        total = conn.execute("select count(*) from enriched_matches").fetchone()[0]
-        today_count = conn.execute(
-            "select count(*) from enriched_matches where match_date = ?", (today,)
-        ).fetchone()[0]
-        live_count = conn.execute(
-            """
-            select count(*) from enriched_matches
-            where json_extract(raw_json, '$.period') is not null
-              and json_extract(raw_json, '$.period') != 'Not start'
-              and json_extract(raw_json, '$.period') != ''
-            """
-        ).fetchone()[0]
-        last_enriched = conn.execute(
-            "select max(enriched_at) from enriched_matches"
-        ).fetchone()[0]
-    return {
-        "total_buffered": total,
-        "today": today_count,
-        "live": live_count,
-        "upcoming": today_count - live_count,
-        "last_enriched_at": last_enriched,
-    }
-
-
 def late_goal_memory_signal(match: dict[str, Any]) -> dict[str, Any] | None:
     memory = league_memory_for_match(match)
     samples = memory.get("samples", 0)

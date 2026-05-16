@@ -8,3 +8,6 @@ trafilatura
 pymongo[srv]
 apscheduler
 rapidfuzz
+langchain
+langchain-core
+langchain-groq
