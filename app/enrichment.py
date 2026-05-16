@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date as dt, datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any
@@ -13,7 +14,15 @@ from app.web_context import search_match_context
 
 
 FUZZY_THRESHOLD = 0.75
-JUNK_MARKERS = (" srl", " u21", " u20", " u19", " u18", " u23", "reserves", "women", "esports", "virtual")
+# Raised from migrated version (was 75 int, now 0.75 float — same threshold)
+# LLM fallback kicks in when fuzzy score is below this
+LLM_FALLBACK_THRESHOLD = 0.60
+
+JUNK_MARKERS = (
+    " srl", " u21", " u20", " u19", " u18", " u23",
+    "reserves", " ii ", " b ", "women", "wfc", "ladies",
+    "esports", "simulated", "virtual",
+)
 
 
 def run_enrichment(match_date: str | None = None, force: bool = False, limit: int = 300) -> dict[str, Any]:
@@ -22,12 +31,25 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     sofa_events = fetch_all_scheduled_events(target_date)
 
     documents = []
-    matched = unmatched = 0
+    matched = unmatched = llm_used = 0
+
     for sporty in sporty_matches:
         sofa, score = _fuzzy_match(sporty, sofa_events)
+
         if score < FUZZY_THRESHOLD:
-            sofa = None
-            unmatched += 1
+            # try LLM fallback for borderline matches (not junk)
+            if score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
+                llm_sofa = _llm_match(sporty, sofa_events)
+                if llm_sofa:
+                    sofa = llm_sofa
+                    llm_used += 1
+                    matched += 1
+                else:
+                    sofa = None
+                    unmatched += 1
+            else:
+                sofa = None
+                unmatched += 1
         else:
             matched += 1
 
@@ -60,6 +82,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "sofascore_detail": detail,
             "web_context": web_context,
             "match_score": round(score, 3),
+            "llm_matched": llm_used > 0 and sofa is not None,
             "enriched_at": datetime.now(timezone.utc).isoformat(),
         }
         documents.append(doc)
@@ -72,10 +95,51 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
         "sporty_count": len(sporty_matches),
         "sofa_count": len(sofa_events),
         "matched": matched,
+        "llm_fallback": llm_used,
         "unmatched": unmatched,
         "stored": stored,
     }
 
+
+# ── LLM fallback matching ─────────────────────────────────────────────────────
+# Ported from migrated predictz/enrichment.py
+# Only fires when fuzzy score is between LLM_FALLBACK_THRESHOLD and FUZZY_THRESHOLD
+# Requires GROQ_API_KEY — silently skips if unavailable
+
+_llm_instance = None
+
+
+def _get_llm_instance():
+    global _llm_instance
+    if _llm_instance is None:
+        from app.llm import get_fast_llm
+        _llm_instance = get_fast_llm()
+    return _llm_instance
+
+
+def _llm_match(sporty: dict[str, Any], sofa_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Ask the LLM to pick the correct SofaScore event when fuzzy matching is borderline."""
+    try:
+        from langchain_core.messages import HumanMessage
+        llm = _get_llm_instance()
+        candidates = [{"id": e["id"], "name": e.get("name")} for e in sofa_events[:50]]
+        prompt = (
+            f"Match this SportyBet fixture to the correct SofaScore event.\n"
+            f"SportyBet: {sporty.get('name')} | tournament: {sporty.get('tournament', '')}\n\n"
+            f"SofaScore candidates:\n{json.dumps(candidates, indent=2)}\n\n"
+            f"Reply with ONLY the matching SofaScore event id as a plain integer, or 0 if no match."
+        )
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        event_id = int(resp.content.strip())
+        if event_id == 0:
+            return None
+        return next((e for e in sofa_events if e["id"] == event_id), None)
+    except Exception as exc:
+        print(f"[enrichment] LLM match skipped ({type(exc).__name__}): {sporty.get('name')}")
+        return None
+
+
+# ── Fuzzy matching ────────────────────────────────────────────────────────────
 
 def _fuzzy_match(sporty: dict[str, Any], sofa_events: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float]:
     name = sporty.get("name") or ""

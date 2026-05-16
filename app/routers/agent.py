@@ -189,3 +189,39 @@ def _to_int(value, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+# ── Groq LangChain agent endpoints ───────────────────────────────────────────
+# Ported from migrated predictz/agent.py
+# Requires GROQ_API_KEY in .env
+
+@router.post("/groq/predict")
+def post_groq_predictions(
+    match_date: Optional[str] = None,
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """
+    Run the Groq LangChain agent over today's enriched matches.
+    Full 10-step reasoning: standings, H2H, Poisson, odds movement, SOS, web context.
+    Requires GROQ_API_KEY.
+    """
+    try:
+        from app.groq_agent import run_groq_predictions
+        return run_groq_predictions(match_date=match_date, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/groq/status")
+def get_groq_status():
+    """Check if Groq LLM is configured and available."""
+    try:
+        from app.llm import is_groq_available, get_llm
+        available = is_groq_available()
+        return {
+            "status": "success",
+            "groq_available": available,
+            "message": "Groq ready" if available else "Set GROQ_API_KEY in .env to enable Groq agent",
+        }
+    except Exception as e:
+        return {"status": "error", "groq_available": False, "detail": str(e)}
