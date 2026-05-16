@@ -130,7 +130,36 @@ The AI brain sits above the rule engine and reviews the existing signals. It is 
 - Override model with `PREDICTX_AI_MODEL`
 - Override URL with `PREDICTX_OLLAMA_URL`
 
-If Ollama is not running, the app falls back to a deterministic supervisor and still returns `ai_brain` in each prediction. The supervisor can approve, pass, or mark caution, then apply a small confidence adjustment.
+For Render or any hosted deployment, it can use Hugging Face Inference Providers:
+
+- Set `HF_TOKEN` or `HUGGINGFACE_HUB_TOKEN`
+- Optional: set `PREDICTX_AI_PROVIDER=huggingface`
+- Optional: set `PREDICTX_HF_MODEL=Qwen/Qwen2.5-7B-Instruct:fastest`
+- Default endpoint: `https://router.huggingface.co/v1/chat/completions`
+
+Provider order in `auto` mode is Hugging Face if a token exists, then Ollama, then the deterministic supervisor. The supervisor can approve, pass, or mark caution, then apply a small confidence adjustment.
+
+## 7. Web Context Search
+
+The enrichment agent can search DuckDuckGo for match previews before prediction. It uses `ddgs` for the search and `trafilatura` to extract readable text from the top result pages.
+
+Limits:
+- Top 3 search results
+- 1,500 characters per scraped page
+- ASCII-only text to keep prompts clean
+- Short timeouts so one slow site does not block prediction
+
+Agent behavior:
+- `/run/enrich` stores `web_context` with snippets and scraped preview text
+- `/run/predict` passes stored `web_context` into the AI brain
+- `/models/web-context?home=...&away=...&tournament=...` tests search directly
+
+Render requirements:
+- `ddgs`
+- `trafilatura`
+
+Optional setting:
+- `PREDICTX_SEARCH_BACKENDS=duckduckgo`
 
 ## Research Sources
 

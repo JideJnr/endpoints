@@ -197,8 +197,10 @@ def _form_edge(event: dict[str, Any], home_form: dict[str, Any], away_form: dict
         edge -= (home_form.get("avg_goals_against", 0) - away_form.get("avg_goals_against", 0)) * 3
         signals.append({"name": "recent_history_edge", "value": round(edge, 2), "impact": round(edge, 2)})
 
-    if home_pre.get("avg_rating") and away_pre.get("avg_rating"):
-        rating_edge = (home_pre["avg_rating"] - away_pre["avg_rating"]) * 10
+    home_rating = _to_float(home_pre.get("avg_rating"))
+    away_rating = _to_float(away_pre.get("avg_rating"))
+    if home_rating is not None and away_rating is not None:
+        rating_edge = (home_rating - away_rating) * 10
         edge += rating_edge
         signals.append({"name": "avg_rating_edge", "value": round(rating_edge, 2), "impact": round(rating_edge, 2)})
 
@@ -256,8 +258,8 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
 
 def _table_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
     pregame = event.get("pregame_form") or {}
-    home_position = (pregame.get("home_team") or {}).get("position")
-    away_position = (pregame.get("away_team") or {}).get("position")
+    home_position = _to_int((pregame.get("home_team") or {}).get("position"), 0)
+    away_position = _to_int((pregame.get("away_team") or {}).get("position"), 0)
     if not home_position or not away_position:
         return 0.0
     edge = max(min((away_position - home_position) * 1.5, 15), -15)

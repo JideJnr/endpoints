@@ -22,9 +22,11 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
     away_goals = _to_int(score.get("away"), 0)
     total_goals = home_goals + away_goals
     minute = _match_minute(match)
-    status_type = (match.get("status") or {}).get("type") or match.get("status")
+    raw_status = match.get("status") or {}
+    status_type = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
     status_text = str(status_type or "").lower()
-    is_finished = status_text in {"finished", "ended", "100"} or (match.get("status") or {}).get("code") == 100
+    status_code = raw_status.get("code") if isinstance(raw_status, dict) else raw_status
+    is_finished = status_text in {"finished", "ended", "100"} or status_code == 100
     is_live = status_text in {"inprogress", "live"} or minute > 0
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -393,6 +395,180 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             ),
         )
         conn.commit()
+
+
+def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> dict[str, Any]:
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("select * from prediction_history where id = ?", (prediction_id,)).fetchone()
+        if not row:
+            return {"graded": False, "reason": "not found"}
+        result = _grade_pick(row["pick_type"], row["selection"], final_home, final_away)
+        conn.execute(
+            "update prediction_history set result = ?, final_home = ?, final_away = ?, graded_at = current_timestamp where id = ?",
+            (result, final_home, final_away, prediction_id),
+        )
+        conn.commit()
+    return {"graded": True, "id": prediction_id, "result": result, "final_home": final_home, "final_away": final_away}
+
+
+def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    _init_db()
+    finished = {str(e["id"]): e for e in events if (e.get("status") or {}).get("type") == "finished"}
+    if not finished:
+        return {"graded": 0, "skipped": 0, "no_finished_events": True}
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select id, match_id, pick_type, selection
+            from prediction_history
+            where graded_at is null
+              and date(created_at) = ?
+            """,
+            (match_date,),
+        ).fetchall()
+
+    graded = skipped = 0
+    for row in rows:
+        event = finished.get(str(row["match_id"]))
+        if not event:
+            skipped += 1
+            continue
+        score = event.get("score") or {}
+        final_home = _to_int(score.get("home"), 0)
+        final_away = _to_int(score.get("away"), 0)
+        result = _grade_pick(row["pick_type"], row["selection"], final_home, final_away)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "update prediction_history set result = ?, final_home = ?, final_away = ?, graded_at = current_timestamp where id = ?",
+                (result, final_home, final_away, row["id"]),
+            )
+            conn.commit()
+        graded += 1
+
+    return {"graded": graded, "skipped": skipped, "date": match_date}
+
+
+def get_grading_metrics() -> dict[str, Any]:
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        totals = conn.execute(
+            """
+            select
+                count(*) as total,
+                sum(case when graded_at is not null then 1 else 0 end) as graded,
+                sum(case when result = 'win' then 1 else 0 end) as wins,
+                sum(case when result = 'loss' then 1 else 0 end) as losses,
+                sum(case when result = 'void' then 1 else 0 end) as voids
+            from prediction_history
+            where pick_type != 'no_bet'
+            """
+        ).fetchone()
+        by_type = conn.execute(
+            """
+            select pick_type,
+                   count(*) as total,
+                   sum(case when result = 'win' then 1 else 0 end) as wins,
+                   sum(case when result = 'loss' then 1 else 0 end) as losses
+            from prediction_history
+            where graded_at is not null and pick_type != 'no_bet'
+            group by pick_type
+            order by total desc
+            """
+        ).fetchall()
+        recent = conn.execute(
+            """
+            select result, confidence, match_name, selection, created_at
+            from prediction_history
+            where graded_at is not null and pick_type != 'no_bet'
+            order by graded_at desc
+            limit 20
+            """
+        ).fetchall()
+
+    graded = totals["graded"] or 0
+    wins = totals["wins"] or 0
+    losses = totals["losses"] or 0
+    win_rate = round(wins / graded, 3) if graded else None
+    return {
+        "total_predictions": totals["total"] or 0,
+        "graded": graded,
+        "pending": (totals["total"] or 0) - graded,
+        "wins": wins,
+        "losses": losses,
+        "voids": totals["voids"] or 0,
+        "win_rate": win_rate,
+        "win_percent": round(win_rate * 100, 1) if win_rate is not None else None,
+        "by_type": [
+            {
+                "pick_type": r["pick_type"],
+                "total": r["total"],
+                "wins": r["wins"] or 0,
+                "losses": r["losses"] or 0,
+                "win_rate": round((r["wins"] or 0) / r["total"], 3) if r["total"] else None,
+            }
+            for r in by_type
+        ],
+        "recent": [
+            {
+                "result": r["result"],
+                "confidence": r["confidence"],
+                "match": r["match_name"],
+                "selection": r["selection"],
+                "created_at": r["created_at"],
+            }
+            for r in recent
+        ],
+    }
+
+
+def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: int) -> str:
+    total = home + away
+    sel = (selection or "").lower()
+    pt = (pick_type or "").lower()
+
+    if pt == "no_bet":
+        return "void"
+
+    if pt == "goals":
+        if "over 2.5" in sel:
+            return "win" if total > 2 else "loss"
+        if "over 1.5" in sel:
+            return "win" if total > 1 else "loss"
+        if "over 0.5" in sel:
+            return "win" if total > 0 else "loss"
+        if "both teams to score" in sel or "btts" in sel:
+            return "win" if home > 0 and away > 0 else "loss"
+        return "void"
+
+    if pt == "live_goals":
+        if "over 0.5" in sel or "next goal" in sel or "late goal" in sel:
+            return "win" if total > 0 else "loss"
+        return "void"
+
+    if pt == "match_result":
+        if " or draw" in sel:
+            return "win" if home > away or home == away else "loss"
+        if "home" in sel:
+            return "win" if home > away else "loss"
+        if "away" in sel:
+            return "win" if away > home else "loss"
+        return "void"
+
+    if pt == "double_chance":
+        if "double chance" in sel:
+            team_part = sel.replace("double chance", "").strip()
+            if "home" in team_part:
+                return "win" if home >= away else "loss"
+            if "away" in team_part:
+                return "win" if away >= home else "loss"
+        return "void"
+
+    return "void"
 
 
 def list_prediction_history(limit: int = 200, match_id: str | None = None) -> dict[str, Any]:
@@ -801,6 +977,11 @@ def _init_db() -> None:
         conn.execute("create index if not exists idx_predictions_created on prediction_history(created_at)")
         conn.execute("create index if not exists idx_odds_match on odds_snapshots(match_id)")
         conn.execute("create index if not exists idx_odds_date on odds_snapshots(match_date)")
+        _ensure_column(conn, "prediction_history", "result", "text")
+        _ensure_column(conn, "prediction_history", "final_home", "integer")
+        _ensure_column(conn, "prediction_history", "final_away", "integer")
+        _ensure_column(conn, "prediction_history", "graded_at", "text")
+        conn.execute("create index if not exists idx_predictions_graded on prediction_history(graded_at)")
         conn.commit()
 
 

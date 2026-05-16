@@ -1,0 +1,207 @@
+[
+  {
+    "match": "Manchester United vs Nottingham Forest",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Manchester United or draw protection",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 78,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "AS Roma vs Lazio",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "AS Roma or draw protection",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 85,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "Juventus vs Fiorentina",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Juventus or draw protection",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 78,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "Genoa vs Milan",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Milan or draw protection",
+        "confidence": 76,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 76,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 69,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "Palmeiras vs Cruzeiro",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Palmeiras or draw protection",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 78,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "River Plate vs Rosario Central",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 81,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 74,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "Estoril Praia vs Benfica",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Benfica or draw protection",
+        "confidence": 76,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 76,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 69,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "Sporting CP vs Gil Vicente",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Sporting CP or draw protection",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 85,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 78,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "RSC Anderlecht vs KV Mechelen",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 81,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 74,
+        "result": "PENDING"
+      },
+      {
+        "selection": "RSC Anderlecht double chance",
+        "confidence": 63,
+        "result": "PENDING"
+      }
+    ]
+  },
+  {
+    "match": "CD Guadalajara vs Cruz Azul",
+    "score": "?-?",
+    "status": "Not started",
+    "picks": [
+      {
+        "selection": "Over 1.5 goals",
+        "confidence": 82,
+        "result": "PENDING"
+      },
+      {
+        "selection": "Over 2.5 goals",
+        "confidence": 75,
+        "result": "PENDING"
+      }
+    ]
+  }
+]

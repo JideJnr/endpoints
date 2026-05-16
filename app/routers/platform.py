@@ -33,6 +33,7 @@ from app.prediction_agent import predict_sofascore_event, predict_sporty_match
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_team_history
 from app.sos import compare_schedules, analyse_schedule
 from app.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post
+from app.web_context import context_for_match, search_match_context
 
 router = APIRouter(tags=["platform"])
 
@@ -185,6 +186,21 @@ def get_match_detail(match_id: str, source: Optional[str] = None):
     return {"status": "success", "match": match}
 
 
+@router.get("/matches/{match_id}/prediction")
+def get_match_prediction(
+    match_id: str,
+    source: Optional[str] = None,
+    date: Optional[str] = None,
+    include_web_context: bool = True,
+):
+    return _prediction_for_match_id(
+        match_id=match_id,
+        source=source,
+        date=date,
+        include_web_context=include_web_context,
+    )
+
+
 @router.get("/countries")
 def get_countries():
     return {"status": "success", **list_countries_from_memory()}
@@ -263,17 +279,61 @@ def get_predictions_history(limit: int = Query(default=200, ge=1, le=1000), matc
 
 
 @router.get("/predictions/{match_id}")
-def get_prediction(match_id: str, date: Optional[str] = None):
+def get_prediction(
+    match_id: str,
+    source: Optional[str] = None,
+    date: Optional[str] = None,
+    include_web_context: bool = True,
+):
+    return _prediction_for_match_id(
+        match_id=match_id,
+        source=source,
+        date=date,
+        include_web_context=include_web_context,
+    )
+
+
+def _prediction_for_match_id(
+    match_id: str,
+    source: Optional[str],
+    date: Optional[str],
+    include_web_context: bool,
+):
     target_date = date or dt.today().isoformat()
+
+    enriched = get_enriched_match(match_id)
+    if enriched and source in (None, "enriched", "memory"):
+        prediction = _predict_enriched(enriched)
+        record_prediction(prediction)
+        return {"status": "success", "source": "enriched", "prediction": prediction}
+
+    if source in (None, "sportybet", "sporty"):
+        try:
+            matches = fetch_live_and_upcoming_matches_post()
+            match = next((item for item in matches if str(item.get("id")) == str(match_id)), None)
+            if match:
+                prediction = _predict_sporty_with_context(match, include_web_context=include_web_context)
+                record_prediction(prediction)
+                return {"status": "success", "source": "sportybet", "prediction": prediction}
+        except Exception:
+            if source in ("sportybet", "sporty"):
+                raise
+
     try:
         events = fetch_all_scheduled_events(target_date)
         event = next((item for item in events if str(item.get("id")) == str(match_id)), None)
         if event:
-            prediction = _predict_sofascore(event, include_history=True)
+            prediction = _predict_sofascore(
+                event,
+                include_history=True,
+                include_web_context=include_web_context,
+            )
             record_prediction(prediction)
-            return {"status": "success", "prediction": prediction}
+            return {"status": "success", "source": "sofascore", "prediction": prediction}
     except Exception:
-        pass
+        if source == "sofascore":
+            raise
+
     history = list_prediction_history(limit=1, match_id=match_id)["predictions"]
     if history:
         return {"status": "success", "source": "memory", "prediction": history[0]}
@@ -415,6 +475,11 @@ def get_schedule_model(home_team_id: int, away_team_id: int):
     return {"status": "success", "schedule": compare_schedules(home_team_id, away_team_id)}
 
 
+@router.get("/models/web-context")
+def get_web_context(home: str, away: str, tournament: str = ""):
+    return {"status": "success", "web_context": search_match_context(home, away, tournament)}
+
+
 def _predictions_for_date(date: Optional[str], limit: int, include_history: bool) -> list[dict[str, Any]]:
     target_date = date or dt.today().isoformat()
     events = fetch_all_scheduled_events(target_date)[:limit]
@@ -442,8 +507,10 @@ def _safe_predictions_for_date(date: Optional[str], limit: int, include_history:
         ]
 
 
-def _predict_sofascore(event: dict[str, Any], include_history: bool) -> dict[str, Any]:
+def _predict_sofascore(event: dict[str, Any], include_history: bool, include_web_context: bool = False) -> dict[str, Any]:
     detail = fetch_event_detail(event)
+    if include_web_context:
+        detail["web_context"] = context_for_match(detail)
     home_history = []
     away_history = []
     if include_history:
@@ -454,11 +521,25 @@ def _predict_sofascore(event: dict[str, Any], include_history: bool) -> dict[str
     return prediction
 
 
+def _predict_sporty_with_context(match: dict[str, Any], include_web_context: bool) -> dict[str, Any]:
+    prediction = predict_sporty_match(match)
+    detail = match
+    if include_web_context:
+        web_context = context_for_match(match)
+        prediction["web_context"] = web_context
+        detail = {**match, "web_context": web_context}
+    _attach_ai_brain(prediction, detail)
+    _attach_value_fields(prediction)
+    return prediction
+
+
 def _predict_enriched(doc: dict[str, Any]) -> dict[str, Any]:
     detail = doc.get("sofascore_detail")
+    web_context = doc.get("web_context")
     if detail:
         prediction = predict_sofascore_event(detail)
-        _attach_deep_analysis(prediction, detail)
+        prediction["web_context"] = web_context
+        _attach_deep_analysis(prediction, {**detail, "web_context": web_context}, attach_brain=False)
     else:
         prediction = predict_sporty_match({
             "id": doc.get("sportybet_id"),
@@ -470,9 +551,9 @@ def _predict_enriched(doc: dict[str, Any]) -> dict[str, Any]:
             "category": doc.get("category"),
             "markets": doc.get("sportybet_markets", []),
         })
-    if "ai_brain" not in prediction:
-        _attach_ai_brain(prediction, detail)
-        _attach_value_fields(prediction)
+        prediction["web_context"] = web_context
+    _attach_ai_brain(prediction, {**(detail or {}), "web_context": web_context})
+    _attach_value_fields(prediction)
     prediction["enriched"] = {
         "sportybet_id": doc.get("sportybet_id"),
         "sofascore_id": doc.get("sofascore_id"),
@@ -483,7 +564,7 @@ def _predict_enriched(doc: dict[str, Any]) -> dict[str, Any]:
     return prediction
 
 
-def _attach_deep_analysis(prediction: dict[str, Any], detail: dict[str, Any]) -> None:
+def _attach_deep_analysis(prediction: dict[str, Any], detail: dict[str, Any], attach_brain: bool = True) -> None:
     home_id = (detail.get("home_team") or {}).get("id")
     away_id = (detail.get("away_team") or {}).get("id")
     if not home_id or not away_id:
@@ -504,8 +585,9 @@ def _attach_deep_analysis(prediction: dict[str, Any], detail: dict[str, Any]) ->
         prediction["signals"].append({"name": "strength_of_schedule", "value": schedule.get("verdict"), "impact": 4})
     except Exception as e:
         prediction["strength_of_schedule"] = {"error": str(e)}
-    _attach_ai_brain(prediction, detail)
-    _attach_value_fields(prediction)
+    if attach_brain:
+        _attach_ai_brain(prediction, detail)
+        _attach_value_fields(prediction)
 
 
 def _attach_value_fields(prediction: dict[str, Any]) -> None:

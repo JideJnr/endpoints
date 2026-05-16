@@ -9,6 +9,7 @@ from app.market import snapshot_odds
 from app.normalise import normalise
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
 from app.sportybet_client import fetch_live_and_upcoming_matches_post
+from app.web_context import search_match_context
 
 
 FUZZY_THRESHOLD = 0.75
@@ -37,6 +38,12 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             except Exception:
                 detail = None
 
+        web_context = search_match_context(
+            sporty.get("home_team") or "",
+            sporty.get("away_team") or "",
+            sporty.get("tournament") or "",
+        )
+
         doc = {
             "sportybet_id": sporty.get("id"),
             "sportybet_name": sporty.get("name"),
@@ -51,7 +58,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "sofascore_id": sofa.get("id") if sofa else None,
             "sofascore_name": sofa.get("name") if sofa else None,
             "sofascore_detail": detail,
-            "web_context": {"query": f"{sporty.get('name')} prediction preview {sporty.get('tournament')}", "snippets": [], "scraped": []},
+            "web_context": web_context,
             "match_score": round(score, 3),
             "enriched_at": datetime.now(timezone.utc).isoformat(),
         }
