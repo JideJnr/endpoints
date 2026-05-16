@@ -28,8 +28,43 @@ app.include_router(mongo.router)
 
 @app.on_event("startup")
 def startup():
+    _init_db()
     if settings.environment != "test":
         start_scheduler()
+        _run_initial_enrichment()
+
+
+def _run_initial_enrichment():
+    """
+    On startup: immediately ingest matches into the buffer so the frontend
+    has data right away. Enrichment worker will pick them up within 2 minutes.
+    The thread is daemonized so it won't block server shutdown.
+    """
+    import threading
+    from app.scheduler import job_ingest_upcoming, job_ingest_live
+
+    def _boot():
+        print("[startup] ingesting upcoming matches into buffer...")
+        try:
+            result = job_ingest_upcoming()
+            print(f"[startup] upcoming ingest done: {result.get('ingested', 0)} buffered")
+        except Exception as exc:
+            print(f"[startup] upcoming ingest failed: {exc}")
+        try:
+            result = job_ingest_live()
+            print(f"[startup] live ingest done: {result.get('live_count', 0)} live matches")
+        except Exception as exc:
+            print(f"[startup] live ingest failed: {exc}")
+        # kick off first enrichment batch immediately
+        try:
+            from app.scheduler import job_enrich_worker
+            result = job_enrich_worker()
+            print(f"[startup] first enrichment batch done: {result.get('stored', 0)} enriched")
+        except Exception as exc:
+            print(f"[startup] first enrichment batch failed: {exc}")
+
+    t = threading.Thread(target=_boot, daemon=True, name="startup-ingest")
+    t.start()
 
 
 @app.get("/health")

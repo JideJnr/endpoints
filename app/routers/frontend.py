@@ -5,8 +5,15 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.league_memory import get_enriched_match, get_enriched_matches, list_prediction_history
+from app.buffer import (
+    get_buffered_matches,
+    get_buffered_match,
+    get_live_buffered_matches,
+    get_buffer_stats,
+)
+from app.league_memory import list_prediction_history
 from app.market import get_movement
+from app.scheduler import scheduler_status
 
 
 router = APIRouter(tags=["frontend"])
@@ -15,7 +22,7 @@ router = APIRouter(tags=["frontend"])
 @router.get("/matches/today")
 def get_matches_today():
     target_date = dt.today().isoformat()
-    docs = get_enriched_matches(target_date)
+    docs = get_buffered_matches(target_date)
     return {
         "status": "success",
         "date": target_date,
@@ -24,9 +31,20 @@ def get_matches_today():
     }
 
 
+@router.get("/matches/live")
+def get_live_matches():
+    """All currently live matches from the buffer regardless of date."""
+    docs = get_live_buffered_matches()
+    return {
+        "status": "success",
+        "count": len(docs),
+        "matches": [_match_summary(doc) for doc in docs],
+    }
+
+
 @router.get("/matches/by-date/{match_date}")
 def get_matches_by_date(match_date: str, limit: int = Query(default=500, ge=1, le=1000)):
-    docs = get_enriched_matches(match_date, limit=limit)
+    docs = get_buffered_matches(match_date, limit=limit)
     return {
         "status": "success",
         "date": match_date,
@@ -37,10 +55,137 @@ def get_matches_by_date(match_date: str, limit: int = Query(default=500, ge=1, l
 
 @router.get("/matches/today/{sportybet_id}")
 def get_today_match_detail(sportybet_id: str):
-    doc = get_enriched_match(sportybet_id)
+    doc = get_buffered_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
     return _match_detail(doc)
+
+
+@router.get("/buffer/status")
+def get_buffer_status():
+    """Scheduler health + buffer counts. Use to verify background jobs are running."""
+    return {
+        "status": "success",
+        "scheduler": scheduler_status(),
+        "buffer": get_buffer_stats(),
+    }
+
+
+@router.post("/matches/{sportybet_id}/enrich")
+def enrich_single_match(sportybet_id: str):
+    """Force-enrich a single match immediately (bypasses staleness check)."""
+    from app.buffer import get_buffered_match, store_enriched
+    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
+    from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
+    from app.web_context import search_match_context
+    from app.market import snapshot_odds
+    from datetime import date, datetime, timezone
+    import json
+
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found in buffer")
+
+    sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+    match_date = doc.get("match_date") or date.today().isoformat()
+
+    try:
+        sofa_events = fetch_all_scheduled_events(match_date)
+    except Exception:
+        sofa_events = []
+
+    sofa, score = _fuzzy_match(sporty, sofa_events)
+    if score < FUZZY_THRESHOLD and score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
+        sofa = _llm_match(sporty, sofa_events) or sofa
+
+    detail = None
+    if sofa:
+        try:
+            detail = fetch_event_detail(sofa)
+        except Exception:
+            pass
+
+    web_context = {}
+    try:
+        web_context = search_match_context(
+            sporty.get("home_team") or "",
+            sporty.get("away_team") or "",
+            sporty.get("tournament") or "",
+        )
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc).isoformat()
+    enriched_doc = {
+        **sporty,
+        "sportybet_id":      sporty.get("id") or sportybet_id,
+        "sportybet_name":    sporty.get("name"),
+        "match_date":        match_date,
+        "sofascore_id":      sofa.get("id") if sofa else None,
+        "sofascore_name":    sofa.get("name") if sofa else None,
+        "sofascore_detail":  detail,
+        "web_context":       web_context,
+        "match_score":       round(score, 3),
+        "enriched_at":       now,
+    }
+
+    snapshot_odds(enriched_doc)
+    store_enriched(sportybet_id, enriched_doc)
+
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "matched_sofascore": bool(sofa),
+        "sofascore_id": sofa.get("id") if sofa else None,
+        "fuzzy_score": round(score, 3),
+        "has_detail": bool(detail),
+        "has_web_context": bool(web_context.get("snippets")),
+        "enriched_at": now,
+    }
+
+
+@router.post("/matches/{sportybet_id}/predict")
+def predict_single_match(sportybet_id: str):
+    """Run the prediction agent on a single match and return the result."""
+    from app.buffer import get_buffered_match
+    from app.prediction_agent import predict_sporty_match
+    from app.ai_brain import oversee_prediction
+    from app.league_memory import record_prediction
+    from datetime import date
+
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+
+    # rules-based prediction (always available)
+    try:
+        prediction = predict_sporty_match(doc)
+        brain = oversee_prediction(prediction, doc)
+        prediction["ai_brain"] = brain
+        adj = int(brain.get("confidence_adjustment") or 0)
+        if adj:
+            for pick in prediction.get("picks") or []:
+                pick["confidence"] = max(1, min(95, int(pick.get("confidence", 50)) + adj))
+        prediction["signals"].append({
+            "name": "ai_brain_review",
+            "value": brain,
+            "impact": adj,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
+
+    # try to save to history
+    try:
+        record_prediction({
+            **prediction,
+            "match_id": sportybet_id,
+            "match_date": doc.get("match_date") or date.today().isoformat(),
+            "source": "rules",
+        })
+    except Exception:
+        pass
+
+    return {"status": "success", "sportybet_id": sportybet_id, "prediction": prediction}
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:

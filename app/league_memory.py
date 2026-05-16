@@ -786,6 +786,91 @@ def get_enriched_match(match_id: str) -> dict[str, Any] | None:
         return None
 
 
+def patch_enriched_match_live(
+    match_id: str,
+    period: str | None,
+    score: dict[str, Any] | None,
+    played_seconds: Any = None,
+) -> bool:
+    """
+    Fast in-place update of period + score for a live match already in the buffer.
+    Avoids a full re-enrichment cycle just to show the current score.
+    Returns True if the row existed and was updated.
+    """
+    if not match_id:
+        return False
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "select raw_json from enriched_matches where match_id = ?", (match_id,)
+        ).fetchone()
+        if not row:
+            return False
+        doc = json.loads(row["raw_json"])
+        doc["period"] = period
+        doc["score"] = score
+        if played_seconds is not None:
+            doc["played_seconds"] = played_seconds
+        conn.execute(
+            "update enriched_matches set raw_json = ? where match_id = ?",
+            (json.dumps(doc), match_id),
+        )
+        conn.commit()
+    return True
+
+
+def get_live_matches_from_buffer(limit: int = 200) -> list[dict[str, Any]]:
+    """
+    Returns all matches currently marked as live (period != 'Not start' and not finished)
+    from the enriched_matches buffer, regardless of match_date.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select raw_json from enriched_matches
+            where json_extract(raw_json, '$.period') is not null
+              and json_extract(raw_json, '$.period') != 'Not start'
+              and json_extract(raw_json, '$.period') != ''
+            order by enriched_at desc
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [json.loads(row["raw_json"]) for row in rows]
+
+
+def get_buffer_stats() -> dict[str, Any]:
+    """Returns counts of live, upcoming, and total matches in the buffer."""
+    _init_db()
+    today = __import__("datetime").date.today().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("select count(*) from enriched_matches").fetchone()[0]
+        today_count = conn.execute(
+            "select count(*) from enriched_matches where match_date = ?", (today,)
+        ).fetchone()[0]
+        live_count = conn.execute(
+            """
+            select count(*) from enriched_matches
+            where json_extract(raw_json, '$.period') is not null
+              and json_extract(raw_json, '$.period') != 'Not start'
+              and json_extract(raw_json, '$.period') != ''
+            """
+        ).fetchone()[0]
+        last_enriched = conn.execute(
+            "select max(enriched_at) from enriched_matches"
+        ).fetchone()[0]
+    return {
+        "total_buffered": total,
+        "today": today_count,
+        "live": live_count,
+        "upcoming": today_count - live_count,
+        "last_enriched_at": last_enriched,
+    }
+
+
 def late_goal_memory_signal(match: dict[str, Any]) -> dict[str, Any] | None:
     memory = league_memory_for_match(match)
     samples = memory.get("samples", 0)

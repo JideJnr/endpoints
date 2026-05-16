@@ -6,9 +6,10 @@ from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.mongo_store import init_mongo, list_finished_matches, mongo_status, save_finished_match
 from app.scheduler import (
-    scan_finished_matches,
-    scan_live_buffer,
-    scan_upcoming_buffer,
+    job_ingest_upcoming,
+    job_ingest_live,
+    job_enrich_worker,
+    job_archive_finished,
     scheduler_status,
     start_scheduler,
     stop_scheduler,
@@ -72,15 +73,23 @@ def post_scheduler_stop():
 @router.post("/scan/upcoming")
 def post_scan_upcoming(limit: int = Query(default=500, ge=1, le=1000)):
     try:
-        return scan_upcoming_buffer(limit=limit)
+        return job_ingest_upcoming(limit=limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/scan/live")
-def post_scan_live(limit: int = Query(default=500, ge=1, le=1000)):
+def post_scan_live(limit: int = Query(default=200, ge=1, le=1000)):
     try:
-        return scan_live_buffer(limit=limit)
+        return job_ingest_live(limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/scan/enrich")
+def post_scan_enrich(batch_size: int = Query(default=30, ge=1, le=100)):
+    try:
+        return job_enrich_worker(batch_size=batch_size)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -88,6 +97,6 @@ def post_scan_live(limit: int = Query(default=500, ge=1, le=1000)):
 @router.post("/scan/finished")
 def post_scan_finished(match_date: Optional[str] = None, limit: int = Query(default=1000, ge=1, le=2000)):
     try:
-        return scan_finished_matches(match_date=match_date, limit=limit)
+        return job_archive_finished(match_date=match_date, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
