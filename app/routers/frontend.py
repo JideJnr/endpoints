@@ -191,6 +191,152 @@ def match_sofascore_candidate(
     }
 
 
+@router.post("/predictions/refresh")
+def refresh_predictions_today():
+    """
+    Clear today's prediction history, re-enrich all buffered matches,
+    and re-run predictions. Call this after engine changes.
+    """
+    from datetime import date
+    from app.league_memory import DB_PATH, _init_db
+    from app.buffer import get_buffered_matches
+    from app.enriched_prediction import predict_enriched_match
+    from app.league_memory import record_prediction
+    import sqlite3 as _sqlite3
+
+    today = date.today().isoformat()
+    _init_db()
+
+    # 1. Delete today's prediction history so we get a clean slate
+    with _sqlite3.connect(DB_PATH) as conn:
+        deleted = conn.execute(
+            "delete from prediction_history where date(created_at) = ?", (today,)
+        ).rowcount
+        conn.commit()
+
+    # 2. Re-predict all buffered matches for today
+    docs = get_buffered_matches(today, limit=500)
+    predicted = 0
+    errors = 0
+    for doc in docs:
+        try:
+            prediction = predict_enriched_match(doc)
+            record_prediction({
+                **prediction,
+                "match_id": doc.get("sportybet_id") or doc.get("id"),
+                "match_date": today,
+                "source": "enriched_ensemble",
+            })
+            predicted += 1
+        except Exception as exc:
+            errors += 1
+
+    return {
+        "status": "success",
+        "date": today,
+        "deleted_old": deleted,
+        "predicted": predicted,
+        "errors": errors,
+        "total_matches": len(docs),
+    }
+
+
+@router.get("/predictions/today")
+def get_predictions_today():
+    """Return today's latest predictions per match, sorted by confidence desc. Excludes no_bet."""
+    from datetime import date
+    from app.league_memory import list_prediction_history, DB_PATH, _init_db
+    import sqlite3 as _sqlite3
+
+    today = date.today().isoformat()
+    all_preds = list_prediction_history(limit=2000).get("predictions") or []
+    today_preds = [p for p in all_preds if (p.get("created_at") or "").startswith(today)]
+
+    # Build a lookup of match_id → buffer status (period, is_live, is_finished)
+    _init_db()
+    buffer_status: dict[str, dict] = {}
+    try:
+        with _sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                "select match_id, period, is_live, is_finished from match_buffer"
+            ).fetchall()
+            for row in rows:
+                buffer_status[str(row["match_id"])] = {
+                    "period":      row["period"],
+                    "is_live":     bool(row["is_live"]),
+                    "is_finished": bool(row["is_finished"]),
+                }
+    except Exception:
+        pass
+
+    # Keep latest prediction per match_id (list is already ordered by created_at desc)
+    seen: dict[str, dict] = {}
+    for p in today_preds:
+        mid = str(p.get("match_id") or "")
+        if not mid or mid in seen:
+            continue
+        # Skip no_bet picks
+        picks = p.get("picks") or []
+        real_picks = [pk for pk in picks if pk.get("type") != "no_bet"]
+        if not real_picks:
+            continue
+        p = {**p, "picks": real_picks}
+        # Update best_pick to the highest confidence real pick
+        best = max(real_picks, key=lambda pk: int(pk.get("confidence") or 0))
+        p["best_pick"] = best
+        # Attach live/period status from buffer
+        status = buffer_status.get(mid, {})
+        p["period"]      = status.get("period") or p.get("period")
+        p["is_live"]     = status.get("is_live", False)
+        p["is_finished"] = status.get("is_finished", False)
+        seen[mid] = p
+
+    sorted_preds = sorted(
+        seen.values(),
+        key=lambda x: int((x.get("best_pick") or {}).get("confidence") or 0),
+        reverse=True,
+    )
+    return {"status": "success", "date": today, "count": len(sorted_preds), "predictions": sorted_preds}
+
+
+@router.post("/matches/cleanup")
+def cleanup_finished_matches():
+    """Immediately remove all finished, 90+, and ghost matches from the buffer."""
+    from app.mongo_store import cleanup_buffer
+    from app.buffer import purge_ghost_matches
+    from app.league_memory import DB_PATH, _init_db
+    import sqlite3 as _sqlite3
+
+    # First pass: archive any is_finished=1 rows that weren't cleaned up
+    _init_db()
+    archived = 0
+    with _sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "select match_id from match_buffer where is_finished = 1"
+        ).fetchall()
+    for (match_id,) in rows:
+        try:
+            from app.buffer import _archive_finished_locally
+            _archive_finished_locally(match_id)
+            archived += 1
+        except Exception:
+            pass
+
+    # Second pass: cleanup by period string + stale rows + 90+ + ghost
+    result = cleanup_buffer()
+    ghost_deleted = purge_ghost_matches()
+
+    return {
+        "status": "success",
+        "archived_locally":  archived,
+        "deleted_finished":  result.get("deleted_finished", 0),
+        "deleted_90_plus":   result.get("deleted_90_plus", 0),
+        "deleted_ghost":     result.get("deleted_ghost", 0) + ghost_deleted,
+        "deleted_stale":     result.get("deleted_stale_unenriched", 0),
+    }
+
+
 @router.get("/buffer/status")
 def get_buffer_status():
     """Scheduler health + buffer counts. Use to verify background jobs are running."""

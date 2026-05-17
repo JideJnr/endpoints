@@ -50,52 +50,143 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
 
 
 def _search(query: str, max_results: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    from ddgs import DDGS
-
+    """Try HTML scrape first (most reliable), then ddgs library as fallback."""
     settings = get_settings()
-    last_error: Exception | None = None
     attempts = []
 
-    for backend in settings.web_search_backends:
-        try:
-            with DDGS(timeout=settings.web_search_timeout_seconds) as ddgs:
-                results = list(ddgs.text(query, max_results=max_results, backend=backend))
-            if results:
-                attempts.append({"backend": backend, "status": "ok", "results": len(results)})
-                return results, attempts
-            attempts.append({"backend": backend, "status": "empty", "results": 0})
-        except Exception as exc:
-            last_error = exc
-            attempts.append({"backend": backend, "status": "error", "error": str(exc)})
-
+    # Primary: DuckDuckGo HTML endpoint — no API key, no rate-limit blocks
     try:
-        fallback = _search_duckduckgo_html(query, max_results)
-        attempts.append({"backend": "duckduckgo_html", "status": "ok" if fallback else "empty", "results": len(fallback)})
-        if fallback:
-            return fallback, attempts
+        results = _search_duckduckgo_html(query, max_results)
+        attempts.append({"backend": "duckduckgo_html", "status": "ok" if results else "empty", "results": len(results)})
+        if results:
+            return results, attempts
     except Exception as exc:
         attempts.append({"backend": "duckduckgo_html", "status": "error", "error": str(exc)})
-        last_error = exc
+
+    # Fallback: ddgs library (if installed)
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS(timeout=settings.web_search_timeout_seconds) as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if results:
+            attempts.append({"backend": "ddgs_lib", "status": "ok", "results": len(results)})
+            return results, attempts
+        attempts.append({"backend": "ddgs_lib", "status": "empty", "results": 0})
+    except ImportError:
+        pass
+    except Exception as exc:
+        attempts.append({"backend": "ddgs_lib", "status": "error", "error": str(exc)})
 
     return [], attempts
 
 
+def _search_duckduckgo_html(query: str, max_results: int) -> list[dict[str, Any]]:
+    """
+    Scrape DuckDuckGo's HTML endpoint directly.
+    More reliable than the API library — no token needed, no JS required.
+    """
+    import requests
+
+    settings = get_settings()
+    response = requests.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+        timeout=settings.web_search_timeout_seconds,
+    )
+    response.raise_for_status()
+    return _parse_ddg_html(response.text, max_results)
+
+
+def _parse_ddg_html(page: str, max_results: int) -> list[dict[str, Any]]:
+    """
+    Parse DuckDuckGo HTML results page.
+    Extracts result__a (title+url) and result__snippet (body) by pairing
+    them in document order — they always appear as adjacent siblings.
+    """
+    # Extract all title links
+    title_pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        re.S,
+    )
+    # Extract all snippet links
+    snippet_pattern = re.compile(
+        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+        re.S,
+    )
+
+    titles = [(m.start(), html.unescape(m.group(1)), _clean_html(m.group(2)))
+              for m in title_pattern.finditer(page)]
+    snippets = [(m.start(), _clean_html(m.group(1)))
+                for m in snippet_pattern.finditer(page)]
+
+    results = []
+    used_snippets = set()
+
+    for t_pos, raw_href, title in titles:
+        if len(results) >= max_results:
+            break
+        if not title:
+            continue
+
+        href = _resolve_ddg_href(raw_href)
+        if not href:
+            continue
+
+        # Find the nearest snippet that comes after this title
+        body = ""
+        for i, (s_pos, s_text) in enumerate(snippets):
+            if i in used_snippets:
+                continue
+            if s_pos > t_pos:
+                body = s_text
+                used_snippets.add(i)
+                break
+
+        results.append({"title": title, "body": body, "href": href})
+
+    return results
+
+
+def _resolve_ddg_href(href: str) -> str:
+    """Unwrap DuckDuckGo redirect URLs to get the real destination URL."""
+    if not href:
+        return ""
+    # Handle protocol-relative URLs
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    # DDG redirect: /l/?uddg=<encoded_url>
+    if parsed.path in ("/l/", "/l"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unquote(target)
+    return href
+
+
+def _clean_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return html.unescape(text)
+
+
 def _scrape_parallel(urls: list[str], timeout_per_url: int) -> list[str]:
-    """Scrape multiple URLs in parallel. Each URL gets its own timeout."""
+    """Scrape multiple URLs in parallel. Total wall time ≈ timeout_per_url (not × n)."""
     if not urls:
         return []
-
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results: list[str] = []
-
-    def _scrape_one(url: str) -> str:
-        return _scrape(url, timeout_per_url)
-
-    # cap total wall time: max_workers × timeout_per_url would be too long
-    # run all in parallel so total time ≈ timeout_per_url (not × n)
     with ThreadPoolExecutor(max_workers=len(urls)) as pool:
-        futures = {pool.submit(_scrape_one, url): url for url in urls}
+        futures = {pool.submit(_scrape, url, timeout_per_url): url for url in urls}
         for future in as_completed(futures, timeout=timeout_per_url + 2):
             try:
                 text = future.result()
@@ -103,16 +194,7 @@ def _scrape_parallel(urls: list[str], timeout_per_url: int) -> list[str]:
                     results.append(text)
             except Exception:
                 pass
-
     return results
-
-
-def context_for_match(match: dict[str, Any]) -> dict[str, Any]:
-    home, away = _teams_from_match(match)
-    tournament = _tournament_from_match(match)
-    if not home or not away:
-        return {"query": "", "snippets": [], "scraped": [], "error": "missing teams"}
-    return search_match_context(home, away, tournament)
 
 
 def _scrape(url: str, timeout: int | None = None) -> str:
@@ -126,7 +208,13 @@ def _scrape(url: str, timeout: int | None = None) -> str:
 
         response = requests.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 PredictX/1.0"},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
             timeout=effective_timeout,
         )
         response.raise_for_status()
@@ -138,47 +226,12 @@ def _scrape(url: str, timeout: int | None = None) -> str:
     return ""
 
 
-def _search_duckduckgo_html(query: str, max_results: int) -> list[dict[str, Any]]:
-    import requests
-
-    settings = get_settings()
-    response = requests.get(
-        "https://duckduckgo.com/html/",
-        params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0 PredictX/1.0"},
-        timeout=settings.web_search_timeout_seconds,
-    )
-    response.raise_for_status()
-    text = response.text
-    blocks = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=<a[^>]+class="result__a"|$)', text, flags=re.S)
-    results = []
-    for href, title, tail in blocks[:max_results]:
-        snippet_match = re.search(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>', tail, flags=re.S)
-        snippet = snippet_match.group(1) or snippet_match.group(2) if snippet_match else ""
-        results.append(
-            {
-                "title": _clean_html(title),
-                "body": _clean_html(snippet),
-                "href": _clean_duckduckgo_href(href),
-            }
-        )
-    return results
-
-
-def _clean_html(value: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", value or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return html.unescape(text)
-
-
-def _clean_duckduckgo_href(href: str) -> str:
-    href = html.unescape(href or "")
-    parsed = urlparse(href)
-    if parsed.path.startswith("/l/"):
-        target = parse_qs(parsed.query).get("uddg", [""])[0]
-        if target:
-            return unquote(target)
-    return href
+def context_for_match(match: dict[str, Any]) -> dict[str, Any]:
+    home, away = _teams_from_match(match)
+    tournament = _tournament_from_match(match)
+    if not home or not away:
+        return {"query": "", "snippets": [], "scraped": [], "error": "missing teams"}
+    return search_match_context(home, away, tournament)
 
 
 def _teams_from_match(match: dict[str, Any]) -> tuple[str, str]:

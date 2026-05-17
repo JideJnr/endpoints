@@ -4,6 +4,7 @@ from typing import Optional
 
 SPORTYBET_URL = "https://www.sportybet.com/api/ng/factsCenter/configurableLiveOrPrematchEvents"
 SPORTYBET_POST_URL = "https://www.sportybet.com/api/ng/factsCenter/wapConfigurableEventsByOrder"
+SPORTYBET_RESULTS_URL = "https://www.sportybet.com/api/ng/factsCenter/eventResultList"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
@@ -70,6 +71,53 @@ def fetch_live_and_upcoming_matches_post() -> list[dict]:
     upcoming = fetch_upcoming_matches_post()
     seen = {match.get("id") for match in live}
     return live + [match for match in upcoming if match.get("id") not in seen]
+
+
+def fetch_results(start_time_ms: int, end_time_ms: int, count: int = 200, last_id: str = "") -> list[dict]:
+    """Fetch finished match results from SportyBet for a time window."""
+    params = {
+        "count": count,
+        "lastId": last_id,
+        "sportId": "sr:sport:1",
+        "startTime": start_time_ms,
+        "endTime": end_time_ms,
+        "_t": int(time.time() * 1000),
+    }
+    response = requests.get(
+        SPORTYBET_RESULTS_URL, params=params, headers=HEADERS,
+        timeout=15, proxies={"http": None, "https": None}
+    )
+    response.raise_for_status()
+    tournaments = response.json().get("data", {}).get("tournaments", [])
+    results = []
+    for tournament in tournaments:
+        sport = tournament.get("events", [{}])[0].get("sport", {}) if tournament.get("events") else {}
+        category = sport.get("category", {})
+        group = {
+            "name": category.get("tournament", {}).get("name") or tournament.get("name"),
+            "categoryName": category.get("name"),
+        }
+        for event in tournament.get("events", []):
+            results.append(_parse_result(event, group))
+    return results
+
+
+def _parse_result(event: dict, group: dict) -> dict:
+    score_parts = (event.get("setScore") or "").split(":")
+    home = int(score_parts[0]) if len(score_parts) == 2 and score_parts[0].isdigit() else None
+    away = int(score_parts[1]) if len(score_parts) == 2 and score_parts[1].isdigit() else None
+    return {
+        "id":         event.get("eventId"),
+        "name":       f"{event.get('homeTeamName')} vs {event.get('awayTeamName')}",
+        "home_team":  event.get("homeTeamName"),
+        "away_team":  event.get("awayTeamName"),
+        "score":      {"home": home, "away": away},
+        "period":     event.get("matchStatus"),
+        "start_time": event.get("estimateStartTime"),
+        "tournament": group.get("name"),
+        "category":   group.get("categoryName"),
+        "status":     event.get("status"),
+    }
 
 
 def _parse_event(event: dict, group: dict) -> dict:

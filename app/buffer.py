@@ -101,6 +101,14 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             if is_finished:
                 continue
 
+            # 90+ minutes — treat as done, skip entirely
+            if _is_90_plus(m.get("played_seconds")):
+                continue
+
+            # kick-off time passed 2+ hours ago and still not live — ghost/postponed, skip
+            if _is_ghost_match(m.get("start_time"), period):
+                continue
+
             # only count genuinely new rows
             exists = conn.execute(
                 "select 1 from match_buffer where match_id = ?", (match_id,)
@@ -158,8 +166,10 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
             period = m.get("period") or ""
             is_live = 1 if (period and period not in ("Not start", "", None)) else 0
             is_finished = 1 if _is_finished_period(period) else 0
+            is_90_plus = _is_90_plus(m.get("played_seconds"))
 
-            if is_finished:
+            if is_finished or is_90_plus:
+                # write final score into both raw_sporty and raw_enriched before archiving
                 # write final score into both raw_sporty and raw_enriched before archiving
                 conn.execute(
                     """
@@ -335,7 +345,7 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
-        clauses = ["1 = 1"]
+        clauses = ["is_finished = 0"]
         params: list[Any] = []
         if match_date:
             clauses.append("match_date = ?")
@@ -402,6 +412,37 @@ def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
         else:
             result.append(_sporty_to_summary(json.loads(row["raw_sporty"])))
     return result
+
+
+def purge_ghost_matches() -> int:
+    """
+    Remove matches from the buffer whose kick-off time has passed by more than
+    GHOST_MATCH_GRACE_MINUTES but are still showing as 'Not start'.
+    These are postponed, cancelled, or data-gap matches that will never go live.
+    Returns the number of rows deleted.
+    """
+    _init_db()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000  # ms threshold
+
+    with sqlite3.connect(DB_PATH) as conn:
+        _init_buffer_table(conn)
+        result = conn.execute(
+            """
+            delete from match_buffer
+            where is_live = 0
+              and is_finished = 0
+              and start_time is not null
+              and cast(start_time as real) < ?
+              and (period is null or lower(period) in ('not start', 'not started', ''))
+            """,
+            (cutoff_ts_ms,),
+        )
+        conn.commit()
+    deleted = result.rowcount
+    if deleted:
+        print(f"[buffer] purge_ghost_matches: removed {deleted} stale not-started matches")
+    return deleted
 
 
 def get_buffer_stats() -> dict[str, Any]:
@@ -665,14 +706,121 @@ def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
 def _is_finished_period(period: str | None) -> bool:
     if not period:
         return False
-    p = period.lower()
-    return p in ("ft", "finished", "ended", "aet", "ap", "full time")
+    p = period.lower().strip()
+    return p in ("ft", "finished", "ended", "aet", "ap", "full time", "after penalties", "after extra time")
+
+
+def _is_90_plus(played_seconds: Any) -> bool:
+    """Returns True if the match has reached or passed the 90-minute mark."""
+    try:
+        return int(played_seconds or 0) >= 90 * 60
+    except (TypeError, ValueError):
+        return False
+
+
+# Grace period after kick-off before we consider a non-live match as ghost/abandoned
+GHOST_MATCH_GRACE_MINUTES = 120  # 2 hours past start_time
+
+
+def _is_ghost_match(start_time: Any, period: str | None) -> bool:
+    """
+    Returns True if a match is still showing 'Not start' but its scheduled
+    kick-off was more than GHOST_MATCH_GRACE_MINUTES ago.
+    These are matches that never went live — postponed, cancelled, or data gaps.
+    """
+    if period and period not in ("Not start", "Not started", "", None):
+        return False  # it did kick off, not a ghost
+    if not start_time:
+        return False
+    try:
+        ts = float(start_time)
+        if ts > 1e12:
+            ts /= 1000  # ms → seconds
+        kickoff = datetime.fromtimestamp(ts, tz=timezone.utc)
+        elapsed_minutes = (datetime.now(timezone.utc) - kickoff).total_seconds() / 60
+        return elapsed_minutes > GHOST_MATCH_GRACE_MINUTES
+    except (TypeError, ValueError, OSError):
+        return False
 
 
 def _try_archive_finished(match_id: str) -> None:
-    """Archive a finished match to MongoDB and remove it from the buffer. Silent on failure."""
+    """Archive a finished match to MongoDB and local SQLite, then remove from buffer.
+    If MongoDB is not configured, still saves locally and deletes from buffer."""
     try:
-        from app.mongo_store import archive_finished_match_from_buffer
-        archive_finished_match_from_buffer(match_id)
+        from app.mongo_store import archive_finished_match_from_buffer, is_configured
+        if is_configured():
+            archive_finished_match_from_buffer(match_id)
+        else:
+            # No MongoDB — save to local SQLite finished_matches table + delete from buffer
+            _archive_finished_locally(match_id)
     except Exception as exc:
         print(f"[buffer] archive failed for {match_id}: {exc}")
+        # Last resort: ensure is_finished=1 so get_buffered_matches filters it out
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("update match_buffer set is_finished = 1 where match_id = ?", (match_id,))
+                conn.commit()
+        except Exception:
+            pass
+
+
+def _archive_finished_locally(match_id: str) -> None:
+    """Write finished match to local SQLite finished_matches table and delete from buffer."""
+    import json as _json
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        _init_buffer_table(conn)
+        # Ensure finished_matches table exists
+        conn.execute("""
+            create table if not exists finished_matches (
+                match_id   text primary key,
+                match_date text,
+                home_team  text,
+                away_team  text,
+                tournament text,
+                score_home text,
+                score_away text,
+                finished_at text not null default current_timestamp,
+                raw_json   text not null
+            )
+        """)
+        row = conn.execute(
+            "select match_date, raw_enriched, raw_sporty, score_home, score_away from match_buffer where match_id = ?",
+            (match_id,),
+        ).fetchone()
+        if row:
+            raw = row[1] or row[2]
+            doc = _json.loads(raw) if raw else {}
+            home = doc.get("home_team") or ""
+            if isinstance(home, dict):
+                home = home.get("name") or ""
+            away = doc.get("away_team") or ""
+            if isinstance(away, dict):
+                away = away.get("name") or ""
+            score = doc.get("score") or {}
+            archive_doc = {
+                "match_id":   match_id,
+                "match_date": row[0],
+                "home_team":  home,
+                "away_team":  away,
+                "tournament": doc.get("tournament") or "",
+                "score":      score,
+                "period":     doc.get("period") or "FT",
+            }
+            conn.execute(
+                """
+                insert or replace into finished_matches
+                    (match_id, match_date, home_team, away_team, tournament, score_home, score_away, raw_json)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    match_id, row[0], home, away,
+                    doc.get("tournament") or "",
+                    str(score.get("home") or row[3] or ""),
+                    str(score.get("away") or row[4] or ""),
+                    _json.dumps(archive_doc),
+                ),
+            )
+        # Delete from buffer regardless
+        conn.execute("delete from match_buffer where match_id = ?", (match_id,))
+        conn.commit()

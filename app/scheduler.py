@@ -20,6 +20,7 @@ from app.buffer import (
     patch_live_scores,
     run_enrichment_worker,
     get_buffer_stats,
+    purge_ghost_matches,
 )
 
 
@@ -132,13 +133,15 @@ def job_flush_to_mongo() -> dict[str, Any]:
 
     flush_result = flush_buffer_to_mongo()
     cleanup_result = cleanup_buffer()
+    ghost_deleted = purge_ghost_matches()
     print(
         f"[scheduler] flush_to_mongo: flushed={flush_result.get('flushed')} "
         f"errors={flush_result.get('errors')} "
         f"cleaned_finished={cleanup_result.get('deleted_finished')} "
-        f"cleaned_stale={cleanup_result.get('deleted_stale_unenriched')}"
+        f"cleaned_stale={cleanup_result.get('deleted_stale_unenriched')} "
+        f"ghost_purged={ghost_deleted}"
     )
-    return {"flush": flush_result, "cleanup": cleanup_result}
+    return {"flush": flush_result, "cleanup": cleanup_result, "ghost_purged": ghost_deleted}
 
 def job_grade_predictions() -> dict[str, Any]:
     """Auto-grade yesterday's predictions against finished SofaScore results."""
@@ -166,6 +169,20 @@ def job_grade_predictions() -> dict[str, Any]:
         return {**result, "metrics": metrics, "elo_updated": elo_updated}
     except Exception as exc:
         print(f"[scheduler] grade_predictions failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+
+def job_prune_mongo(keep_days: int = 90) -> dict[str, Any]:
+    """Prune MongoDB finished_matches older than keep_days to control storage."""
+    try:
+        from app.mongo_store import prune_old_finished_matches, is_configured
+        if not is_configured():
+            return {"status": "skipped", "reason": "mongodb not configured"}
+        deleted = prune_old_finished_matches(keep_days=keep_days)
+        print(f"[scheduler] prune_mongo: deleted {deleted} finished matches older than {keep_days} days")
+        return {"status": "ok", "deleted": deleted, "keep_days": keep_days}
+    except Exception as exc:
+        print(f"[scheduler] prune_mongo failed: {exc}")
         return {"status": "error", "error": str(exc)}
 
 
@@ -250,6 +267,17 @@ def start_scheduler():
         misfire_grace_time=900,
     )
 
+    # prune old MongoDB finished matches — weekly
+    scheduler.add_job(
+        _safe(job_prune_mongo),
+        IntervalTrigger(days=7),
+        id="prune_mongo",
+        name="Prune old finished matches from MongoDB",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
     scheduler.start()
     _scheduler = scheduler
     print("[scheduler] started — running forever, no frontend required")
@@ -259,6 +287,7 @@ def start_scheduler():
     print("[scheduler]   flush_to_mongo   every  2 min  (buffer → MongoDB)")
     print("[scheduler]   archive_finished every 15 min  (finished → MongoDB)")
     print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
+    print("[scheduler]   prune_mongo      every  7 days (remove matches >90 days old)")
     return scheduler
 
 

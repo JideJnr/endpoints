@@ -572,22 +572,24 @@ def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: i
             return "win" if total > 0 else "loss"
         return "void"
 
-    if pt == "match_result":
-        if " or draw" in sel:
-            return "win" if home > away or home == away else "loss"
-        if "home" in sel:
-            return "win" if home > away else "loss"
-        if "away" in sel:
-            return "win" if away > home else "loss"
-        return "void"
-
-    if pt == "double_chance":
-        if "double chance" in sel:
-            team_part = sel.replace("double chance", "").strip()
-            if "home" in team_part:
+    if pt in ("match_result", "double_chance", "market_value"):
+        sel_lower = sel
+        # Handle "{Team} or draw protection" and "{Team} double chance"
+        if "or draw" in sel_lower or "double chance" in sel_lower:
+            # These are home-or-draw / away-or-draw style picks
+            # Try to detect which side from context
+            if "home" in sel_lower:
                 return "win" if home >= away else "loss"
-            if "away" in team_part:
+            if "away" in sel_lower:
                 return "win" if away >= home else "loss"
+            # Generic "or draw protection" — treat as favourite side wins or draws
+            return "win" if home == away or home > away else "loss"
+        if "home" in sel_lower:
+            return "win" if home > away else "loss"
+        if "away" in sel_lower:
+            return "win" if away > home else "loss"
+        if "draw" in sel_lower:
+            return "win" if home == away else "loss"
         return "void"
 
     return "void"

@@ -22,6 +22,68 @@ HIGH_LATE_GOAL_LEAGUES = (
 )
 
 
+# ── Time-decay for live confidence ───────────────────────────────────────────
+#
+# As a match progresses, the window for a prediction to materialise shrinks.
+# We apply a decay multiplier to confidence based on the current minute:
+#
+#   0–45  min  → no decay (full confidence)
+#   46–59 min  → mild decay  (×0.90)
+#   60–69 min  → moderate    (×0.80)
+#   70–79 min  → strong      (×0.70)
+#   80–84 min  → heavy       (×0.60)
+#   85–89 min  → very heavy  (×0.50)
+#   90+   min  → minimal     (×0.35)
+#
+# Exception: live_goals / late_goal picks in high-late-goal leagues are
+# BOOSTED instead of decayed (the window is exactly what we're betting on).
+
+_DECAY_BRACKETS = [
+    (90, 0.35),
+    (85, 0.50),
+    (80, 0.60),
+    (70, 0.70),
+    (60, 0.80),
+    (46, 0.90),
+    (0,  1.00),
+]
+
+
+def _time_decay_multiplier(minute: int) -> float:
+    for threshold, multiplier in _DECAY_BRACKETS:
+        if minute >= threshold:
+            return multiplier
+    return 1.0
+
+
+def _apply_time_decay(
+    picks: list[dict[str, Any]],
+    minute: int,
+    is_live: bool,
+    late_goal_league: bool,
+) -> list[dict[str, Any]]:
+    """Apply time-decay to confidence for live matches."""
+    if not is_live or minute < 46:
+        return picks
+
+    decay = _time_decay_multiplier(minute)
+    result = []
+    for pick in picks:
+        kind = pick.get("type", "")
+        conf = pick["confidence"]
+
+        # Late-goal picks in high-late-goal leagues: boost instead of decay
+        if kind in ("live_goals", "late_goal") and late_goal_league:
+            # Slight boost for being in the prime late-goal window
+            boost = 1.05 if minute >= 70 else 1.0
+            new_conf = max(1, min(95, round(conf * boost)))
+        else:
+            new_conf = max(1, min(95, round(conf * decay)))
+
+        result.append({**pick, "confidence": new_conf})
+    return result
+
+
 def predict_sofascore_event(
     event: dict[str, Any],
     home_history: list[dict[str, Any]] | None = None,
@@ -29,8 +91,8 @@ def predict_sofascore_event(
 ) -> dict[str, Any]:
     home_history = home_history or []
     away_history = away_history or []
-    home = event.get("home_team", {})
-    away = event.get("away_team", {})
+    home = event.get("home_team") or event.get("homeTeam") or {}
+    away = event.get("away_team") or event.get("awayTeam") or {}
     status = event.get("status", {})
     score = event.get("score", {})
     tournament = event.get("tournament", {})
@@ -45,6 +107,13 @@ def predict_sofascore_event(
     h2h_edge = _h2h_edge(event, signals)
     table_edge = _table_edge(event, signals)
     odds_edge = _odds_edge(event, signals)
+    common_opp_edge = _common_opponent_edge(
+        home.get("name") or "",
+        away.get("name") or "",
+        home_history,
+        away_history,
+        signals,
+    )
 
     total_goals = _to_int(score.get("home"), 0) + _to_int(score.get("away"), 0)
     minute = _event_minute(event)
@@ -53,22 +122,35 @@ def predict_sofascore_event(
     memory_signal = late_goal_memory_signal(event)
     memory_boost = _late_goal_memory_boost(memory_signal, signals)
 
-    home_power = form_edge + league_edge + h2h_edge + table_edge + odds_edge
-    if abs(home_power) >= 12:
-        side = home.get("name") if home_power > 0 else away.get("name")
-        picks.append(_pick("match_result", f"{side} or draw protection", 58 + min(abs(home_power), 22), "stronger side with safety"))
-    elif abs(home_power) >= 6:
-        side = home.get("name") if home_power > 0 else away.get("name")
-        picks.append(_pick("double_chance", f"{side} double chance", 55 + min(abs(home_power), 18), "small edge, safer market"))
+    home_power = form_edge + league_edge + h2h_edge + table_edge + odds_edge + common_opp_edge
+    if abs(home_power) >= 8:
+        side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
+        picks.append(_pick("match_result", f"{side} or draw protection", 55 + min(abs(home_power), 25), "stronger side with safety"))
+    elif abs(home_power) >= 4:
+        side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
+        picks.append(_pick("double_chance", f"{side} double chance", 52 + min(abs(home_power), 20), "small edge, safer market"))
 
     goal_pressure = _goal_pressure(home_form, away_form, event, signals)
     live_chase_pressure = _live_chase_pressure(event, home_power, goal_pressure, signals)
-    if goal_pressure >= 14:
-        picks.append(_pick("goals", "Over 1.5 goals", 64 + min(goal_pressure, 16), "both teams show goal trend"))
-    if goal_pressure >= 22:
-        picks.append(_pick("goals", "Over 2.5 goals", 55 + min(goal_pressure, 18), "high combined scoring/conceding trend"))
-    if _btts_pressure(home_form, away_form) >= 16:
-        picks.append(_pick("goals", "Both teams to score", 54 + min(_btts_pressure(home_form, away_form), 16), "both sides regularly score and concede"))
+    if goal_pressure >= 10:
+        picks.append(_pick("goals", "Over 1.5 goals", 60 + min(goal_pressure, 20), "both teams show goal trend"))
+    if goal_pressure >= 18:
+        picks.append(_pick("goals", "Over 2.5 goals", 52 + min(goal_pressure, 22), "high combined scoring/conceding trend"))
+    if _btts_pressure(home_form, away_form) >= 12:
+        picks.append(_pick("goals", "Both teams to score", 52 + min(_btts_pressure(home_form, away_form), 18), "both sides regularly score and concede"))
+
+    # Fallback goal pick from odds when no form data
+    if not picks and not home_form.get("sample_size"):
+        markets = event.get("sportybet_markets") or event.get("markets") or []
+        for mkt in markets:
+            if (mkt.get("name") or "").lower() in ("over/under", "total goals") or mkt.get("id") == "18":
+                for sel in mkt.get("selections", []):
+                    if "over 2.5" in (sel.get("name") or "").lower():
+                        dec = _to_float(sel.get("odds"))
+                        if dec and 1.5 <= dec <= 2.2:
+                            picks.append(_pick("goals", "Over 2.5 goals", 55, "market prices over 2.5 as likely"))
+                        break
+                break
 
     if is_live and minute >= 70 and late_goal_league and total_goals <= 2:
         picks.append(_pick("live_goals", "Late goal watch", 61 + memory_boost, "league profile plus learned late-goal memory"))
@@ -88,6 +170,8 @@ def predict_sofascore_event(
     if not picks:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available data"))
 
+    picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
+
     return {
         "match_id": event.get("id"),
         "name": event.get("name"),
@@ -100,6 +184,8 @@ def predict_sofascore_event(
         "features": {"home": home_form, "away": away_form},
         "signals": sorted(signals, key=lambda s: abs(s.get("impact", 0)), reverse=True),
         "picks": sorted(picks, key=lambda p: p["confidence"], reverse=True),
+        "time_decay_applied": is_live and minute >= 46,
+        "time_decay_multiplier": _time_decay_multiplier(minute) if is_live else 1.0,
     }
 
 
@@ -138,6 +224,10 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
     if not picks:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available live data"))
 
+    is_live_sporty = bool(match.get("period") and match.get("period") not in ("Not start", "Not started", ""))
+    late_goal_league_sporty = _is_high_late_goal_league(f"{category} {tournament}")
+    picks = _apply_time_decay(picks, minute, is_live_sporty, late_goal_league_sporty)
+
     return {
         "match_id": match.get("id"),
         "name": match.get("name"),
@@ -149,6 +239,8 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
         "category": category,
         "signals": sorted(signals, key=lambda s: abs(s.get("impact", 0)), reverse=True),
         "picks": sorted(picks, key=lambda p: p["confidence"], reverse=True),
+        "time_decay_applied": is_live_sporty and minute >= 46,
+        "time_decay_multiplier": _time_decay_multiplier(minute) if is_live_sporty else 1.0,
     }
 
 
@@ -183,6 +275,149 @@ def _team_history_features(team_id: int | None, history: list[dict[str, Any]]) -
         "form": results,
         "form_points": sum(3 if r == "W" else 1 if r == "D" else 0 for r in results),
     }
+
+
+def _common_opponent_edge(
+    home_name: str,
+    away_name: str,
+    home_history: list[dict[str, Any]],
+    away_history: list[dict[str, Any]],
+    signals: list[dict[str, Any]],
+) -> float:
+    """
+    Find opponents both teams have faced recently and compare results.
+    e.g. if both played Barca: home team won 2-0, away team lost 0-3 → strong home edge.
+
+    Scoring per shared opponent:
+      Win   = +3 pts,  Draw = +1,  Loss = 0
+      Edge  = (home_pts - away_pts) across all shared opponents
+      Scaled to max ±12 and added to home_power.
+    """
+    def _opp_name(event: dict[str, Any], team: str) -> str:
+        h = event.get("home_team", {}).get("name") or event.get("homeTeam", {}).get("name") or ""
+        a = event.get("away_team", {}).get("name") or event.get("awayTeam", {}).get("name") or ""
+        return a if h.lower() == team.lower() else h
+
+    def _result_pts(event: dict[str, Any], team: str) -> int:
+        h = event.get("home_team", {}).get("name") or event.get("homeTeam", {}).get("name") or ""
+        score = event.get("score") or {}
+        hs = _to_int(score.get("home"), -1)
+        as_ = _to_int(score.get("away"), -1)
+        if hs < 0 or as_ < 0:
+            return -1
+        is_home = h.lower() == team.lower()
+        own = hs if is_home else as_
+        opp = as_ if is_home else hs
+        if own > opp: return 3
+        if own == opp: return 1
+        return 0
+
+    def _norm(name: str) -> str:
+        return name.lower().strip()[:8]
+
+    # Build lookup: normalised opponent name → best result for each team
+    home_opp: dict[str, dict] = {}
+    for ev in home_history:
+        if (ev.get("status") or {}).get("type") != "finished":
+            continue
+        opp = _opp_name(ev, home_name)
+        if not opp:
+            continue
+        key = _norm(opp)
+        pts = _result_pts(ev, home_name)
+        if pts < 0:
+            continue
+        if key not in home_opp or pts > home_opp[key]["pts"]:
+            home_opp[key] = {"pts": pts, "opp": opp, "event": ev}
+
+    away_opp: dict[str, dict] = {}
+    for ev in away_history:
+        if (ev.get("status") or {}).get("type") != "finished":
+            continue
+        opp = _opp_name(ev, away_name)
+        if not opp:
+            continue
+        key = _norm(opp)
+        pts = _result_pts(ev, away_name)
+        if pts < 0:
+            continue
+        if key not in away_opp or pts > away_opp[key]["pts"]:
+            away_opp[key] = {"pts": pts, "opp": opp, "event": ev}
+
+    shared_keys = set(home_opp) & set(away_opp)
+    if not shared_keys:
+        return 0.0
+
+    home_total = 0
+    away_total = 0
+    comparisons = []
+    for key in shared_keys:
+        h_entry = home_opp[key]
+        a_entry = away_opp[key]
+        home_total += h_entry["pts"]
+        away_total += a_entry["pts"]
+        comparisons.append({
+            "opponent": h_entry["opp"],
+            "home_pts": h_entry["pts"],
+            "away_pts": a_entry["pts"],
+            "home_event": h_entry["event"],
+            "away_event": a_entry["event"],
+        })
+
+    raw_edge = home_total - away_total
+    edge = round(max(-12, min(12, raw_edge * 1.5)), 2)
+
+    if abs(edge) >= 1.5:
+        signals.append({
+            "name": "common_opponent_edge",
+            "value": {
+                "shared_opponents": len(shared_keys),
+                "home_points": home_total,
+                "away_points": away_total,
+                "comparisons": [
+                    {
+                        "opponent": c["opponent"],
+                        "home_result": _pts_label(c["home_pts"]),
+                        "away_result": _pts_label(c["away_pts"]),
+                        "home_score": _score_str(c["home_event"]),
+                        "away_score": _score_str(c["away_event"]),
+                        "home_date": _event_date(c["home_event"]),
+                        "away_date": _event_date(c["away_event"]),
+                    }
+                    for c in comparisons
+                ],
+            },
+            "impact": edge,
+        })
+
+    return edge
+
+
+def _pts_label(pts: int) -> str:
+    return "W" if pts == 3 else "D" if pts == 1 else "L"
+
+
+def _score_str(event: dict[str, Any]) -> str:
+    score = event.get("score") or {}
+    h = score.get("home")
+    a = score.get("away")
+    if h is None or a is None:
+        return "?-?"
+    return f"{h}-{a}"
+
+
+def _event_date(event: dict[str, Any]) -> str:
+    ts = event.get("start_timestamp") or event.get("startTimestamp") or event.get("start_time")
+    if not ts:
+        return ""
+    try:
+        t = float(ts)
+        if t > 1e10:
+            t /= 1000
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%d %b %Y")
+    except Exception:
+        return str(ts)[:10]
 
 
 def _form_edge(event: dict[str, Any], home_form: dict[str, Any], away_form: dict[str, Any], signals: list[dict[str, Any]]) -> float:
@@ -268,16 +503,34 @@ def _table_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
 
 
 def _odds_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
+    """Extract implied probability edge from available odds sources."""
+    # Try SofaScore fractional odds first
     market = ((event.get("odds_featured") or {}).get("default") or {}).get("choices") or []
-    prices = {choice.get("name"): _fraction_to_probability(choice.get("fractional_value")) for choice in market}
-    home_prob = prices.get("1") or prices.get("Home")
-    away_prob = prices.get("2") or prices.get("Away")
-    if home_prob is None or away_prob is None:
-        return 0.0
-    edge = (home_prob - away_prob) * 30
-    signals.append({"name": "odds_edge", "value": round(edge, 2), "impact": round(edge, 2)})
-    edge += _odds_momentum_edge(market, signals)
-    return edge
+    if market:
+        prices = {choice.get("name"): _fraction_to_probability(choice.get("fractional_value")) for choice in market}
+        home_prob = prices.get("1") or prices.get("Home")
+        away_prob = prices.get("2") or prices.get("Away")
+        if home_prob is not None and away_prob is not None:
+            edge = (home_prob - away_prob) * 30
+            signals.append({"name": "odds_edge", "value": round(edge, 2), "impact": round(edge, 2)})
+            edge += _odds_momentum_edge(market, signals)
+            return edge
+
+    # Fallback: use SportyBet decimal odds from sportybet_markets / markets
+    markets = event.get("sportybet_markets") or event.get("markets") or []
+    for mkt in markets:
+        name = (mkt.get("name") or "").lower()
+        if mkt.get("id") == "1" or "1x2" in name or name == "match result":
+            sels = {s.get("name"): s.get("odds") for s in mkt.get("selections", [])}
+            home_dec = _to_float(sels.get("Home") or sels.get("1"))
+            away_dec = _to_float(sels.get("Away") or sels.get("2"))
+            if home_dec and away_dec and home_dec > 1 and away_dec > 1:
+                home_prob = 1 / home_dec
+                away_prob = 1 / away_dec
+                edge = (home_prob - away_prob) * 30
+                signals.append({"name": "odds_edge", "value": round(edge, 2), "impact": round(edge, 2)})
+                return edge
+    return 0.0
 
 
 def _odds_momentum_edge(market: list[dict[str, Any]], signals: list[dict[str, Any]]) -> float:
@@ -410,6 +663,18 @@ def _sporty_market_edge(odds: list[dict[str, Any]]) -> float:
     home = odds[0]["implied_probability"]
     away = odds[-1]["implied_probability"]
     return (home - away) * 30
+
+
+def _side_name(team: dict[str, Any], event: dict[str, Any], side: str) -> str:
+    """Resolve a team name, falling back to the match name split if the team dict is empty."""
+    name = team.get("name") if isinstance(team, dict) else None
+    if name:
+        return name
+    match_name = str(event.get("name") or "")
+    parts = [p.strip() for p in match_name.split(" vs ", 1)]
+    if len(parts) == 2:
+        return parts[0] if side == "home" else parts[1]
+    return match_name
 
 
 def _pick(kind: str, selection: str, confidence: float, reason: str) -> dict[str, Any]:

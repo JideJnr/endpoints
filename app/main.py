@@ -15,6 +15,14 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_db()
+    # Clean up any finished matches left in buffer from previous run
+    try:
+        from app.mongo_store import cleanup_buffer
+        result = cleanup_buffer()
+        if result.get("deleted_finished") or result.get("deleted_stale_unenriched"):
+            print(f"[startup] buffer cleanup: removed {result.get('deleted_finished')} finished, {result.get('deleted_stale_unenriched')} stale")
+    except Exception as exc:
+        print(f"[startup] buffer cleanup failed: {exc}")
     if settings.environment != "test":
         start_scheduler()
         _run_initial_enrichment()

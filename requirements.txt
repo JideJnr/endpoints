@@ -3,7 +3,7 @@ uvicorn[standard]
 requests
 httpx
 curl_cffi
-ddgs
+duckduckgo-search==6.3.7
 trafilatura
 pymongo[srv]
 apscheduler
@@ -16,3 +16,4 @@ scipy
 scikit-learn
 redis
 websockets
+typing_extensions

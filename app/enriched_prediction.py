@@ -48,6 +48,19 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     signals = list(rules.get("signals") or [])
     signals.extend(_model_signals(poisson, dixon, elo, ensemble, doc))
 
+    # Time-decay for live matches
+    minute = rules.get("minute") or 0
+    is_live = bool(detail.get("status", {}).get("type") == "inprogress") or bool(
+        doc.get("period") and doc.get("period") not in ("Not start", "Not started", "", None)
+    )
+    from app.prediction_agent import _apply_time_decay, _is_high_late_goal_league, _time_decay_multiplier
+    late_goal_league = _is_high_late_goal_league(
+        (doc.get("tournament") or "") + " " + (doc.get("category") or "")
+    )
+
+    picks = _combined_picks(rules, ensemble, value_bets)
+    picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
+
     prediction = {
         "match_id": doc.get("sportybet_id") or doc.get("id") or detail.get("id"),
         "name": doc.get("sportybet_name") or doc.get("name") or detail.get("name"),
@@ -68,7 +81,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         "web_context": doc.get("web_context") or {},
         "value_bets": value_bets,
         "signals": sorted(signals, key=lambda item: abs(item.get("impact") or 0), reverse=True),
-        "picks": _combined_picks(rules, ensemble, value_bets),
+        "picks": picks,
+        "time_decay_applied": is_live and minute >= 46,
+        "time_decay_multiplier": _time_decay_multiplier(minute) if is_live else 1.0,
         "data_quality": {
             "has_sofascore_detail": bool(detail),
             "has_sportybet_markets": bool(doc.get("sportybet_markets") or doc.get("markets")),
@@ -132,26 +147,32 @@ def _value_bets(doc: dict[str, Any], model: dict[str, Any] | None) -> list[dict[
 def _combined_picks(rules: dict[str, Any], ensemble: dict[str, Any], value_bets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     picks = []
     if ensemble and not ensemble.get("error"):
-        picks.append(
-            {
-                "type": "ensemble_1x2",
-                "selection": ensemble["prediction"],
-                "confidence": round(float(ensemble["confidence"])),
-                "reason": f"Weighted model blend using {', '.join(ensemble.get('models_used') or [])}",
-            }
-        )
-    picks.extend(rules.get("picks") or [])
+        picks.append({
+            "type": "ensemble_1x2",
+            "selection": ensemble["prediction"],
+            "confidence": round(float(ensemble["confidence"])),
+            "reason": f"Weighted model blend using {', '.join(ensemble.get('models_used') or [])}",
+        })
+    # Add rules picks, excluding no_bet
+    for pick in (rules.get("picks") or []):
+        if pick.get("type") != "no_bet":
+            picks.append(pick)
     if value_bets:
         top = value_bets[0]
-        picks.insert(
-            0,
-            {
-                "type": "value_bet",
-                "selection": top["selection"],
-                "confidence": round(top["kelly"]["probability"] * 100),
-                "reason": f"{top['kelly']['edge_percent']}% model edge, stake {top['kelly']['stake_per_100']} per 100",
-            },
-        )
+        picks.insert(0, {
+            "type": "value_bet",
+            "selection": top["selection"],
+            "confidence": round(top["kelly"]["probability"] * 100),
+            "reason": f"{top['kelly']['edge_percent']}% model edge, stake {top['kelly']['stake_per_100']} per 100",
+        })
+    # If nothing meaningful, add a low-confidence ensemble pick rather than no_bet
+    if not picks and ensemble and not ensemble.get("error"):
+        picks.append({
+            "type": "ensemble_1x2",
+            "selection": ensemble["prediction"],
+            "confidence": max(1, round(float(ensemble["confidence"])) - 10),
+            "reason": "Low confidence ensemble — insufficient rule signals",
+        })
     return sorted(picks, key=lambda pick: pick.get("confidence") or 0, reverse=True)
 
 

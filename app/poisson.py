@@ -63,23 +63,91 @@ def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[
 
 
 def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
+    """Build scoring/conceding averages from SofaScore history + MongoDB finished matches."""
+    # 1. SofaScore API history (live/recent)
     try:
         events = fetch_team_history(team_id).get("events", [])
     except Exception:
         events = []
-    finished = [event for event in events if event.get("status", {}).get("type") == "finished"][:last_n]
-    if not finished:
+    sofa_finished = [e for e in events if e.get("status", {}).get("type") == "finished"][:last_n]
+
+    # 2. MongoDB finished matches (our own recorded results — grows with training)
+    mongo_finished: list[dict[str, Any]] = []
+    try:
+        from app.mongo_store import get_team_finished_matches, is_configured
+        if is_configured():
+            mongo_finished = get_team_finished_matches(team_id, limit=last_n)
+    except Exception:
+        pass
+
+    # 3. SQLite local fallback (when MongoDB not configured)
+    local_finished: list[dict[str, Any]] = []
+    if not mongo_finished:
+        local_finished = _local_team_matches(str(team_id), last_n)
+
+    # Merge: SofaScore first (richest), then MongoDB/local to fill gaps
+    historical = mongo_finished or local_finished
+    all_finished = sofa_finished
+    if len(all_finished) < last_n:
+        all_finished = all_finished + historical
+    all_finished = all_finished[:last_n]
+
+    if not all_finished:
         return {"scored": 1.4, "conceded": 1.2, "matches": 0}
 
     scored = conceded = 0
-    for event in finished:
+    for event in all_finished:
         score = event.get("score") or {}
-        is_home = event.get("home_team", {}).get("id") == team_id
-        scored += _to_int(score.get("home" if is_home else "away"), 0)
+        home_id = event.get("home_team", {}).get("id") if isinstance(event.get("home_team"), dict) else None
+        is_home = str(home_id) == str(team_id) if home_id else False
+        scored   += _to_int(score.get("home" if is_home else "away"), 0)
         conceded += _to_int(score.get("away" if is_home else "home"), 0)
 
-    count = len(finished)
+    count = len(all_finished)
     return {"scored": round(scored / count, 3), "conceded": round(conceded / count, 3), "matches": count}
+
+
+def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
+    """Pull finished matches for a team from our local SQLite finished_matches archive."""
+    try:
+        from app.league_memory import DB_PATH, _init_db
+        import sqlite3 as _sqlite3
+        import json as _json
+        _init_db()
+        with _sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            # Check if finished_matches table exists (MongoDB stub may not have it)
+            tables = {r[0] for r in conn.execute("select name from sqlite_master where type='table'").fetchall()}
+            if "finished_matches" not in tables:
+                return []
+            rows = conn.execute(
+                """
+                select raw_json from finished_matches
+                where json_extract(raw_json, '$.home_team') = ?
+                   or json_extract(raw_json, '$.away_team') = ?
+                order by rowid desc limit ?
+                """,
+                (team_id, team_id, limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                doc = _json.loads(row["raw_json"])
+                score = doc.get("score") or {}
+                if score.get("home") is None or score.get("away") is None:
+                    continue
+                # Normalise to the shape _team_stats expects
+                result.append({
+                    "score": score,
+                    "home_team": {"id": doc.get("home_team")},
+                    "away_team": {"id": doc.get("away_team")},
+                    "status": {"type": "finished"},
+                })
+            except Exception:
+                continue
+        return result
+    except Exception:
+        return []
 
 
 def _poisson_prob(lam: float, goals: int) -> float:

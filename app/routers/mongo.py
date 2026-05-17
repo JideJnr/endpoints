@@ -119,3 +119,13 @@ def post_cleanup_buffer():
         return cleanup_buffer()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/prune")
+def post_prune_mongo(keep_days: int = Query(default=90, ge=7, le=365)):
+    """Prune finished_matches from MongoDB older than keep_days. Default 90 days."""
+    try:
+        from app.scheduler import job_prune_mongo
+        return job_prune_mongo(keep_days=keep_days)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
