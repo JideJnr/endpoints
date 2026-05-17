@@ -1,12 +1,12 @@
 """
 Scheduler
 ---------
-  every  5 min  — INGEST upcoming matches from SportyBet into buffer (fast)
-  every  1 min  — INGEST live matches + patch scores/periods (fast)
+  every 30 sec  — INGEST live matches + patch scores/periods (fast)
                   └ finished matches archived to MongoDB + deleted from buffer immediately
-  every  1 min  — ENRICH worker: picks up unenriched/stale matches
+  every  2 min  — INGEST upcoming matches from SportyBet into buffer (fast)
+  every 30 sec  — ENRICH worker: picks up unenriched/stale matches, auto-predicts
+  every  2 min  — FLUSH live/upcoming enriched rows to MongoDB + safety-net cleanup
   every 15 min  — ARCHIVE SofaScore scheduled events to MongoDB
-  every 10 min  — FLUSH live/upcoming enriched rows to MongoDB + safety-net cleanup
   every  6 hrs  — GRADE yesterday's predictions + update ELO
 """
 from __future__ import annotations
@@ -185,38 +185,48 @@ def start_scheduler():
 
     scheduler = BackgroundScheduler(timezone="UTC")
 
-    # ingest upcoming — every 5 min, fast
-    scheduler.add_job(
-        _safe(job_ingest_upcoming),
-        IntervalTrigger(minutes=5),
-        id="ingest_upcoming",
-        name="Ingest upcoming matches from SportyBet",
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=120,
-    )
-
-    # ingest live — every 1 min, fast
+    # ingest live — every 30 sec
     scheduler.add_job(
         _safe(job_ingest_live),
-        IntervalTrigger(minutes=1),
+        IntervalTrigger(seconds=30),
         id="ingest_live",
         name="Ingest live matches + patch scores",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+
+    # ingest upcoming — every 2 min
+    scheduler.add_job(
+        _safe(job_ingest_upcoming),
+        IntervalTrigger(minutes=2),
+        id="ingest_upcoming",
+        name="Ingest upcoming matches from SportyBet",
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=60,
     )
 
-    # enrichment worker — every 1 min, processes a batch
-    # misfire_grace_time=600 because enrichment can take a few minutes per batch
+    # enrichment worker — every 90 sec, processes a batch
     scheduler.add_job(
         _safe(job_enrich_worker),
-        IntervalTrigger(minutes=1),
+        IntervalTrigger(seconds=90),
         id="enrich_worker",
-        name="Enrichment worker (SofaScore + web context)",
+        name="Enrichment + prediction worker",
         replace_existing=True,
         max_instances=1,
-        misfire_grace_time=600,
+        misfire_grace_time=120,
+    )
+
+    # flush to mongo — every 2 min
+    scheduler.add_job(
+        _safe(job_flush_to_mongo),
+        IntervalTrigger(minutes=2),
+        id="flush_to_mongo",
+        name="Flush buffer to MongoDB + cleanup",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=120,
     )
 
     # archive finished — every 15 min
@@ -231,20 +241,10 @@ def start_scheduler():
     )
 
     scheduler.add_job(
-        _safe(job_flush_to_mongo),
-        IntervalTrigger(minutes=10),
-        id="flush_to_mongo",
-        name="Flush buffer to MongoDB + cleanup",
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=300,
-    )
-
-    scheduler.add_job(
         _safe(job_grade_predictions),
         IntervalTrigger(hours=6),
         id="grade_predictions",
-        name="Auto-grade predictions",
+        name="Auto-grade predictions + ELO update",
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=900,
@@ -252,12 +252,12 @@ def start_scheduler():
 
     scheduler.start()
     _scheduler = scheduler
-    print("[scheduler] started")
-    print("[scheduler]   ingest_upcoming  every  5 min  (fast)")
-    print("[scheduler]   ingest_live      every  1 min  (fast)")
-    print("[scheduler]   enrich_worker    every  1 min  (batch enrichment + auto prediction)")
-    print("[scheduler]   archive_finished every 15 min  (MongoDB)")
-    print("[scheduler]   flush_to_mongo   every 10 min  (buffer → MongoDB + cleanup)")
+    print("[scheduler] started — running forever, no frontend required")
+    print("[scheduler]   ingest_live      every 30 sec  (scores + periods)")
+    print("[scheduler]   ingest_upcoming  every  2 min  (new matches)")
+    print("[scheduler]   enrich_worker    every 30 sec  (SofaScore + web + predict)")
+    print("[scheduler]   flush_to_mongo   every  2 min  (buffer → MongoDB)")
+    print("[scheduler]   archive_finished every 15 min  (finished → MongoDB)")
     print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
     return scheduler
 

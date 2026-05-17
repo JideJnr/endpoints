@@ -19,6 +19,8 @@ async def lifespan(app: FastAPI):
         start_scheduler()
         _run_initial_enrichment()
     yield
+    from app.scheduler import stop_scheduler
+    stop_scheduler()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
@@ -50,20 +52,27 @@ def _run_initial_enrichment():
     import threading
     from app.scheduler import job_ingest_upcoming, job_ingest_live
 
+    _shutdown = threading.Event()
+
     def _boot():
         print("[startup] ingesting upcoming matches into buffer...")
         try:
+            if _shutdown.is_set():
+                return
             result = job_ingest_upcoming()
             print(f"[startup] upcoming ingest done: {result.get('ingested', 0)} buffered")
         except Exception as exc:
             print(f"[startup] upcoming ingest failed: {exc}")
         try:
+            if _shutdown.is_set():
+                return
             result = job_ingest_live()
             print(f"[startup] live ingest done: {result.get('live_count', 0)} live matches")
         except Exception as exc:
             print(f"[startup] live ingest failed: {exc}")
-        # kick off first enrichment batch immediately
         try:
+            if _shutdown.is_set():
+                return
             from app.scheduler import job_enrich_worker
             result = job_enrich_worker()
             print(f"[startup] first enrichment batch done: {result.get('stored', 0)} enriched")
@@ -120,7 +129,7 @@ async def websocket_live(websocket: WebSocket):
                     "matches": [_match_summary(match) for match in matches],
                 }
             )
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
     except WebSocketDisconnect:
         if websocket in connected_clients:
             connected_clients.remove(websocket)

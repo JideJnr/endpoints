@@ -132,6 +132,16 @@ def get_movement(match_id: str) -> dict[str, Any]:
         "snapshots": len(rows),
         "opening": _odds_row(opening),
         "current": _odds_row(current),
+        # full 1X2 time-series for the chart
+        "series": [
+            {
+                "time": row["snapshot_time"],
+                "home": row["home_odds"],
+                "draw": row["draw_odds"],
+                "away": row["away_odds"],
+            }
+            for row in rows
+        ],
         "movement": {
             "home": _move(opening["home_odds"], current["home_odds"]),
             "draw": _move(opening["draw_odds"], current["draw_odds"]),
@@ -232,6 +242,11 @@ def _all_market_movements(conn: sqlite3.Connection, match_id: str) -> list[dict[
                 "movement": _move(opening["odds"], current["odds"]),
                 "delta": _delta(opening["odds"], current["odds"]),
                 "source": current["source"],
+                # full time-series for the chart
+                "snapshots_data": [
+                    {"time": row["snapshot_time"], "odds": row["odds"]}
+                    for row in items
+                ],
             }
         )
     result.sort(key=lambda x: (x["market"], x["specifier"], x["selection"]))

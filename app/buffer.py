@@ -34,16 +34,12 @@ from app.league_memory import DB_PATH, _init_db
 from app.market import snapshot_odds
 from app.normalise import normalise
 
-# How old an enrichment must be before we redo it
-LIVE_STALE_MINUTES = 10
-UPCOMING_STALE_MINUTES = 60
-
 # How many SofaScore detail calls to run in parallel
-ENRICH_WORKERS = 6
-WEB_WORKERS = 8
+ENRICH_WORKERS = 8
+WEB_WORKERS = 10
 
 # How many matches to enrich per worker cycle
-ENRICH_BATCH_SIZE = 30
+ENRICH_BATCH_SIZE = 10
 
 
 # ── Table init ────────────────────────────────────────────────────────────────
@@ -261,9 +257,8 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
     """
     Returns matches that need enrichment:
     - Never enriched (enriched_at IS NULL)
-    - Live and enriched more than LIVE_STALE_MINUTES ago
-    - Upcoming and enriched more than UPCOMING_STALE_MINUTES ago
-    - Finished matches are skipped entirely
+    - Enriched but sofascore_detail is missing (matched but detail fetch failed)
+    - Finished matches and already-fully-enriched matches are skipped entirely
     """
     _init_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -276,8 +271,8 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
             where is_finished = 0
               and (
                 enriched_at is null
-                or (is_live = 1 and datetime(enriched_at) < datetime('now', ?))
-                or (is_live = 0 and datetime(enriched_at) < datetime('now', ?))
+                or sofascore_id is null
+                or sofascore_id = ''
               )
             order by
               is_live desc,
@@ -285,11 +280,7 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
               start_time asc
             limit ?
             """,
-            (
-                f"-{LIVE_STALE_MINUTES} minutes",
-                f"-{UPCOMING_STALE_MINUTES} minutes",
-                limit,
-            ),
+            (limit,),
         ).fetchall()
     return [
         {
@@ -429,11 +420,10 @@ def get_buffer_stats() -> dict[str, Any]:
             select count(*) from match_buffer
             where is_finished = 0 and (
                 enriched_at is null
-                or (is_live = 1 and datetime(enriched_at) < datetime('now', ?))
-                or (is_live = 0 and datetime(enriched_at) < datetime('now', ?))
+                or sofascore_id is null
+                or sofascore_id = ''
             )
-            """,
-            (f"-{LIVE_STALE_MINUTES} minutes", f"-{UPCOMING_STALE_MINUTES} minutes"),
+            """
         ).fetchone()[0]
         last_ingest = conn.execute("select max(ingested_at) from match_buffer").fetchone()[0]
         last_enrich = conn.execute("select max(enriched_at) from match_buffer").fetchone()[0]

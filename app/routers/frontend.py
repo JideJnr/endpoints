@@ -70,24 +70,33 @@ def get_sofascore_candidates(sportybet_id: str):
 
     doc = get_buffered_match(sportybet_id)
     if not doc:
-        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found in buffer")
 
     target_date = doc.get("match_date") or dt.today().isoformat()
     live = _is_live_doc(doc)
+
     try:
         events = fetch_live_events() if live else fetch_all_scheduled_events(target_date)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SofaScore match list scan failed: {exc}")
+        # SofaScore unreachable / rate-limited — return empty list with a clear message
+        return {
+            "status": "error",
+            "sportybet_id": sportybet_id,
+            "match_date": target_date,
+            "mode": "live" if live else "prematch",
+            "count": 0,
+            "candidates": [],
+            "error": f"SofaScore scan failed: {exc}",
+        }
 
     filtered = []
     for event in events:
         status_type = (event.get("status") or {}).get("type")
         event_live = status_type == "inprogress"
-        event_finished = (event.get("status") or {}).get("type") == "finished"
-        if live:
-            if not event_live:
-                continue
-        elif event_live:
+        event_finished = status_type == "finished"
+        if live and not event_live:
+            continue
+        if not live and event_live:
             continue
         if event_finished:
             continue
