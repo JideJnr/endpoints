@@ -91,7 +91,13 @@ def _rules_prediction(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, 
             )
         except Exception:
             pass
-    return predict_sporty_match(doc)
+    sporty_doc = {
+        **doc,
+        "id": doc.get("id") or doc.get("sportybet_id"),
+        "name": doc.get("name") or doc.get("sportybet_name"),
+        "markets": doc.get("markets") or doc.get("sportybet_markets") or [],
+    }
+    return predict_sporty_match(sporty_doc)
 
 
 def _value_bets(doc: dict[str, Any], model: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -191,7 +197,12 @@ def _team_name(doc: dict[str, Any], side: str) -> str:
     team = doc.get(f"{side}_team")
     if isinstance(team, dict):
         return team.get("name") or ""
-    return str(team or "")
+    if team:
+        return str(team)
+    name = doc.get("sportybet_name") or doc.get("name") or ""
+    parts = [part.strip() for part in str(name).split(" vs ", 1)]
+    index = 0 if side == "home" else 1
+    return parts[index] if len(parts) > index else ""
 
 
 def _to_float(value: Any) -> float | None:

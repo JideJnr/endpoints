@@ -176,10 +176,10 @@ def start_scheduler():
 
     scheduler = BackgroundScheduler(timezone="UTC")
 
-    # ingest upcoming — every 15 min, fast
+    # ingest upcoming — every 5 min, fast
     scheduler.add_job(
         _safe(job_ingest_upcoming),
-        IntervalTrigger(minutes=15),
+        IntervalTrigger(minutes=5),
         id="ingest_upcoming",
         name="Ingest upcoming matches from SportyBet",
         replace_existing=True,
@@ -187,10 +187,10 @@ def start_scheduler():
         misfire_grace_time=120,
     )
 
-    # ingest live — every 5 min, fast
+    # ingest live — every 1 min, fast
     scheduler.add_job(
         _safe(job_ingest_live),
-        IntervalTrigger(minutes=5),
+        IntervalTrigger(minutes=1),
         id="ingest_live",
         name="Ingest live matches + patch scores",
         replace_existing=True,
@@ -198,11 +198,11 @@ def start_scheduler():
         misfire_grace_time=60,
     )
 
-    # enrichment worker — every 2 min, processes a batch
+    # enrichment worker — every 1 min, processes a batch
     # misfire_grace_time=600 because enrichment can take a few minutes per batch
     scheduler.add_job(
         _safe(job_enrich_worker),
-        IntervalTrigger(minutes=2),
+        IntervalTrigger(minutes=1),
         id="enrich_worker",
         name="Enrichment worker (SofaScore + web context)",
         replace_existing=True,
@@ -234,9 +234,9 @@ def start_scheduler():
     scheduler.start()
     _scheduler = scheduler
     print("[scheduler] started")
-    print("[scheduler]   ingest_upcoming  every 15 min  (fast)")
-    print("[scheduler]   ingest_live      every  5 min  (fast)")
-    print("[scheduler]   enrich_worker    every  2 min  (batch enrichment)")
+    print("[scheduler]   ingest_upcoming  every  5 min  (fast)")
+    print("[scheduler]   ingest_live      every  1 min  (fast)")
+    print("[scheduler]   enrich_worker    every  1 min  (batch enrichment + auto prediction)")
     print("[scheduler]   archive_finished every 15 min  (MongoDB)")
     print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
     return scheduler

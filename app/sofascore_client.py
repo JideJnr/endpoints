@@ -1,3 +1,6 @@
+import random
+import time
+
 from curl_cffi import requests
 
 SOFASCORE_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/unique-tournament/{tournament_id}/scheduled-events/{date}"
@@ -18,41 +21,67 @@ SOFASCORE_ODDS_FEATURED_URL = "https://www.sofascore.com/api/v1/event/{event_id}
 HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.sofascore.com/",
+    "Origin": "https://www.sofascore.com",
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
 }
+
+_HOME_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_session = requests.Session(impersonate="chrome124")
+
+
+def _get(url: str) -> requests.Response:
+    """Persistent session with cookie warm-up retry on failure."""
+    global _session
+    try:
+        resp = _session.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        return resp
+    except Exception:
+        # rebuild session, warm cookies via homepage, then retry once
+        _session = requests.Session(impersonate="chrome124")
+        try:
+            _session.get("https://www.sofascore.com/", headers=_HOME_HEADERS, timeout=10)
+        except Exception:
+            pass
+        resp = _session.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        return resp
 
 
 def fetch_scheduled_events(date: str, tournament_id: int = 17) -> list[dict]:
     url = SOFASCORE_TOURNAMENT_URL.format(tournament_id=tournament_id, date=date)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    events = response.json().get("events", [])
+    events = _get(url).json().get("events", [])
     return [_parse_event(e) for e in events]
 
 
 def fetch_all_scheduled_events(date: str) -> list[dict]:
     url = SOFASCORE_ALL_URL.format(date=date)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    events = response.json().get("events", [])
+    events = _get(url).json().get("events", [])
     return [_parse_event(e) for e in events]
 
 
 def fetch_live_events() -> list[dict]:
-    response = requests.get(SOFASCORE_LIVE_URL, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    events = response.json().get("events", [])
+    events = _get(SOFASCORE_LIVE_URL).json().get("events", [])
     return [_parse_event(e) for e in events]
 
 
 def fetch_team_history(team_id: int, page: int = 0) -> dict:
     url = SOFASCORE_TEAM_HISTORY_URL.format(team_id=team_id, page=page)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    data = response.json()
+    data = _get(url).json()
     return {
         "has_next_page": data.get("hasNextPage", False),
         "events": [_parse_event(e) for e in data.get("events", [])],
@@ -61,15 +90,14 @@ def fetch_team_history(team_id: int, page: int = 0) -> dict:
 
 def fetch_standings(tournament_id: int, season_id: int) -> list[dict]:
     url = SOFASCORE_STANDINGS_URL.format(tournament_id=tournament_id, season_id=season_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    standings = response.json().get("standings", [])
+    standings = _get(url).json().get("standings", [])
     if not standings:
         return []
     return [_parse_standing_row(row) for row in standings[0].get("rows", [])]
 
 
 def fetch_event_detail(event: dict) -> dict:
+    time.sleep(random.uniform(0.5, 1.5))  # jitter to avoid rate limiting
     event_id = event["id"]
     home_id = event["home_team"]["id"]
     away_id = event["away_team"]["id"]
@@ -124,9 +152,7 @@ def _parse_standing_row(row: dict) -> dict:
 
 def fetch_h2h(event_id: int) -> dict:
     url = SOFASCORE_H2H_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    d = response.json()
+    d = _get(url).json()
     return {
         "team_duel": d.get("teamDuel"),
         "manager_duel": d.get("managerDuel"),
@@ -135,30 +161,22 @@ def fetch_h2h(event_id: int) -> dict:
 
 def fetch_event_statistics(event_id: int) -> list[dict]:
     url = SOFASCORE_STATISTICS_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    return response.json().get("statistics", [])
+    return _get(url).json().get("statistics", [])
 
 
 def fetch_event_incidents(event_id: int) -> list[dict]:
     url = SOFASCORE_INCIDENTS_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    return response.json().get("incidents", [])
+    return _get(url).json().get("incidents", [])
 
 
 def fetch_event_lineups(event_id: int) -> dict:
     url = SOFASCORE_LINEUPS_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    return response.json()
+    return _get(url).json()
 
 
 def fetch_pregame_form(event_id: int) -> dict:
     url = SOFASCORE_PREGAME_FORM_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    d = response.json()
+    d = _get(url).json()
     return {
         "label": d.get("label"),
         "home_team": {
@@ -178,9 +196,7 @@ def fetch_pregame_form(event_id: int) -> dict:
 
 def fetch_managers(event_id: int) -> dict:
     url = SOFASCORE_MANAGERS_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    d = response.json()
+    d = _get(url).json()
     return {
         "home_manager": _parse_manager(d.get("homeManager", {})),
         "away_manager": _parse_manager(d.get("awayManager", {})),
@@ -189,9 +205,7 @@ def fetch_managers(event_id: int) -> dict:
 
 def fetch_featured_players(team_id: int) -> list[dict]:
     url = SOFASCORE_FEATURED_PLAYERS_URL.format(team_id=team_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    featured = response.json().get("featuredPlayers", {})
+    featured = _get(url).json().get("featuredPlayers", {})
     seen = set()
     players = []
     for entry in featured.values():
@@ -212,17 +226,13 @@ def fetch_featured_players(team_id: int) -> list[dict]:
 
 def fetch_odds(event_id: int) -> list[dict]:
     url = SOFASCORE_ODDS_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    markets = response.json().get("markets", [])
+    markets = _get(url).json().get("markets", [])
     return [_parse_odds_market(m) for m in markets]
 
 
 def fetch_odds_featured(event_id: int) -> dict:
     url = SOFASCORE_ODDS_FEATURED_URL.format(event_id=event_id)
-    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
-    response.raise_for_status()
-    d = response.json()
+    d = _get(url).json()
     featured = d.get("featured", {})
     return {
         "has_more_odds": d.get("hasMoreOdds"),

@@ -21,8 +21,8 @@ LLM_FALLBACK_THRESHOLD = 0.60
 
 # How many SofaScore detail + web-search calls to run in parallel.
 # Keep low enough not to get rate-limited by SofaScore.
-DETAIL_WORKERS = 6
-WEB_WORKERS = 8
+DETAIL_WORKERS = 2
+WEB_WORKERS = 4
 
 JUNK_MARKERS = (
     " srl", " u21", " u20", " u19", " u18", " u23",

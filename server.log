@@ -1,12 +1,40 @@
-INFO:     Started server process [7220]
+INFO:     Started server process [20376]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:49612 - "GET /health HTTP/1.1" 200 OK
-INFO:     127.0.0.1:49709 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
-INFO:     127.0.0.1:49739 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
-INFO:     127.0.0.1:49744 - "GET /sporty/live/all HTTP/1.1" 200 OK
-INFO:     127.0.0.1:49971 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
-INFO:     127.0.0.1:49976 - "GET /sporty/live/all HTTP/1.1" 200 OK
-INFO:     127.0.0.1:49988 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
-INFO:     127.0.0.1:50011 - "GET /sofascore/scheduled/2025-05-04/all HTTP/1.1" 502 Bad Gateway
+Execution of job "Enrichment worker (SofaScore + web context) (trigger: interval[0:01:00], next run at: 2026-05-17 10:42:33 WAT)" skipped: maximum number of running instances reached (1)
+Execution of job "Enrichment worker (SofaScore + web context) (trigger: interval[0:01:00], next run at: 2026-05-17 10:43:33 WAT)" skipped: maximum number of running instances reached (1)
+Execution of job "Enrichment worker (SofaScore + web context) (trigger: interval[0:01:00], next run at: 2026-05-17 10:44:33 WAT)" skipped: maximum number of running instances reached (1)
+[scheduler] started
+[scheduler]   ingest_upcoming  every  5 min  (fast)
+[scheduler]   ingest_live      every  1 min  (fast)
+[scheduler]   enrich_worker    every  1 min  (batch enrichment + auto prediction)
+[scheduler]   archive_finished every 15 min  (MongoDB)
+[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)
+[startup] ingesting upcoming matches into buffer...
+[scheduler] job_ingest_live failed: HTTPSConnectionPool(host='www.sportybet.com', port=443): Max retries exceeded with url: /api/ng/factsCenter/wapConfigurableEventsByOrder (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000001D740CA0190>: Failed to resolve 'www.sportybet.com' ([Errno 11001] getaddrinfo failed)"))
+[scheduler] job_ingest_live failed: HTTPSConnectionPool(host='www.sportybet.com', port=443): Max retries exceeded with url: /api/ng/factsCenter/wapConfigurableEventsByOrder (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000001D7447DDB80>: Failed to resolve 'www.sportybet.com' ([Errno 11001] getaddrinfo failed)"))
+[scheduler] job_ingest_live failed: HTTPSConnectionPool(host='www.sportybet.com', port=443): Max retries exceeded with url: /api/ng/factsCenter/wapConfigurableEventsByOrder (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000001D7447CFD60>: Failed to resolve 'www.sportybet.com' ([Errno 11001] getaddrinfo failed)"))
+[scheduler] enrich_worker: batch=30 matched=0 stored=30 llm=0
+INFO:     127.0.0.1:62333 - "GET /sporty/live/all HTTP/1.1" 502 Bad Gateway
+Execution of job "Ingest live matches + patch scores (trigger: interval[0:01:00], next run at: 2026-05-17 10:45:33 WAT)" skipped: maximum number of running instances reached (1)
+[scheduler] ingest_live: 200 live | 200 new | 200 patched | 200 odds snapped
+INFO:     127.0.0.1:49391 - "GET /sporty/live/all HTTP/1.1" 200 OK
+Execution of job "Ingest live matches + patch scores (trigger: interval[0:01:00], next run at: 2026-05-17 10:47:33 WAT)" skipped: maximum number of running instances reached (1)
+[scheduler] ingest_upcoming: 300 matches buffered for 2026-05-17 | 300 odds snapped
+[startup] upcoming ingest done: 300 buffered
+[scheduler] enrich_worker: batch=30 matched=3 stored=30 llm=0
+[scheduler] ingest_upcoming: 300 matches buffered for 2026-05-17 | 300 odds snapped
+[scheduler] ingest_live: 200 live | 200 new | 200 patched | 200 odds snapped
+[startup] live ingest done: 200 live matches
+[scheduler] enrich_worker: batch=30 matched=4 stored=30 llm=0
+[scheduler] enrich_worker: batch=30 matched=4 stored=30 llm=0
+[startup] first enrichment batch done: 30 enriched
+INFO:     127.0.0.1:49750 - "GET /matches/sr%3Amatch%3A61061669/sofascore-candidates HTTP/1.1" 200 OK
+[scheduler] ingest_live: 200 live | 200 new | 200 patched | 200 odds snapped
+[scheduler] enrich_worker: batch=30 matched=1 stored=30 llm=0
+INFO:     127.0.0.1:49818 - "GET /matches/sr%3Amatch%3A61061669/sofascore-candidates HTTP/1.1" 200 OK
+[scheduler] enrich_worker: batch=30 matched=9 stored=30 llm=0
+[scheduler] ingest_live: 200 live | 200 new | 200 patched | 200 odds snapped
+INFO:     127.0.0.1:50226 - "GET /matches/today HTTP/1.1" 200 OK
+Execution of job "Enrichment worker (SofaScore + web context) (trigger: interval[0:01:00], next run at: 2026-05-17 10:52:33 WAT)" skipped: maximum number of running instances reached (1)

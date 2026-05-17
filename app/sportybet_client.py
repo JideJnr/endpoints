@@ -25,7 +25,7 @@ def fetch_live_matches() -> list[dict]:
         "withOneUpMarket": "true",
         "_t": int(time.time() * 1000),
     }
-    response = requests.get(SPORTYBET_URL, params=params, headers=HEADERS, timeout=10)
+    response = requests.get(SPORTYBET_URL, params=params, headers=HEADERS, timeout=10, proxies={"http": None, "https": None})
     response.raise_for_status()
     groups = response.json().get("data", [])
     matches = []
@@ -43,7 +43,7 @@ def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
     }
     if is_live is not None:
         payload["isLive"] = is_live
-    response = requests.post(SPORTYBET_POST_URL, json=payload, headers=POST_HEADERS, timeout=15)
+    response = requests.post(SPORTYBET_POST_URL, json=payload, headers=POST_HEADERS, timeout=15, proxies={"http": None, "https": None})
     response.raise_for_status()
     tournaments = response.json().get("data", {}).get("tournaments", [])
     matches = []

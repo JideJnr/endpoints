@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import html
+import re
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 from app.config import get_settings
 
@@ -11,12 +14,9 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
     settings = get_settings()
 
     if not settings.web_search_enabled:
-        return {"query": query, "snippets": [], "scraped": [], "disabled": True}
+        return {"query": query, "snippets": [], "scraped": [], "disabled": True, "diagnostics": _diagnostics(settings)}
 
-    try:
-        results = _search(query, settings.web_search_max_results)
-    except Exception as exc:
-        return {"query": query, "snippets": [], "scraped": [], "error": str(exc)}
+    results, attempts = _search(query, settings.web_search_max_results)
 
     snippets = []
     urls_to_scrape = []
@@ -34,27 +34,50 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
     # scrape pages in parallel with a hard wall-clock timeout
     scraped = _scrape_parallel(urls_to_scrape, settings.web_scrape_timeout_seconds)
 
-    return {"query": query, "snippets": snippets, "scraped": scraped}
+    search_error = next((item.get("error") for item in reversed(attempts) if item.get("status") == "error"), None)
+    return {
+        "query": query,
+        "snippets": snippets,
+        "scraped": scraped,
+        "error": search_error if not results else None,
+        "diagnostics": {
+            **_diagnostics(settings),
+            "attempts": attempts,
+            "results": len(results),
+            "scraped": len(scraped),
+        },
+    }
 
 
-def _search(query: str, max_results: int) -> list[dict[str, Any]]:
+def _search(query: str, max_results: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     from ddgs import DDGS
 
     settings = get_settings()
     last_error: Exception | None = None
+    attempts = []
 
     for backend in settings.web_search_backends:
         try:
             with DDGS(timeout=settings.web_search_timeout_seconds) as ddgs:
                 results = list(ddgs.text(query, max_results=max_results, backend=backend))
             if results:
-                return results
+                attempts.append({"backend": backend, "status": "ok", "results": len(results)})
+                return results, attempts
+            attempts.append({"backend": backend, "status": "empty", "results": 0})
         except Exception as exc:
             last_error = exc
+            attempts.append({"backend": backend, "status": "error", "error": str(exc)})
 
-    if last_error:
-        raise last_error
-    return []
+    try:
+        fallback = _search_duckduckgo_html(query, max_results)
+        attempts.append({"backend": "duckduckgo_html", "status": "ok" if fallback else "empty", "results": len(fallback)})
+        if fallback:
+            return fallback, attempts
+    except Exception as exc:
+        attempts.append({"backend": "duckduckgo_html", "status": "error", "error": str(exc)})
+        last_error = exc
+
+    return [], attempts
 
 
 def _scrape_parallel(urls: list[str], timeout_per_url: int) -> list[str]:
@@ -115,6 +138,49 @@ def _scrape(url: str, timeout: int | None = None) -> str:
     return ""
 
 
+def _search_duckduckgo_html(query: str, max_results: int) -> list[dict[str, Any]]:
+    import requests
+
+    settings = get_settings()
+    response = requests.get(
+        "https://duckduckgo.com/html/",
+        params={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 PredictX/1.0"},
+        timeout=settings.web_search_timeout_seconds,
+    )
+    response.raise_for_status()
+    text = response.text
+    blocks = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=<a[^>]+class="result__a"|$)', text, flags=re.S)
+    results = []
+    for href, title, tail in blocks[:max_results]:
+        snippet_match = re.search(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>', tail, flags=re.S)
+        snippet = snippet_match.group(1) or snippet_match.group(2) if snippet_match else ""
+        results.append(
+            {
+                "title": _clean_html(title),
+                "body": _clean_html(snippet),
+                "href": _clean_duckduckgo_href(href),
+            }
+        )
+    return results
+
+
+def _clean_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return html.unescape(text)
+
+
+def _clean_duckduckgo_href(href: str) -> str:
+    href = html.unescape(href or "")
+    parsed = urlparse(href)
+    if parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unquote(target)
+    return href
+
+
 def _teams_from_match(match: dict[str, Any]) -> tuple[str, str]:
     home = match.get("home_team")
     away = match.get("away_team")
@@ -140,3 +206,13 @@ def _tournament_from_match(match: dict[str, Any]) -> str:
 
 def _ascii(value: Any) -> str:
     return str(value or "").encode("ascii", errors="ignore").decode("ascii")
+
+
+def _diagnostics(settings) -> dict[str, Any]:
+    return {
+        "enabled": settings.web_search_enabled,
+        "backends": settings.web_search_backends,
+        "max_results": settings.web_search_max_results,
+        "search_timeout_seconds": settings.web_search_timeout_seconds,
+        "scrape_timeout_seconds": settings.web_scrape_timeout_seconds,
+    }
