@@ -11,3 +11,8 @@ rapidfuzz
 langchain
 langchain-core
 langchain-groq
+numpy
+scipy
+scikit-learn
+redis
+websockets

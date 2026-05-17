@@ -34,11 +34,22 @@ _scheduler = None
 
 def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
     """Fast: fetch upcoming matches from SportyBet and dump into buffer."""
+    from app.market import snapshot_odds
+
     today = dt.today().isoformat()
     matches = fetch_upcoming_matches_post()[:limit]
     ingested = ingest_matches(matches, today)
-    print(f"[scheduler] ingest_upcoming: {ingested} matches buffered for {today}")
-    return {"status": "ok", "job": "ingest_upcoming", "date": today, "ingested": ingested}
+    snapped = 0
+    for m in matches:
+        if snapshot_odds({
+            "sportybet_id":      m.get("id"),
+            "sportybet_name":    m.get("name"),
+            "match_date":        today,
+            "sportybet_markets": m.get("markets", []),
+        }):
+            snapped += 1
+    print(f"[scheduler] ingest_upcoming: {ingested} matches buffered for {today} | {snapped} odds snapped")
+    return {"status": "ok", "job": "ingest_upcoming", "date": today, "ingested": ingested, "odds_snapshots": snapped}
 
 
 def job_ingest_live(limit: int = 200) -> dict[str, Any]:
@@ -120,6 +131,35 @@ def job_archive_finished(match_date: str | None = None, limit: int = 1000) -> di
         return {"status": "error", "job": "archive_finished", "error": str(exc)}
 
 
+def job_grade_predictions() -> dict[str, Any]:
+    """Auto-grade yesterday's predictions against finished SofaScore results."""
+    from datetime import date, timedelta
+
+    from app.elo import record_match_result_once
+    from app.league_memory import get_grading_metrics, grade_predictions_for_date
+    from app.sofascore_client import fetch_all_scheduled_events
+
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    try:
+        events = fetch_all_scheduled_events(yesterday)
+        result = grade_predictions_for_date(yesterday, events)
+        finished = [event for event in events if (event.get("status") or {}).get("type") == "finished"]
+        elo_updated = 0
+        for event in finished:
+            elo_result = record_match_result_once("sofascore", event)
+            if elo_result.get("updated"):
+                elo_updated += 1
+        metrics = get_grading_metrics()
+        print(
+            f"[scheduler] grade_predictions: graded={result.get('graded')} "
+            f"elo_updated={elo_updated} win_rate={metrics.get('win_percent')}%"
+        )
+        return {**result, "metrics": metrics, "elo_updated": elo_updated}
+    except Exception as exc:
+        print(f"[scheduler] grade_predictions failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+
 # ── Scheduler setup ───────────────────────────────────────────────────────────
 
 def start_scheduler():
@@ -181,6 +221,16 @@ def start_scheduler():
         misfire_grace_time=300,
     )
 
+    scheduler.add_job(
+        _safe(job_grade_predictions),
+        IntervalTrigger(hours=6),
+        id="grade_predictions",
+        name="Auto-grade predictions",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
     scheduler.start()
     _scheduler = scheduler
     print("[scheduler] started")
@@ -188,6 +238,7 @@ def start_scheduler():
     print("[scheduler]   ingest_live      every  5 min  (fast)")
     print("[scheduler]   enrich_worker    every  2 min  (batch enrichment)")
     print("[scheduler]   archive_finished every 15 min  (MongoDB)")
+    print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
     return scheduler
 
 

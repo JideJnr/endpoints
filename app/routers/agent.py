@@ -156,6 +156,137 @@ def get_sofascore_event_prediction(event_id: int, date: Optional[str] = None, in
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/value-bets")
+def get_value_bets(
+    date: Optional[str] = None,
+    min_edge: float = Query(default=3.0, ge=0, le=100),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """
+    Scan buffered/enriched matches for 1X2 prices where model probability beats implied odds.
+    """
+    from app.buffer import get_buffered_matches
+    from app.kelly import kelly_fraction
+    from app.poisson import run_poisson
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    target_date = date or dt.today().isoformat()
+    docs = get_buffered_matches(target_date, limit=limit)
+
+    def _scan_doc(doc: dict) -> list[dict]:
+        detail = doc.get("sofascore_detail") or {}
+        home_team = detail.get("home_team") or detail.get("homeTeam") or {}
+        away_team = detail.get("away_team") or detail.get("awayTeam") or {}
+        home_id = home_team.get("id")
+        away_id = away_team.get("id")
+        markets = doc.get("sportybet_markets") or doc.get("markets") or []
+        if not home_id or not away_id or not markets:
+            return []
+
+        try:
+            model = run_poisson(int(home_id), int(away_id))
+        except Exception:
+            return []
+
+        bets = []
+        probabilities = model.get("probabilities") or {}
+        for market in markets:
+            name = (market.get("name") or "").lower()
+            if not (market.get("id") == "1" or "1x2" in name or name == "match result"):
+                continue
+            for selection in market.get("selections", []):
+                decimal = _to_float(selection.get("odds"), 0)
+                if decimal < 1.1:
+                    continue
+                selection_name = str(selection.get("name") or "")
+                if selection_name in ("Home", "1"):
+                    model_prob = float(probabilities.get("home_win") or 0)
+                    side = "Home"
+                elif selection_name in ("Away", "2"):
+                    model_prob = float(probabilities.get("away_win") or 0)
+                    side = "Away"
+                elif selection_name in ("Draw", "X"):
+                    model_prob = float(probabilities.get("draw") or 0)
+                    side = "Draw"
+                else:
+                    continue
+
+                implied = 1 / decimal * 100
+                edge = model_prob - implied
+                if edge >= min_edge:
+                    bets.append(
+                        {
+                            "match": doc.get("sportybet_name") or doc.get("name"),
+                            "sportybet_id": str(doc.get("sportybet_id") or doc.get("id") or ""),
+                            "tournament": doc.get("tournament"),
+                            "selection": side,
+                            "decimal_odds": decimal,
+                            "model_probability": round(model_prob, 1),
+                            "implied_probability": round(implied, 1),
+                            "edge": round(edge, 1),
+                            "kelly": kelly_fraction(model_prob / 100, decimal),
+                        }
+                    )
+        return bets
+
+    value_bets = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_scan_doc, doc) for doc in docs]
+        for future in as_completed(futures):
+            value_bets.extend(future.result())
+
+    value_bets.sort(key=lambda item: item["edge"], reverse=True)
+    return {"status": "success", "date": target_date, "count": len(value_bets), "value_bets": value_bets}
+
+
+@router.get("/analytics/performance")
+def get_performance_analytics():
+    """Win rates, grading status, market types, and recent graded results."""
+    from app.league_memory import get_grading_metrics
+
+    return {"status": "success", **get_grading_metrics()}
+
+
+@router.get("/analytics/roi")
+def get_roi_analysis():
+    """Flat-stake ROI proxy, grouped by confidence band."""
+    import sqlite3
+    from app.league_memory import DB_PATH, _init_db
+
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select pick_type, selection, confidence, result
+            from prediction_history
+            where graded_at is not null and pick_type != 'no_bet'
+            """
+        ).fetchall()
+
+    total_staked = len(rows)
+    total_returned = sum(1.0 if row["result"] == "win" else 0.0 for row in rows)
+    roi = round((total_returned - total_staked) / total_staked * 100, 2) if total_staked else 0
+    bands: dict[str, list[bool]] = {"50-59": [], "60-69": [], "70-79": [], "80+": []}
+    for row in rows:
+        confidence = row["confidence"] or 0
+        band = "80+" if confidence >= 80 else "70-79" if confidence >= 70 else "60-69" if confidence >= 60 else "50-59"
+        bands[band].append(row["result"] == "win")
+
+    return {
+        "status": "success",
+        "total_predictions": total_staked,
+        "roi_percent": roi,
+        "by_confidence": {
+            band: {
+                "count": len(results),
+                "win_rate": round(sum(results) / len(results) * 100, 1) if results else 0,
+            }
+            for band, results in bands.items()
+        },
+    }
+
+
 def _predict_sofascore_with_detail(event: dict, date: str, include_history: bool) -> dict:
     detail = fetch_event_detail(event)
     home_history = []
@@ -187,6 +318,13 @@ def _with_ai_brain(prediction: dict, detail: dict | None = None) -> dict:
 def _to_int(value, default: int = 0) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 

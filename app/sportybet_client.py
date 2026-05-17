@@ -94,6 +94,8 @@ def _parse_event(event: dict, group: dict) -> dict:
         "category": group.get("categoryName"),
         "venue": event.get("fixtureVenue", {}).get("name"),
         "markets": [_parse_market(m) for m in event.get("markets", [])],
+        "raw_event": event,
+        "raw_group": group,
     }
 
 

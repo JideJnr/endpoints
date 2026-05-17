@@ -27,6 +27,10 @@ from app.league_memory import (
 from app.ai_brain import oversee_prediction
 from app.bot2 import run_bot2
 from app.enrichment import run_enrichment
+from app.dixon_coles import run_dixon_coles
+from app.elo import elo_prediction
+from app.ensemble import ensemble_prediction
+from app.kelly import kelly_fraction
 from app.market import get_all_movements, get_movement
 from app.poisson import run_poisson
 from app.prediction_agent import predict_sofascore_event, predict_sporty_match
@@ -468,6 +472,35 @@ def get_odds_movements(date: Optional[str] = None):
 @router.get("/models/poisson")
 def get_poisson_model(home_team_id: int, away_team_id: int):
     return {"status": "success", "poisson": run_poisson(home_team_id, away_team_id)}
+
+
+@router.get("/models/dixon-coles")
+def get_dixon_coles_model(home_team_id: int, away_team_id: int):
+    return {"status": "success", "dixon_coles": run_dixon_coles(home_team_id, away_team_id)}
+
+
+@router.get("/models/elo")
+def get_elo_model(home_team_id: str, away_team_id: str):
+    return {"status": "success", "elo": elo_prediction(home_team_id, away_team_id)}
+
+
+@router.get("/models/kelly")
+def get_kelly_model(probability: float = Query(ge=0, le=1), decimal_odds: float = Query(gt=1), fraction: float = Query(default=0.25, gt=0, le=1)):
+    return {"status": "success", "kelly": kelly_fraction(probability, decimal_odds, fraction)}
+
+
+@router.get("/models/ensemble")
+def get_ensemble_model(
+    home_team_id: int,
+    away_team_id: int,
+    rules_confidence: int = Query(default=50, ge=0, le=95),
+    rules_pick: str = "home",
+):
+    poisson = run_poisson(home_team_id, away_team_id)
+    dixon = run_dixon_coles(home_team_id, away_team_id)
+    elo = elo_prediction(str(home_team_id), str(away_team_id))
+    ensemble = ensemble_prediction(dixon, elo, poisson, rules_confidence, rules_pick)
+    return {"status": "success", "ensemble": ensemble, "models": {"poisson": poisson, "dixon_coles": dixon, "elo": elo}}
 
 
 @router.get("/models/schedule")

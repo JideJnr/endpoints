@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import date as dt
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.buffer import (
     get_buffered_matches,
@@ -61,6 +63,125 @@ def get_today_match_detail(sportybet_id: str):
     return _match_detail(doc)
 
 
+@router.get("/matches/{sportybet_id}/sofascore-candidates")
+def get_sofascore_candidates(sportybet_id: str):
+    """Return the full SofaScore pool for this SportyBet match state."""
+    from app.sofascore_client import fetch_all_scheduled_events, fetch_live_events
+
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+
+    target_date = doc.get("match_date") or dt.today().isoformat()
+    live = _is_live_doc(doc)
+    try:
+        events = fetch_live_events() if live else fetch_all_scheduled_events(target_date)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"SofaScore match list scan failed: {exc}")
+
+    filtered = []
+    for event in events:
+        status_type = (event.get("status") or {}).get("type")
+        event_live = status_type == "inprogress"
+        event_finished = (event.get("status") or {}).get("type") == "finished"
+        if live:
+            if not event_live:
+                continue
+        elif event_live:
+            continue
+        if event_finished:
+            continue
+        filtered.append(event)
+
+    candidates = sorted(
+        (_candidate_summary(event, doc, target_date) for event in filtered),
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "match_date": target_date,
+        "mode": "live" if live else "prematch",
+        "count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+@router.post("/matches/{sportybet_id}/sofascore-match")
+def match_sofascore_candidate(
+    sportybet_id: str,
+    payload: dict[str, Any] = Body(...),
+):
+    """Manually attach a SofaScore event and persist the correction."""
+    from app.buffer import store_enriched
+    from app.sofascore_client import fetch_all_scheduled_events, fetch_live_events
+
+    sofa_id = payload.get("sofascore_id")
+    if sofa_id is None:
+        raise HTTPException(status_code=400, detail="sofascore_id is required")
+
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+
+    dates = []
+    for value in (payload.get("match_date"), doc.get("match_date"), dt.today().isoformat()):
+        if value and value not in dates:
+            dates.append(value)
+
+    sofa = None
+    if _is_live_doc(doc):
+        try:
+            sofa = next((event for event in fetch_live_events() if str(event.get("id")) == str(sofa_id)), None)
+        except Exception:
+            sofa = None
+    for target_date in dates:
+        if sofa:
+            break
+        try:
+            events = fetch_all_scheduled_events(target_date)
+        except Exception:
+            continue
+        sofa = next((event for event in events if str(event.get("id")) == str(sofa_id)), None)
+        if sofa:
+            break
+    if not sofa and isinstance(payload.get("event"), dict):
+        sofa = payload["event"]
+    if not sofa:
+        raise HTTPException(status_code=404, detail=f"SofaScore event {sofa_id} was not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    enriched_doc = {
+        **doc,
+        "sportybet_id": sportybet_id,
+        "sportybet_name": doc.get("sportybet_name") or doc.get("name"),
+        "match_date": doc.get("match_date") or payload.get("match_date") or dt.today().isoformat(),
+        "sofascore_id": sofa.get("id"),
+        "sofascore_name": sofa.get("name"),
+        "sofascore_event": sofa,
+        "sofascore_detail": None,
+        "web_context": {},
+        "match_score": _candidate_score(sofa, doc),
+        "manual_match": True,
+        "manual_matched_at": now,
+        "raw_sporty": doc.get("raw_sporty") or doc,
+        "raw_sofascore_event": sofa.get("raw_event"),
+        "enriched_at": now,
+    }
+
+    store_enriched(sportybet_id, enriched_doc)
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "sofascore_id": sofa.get("id"),
+        "matched_sofascore": True,
+        "saved": True,
+        "needs_enrichment": True,
+        "match": _match_detail(enriched_doc),
+    }
+
+
 @router.get("/buffer/status")
 def get_buffer_status():
     """Scheduler health + buffer counts. Use to verify background jobs are running."""
@@ -73,14 +194,14 @@ def get_buffer_status():
 
 @router.post("/matches/{sportybet_id}/enrich")
 def enrich_single_match(sportybet_id: str):
-    """Force-enrich a single match immediately (bypasses staleness check)."""
+    """Force-enrich a single match using saved manual SofaScore match when present."""
     from app.buffer import get_buffered_match, store_enriched
-    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
+    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.web_context import search_match_context
     from app.market import snapshot_odds
+    from app.time_context import match_time_context
     from datetime import date, datetime, timezone
-    import json
 
     doc = get_buffered_match(sportybet_id)
     if not doc:
@@ -88,15 +209,26 @@ def enrich_single_match(sportybet_id: str):
 
     sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
     match_date = doc.get("match_date") or date.today().isoformat()
+    saved_sofa_id = doc.get("sofascore_id")
+    sofa = None
+    score = 0.0
+    source = "auto"
 
-    try:
-        sofa_events = fetch_all_scheduled_events(match_date)
-    except Exception:
-        sofa_events = []
+    if saved_sofa_id:
+        sofa = _find_sofascore_event(str(saved_sofa_id), match_date, _is_live_doc(doc), fetch_live_events, fetch_all_scheduled_events)
+        if not sofa and isinstance(doc.get("sofascore_event"), dict):
+            sofa = doc["sofascore_event"]
+        score = _candidate_score(sofa, doc) if sofa else float(doc.get("match_score") or 1.0)
+        source = "manual"
+    else:
+        try:
+            sofa_events = fetch_live_events() if _is_live_doc(doc) else fetch_all_scheduled_events(match_date)
+        except Exception:
+            sofa_events = []
 
-    sofa, score = _fuzzy_match(sporty, sofa_events)
-    if score < FUZZY_THRESHOLD and score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
-        sofa = _llm_match(sporty, sofa_events) or sofa
+        sofa, score = _fuzzy_match(sporty, sofa_events)
+        if score < FUZZY_THRESHOLD and score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
+            sofa = _llm_match(sporty, sofa_events) or sofa
 
     detail = None
     if sofa:
@@ -108,8 +240,8 @@ def enrich_single_match(sportybet_id: str):
     web_context = {}
     try:
         web_context = search_match_context(
-            sporty.get("home_team") or "",
-            sporty.get("away_team") or "",
+            _home_team(sporty),
+            _away_team(sporty),
             sporty.get("tournament") or "",
         )
     except Exception:
@@ -117,20 +249,35 @@ def enrich_single_match(sportybet_id: str):
 
     now = datetime.now(timezone.utc).isoformat()
     enriched_doc = {
+        **doc,
         **sporty,
         "sportybet_id":      sporty.get("id") or sportybet_id,
-        "sportybet_name":    sporty.get("name"),
+        "sportybet_name":    sporty.get("sportybet_name") or sporty.get("name"),
         "match_date":        match_date,
         "sofascore_id":      sofa.get("id") if sofa else None,
         "sofascore_name":    sofa.get("name") if sofa else None,
+        "sofascore_event":   sofa,
         "sofascore_detail":  detail,
         "web_context":       web_context,
         "match_score":       round(score, 3),
+        "match_source":      source,
+        "manual_match":      bool(saved_sofa_id),
+        "manual_matched_at":  doc.get("manual_matched_at"),
+        "raw_sporty":        doc.get("raw_sporty") or sporty,
+        "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
+        "time_context":      match_time_context({**sporty, "sofascore_event": sofa}),
         "enriched_at":       now,
     }
 
     snapshot_odds(enriched_doc)
     store_enriched(sportybet_id, enriched_doc)
+    try:
+        from app.enriched_prediction import predict_enriched_match
+        from app.league_memory import record_prediction
+
+        record_prediction(predict_enriched_match(enriched_doc))
+    except Exception:
+        pass
 
     return {
         "status": "success",
@@ -138,17 +285,19 @@ def enrich_single_match(sportybet_id: str):
         "matched_sofascore": bool(sofa),
         "sofascore_id": sofa.get("id") if sofa else None,
         "fuzzy_score": round(score, 3),
+        "match_source": source,
         "has_detail": bool(detail),
         "has_web_context": bool(web_context.get("snippets")),
+        "web_context_query": web_context.get("query"),
         "enriched_at": now,
     }
 
 
 @router.post("/matches/{sportybet_id}/predict")
 def predict_single_match(sportybet_id: str):
-    """Run the prediction agent on a single match and return the result."""
+    """Run every available model on the richest available match data."""
     from app.buffer import get_buffered_match
-    from app.prediction_agent import predict_sporty_match
+    from app.enriched_prediction import predict_enriched_match
     from app.ai_brain import oversee_prediction
     from app.league_memory import record_prediction
     from datetime import date
@@ -157,9 +306,15 @@ def predict_single_match(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
 
-    # rules-based prediction (always available)
+    if not doc.get("sofascore_detail") and (doc.get("sofascore_id") or not doc.get("enriched_at")):
+        try:
+            enrich_single_match(sportybet_id)
+            doc = get_buffered_match(sportybet_id) or doc
+        except Exception:
+            pass
+
     try:
-        prediction = predict_sporty_match(doc)
+        prediction = predict_enriched_match(doc)
         brain = oversee_prediction(prediction, doc)
         prediction["ai_brain"] = brain
         adj = int(brain.get("confidence_adjustment") or 0)
@@ -180,7 +335,7 @@ def predict_single_match(sportybet_id: str):
             **prediction,
             "match_id": sportybet_id,
             "match_date": doc.get("match_date") or date.today().isoformat(),
-            "source": "rules",
+            "source": "enriched_ensemble",
         })
     except Exception:
         pass
@@ -207,6 +362,8 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "category": doc.get("category"),
         "start_time": doc.get("start_time"),
         "period": doc.get("period"),
+        "played_seconds": doc.get("played_seconds"),
+        "is_live": _is_live_doc(doc),
         "score": doc.get("score"),
         "venue": doc.get("venue"),
         "enriched_at": doc.get("enriched_at"),
@@ -221,7 +378,11 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "home_avg_rating": home_form.get("avgRating") or home_form.get("avg_rating"),
         "away_avg_rating": away_form.get("avgRating") or away_form.get("avg_rating"),
         "h2h": detail.get("h2h"),
+        "statistics": detail.get("statistics") or [],
         "standings": detail.get("standings"),
+        "home_last_matches": detail.get("home_last_matches") or [],
+        "away_last_matches": detail.get("away_last_matches") or [],
+        "lineups": detail.get("lineups"),
         "home_players": detail.get("homeFeaturedPlayers") or detail.get("home_featured_players"),
         "away_players": detail.get("awayFeaturedPlayers") or detail.get("away_featured_players"),
         "incidents": detail.get("incidents"),
@@ -229,11 +390,89 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
             "query": web.get("query"),
             "snippets": web.get("snippets", []),
             "articles": web.get("scraped", []) or web.get("articles", []),
+            "error": web.get("error"),
+            "disabled": web.get("disabled"),
+            "diagnostics": web.get("diagnostics"),
         },
+        "time_context": doc.get("time_context"),
+        "manual_match": bool(doc.get("manual_match")),
+        "raw_sporty": doc.get("raw_sporty"),
+        "raw_sofascore_event": doc.get("raw_sofascore_event"),
         "odds_movement": get_movement(sportybet_id) if sportybet_id else {"snapshots": 0, "movement": None},
         "prediction": _latest_prediction(sportybet_id),
         "raw": doc,
     }
+
+
+def _find_sofascore_event(
+    sofa_id: str,
+    match_date: str,
+    live: bool,
+    fetch_live_events,
+    fetch_all_scheduled_events,
+) -> dict[str, Any] | None:
+    if live:
+        try:
+            match = next((event for event in fetch_live_events() if str(event.get("id")) == sofa_id), None)
+            if match:
+                return match
+        except Exception:
+            pass
+
+    dates = []
+    for value in (match_date, dt.today().isoformat()):
+        if value and value not in dates:
+            dates.append(value)
+    for target_date in dates:
+        try:
+            events = fetch_all_scheduled_events(target_date)
+        except Exception:
+            continue
+        match = next((event for event in events if str(event.get("id")) == sofa_id), None)
+        if match:
+            return match
+    return None
+
+
+def _candidate_summary(event: dict[str, Any], doc: dict[str, Any], match_date: str) -> dict[str, Any]:
+    status = event.get("status") or {}
+    score = event.get("score") or {}
+    return {
+        "id": event.get("id"),
+        "name": event.get("name"),
+        "home_team": (event.get("home_team") or {}).get("name"),
+        "away_team": (event.get("away_team") or {}).get("name"),
+        "tournament": (event.get("tournament") or {}).get("name"),
+        "status": status.get("description") or status.get("type"),
+        "status_type": status.get("type"),
+        "scoreline": _scoreline(score),
+        "start_timestamp": event.get("start_timestamp"),
+        "match_date": match_date,
+        "score": _candidate_score(event, doc),
+        "event": event,
+    }
+
+
+def _candidate_score(event: dict[str, Any], doc: dict[str, Any]) -> float:
+    sofa_name = event.get("name") or ""
+    sporty_name = doc.get("sportybet_name") or doc.get("name") or ""
+    direct = SequenceMatcher(None, sofa_name.lower(), sporty_name.lower()).ratio()
+    home = SequenceMatcher(None, ((event.get("home_team") or {}).get("name") or "").lower(), _home_team(doc).lower()).ratio()
+    away = SequenceMatcher(None, ((event.get("away_team") or {}).get("name") or "").lower(), _away_team(doc).lower()).ratio()
+    return round(max(direct, (home + away) / 2), 3)
+
+
+def _scoreline(score: dict[str, Any]) -> str | None:
+    home = score.get("home")
+    away = score.get("away")
+    if home is None or away is None:
+        return None
+    return f"{home}-{away}"
+
+
+def _is_live_doc(doc: dict[str, Any]) -> bool:
+    period = doc.get("period")
+    return bool(period and period not in ("Not started", "Not start", "FT", "AET", "Finished", "Ended", ""))
 
 
 def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +491,7 @@ def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
         "category": doc.get("category"),
         "start_time": doc.get("start_time"),
         "period": doc.get("period"),
+        "played_seconds": doc.get("played_seconds"),
         "score": doc.get("score"),
         "venue": doc.get("venue"),
         "enriched_at": doc.get("enriched_at"),
@@ -263,6 +503,9 @@ def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
         "has_sofascore": bool(detail),
         "has_h2h": bool(detail.get("h2h")),
         "has_standings": bool(detail.get("standings")),
+        "has_statistics": bool(detail.get("statistics")),
+        "has_lineups": bool(detail.get("lineups")),
+        "has_last_matches": bool(detail.get("home_last_matches") or detail.get("away_last_matches")),
         "has_web_context": bool(doc.get("web_context")),
     }
 

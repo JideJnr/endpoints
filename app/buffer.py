@@ -232,7 +232,7 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            select match_id, raw_sporty, is_live, match_date
+            select match_id, raw_sporty, raw_enriched, is_live, match_date
             from match_buffer
             where is_finished = 0
               and (
@@ -258,6 +258,7 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
             "is_live": bool(row["is_live"]),
             "match_date": row["match_date"],
             "sporty": json.loads(row["raw_sporty"]),
+            "existing": json.loads(row["raw_enriched"]) if row["raw_enriched"] else None,
         }
         for row in rows
     ]
@@ -269,6 +270,11 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
+        row = conn.execute("select raw_sporty, raw_enriched from match_buffer where match_id = ?", (match_id,)).fetchone()
+        if row:
+            raw_sporty = json.loads(row[0]) if row[0] else {}
+            existing = json.loads(row[1]) if row[1] else {}
+            doc = _merge_enriched(raw_sporty, existing, doc)
         conn.execute(
             """
             update match_buffer set
@@ -416,6 +422,7 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
     from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.web_context import search_match_context
+    from app.time_context import match_time_context
     from datetime import date
 
     batch = get_unenriched_batch(batch_size)
@@ -441,7 +448,21 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
 
     for item in batch:
         sporty = item["sporty"]
+        existing = item.get("existing") or {}
         sofa_events = sofa_cache.get(item["match_date"] or date.today().isoformat(), [])
+        saved_sofa_id = existing.get("sofascore_id")
+        sofa = None
+        score = 0.0
+
+        if saved_sofa_id:
+            sofa = next((event for event in sofa_events if str(event.get("id")) == str(saved_sofa_id)), None)
+            if not sofa and isinstance(existing.get("sofascore_event"), dict):
+                sofa = existing["sofascore_event"]
+            score = float(existing.get("match_score") or 1.0)
+            matched += 1
+            pairs.append((item, sofa, score))
+            continue
+
         sofa, score = _fuzzy_match(sporty, sofa_events)
 
         if score < FUZZY_THRESHOLD:
@@ -501,13 +522,16 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
     # assemble and store
     now = datetime.now(timezone.utc).isoformat()
     stored = 0
+    predicted = 0
 
     for i, (item, sofa, score) in enumerate(pairs):
         sporty = item["sporty"]
+        existing = item.get("existing") or {}
         detail = details.get(i)
         web_context = web_contexts.get(i, {"query": "", "snippets": [], "scraped": []})
 
         doc = {
+            **existing,
             "sportybet_id":      sporty.get("id"),
             "sportybet_name":    sporty.get("name"),
             "match_date":        item["match_date"],
@@ -515,19 +539,33 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             "category":          sporty.get("category"),
             "start_time":        sporty.get("start_time"),
             "period":            sporty.get("period"),
+            "played_seconds":    sporty.get("played_seconds"),
             "score":             sporty.get("score"),
             "venue":             sporty.get("venue"),
             "sportybet_markets": sporty.get("markets", []),
             "sofascore_id":      sofa.get("id") if sofa else None,
             "sofascore_name":    sofa.get("name") if sofa else None,
+            "sofascore_event":   sofa,
             "sofascore_detail":  detail,
             "web_context":       web_context,
             "match_score":       round(score, 3),
+            "manual_match":      bool(existing.get("manual_match")),
+            "raw_sporty":        sporty,
+            "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
+            "time_context":      match_time_context({**sporty, "sofascore_event": sofa}),
             "enriched_at":       now,
         }
 
         snapshot_odds(doc)
         store_enriched(item["match_id"], doc)
+        try:
+            from app.enriched_prediction import predict_enriched_match
+            from app.league_memory import record_prediction
+
+            record_prediction(predict_enriched_match(doc))
+            predicted += 1
+        except Exception as exc:
+            print(f"[buffer] auto prediction failed for {item['match_id']}: {exc}")
         stored += 1
 
     return {
@@ -537,6 +575,7 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
         "llm_fallback": llm_used,
         "unmatched": unmatched,
         "stored": stored,
+        "predicted": predicted,
     }
 
 
@@ -557,12 +596,28 @@ def _sporty_to_summary(m: dict[str, Any]) -> dict[str, Any]:
         "category":       m.get("category"),
         "start_time":     m.get("start_time"),
         "period":         m.get("period"),
+        "played_seconds": m.get("played_seconds"),
         "score":          score,
         "venue":          m.get("venue"),
         "odds_1x2":       _extract_1x2(m.get("markets", [])),
+        "raw_sporty":     m,
         "has_sofascore":  False,
         "enriched":       False,
     }
+
+
+def _merge_enriched(raw_sporty: dict[str, Any], existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Preserve sticky user-matched SofaScore state while refreshing volatile match data."""
+    merged = {**existing, **incoming}
+    merged["raw_sporty"] = raw_sporty or incoming.get("raw_sporty") or existing.get("raw_sporty")
+    if existing.get("manual_match") and existing.get("sofascore_id"):
+        merged["manual_match"] = True
+        merged["manual_matched_at"] = existing.get("manual_matched_at")
+        merged["sofascore_id"] = existing.get("sofascore_id")
+        merged["sofascore_name"] = incoming.get("sofascore_name") or existing.get("sofascore_name")
+        merged["sofascore_event"] = incoming.get("sofascore_event") or existing.get("sofascore_event")
+        merged["match_score"] = incoming.get("match_score") or existing.get("match_score") or 1.0
+    return merged
 
 
 def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:

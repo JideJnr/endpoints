@@ -2,9 +2,13 @@ from curl_cffi import requests
 
 SOFASCORE_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/unique-tournament/{tournament_id}/scheduled-events/{date}"
 SOFASCORE_ALL_URL = "https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
+SOFASCORE_LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 SOFASCORE_TEAM_HISTORY_URL = "https://www.sofascore.com/api/v1/team/{team_id}/events/last/{page}"
 SOFASCORE_STANDINGS_URL = "https://www.sofascore.com/api/v1/tournament/{tournament_id}/season/{season_id}/standings/total"
 SOFASCORE_H2H_URL = "https://www.sofascore.com/api/v1/event/{event_id}/h2h"
+SOFASCORE_STATISTICS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/statistics"
+SOFASCORE_INCIDENTS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/incidents"
+SOFASCORE_LINEUPS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/lineups"
 SOFASCORE_PREGAME_FORM_URL = "https://www.sofascore.com/api/v1/event/{event_id}/pregame-form"
 SOFASCORE_MANAGERS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/managers"
 SOFASCORE_FEATURED_PLAYERS_URL = "https://www.sofascore.com/api/v1/team/{team_id}/featured-players"
@@ -32,6 +36,13 @@ def fetch_scheduled_events(date: str, tournament_id: int = 17) -> list[dict]:
 def fetch_all_scheduled_events(date: str) -> list[dict]:
     url = SOFASCORE_ALL_URL.format(date=date)
     response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
+    response.raise_for_status()
+    events = response.json().get("events", [])
+    return [_parse_event(e) for e in events]
+
+
+def fetch_live_events() -> list[dict]:
+    response = requests.get(SOFASCORE_LIVE_URL, headers=HEADERS, impersonate="chrome124", timeout=10)
     response.raise_for_status()
     events = response.json().get("events", [])
     return [_parse_event(e) for e in events]
@@ -74,8 +85,13 @@ def fetch_event_detail(event: dict) -> dict:
     return {
         **event,
         "h2h": safe(fetch_h2h, event_id),
+        "statistics": safe(fetch_event_statistics, event_id),
+        "incidents": safe(fetch_event_incidents, event_id),
+        "lineups": safe(fetch_event_lineups, event_id),
         "pregame_form": safe(fetch_pregame_form, event_id),
         "managers": safe(fetch_managers, event_id),
+        "home_last_matches": safe(lambda team_id: fetch_team_history(team_id).get("events", []), home_id),
+        "away_last_matches": safe(lambda team_id: fetch_team_history(team_id).get("events", []), away_id),
         "home_featured_players": safe(fetch_featured_players, home_id),
         "away_featured_players": safe(fetch_featured_players, away_id),
         "odds_featured": safe(fetch_odds_featured, event_id),
@@ -115,6 +131,27 @@ def fetch_h2h(event_id: int) -> dict:
         "team_duel": d.get("teamDuel"),
         "manager_duel": d.get("managerDuel"),
     }
+
+
+def fetch_event_statistics(event_id: int) -> list[dict]:
+    url = SOFASCORE_STATISTICS_URL.format(event_id=event_id)
+    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
+    response.raise_for_status()
+    return response.json().get("statistics", [])
+
+
+def fetch_event_incidents(event_id: int) -> list[dict]:
+    url = SOFASCORE_INCIDENTS_URL.format(event_id=event_id)
+    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
+    response.raise_for_status()
+    return response.json().get("incidents", [])
+
+
+def fetch_event_lineups(event_id: int) -> dict:
+    url = SOFASCORE_LINEUPS_URL.format(event_id=event_id)
+    response = requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=10)
+    response.raise_for_status()
+    return response.json()
 
 
 def fetch_pregame_form(event_id: int) -> dict:
@@ -272,4 +309,5 @@ def _parse_event(e: dict) -> dict:
         "venue": venue.get("name"),
         "start_timestamp": e.get("startTimestamp"),
         "winner_code": e.get("winnerCode"),
+        "raw_event": e,
     }

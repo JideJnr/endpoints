@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
+import asyncio
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings, public_settings
@@ -35,6 +36,9 @@ app.include_router(agent.router)
 app.include_router(frontend.router)
 app.include_router(platform.router)
 app.include_router(mongo.router)
+
+
+connected_clients: list[WebSocket] = []
 
 
 def _run_initial_enrichment():
@@ -97,6 +101,29 @@ def readiness():
 @app.get("/config")
 def config():
     return {"status": "success", "settings": public_settings()}
+
+
+@app.websocket("/ws/live")
+async def websocket_live(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+    try:
+        while True:
+            from app.buffer import get_live_buffered_matches
+            from app.routers.frontend import _match_summary
+
+            matches = get_live_buffered_matches(limit=50)
+            await websocket.send_json(
+                {
+                    "type": "live_update",
+                    "count": len(matches),
+                    "matches": [_match_summary(match) for match in matches],
+                }
+            )
+            await asyncio.sleep(30)
+    except WebSocketDisconnect:
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
 
 
 @app.get("/contract", response_class=PlainTextResponse)
