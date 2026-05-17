@@ -4,12 +4,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.mongo_store import init_mongo, list_finished_matches, mongo_status, save_finished_match
+from app.mongo_store import init_mongo, list_finished_matches, mongo_status, save_finished_match, flush_buffer_to_mongo, cleanup_buffer
 from app.scheduler import (
     job_ingest_upcoming,
     job_ingest_live,
     job_enrich_worker,
     job_archive_finished,
+    job_flush_to_mongo,
     scheduler_status,
     start_scheduler,
     stop_scheduler,
@@ -98,5 +99,23 @@ def post_scan_enrich(batch_size: int = Query(default=30, ge=1, le=100)):
 def post_scan_finished(match_date: Optional[str] = None, limit: int = Query(default=1000, ge=1, le=2000)):
     try:
         return job_archive_finished(match_date=match_date, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/flush")
+def post_flush_to_mongo():
+    """Flush live/upcoming enriched buffer rows to MongoDB."""
+    try:
+        return job_flush_to_mongo()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/cleanup")
+def post_cleanup_buffer():
+    """Safety-net: remove any finished rows still in buffer + stale unenriched rows."""
+    try:
+        return cleanup_buffer()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))

@@ -172,6 +172,11 @@ def get_value_bets(
 
     target_date = date or dt.today().isoformat()
     docs = get_buffered_matches(target_date, limit=limit)
+    # only scan upcoming and live — finished matches have no betting value
+    docs = [
+        doc for doc in docs
+        if not _is_finished_doc(doc)
+    ]
 
     def _scan_doc(doc: dict) -> list[dict]:
         detail = doc.get("sofascore_detail") or {}
@@ -327,6 +332,11 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_finished_doc(doc: dict) -> bool:
+    period = (doc.get("period") or "").lower()
+    return period in ("ft", "finished", "ended", "aet", "ap", "full time")
 
 
 # ── Groq LangChain agent endpoints ───────────────────────────────────────────

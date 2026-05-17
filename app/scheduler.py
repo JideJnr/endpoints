@@ -1,17 +1,13 @@
 """
 Scheduler
 ---------
-Three background jobs:
-
-  every 15 min  — INGEST upcoming matches from SportyBet into buffer (fast, no enrichment)
-  every 5  min  — INGEST live matches + patch scores/periods (fast)
-  every 2  min  — ENRICH worker: picks up unenriched/stale matches and enriches them
-  every 15 min  — ARCHIVE finished matches to MongoDB
-
-The ingest jobs are intentionally fast — they just dump raw data into the buffer.
-The enrich worker runs continuously and processes matches in small batches.
-This means the frontend always has data (even unenriched) and enrichment
-catches up in the background without blocking anything.
+  every  5 min  — INGEST upcoming matches from SportyBet into buffer (fast)
+  every  1 min  — INGEST live matches + patch scores/periods (fast)
+                  └ finished matches archived to MongoDB + deleted from buffer immediately
+  every  1 min  — ENRICH worker: picks up unenriched/stale matches
+  every 15 min  — ARCHIVE SofaScore scheduled events to MongoDB
+  every 10 min  — FLUSH live/upcoming enriched rows to MongoDB + safety-net cleanup
+  every  6 hrs  — GRADE yesterday's predictions + update ELO
 """
 from __future__ import annotations
 
@@ -53,17 +49,17 @@ def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
 
 
 def job_ingest_live(limit: int = 200) -> dict[str, Any]:
-    """Fast: fetch live matches, update scores/periods in buffer, snapshot odds."""
+    """Fast: fetch live matches, add new ones to buffer, patch scores on existing ones."""
     from app.league_memory import observe_matches
     from app.market import snapshot_odds
 
     today = dt.today().isoformat()
     matches = fetch_live_matches_post()[:limit]
 
-    # ingest any new live matches not yet in buffer
-    ingested = ingest_matches(matches, today)
+    # add brand-new live matches not yet in buffer
+    new_count = ingest_matches(matches, today)
 
-    # patch scores/periods on already-buffered matches
+    # patch scores/periods + archive finished ones
     patched = patch_live_scores(matches)
 
     # snapshot odds for movement tracking
@@ -77,15 +73,14 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
         }):
             snapped += 1
 
-    # record in league memory for late-goal stats
     observe_matches("sportybet", matches)
 
-    print(f"[scheduler] ingest_live: {len(matches)} live | {ingested} new | {patched} patched | {snapped} odds snapped")
+    print(f"[scheduler] ingest_live: {len(matches)} from api | {new_count} new | {patched} patched | {snapped} odds snapped")
     return {
         "status": "ok",
         "job": "ingest_live",
         "live_count": len(matches),
-        "ingested": ingested,
+        "new": new_count,
         "patched": patched,
         "odds_snapshots": snapped,
     }
@@ -130,6 +125,20 @@ def job_archive_finished(match_date: str | None = None, limit: int = 1000) -> di
         print(f"[scheduler] archive_finished failed: {exc}")
         return {"status": "error", "job": "archive_finished", "error": str(exc)}
 
+
+def job_flush_to_mongo() -> dict[str, Any]:
+    """Flush live/upcoming enriched buffer rows to MongoDB, then run safety-net cleanup."""
+    from app.mongo_store import flush_buffer_to_mongo, cleanup_buffer
+
+    flush_result = flush_buffer_to_mongo()
+    cleanup_result = cleanup_buffer()
+    print(
+        f"[scheduler] flush_to_mongo: flushed={flush_result.get('flushed')} "
+        f"errors={flush_result.get('errors')} "
+        f"cleaned_finished={cleanup_result.get('deleted_finished')} "
+        f"cleaned_stale={cleanup_result.get('deleted_stale_unenriched')}"
+    )
+    return {"flush": flush_result, "cleanup": cleanup_result}
 
 def job_grade_predictions() -> dict[str, Any]:
     """Auto-grade yesterday's predictions against finished SofaScore results."""
@@ -222,6 +231,16 @@ def start_scheduler():
     )
 
     scheduler.add_job(
+        _safe(job_flush_to_mongo),
+        IntervalTrigger(minutes=10),
+        id="flush_to_mongo",
+        name="Flush buffer to MongoDB + cleanup",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
         _safe(job_grade_predictions),
         IntervalTrigger(hours=6),
         id="grade_predictions",
@@ -238,6 +257,7 @@ def start_scheduler():
     print("[scheduler]   ingest_live      every  1 min  (fast)")
     print("[scheduler]   enrich_worker    every  1 min  (batch enrichment + auto prediction)")
     print("[scheduler]   archive_finished every 15 min  (MongoDB)")
+    print("[scheduler]   flush_to_mongo   every 10 min  (buffer → MongoDB + cleanup)")
     print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
     return scheduler
 

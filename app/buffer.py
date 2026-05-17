@@ -79,9 +79,9 @@ def _init_buffer_table(conn: sqlite3.Connection) -> None:
 def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     """
     Fast ingest of raw SportyBet matches into the buffer.
-    Upserts: updates score/period/markets if match already exists.
-    Does NOT touch enriched_at or sofascore data.
-    Returns number of rows upserted.
+    Upserts score/period/markets if match already exists.
+    Finished matches are skipped — handled by patch_live_scores on transition.
+    Returns number of NEW rows inserted (not upserts).
     """
     if not matches:
         return 0
@@ -101,6 +101,15 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             is_live = 1 if (period and period not in ("Not start", "", None)) else 0
             is_finished = 1 if _is_finished_period(period) else 0
 
+            # finished matches are handled by patch_live_scores on transition — skip here
+            if is_finished:
+                continue
+
+            # only count genuinely new rows
+            exists = conn.execute(
+                "select 1 from match_buffer where match_id = ?", (match_id,)
+            ).fetchone()
+
             conn.execute(
                 """
                 insert into match_buffer (
@@ -119,22 +128,15 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                     ingested_at = excluded.ingested_at
                 """,
                 (
-                    match_id,
-                    match_date,
-                    m.get("tournament"),
-                    m.get("category"),
-                    m.get("name"),
-                    m.get("start_time"),
-                    period,
-                    str(score.get("home") or ""),
-                    str(score.get("away") or ""),
-                    is_live,
-                    is_finished,
-                    now,
-                    json.dumps(m),
+                    match_id, match_date,
+                    m.get("tournament"), m.get("category"), m.get("name"),
+                    m.get("start_time"), period,
+                    str(score.get("home") or ""), str(score.get("away") or ""),
+                    is_live, is_finished, now, json.dumps(m),
                 ),
             )
-            count += 1
+            if not exists:
+                count += 1
         conn.commit()
     return count
 
@@ -142,7 +144,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
 def patch_live_scores(matches: list[dict[str, Any]]) -> int:
     """
     Fast update of score/period for live matches already in the buffer.
-    Called every 5 min by the live scan job — no enrichment needed.
+    When a match transitions to finished, archives to MongoDB and removes from buffer.
     """
     if not matches:
         return 0
@@ -161,7 +163,44 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
             is_live = 1 if (period and period not in ("Not start", "", None)) else 0
             is_finished = 1 if _is_finished_period(period) else 0
 
-            # also update raw_enriched if it exists — patch score/period inside it
+            if is_finished:
+                # write final score into both raw_sporty and raw_enriched before archiving
+                conn.execute(
+                    """
+                    update match_buffer set
+                        period = ?, score_home = ?, score_away = ?,
+                        is_live = 0, is_finished = 1, raw_sporty = ?
+                    where match_id = ?
+                    """,
+                    (
+                        period,
+                        str(score.get("home") or ""),
+                        str(score.get("away") or ""),
+                        json.dumps(m),
+                        match_id,
+                    ),
+                )
+                row = conn.execute(
+                    "select raw_enriched from match_buffer where match_id = ?", (match_id,)
+                ).fetchone()
+                if row and row[0]:
+                    try:
+                        enriched_doc = json.loads(row[0])
+                        enriched_doc["period"] = period
+                        enriched_doc["score"] = score
+                        enriched_doc["is_finished"] = True
+                        conn.execute(
+                            "update match_buffer set raw_enriched = ? where match_id = ?",
+                            (json.dumps(enriched_doc), match_id),
+                        )
+                    except Exception:
+                        pass
+                conn.commit()
+                _try_archive_finished(match_id)
+                count += 1
+                continue
+
+            # still live — patch score/period in place
             row = conn.execute(
                 "select raw_enriched from match_buffer where match_id = ?", (match_id,)
             ).fetchone()
@@ -638,3 +677,12 @@ def _is_finished_period(period: str | None) -> bool:
         return False
     p = period.lower()
     return p in ("ft", "finished", "ended", "aet", "ap", "full time")
+
+
+def _try_archive_finished(match_id: str) -> None:
+    """Archive a finished match to MongoDB and remove it from the buffer. Silent on failure."""
+    try:
+        from app.mongo_store import archive_finished_match_from_buffer
+        archive_finished_match_from_buffer(match_id)
+    except Exception as exc:
+        print(f"[buffer] archive failed for {match_id}: {exc}")
