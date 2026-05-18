@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -394,29 +395,165 @@ def record_prediction(prediction: dict[str, Any]) -> None:
     if not match_id:
         return
     best_pick = (prediction.get("picks") or [{}])[0]
+    league_name = _league_from_match(prediction)
+    country_name = _country_from_league(league_name)
+
+    # ── Fix 3: skip junk predictions ───────────────────────────────────────────
+    # Don't pollute prediction_history with no_bet or sub-55% confidence picks.
+    if best_pick.get("type") == "no_bet":
+        return
+    if (best_pick.get("confidence") or 0) < 55:
+        return
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             insert into prediction_history (
                 source, match_id, match_name, league_name, pick_type, selection,
-                confidence, reason, signals_json, picks_json, created_at
+                confidence, reason, signals_json, picks_json, country_name, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             """,
             (
                 source,
                 match_id,
                 prediction.get("name"),
-                _league_from_match(prediction),
+                league_name,
                 best_pick.get("type"),
                 best_pick.get("selection"),
                 best_pick.get("confidence"),
                 best_pick.get("reason"),
                 json.dumps(prediction.get("signals") or []),
                 json.dumps(prediction.get("picks") or []),
+                country_name,
             ),
         )
         conn.commit()
+
+    # ── Record CLV entry: capture entry odds at prediction time ────────────────
+    try:
+        from app.clv import record_clv_entry
+        record_clv_entry(
+            match_id=match_id,
+            pick_type=best_pick.get("type") or "match_result",
+            selection=best_pick.get("selection") or "",
+            confidence=int(best_pick.get("confidence") or 0),
+            match_name=prediction.get("name"),
+            match_date=prediction.get("match_date"),
+        )
+    except Exception:
+        pass
+
+
+def weighted_prediction_memory(
+    match: dict[str, Any],
+    pick_type: str | None,
+    selection: str | None,
+) -> dict[str, Any]:
+    """Blend graded prediction performance: tournament first, then country, then global."""
+    _init_db()
+    league = _league_from_match(match)
+    country = _country_from_league(league)
+    pick_type = pick_type or ""
+    selection = selection or ""
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        scopes = {
+            "tournament": _prediction_scope_stats(
+                conn,
+                "league_name = ? and pick_type = ? and selection = ?",
+                (league, pick_type, selection),
+            ),
+            "country": _prediction_scope_stats(
+                conn,
+                "country_name = ? and pick_type = ? and selection = ?",
+                (country, pick_type, selection),
+            ),
+            "global": _prediction_scope_stats(
+                conn,
+                "pick_type = ? and selection = ?",
+                (pick_type, selection),
+            ),
+        }
+
+    base_weights = {"tournament": 0.55, "country": 0.30, "global": 0.15}
+    weighted = 0.0
+    total_weight = 0.0
+    for scope, stats in scopes.items():
+        samples = stats["samples"]
+        if samples <= 0:
+            continue
+        sample_factor = min(1.0, samples / 30)
+        weight = base_weights[scope] * sample_factor
+        weighted += stats["win_rate"] * weight
+        total_weight += weight
+
+    blended = round(weighted / total_weight * 100, 1) if total_weight else None
+    impact = 0
+    if blended is not None:
+        impact = max(-8, min(8, round((blended - 52) / 4)))
+
+    return {
+        "league": league,
+        "country": country,
+        "pick_type": pick_type,
+        "selection": selection,
+        "weights": base_weights,
+        "scopes": scopes,
+        "blended_win_rate": blended,
+        "confidence_adjustment": impact,
+    }
+
+
+def weighted_finished_match_memory(match: dict[str, Any]) -> dict[str, Any]:
+    """Blend finished-match outcomes from tournament, country, and the whole database."""
+    _init_db()
+    league = _league_from_match(match)
+    country = _country_from_league(league)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        scopes = {
+            "tournament": _finished_scope_stats(conn, "league_name = ?", (league,)),
+            "country": _finished_scope_stats(conn, "country_name = ?", (country,)),
+            "global": _finished_scope_stats(conn, "1 = 1", ()),
+        }
+
+    base_weights = {"tournament": 0.50, "country": 0.30, "global": 0.20}
+    totals = {
+        "home_win_rate": 0.0,
+        "draw_rate": 0.0,
+        "away_win_rate": 0.0,
+        "over_2_5_rate": 0.0,
+        "btts_rate": 0.0,
+        "avg_goals": 0.0,
+    }
+    total_weight = 0.0
+    effective_weights: dict[str, float] = {}
+    for scope, stats in scopes.items():
+        samples = stats["samples"]
+        if samples <= 0:
+            continue
+        sample_factor = min(1.0, samples / 50)
+        weight = base_weights[scope] * sample_factor
+        effective_weights[scope] = round(weight, 3)
+        total_weight += weight
+        for key in totals:
+            totals[key] += float(stats[key] or 0) * weight
+
+    blended = {
+        key: round(value / total_weight, 3)
+        for key, value in totals.items()
+    } if total_weight else {}
+
+    return {
+        "league": league,
+        "country": country,
+        "weights": base_weights,
+        "effective_weights": effective_weights,
+        "scopes": scopes,
+        "blended": blended,
+        "samples": sum(stats["samples"] for stats in scopes.values()),
+    }
 
 
 def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> dict[str, Any]:
@@ -657,6 +794,51 @@ def list_betbuilder_history(limit: int = 100) -> dict[str, Any]:
             for row in rows
         ]
     }
+
+
+# ── Fix 1: Team history cache ─────────────────────────────────────────────────────────────────────────────
+# Store team history in SQLite so Poisson/Dixon/ELO read from local cache
+# instead of hitting SofaScore on every prediction. Refresh weekly.
+_TEAM_HISTORY_CACHE_DAYS = 7
+
+
+def get_cached_team_history(team_id: int) -> list[dict[str, Any]] | None:
+    """Return cached team history if fresh enough, else None."""
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "select events_json, cached_at from team_history_cache where team_id = ?",
+            (str(team_id),),
+        ).fetchone()
+    if not row:
+        return None
+    cached_at = row["cached_at"]
+    if cached_at:
+        from datetime import datetime, timezone, timedelta
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(cached_at.replace("Z", "+00:00"))
+            if age > timedelta(days=_TEAM_HISTORY_CACHE_DAYS):
+                return None
+        except Exception:
+            pass
+    return json.loads(row["events_json"])
+
+
+def store_team_history(team_id: int, events: list[dict[str, Any]]) -> None:
+    """Persist team history to SQLite cache."""
+    _init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            insert into team_history_cache (team_id, events_json, cached_at)
+            values (?, ?, ?)
+            on conflict(team_id) do update set events_json=excluded.events_json, cached_at=excluded.cached_at
+            """,
+            (str(team_id), json.dumps(events), now),
+        )
+        conn.commit()
 
 
 def set_engine_status(engine_id: str, status: str) -> dict[str, Any]:
@@ -1082,7 +1264,38 @@ def _init_db() -> None:
         _ensure_column(conn, "prediction_history", "final_home", "integer")
         _ensure_column(conn, "prediction_history", "final_away", "integer")
         _ensure_column(conn, "prediction_history", "graded_at", "text")
+        _ensure_column(conn, "prediction_history", "country_name", "text")
+        conn.execute(
+            """
+            update prediction_history
+            set country_name = case
+                when instr(league_name, ' ') > 0 then substr(league_name, 1, instr(league_name, ' ') - 1)
+                else 'Global'
+            end
+            where country_name is null or country_name = ''
+            """
+        )
         conn.execute("create index if not exists idx_predictions_graded on prediction_history(graded_at)")
+        conn.execute("create index if not exists idx_predictions_scope on prediction_history(league_name, country_name, pick_type, selection)")
+        _ensure_column(conn, "matches", "country_name", "text")
+        conn.execute(
+            """
+            update matches
+            set country_name = case
+                when instr(league_name, ' ') > 0 then substr(league_name, 1, instr(league_name, ' ') - 1)
+                else 'Global'
+            end
+            where country_name is null or country_name = ''
+            """
+        )
+        conn.execute("create index if not exists idx_matches_scope on matches(league_name, country_name, is_finished)")
+        conn.execute("""
+            create table if not exists team_history_cache (
+                team_id    text primary key,
+                events_json text not null,
+                cached_at  text not null
+            )
+        """)
         conn.commit()
 
 
@@ -1101,9 +1314,9 @@ def _upsert_match(
         """
         insert into matches (
             source, match_id, league_key, league_name, match_fingerprint, home_team, away_team,
-            start_time, final_home_goals, final_away_goals, is_finished, last_seen_at
+            start_time, final_home_goals, final_away_goals, is_finished, country_name, last_seen_at
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
         on conflict(source, match_id) do update set
             league_key = excluded.league_key,
             league_name = excluded.league_name,
@@ -1114,6 +1327,7 @@ def _upsert_match(
             final_home_goals = case when excluded.is_finished = 1 then excluded.final_home_goals else matches.final_home_goals end,
             final_away_goals = case when excluded.is_finished = 1 then excluded.final_away_goals else matches.final_away_goals end,
             is_finished = max(matches.is_finished, excluded.is_finished),
+            country_name = excluded.country_name,
             last_seen_at = current_timestamp
         """,
         (
@@ -1128,6 +1342,7 @@ def _upsert_match(
             home_goals if is_finished else None,
             away_goals if is_finished else None,
             1 if is_finished else 0,
+            _country_from_league(league),
         ),
     )
 
@@ -1484,7 +1699,11 @@ def _league_from_match(match: dict[str, Any]) -> str:
     if match.get("league_name"):
         return str(match.get("league_name"))
     category = match.get("category")
-    return " ".join(part for part in [str(category or ""), str(tournament or "")] if part).strip()
+    category_text = str(category or "").strip()
+    tournament_text = str(tournament or "").strip()
+    if category_text and tournament_text.lower().startswith(category_text.lower() + " "):
+        return tournament_text
+    return " ".join(part for part in [category_text, tournament_text] if part).strip()
 
 
 def _match_fingerprint(league: str, match: dict[str, Any]) -> str:
@@ -1679,12 +1898,82 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _country_from_league(league_name: str | None) -> str:
-    text = league_name or "Unknown"
-    if " " in text:
-        first = text.split(" ", 1)[0]
-        if first.lower() in {"england", "spain", "germany", "italy", "france", "netherlands", "nigeria", "brazil"}:
-            return first
+    text = (league_name or "Unknown").strip()
+    countries = {
+        "argentina", "australia", "austria", "belgium", "brazil", "bulgaria",
+        "canada", "chile", "china", "colombia", "croatia", "czech republic",
+        "denmark", "ecuador", "england", "finland", "france", "germany",
+        "ghana", "greece", "india", "indonesia", "ireland", "israel",
+        "italy", "japan", "kenya", "mexico", "morocco", "netherlands",
+        "nigeria", "norway", "paraguay", "peru", "poland", "portugal",
+        "romania", "russia", "saudi arabia", "scotland", "serbia",
+        "south africa", "south korea", "spain", "sweden", "switzerland",
+        "turkey", "ukraine", "uruguay", "usa", "united states", "wales",
+    }
+    lower = text.lower()
+    for country in sorted(countries, key=len, reverse=True):
+        if lower == country or lower.startswith(country + " ") or f" {country} " in f" {lower} ":
+            return "USA" if country in {"usa", "united states"} else country.title()
     return "Global"
+
+
+def _prediction_scope_stats(conn: sqlite3.Connection, where: str, params: tuple[Any, ...]) -> dict[str, Any]:
+    row = conn.execute(
+        f"""
+        select
+            count(*) as samples,
+            sum(case when result = 'win' then 1 else 0 end) as wins,
+            sum(case when result = 'loss' then 1 else 0 end) as losses
+        from prediction_history
+        where graded_at is not null
+          and result in ('win', 'loss')
+          and {where}
+        """,
+        params,
+    ).fetchone()
+    samples = row["samples"] or 0
+    wins = row["wins"] or 0
+    return {
+        "samples": samples,
+        "wins": wins,
+        "losses": row["losses"] or 0,
+        "win_rate": round(wins / samples, 3) if samples else 0.0,
+    }
+
+
+def _finished_scope_stats(conn: sqlite3.Connection, where: str, params: tuple[Any, ...]) -> dict[str, Any]:
+    row = conn.execute(
+        f"""
+        select
+            count(*) as samples,
+            sum(case when final_home_goals > final_away_goals then 1 else 0 end) as home_wins,
+            sum(case when final_home_goals = final_away_goals then 1 else 0 end) as draws,
+            sum(case when final_away_goals > final_home_goals then 1 else 0 end) as away_wins,
+            sum(case when final_home_goals + final_away_goals > 2 then 1 else 0 end) as over_2_5,
+            sum(case when final_home_goals > 0 and final_away_goals > 0 then 1 else 0 end) as btts,
+            avg(final_home_goals + final_away_goals) as avg_goals
+        from matches
+        where is_finished = 1
+          and final_home_goals is not null
+          and final_away_goals is not null
+          and {where}
+        """,
+        params,
+    ).fetchone()
+    samples = row["samples"] or 0
+
+    def rate(key: str) -> float:
+        return round((row[key] or 0) / samples, 3) if samples else 0.0
+
+    return {
+        "samples": samples,
+        "home_win_rate": rate("home_wins"),
+        "draw_rate": rate("draws"),
+        "away_win_rate": rate("away_wins"),
+        "over_2_5_rate": rate("over_2_5"),
+        "btts_rate": rate("btts"),
+        "avg_goals": round(float(row["avg_goals"] or 0), 3),
+    }
 
 
 def _standings_from_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:

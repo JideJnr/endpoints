@@ -32,21 +32,28 @@ _scheduler = None
 def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
     """Fast: fetch upcoming matches from SportyBet and dump into buffer."""
     from app.market import snapshot_odds
+    from app.buffer import purge_ghost_matches
 
-    today = dt.today().isoformat()
     matches = fetch_upcoming_matches_post()[:limit]
-    ingested = ingest_matches(matches, today)
+    groups = _group_matches_by_local_date(matches)
+    ingested = 0
+    for match_date, dated_matches in groups.items():
+        ingested += ingest_matches(dated_matches, match_date)
     snapped = 0
     for m in matches:
+        match_date = _match_local_date(m)
         if snapshot_odds({
             "sportybet_id":      m.get("id"),
             "sportybet_name":    m.get("name"),
-            "match_date":        today,
+            "match_date":        match_date,
             "sportybet_markets": m.get("markets", []),
+            "time_context":      _match_time(m),
         }):
             snapped += 1
-    print(f"[scheduler] ingest_upcoming: {ingested} matches buffered for {today} | {snapped} odds snapped")
-    return {"status": "ok", "job": "ingest_upcoming", "date": today, "ingested": ingested, "odds_snapshots": snapped}
+    purged = purge_ghost_matches()
+    dates = sorted(groups)
+    print(f"[scheduler] ingest_upcoming: {ingested} matches buffered across {len(dates)} date(s) | {snapped} odds snapped | {purged} ghosts purged")
+    return {"status": "ok", "job": "ingest_upcoming", "dates": dates, "ingested": ingested, "odds_snapshots": snapped, "purged": purged}
 
 
 def job_ingest_live(limit: int = 200) -> dict[str, Any]:
@@ -54,11 +61,13 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
     from app.league_memory import observe_matches
     from app.market import snapshot_odds
 
-    today = dt.today().isoformat()
     matches = fetch_live_matches_post()[:limit]
 
     # add brand-new live matches not yet in buffer
-    new_count = ingest_matches(matches, today)
+    groups = _group_matches_by_local_date(matches)
+    new_count = 0
+    for match_date, dated_matches in groups.items():
+        new_count += ingest_matches(dated_matches, match_date)
 
     # patch scores/periods + archive finished ones
     patched = patch_live_scores(matches)
@@ -66,11 +75,13 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
     # snapshot odds for movement tracking
     snapped = 0
     for m in matches:
+        match_date = _match_local_date(m)
         if snapshot_odds({
             "sportybet_id":      m.get("id"),
             "sportybet_name":    m.get("name"),
-            "match_date":        today,
+            "match_date":        match_date,
             "sportybet_markets": m.get("markets", []),
+            "time_context":      _match_time(m),
         }):
             snapped += 1
 
@@ -93,15 +104,16 @@ def job_enrich_worker() -> dict[str, Any]:
     Runs every 2 minutes — processes ENRICH_BATCH_SIZE matches per run.
     Prioritises: live matches first, then never-enriched, then stale upcoming.
     """
-    result = run_enrichment_worker()
+    result = run_enrichment_worker(batch_size=1)
     if result.get("status") == "idle":
         print("[scheduler] enrich_worker: nothing to enrich")
     else:
         print(
             f"[scheduler] enrich_worker: "
-            f"batch={result.get('batch')} "
+            f"processed={result.get('batch')} "
             f"matched={result.get('matched')} "
             f"stored={result.get('stored')} "
+            f"predicted={result.get('predicted')} "
             f"llm={result.get('llm_fallback')}"
         )
     return result
@@ -162,11 +174,38 @@ def job_grade_predictions() -> dict[str, Any]:
             if elo_result.get("updated"):
                 elo_updated += 1
         metrics = get_grading_metrics()
+
+        # Rebuild confidence calibration from updated win/loss history
+        try:
+            from app.confidence_calibrator import rebuild_calibration
+            cal_result = rebuild_calibration()
+        except Exception as exc:
+            cal_result = {"error": str(exc)}
+
+        # Grade odds patterns for yesterday
+        try:
+            from app.odds_pattern import grade_patterns_for_date
+            pattern_result = grade_patterns_for_date(yesterday)
+        except Exception as exc:
+            pattern_result = {"error": str(exc)}
+
+        # Compute CLV for yesterday — fill closing odds + attach results
+        try:
+            from app.clv import compute_clv_for_date
+            clv_result = compute_clv_for_date(yesterday)
+        except Exception as exc:
+            clv_result = {"error": str(exc)}
+
         print(
             f"[scheduler] grade_predictions: graded={result.get('graded')} "
-            f"elo_updated={elo_updated} win_rate={metrics.get('win_percent')}%"
+            f"elo_updated={elo_updated} win_rate={metrics.get('win_percent')}% "
+            f"calibration_bands={cal_result.get('bands_updated', 0)} "
+            f"patterns_graded={pattern_result.get('graded_patterns', 0)} "
+            f"clv_updated={clv_result.get('clv_entries_updated', 0)}"
         )
-        return {**result, "metrics": metrics, "elo_updated": elo_updated}
+        return {**result, "metrics": metrics, "elo_updated": elo_updated,
+                "calibration": cal_result, "patterns": pattern_result,
+                "clv": clv_result}
     except Exception as exc:
         print(f"[scheduler] grade_predictions failed: {exc}")
         return {"status": "error", "error": str(exc)}
@@ -227,7 +266,7 @@ def start_scheduler():
     # enrichment worker — every 90 sec, processes a batch
     scheduler.add_job(
         _safe(job_enrich_worker),
-        IntervalTrigger(seconds=90),
+        IntervalTrigger(seconds=30),
         id="enrich_worker",
         name="Enrichment + prediction worker",
         replace_existing=True,
@@ -326,3 +365,21 @@ def _safe(fn):
         except Exception as exc:
             print(f"[scheduler] {fn.__name__} failed: {exc}")
     return wrapper
+
+
+def _match_time(match: dict[str, Any]) -> dict[str, Any]:
+    from app.time_context import match_time_context
+
+    return match_time_context(match)
+
+
+def _match_local_date(match: dict[str, Any]) -> str:
+    context = _match_time(match)
+    return context.get("local_date") or context.get("utc_date") or dt.today().isoformat()
+
+
+def _group_matches_by_local_date(matches: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for match in matches:
+        groups.setdefault(_match_local_date(match), []).append(match)
+    return groups

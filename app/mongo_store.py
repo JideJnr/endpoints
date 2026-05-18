@@ -32,6 +32,10 @@ def init_mongo() -> dict[str, Any]:
     if not is_configured():
         return {"configured": False}
     _get_db()["finished_matches"].create_index("match_date")
+    _get_db()["signal_outcomes"].create_index("signal_name")
+    _get_db()["signal_outcomes"].create_index("tournament")
+    _get_db()["signal_outcomes"].create_index("country")
+    _get_db()["signal_outcomes"].create_index("result")
     return {"configured": True, "database": get_settings().mongodb_db}
 
 
@@ -154,6 +158,108 @@ def get_team_finished_matches(team_id: str | int, limit: int = 15) -> list[dict[
     return result
 
 
+# ── Signal outcomes ──────────────────────────────────────────────────────────
+
+def store_signal_outcomes(
+    match_id: str,
+    match_name: str | None,
+    tournament: str | None,
+    country: str | None,
+    match_date: str | None,
+    signals: list[dict[str, Any]],
+    result: str,
+    pick_type: str | None,
+    selection: str | None,
+    confidence: int | None,
+) -> int:
+    """
+    After a prediction is graded, store one doc per signal into signal_outcomes.
+    This lets us query: which signals have the highest win rate?
+    Scoped by whole DB, country, or tournament.
+    """
+    if not is_configured() or not signals:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    docs = []
+    for signal in signals:
+        name = signal.get("name")
+        if not name:
+            continue
+        docs.append({
+            "match_id":   match_id,
+            "match_name": match_name,
+            "tournament": tournament,
+            "country":    country,
+            "match_date": match_date,
+            "signal_name": name,
+            "signal_value": signal.get("value"),
+            "signal_impact": signal.get("impact"),
+            "result":     result,
+            "pick_type":  pick_type,
+            "selection":  selection,
+            "confidence": confidence,
+            "recorded_at": now,
+        })
+    if docs:
+        _get_db()["signal_outcomes"].insert_many(docs)
+    return len(docs)
+
+
+def get_signal_stats(
+    country: str | None = None,
+    tournament: str | None = None,
+    min_samples: int = 5,
+) -> dict[str, Any]:
+    """
+    Aggregate win rate per signal.
+    Scope: whole DB (default), filtered by country, or filtered by tournament.
+    """
+    if not is_configured():
+        return {"configured": False, "signals": []}
+
+    match_filter: dict[str, Any] = {"result": {"$in": ["win", "loss"]}}
+    scope = "all"
+    if tournament:
+        match_filter["tournament"] = {"$regex": tournament, "$options": "i"}
+        scope = f"tournament:{tournament}"
+    elif country:
+        match_filter["country"] = {"$regex": country, "$options": "i"}
+        scope = f"country:{country}"
+
+    pipeline = [
+        {"$match": match_filter},
+        {"$group": {
+            "_id": "$signal_name",
+            "total":  {"$sum": 1},
+            "wins":   {"$sum": {"$cond": [{"$eq": ["$result", "win"]}, 1, 0]}},
+            "losses": {"$sum": {"$cond": [{"$eq": ["$result", "loss"]}, 1, 0]}},
+            "avg_impact": {"$avg": "$signal_impact"},
+            "avg_confidence": {"$avg": "$confidence"},
+        }},
+        {"$match": {"total": {"$gte": min_samples}}},
+        {"$addFields": {"win_rate": {"$divide": ["$wins", "$total"]}}},
+        {"$sort": {"win_rate": -1}},
+    ]
+
+    results = list(_get_db()["signal_outcomes"].aggregate(pipeline))
+    return {
+        "scope": scope,
+        "min_samples": min_samples,
+        "signals": [
+            {
+                "signal":       r["_id"],
+                "total":        r["total"],
+                "wins":         r["wins"],
+                "losses":       r["losses"],
+                "win_rate":     round(r["win_rate"] * 100, 1),
+                "avg_impact":   round(r.get("avg_impact") or 0, 2),
+                "avg_confidence": round(r.get("avg_confidence") or 0, 1),
+            }
+            for r in results
+        ],
+    }
+
+
 def prune_old_finished_matches(keep_days: int = 90) -> int:
     """
     Remove finished matches older than keep_days from MongoDB to control storage.
@@ -212,6 +318,8 @@ def cleanup_buffer() -> dict[str, Any]:
             """
         )
         # Delete ghost matches — kick-off passed 2+ hours ago, still not started
+        # start_time from SportyBet is Unix milliseconds (13-digit)
+        ghost_cutoff_ms = (now_ts - 120 * 60) * 1000
         r4 = conn.execute(
             """
             delete from match_buffer

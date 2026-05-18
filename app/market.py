@@ -115,17 +115,21 @@ def get_movement(match_id: str) -> dict[str, Any]:
 
     opening = rows[0]
     current = rows[-1]
-    home_drop = (opening["home_odds"] or 0) - (current["home_odds"] or 0)
-    away_drop = (opening["away_odds"] or 0) - (current["away_odds"] or 0)
+    pulls = {
+        "home": _market_pull(opening["home_odds"], current["home_odds"]),
+        "draw": _market_pull(opening["draw_odds"], current["draw_odds"]),
+        "away": _market_pull(opening["away_odds"], current["away_odds"]),
+    }
+    strongest_pull = _strongest_pull(pulls)
     sharp_signal = None
-    if home_drop > 0.15:
-        sharp_signal = "Sharp money on HOME"
-    elif away_drop > 0.15:
-        sharp_signal = "Sharp money on AWAY"
-    elif home_drop > 0.08:
-        sharp_signal = "Moderate money on HOME"
-    elif away_drop > 0.08:
-        sharp_signal = "Moderate money on AWAY"
+    if strongest_pull and strongest_pull.get("direction") == "backed":
+        label = strongest_pull["selection"].upper()
+        strength = "Sharp" if strongest_pull.get("strength") == "strong" else "Moderate"
+        sharp_signal = f"{strength} market backing on {label}"
+    elif strongest_pull and strongest_pull.get("direction") == "faded":
+        label = strongest_pull["selection"].upper()
+        strength = "Sharp" if strongest_pull.get("strength") == "strong" else "Moderate"
+        sharp_signal = f"{strength} market fade on {label}"
 
     return {
         "match": current["match_name"],
@@ -147,6 +151,8 @@ def get_movement(match_id: str) -> dict[str, Any]:
             "draw": _move(opening["draw_odds"], current["draw_odds"]),
             "away": _move(opening["away_odds"], current["away_odds"]),
         },
+        "market_pull": pulls,
+        "strongest_pull": strongest_pull,
         "sharp_signal": sharp_signal,
         "markets": markets,
         "market_snapshots": sum(item.get("snapshots", 0) for item in markets),
@@ -241,6 +247,7 @@ def _all_market_movements(conn: sqlite3.Connection, match_id: str) -> list[dict[
                 "current": {"odds": current["odds"], "time": current["snapshot_time"]},
                 "movement": _move(opening["odds"], current["odds"]),
                 "delta": _delta(opening["odds"], current["odds"]),
+                "market_pull": _market_pull(opening["odds"], current["odds"]),
                 "source": current["source"],
                 # full time-series for the chart
                 "snapshots_data": [
@@ -373,10 +380,12 @@ def _implied(decimal_odds: float | None) -> float | None:
 def _move(opening: float | None, current: float | None) -> str | None:
     if not opening or not current:
         return None
-    diff = round(current - opening, 3)
-    if diff < -0.05:
+    pct = _percent_change(opening, current)
+    if pct is None:
+        return None
+    if pct <= -3:
         return "shortened"
-    if diff > 0.05:
+    if pct >= 3:
         return "drifted"
     return "stable"
 
@@ -385,6 +394,65 @@ def _delta(opening: float | None, current: float | None) -> float | None:
     if opening is None or current is None:
         return None
     return round(current - opening, 3)
+
+
+def _percent_change(opening: float | None, current: float | None) -> float | None:
+    if not opening or not current:
+        return None
+    return round((current - opening) / opening * 100, 2)
+
+
+def _market_pull(opening: float | None, current: float | None) -> dict[str, Any] | None:
+    if not opening or not current:
+        return None
+    odds_change = _percent_change(opening, current)
+    opening_implied = 100 / opening
+    current_implied = 100 / current
+    implied_change = round((current_implied - opening_implied) / opening_implied * 100, 2)
+    implied_points = round(current_implied - opening_implied, 2)
+
+    magnitude = max(abs(odds_change or 0), abs(implied_change))
+    if odds_change is not None and odds_change <= -10:
+        direction = "backed"
+    elif odds_change is not None and odds_change >= 10:
+        direction = "faded"
+    elif implied_change >= 7:
+        direction = "backed"
+    elif implied_change <= -7:
+        direction = "faded"
+    else:
+        direction = "stable"
+
+    if magnitude >= 10:
+        strength = "strong"
+    elif magnitude >= 5:
+        strength = "moderate"
+    else:
+        strength = "light"
+
+    return {
+        "opening_odds": round(opening, 3),
+        "current_odds": round(current, 3),
+        "odds_change_percent": odds_change,
+        "opening_implied": round(opening_implied, 2),
+        "current_implied": round(current_implied, 2),
+        "implied_change_percent": implied_change,
+        "implied_probability_points": implied_points,
+        "direction": direction,
+        "strength": strength,
+        "market_belief": "increasing" if direction == "backed" else "decreasing" if direction == "faded" else "stable",
+    }
+
+
+def _strongest_pull(pulls: dict[str, dict[str, Any] | None]) -> dict[str, Any] | None:
+    candidates = []
+    for selection, pull in pulls.items():
+        if not pull or pull.get("direction") == "stable":
+            continue
+        candidates.append({**pull, "selection": selection})
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: abs(float(item.get("implied_change_percent") or 0)))
 
 
 def _odds_row(row: sqlite3.Row) -> dict[str, Any]:

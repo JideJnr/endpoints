@@ -19,6 +19,20 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     home_id = home.get("id")
     away_id = away.get("id")
 
+    # ── Data quality gate ─────────────────────────────────────────────────────
+    # Don't waste a prediction record on matches with no real data.
+    # Require at minimum a SofaScore detail block OR team history with sample_size >= 3.
+    home_history = detail.get("home_last_matches") or []
+    away_history = detail.get("away_last_matches") or []
+    home_sample  = len([m for m in home_history if (m.get("status") or {}).get("type") == "finished"])
+    away_sample  = len([m for m in away_history if (m.get("status") or {}).get("type") == "finished"])
+    has_real_data = bool(detail) and home_sample >= 3 and away_sample >= 3
+    if not has_real_data:
+        raise ValueError(
+            f"Insufficient data for prediction: "
+            f"has_detail={bool(detail)} home_sample={home_sample} away_sample={away_sample}"
+        )
+
     rules = _rules_prediction(doc, detail)
     poisson = dixon = elo = None
     if home_id and away_id:
@@ -47,6 +61,57 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     value_bets = _value_bets(doc, dixon if dixon and not dixon.get("error") else poisson)
     signals = list(rules.get("signals") or [])
     signals.extend(_model_signals(poisson, dixon, elo, ensemble, doc))
+    finished_memory: dict[str, Any] = {}
+    database_adj = 0
+    try:
+        from app.league_memory import weighted_finished_match_memory
+
+        finished_memory = weighted_finished_match_memory(doc)
+        database_adj = _finished_memory_adjustment(ensemble, finished_memory)
+        signals.append({
+            "name": "finished_database_memory",
+            "value": finished_memory,
+            "impact": database_adj,
+        })
+    except Exception:
+        pass
+
+    # ── Odds pattern signal ───────────────────────────────────────────────────
+    odds_pattern_signal: dict[str, Any] = {}
+    pattern_adj = 0
+    odds_movement: dict[str, Any] = {}
+    market_adj = 0
+    try:
+        from app.odds_pattern import pattern_signal
+        match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
+        if match_id_str:
+            odds_pattern_signal = pattern_signal(match_id_str)
+            pattern_adj = int(odds_pattern_signal.get("confidence_adjustment") or 0)
+            signals.append({
+                "name":   "odds_pattern",
+                "value":  odds_pattern_signal,
+                "impact": pattern_adj,
+            })
+    except Exception:
+        pass
+
+    try:
+        from app.market import get_movement
+        match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
+        if match_id_str:
+            odds_movement = get_movement(match_id_str)
+            market_adj = _market_adjustment(ensemble, odds_movement)
+            signals.append({
+                "name": "odds_progression",
+                "value": {
+                    "sharp_signal": odds_movement.get("sharp_signal"),
+                    "strongest_pull": odds_movement.get("strongest_pull"),
+                    "market_snapshots": odds_movement.get("market_snapshots"),
+                },
+                "impact": market_adj,
+            })
+    except Exception:
+        pass
 
     # Time-decay for live matches
     minute = rules.get("minute") or 0
@@ -60,6 +125,62 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
 
     picks = _combined_picks(rules, ensemble, value_bets)
     picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
+
+    # ── Calibration: adjust confidence based on historical win rates ──────────
+    try:
+        from app.confidence_calibrator import calibrate_confidence, stake_multiplier
+        from app.league_memory import weighted_prediction_memory
+        from app.regime import get_regime_for_doc, apply_regime_stake_cap
+
+        regime = get_regime_for_doc(doc)
+
+        for pick in picks:
+            raw_conf = int(pick.get("confidence") or 50)
+            cal = calibrate_confidence(pick.get("type") or "match_result", raw_conf)
+            memory = weighted_prediction_memory(doc, pick.get("type"), pick.get("selection"))
+            memory_adj = int(memory.get("confidence_adjustment") or 0)
+            # Apply pattern and market movement adjustment on top.
+            cal_conf = min(99, max(1, cal["adjusted_confidence"] + pattern_adj + market_adj + memory_adj + database_adj))
+            # Apply regime tier penalty (Tier 4 gets -5)
+            tier_penalty = {1: 0, 2: 0, 3: 0, 4: -5}.get(regime.tier, 0)
+            cal_conf = min(99, max(1, cal_conf + tier_penalty))
+            pick["confidence"] = cal_conf
+
+            raw_stake = stake_multiplier(pick.get("type") or "match_result", raw_conf)
+            capped_stake = apply_regime_stake_cap(raw_stake, doc.get("tournament"), doc.get("category"))
+
+            pick["calibration"] = {
+                "raw_confidence":    raw_conf,
+                "win_rate":          cal.get("win_rate"),
+                "samples":           cal.get("samples"),
+                "double_down":       cal.get("double_down", False),
+                "stake_multiplier":  capped_stake,
+                "calibrated":        cal.get("calibrated", False),
+                "regime_tier":       regime.tier,
+                "regime_name":       regime.name,
+                "regime_stake_cap":  regime.stake_cap,
+                "memory_weighting":   memory,
+            }
+            if memory.get("blended_win_rate") is not None:
+                signals.append({
+                    "name": "prediction_memory",
+                    "value": memory,
+                    "impact": memory_adj,
+                })
+            # Prefer CLV-based stake sizing if enough data exists
+            try:
+                from app.clv import clv_stake_multiplier
+                clv_mult = clv_stake_multiplier(pick.get("type") or "match_result", raw_conf)
+                if clv_mult != 1.0:
+                    capped_clv = apply_regime_stake_cap(clv_mult, doc.get("tournament"), doc.get("category"))
+                    pick["calibration"]["stake_multiplier"] = capped_clv
+                    pick["calibration"]["stake_source"] = "clv"
+                else:
+                    pick["calibration"]["stake_source"] = "win_rate"
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     prediction = {
         "match_id": doc.get("sportybet_id") or doc.get("id") or detail.get("id"),
@@ -77,13 +198,16 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             "dixon_coles": dixon,
             "elo": elo,
             "ensemble": ensemble,
+            "finished_database_memory": finished_memory,
         },
         "web_context": doc.get("web_context") or {},
+        "odds_movement": odds_movement,
         "value_bets": value_bets,
         "signals": sorted(signals, key=lambda item: abs(item.get("impact") or 0), reverse=True),
         "picks": picks,
         "time_decay_applied": is_live and minute >= 46,
         "time_decay_multiplier": _time_decay_multiplier(minute) if is_live else 1.0,
+        "regime": _regime_info(doc),
         "data_quality": {
             "has_sofascore_detail": bool(detail),
             "has_sportybet_markets": bool(doc.get("sportybet_markets") or doc.get("markets")),
@@ -214,6 +338,53 @@ def _prob_impact(model: dict[str, Any]) -> float:
     return round((max(float(probs.get("home_win") or 0), float(probs.get("away_win") or 0), float(probs.get("draw") or 0)) - 33.3) / 3, 2)
 
 
+def _market_adjustment(ensemble: dict[str, Any], odds_movement: dict[str, Any]) -> int:
+    pull = odds_movement.get("strongest_pull") or {}
+    direction = pull.get("direction")
+    selection = str(pull.get("selection") or "").lower()
+    if not direction or direction == "stable" or not selection:
+        return 0
+
+    prediction = str((ensemble or {}).get("prediction") or "").lower()
+    if "home" in prediction:
+        predicted_side = "home"
+    elif "away" in prediction:
+        predicted_side = "away"
+    elif "draw" in prediction:
+        predicted_side = "draw"
+    else:
+        return 0
+
+    strength = pull.get("strength")
+    base = 5 if strength == "strong" else 3 if strength == "moderate" else 1
+    if selection == predicted_side and direction == "backed":
+        return base
+    if selection == predicted_side and direction == "faded":
+        return -base
+    if selection != predicted_side and direction == "backed":
+        return -max(1, base - 1)
+    return 0
+
+
+def _finished_memory_adjustment(ensemble: dict[str, Any], memory: dict[str, Any]) -> int:
+    blended = memory.get("blended") or {}
+    if not blended:
+        return 0
+    prediction = str((ensemble or {}).get("prediction") or "").lower()
+    if "home" in prediction:
+        rate = float(blended.get("home_win_rate") or 0)
+    elif "draw" in prediction:
+        rate = float(blended.get("draw_rate") or 0)
+    elif "away" in prediction:
+        rate = float(blended.get("away_win_rate") or 0)
+    else:
+        return 0
+    baseline = 0.333
+    samples = int(memory.get("samples") or 0)
+    sample_factor = min(1.0, samples / 100)
+    return max(-6, min(6, round((rate - baseline) * 18 * sample_factor)))
+
+
 def _team_name(doc: dict[str, Any], side: str) -> str:
     team = doc.get(f"{side}_team")
     if isinstance(team, dict):
@@ -231,3 +402,19 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _regime_info(doc: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from app.regime import get_regime_for_doc
+        r = get_regime_for_doc(doc)
+        return {
+            "tier":           r.tier,
+            "name":           r.name,
+            "min_confidence": r.min_confidence,
+            "edge_threshold": r.edge_threshold,
+            "stake_cap":      r.stake_cap,
+            "description":    r.description,
+        }
+    except Exception:
+        return {}

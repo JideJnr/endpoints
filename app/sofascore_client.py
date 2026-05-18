@@ -80,11 +80,27 @@ def fetch_live_events() -> list[dict]:
 
 
 def fetch_team_history(team_id: int, page: int = 0) -> dict:
+    # ── Fix 1: serve from cache on page 0, bypass cache for page 1+ ────────────────────────
+    if page == 0:
+        try:
+            from app.league_memory import get_cached_team_history, store_team_history
+            cached = get_cached_team_history(team_id)
+            if cached is not None:
+                return {"has_next_page": True, "events": cached}
+        except Exception:
+            pass
     url = SOFASCORE_TEAM_HISTORY_URL.format(team_id=team_id, page=page)
     data = _get(url).json()
+    events = [_parse_event(e) for e in data.get("events", [])]
+    if page == 0 and events:
+        try:
+            from app.league_memory import store_team_history
+            store_team_history(team_id, events)
+        except Exception:
+            pass
     return {
         "has_next_page": data.get("hasNextPage", False),
-        "events": [_parse_event(e) for e in data.get("events", [])],
+        "events": events,
     }
 
 
@@ -118,8 +134,14 @@ def fetch_event_detail(event: dict) -> dict:
         "lineups": safe(fetch_event_lineups, event_id),
         "pregame_form": safe(fetch_pregame_form, event_id),
         "managers": safe(fetch_managers, event_id),
-        "home_last_matches": safe(lambda team_id: fetch_team_history(team_id).get("events", []), home_id),
-        "away_last_matches": safe(lambda team_id: fetch_team_history(team_id).get("events", []), away_id),
+        "home_last_matches": safe(lambda tid: (
+            fetch_team_history(tid, 0).get("events", []) +
+            fetch_team_history(tid, 1).get("events", [])
+        ), home_id),
+        "away_last_matches": safe(lambda tid: (
+            fetch_team_history(tid, 0).get("events", []) +
+            fetch_team_history(tid, 1).get("events", [])
+        ), away_id),
         "home_featured_players": safe(fetch_featured_players, home_id),
         "away_featured_players": safe(fetch_featured_players, away_id),
         "odds_featured": safe(fetch_odds_featured, event_id),

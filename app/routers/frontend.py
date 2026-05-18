@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date as dt
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
@@ -290,14 +290,134 @@ def get_predictions_today():
         p["period"]      = status.get("period") or p.get("period")
         p["is_live"]     = status.get("is_live", False)
         p["is_finished"] = status.get("is_finished", False)
-        seen[mid] = p
 
+        # Attach regime info + filter picks that don't meet regime threshold
+        try:
+            from app.regime import get_regime, passes_regime_gate
+            tournament = p.get("league_name") or p.get("tournament") or ""
+            regime = get_regime(tournament)
+            p["regime"] = {"tier": regime.tier, "name": regime.name}
+            # Filter picks below regime minimum confidence
+            regime_picks = [
+                pk for pk in real_picks
+                if int(pk.get("confidence") or 0) >= regime.min_confidence
+            ]
+            if regime_picks:
+                p["picks"] = regime_picks
+                best = max(regime_picks, key=lambda pk: int(pk.get("confidence") or 0))
+                p["best_pick"] = best
+        except Exception:
+            pass
+
+        seen[mid] = p
     sorted_preds = sorted(
         seen.values(),
         key=lambda x: int((x.get("best_pick") or {}).get("confidence") or 0),
         reverse=True,
     )
-    return {"status": "success", "date": today, "count": len(sorted_preds), "predictions": sorted_preds}
+
+    # ── Portfolio correlation filter ──────────────────────────────────────────
+    try:
+        from app.portfolio import filter_correlated, portfolio_summary
+        sorted_preds = filter_correlated(sorted_preds)
+        summary = portfolio_summary(sorted_preds)
+    except Exception:
+        summary = {}
+
+    return {
+        "status": "success",
+        "date": today,
+        "count": len(sorted_preds),
+        "predictions": sorted_preds,
+        "portfolio": summary,
+    }
+
+
+@router.get("/matches/upcoming-enriched-predicted")
+def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=1000)):
+    """Upcoming buffered matches with enrichment and latest prediction status."""
+    from datetime import date
+    from app.buffer import get_buffered_matches
+    from app.league_memory import list_prediction_history
+
+    today = date.today().isoformat()
+    docs = get_buffered_matches(limit=limit)
+    history = list_prediction_history(limit=3000).get("predictions") or []
+    latest_by_match: dict[str, dict[str, Any]] = {}
+    for prediction in history:
+        match_id = str(prediction.get("match_id") or "")
+        if match_id and match_id not in latest_by_match:
+            latest_by_match[match_id] = prediction
+
+    rows = []
+    for doc in docs:
+        time_context = doc.get("time_context") or {}
+        match_date = time_context.get("local_date") or doc.get("match_date") or today
+        if str(match_date) < today:
+            continue
+        if _is_live_doc(doc) or _is_finished_doc(doc):
+            continue
+        match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
+        prediction = latest_by_match.get(match_id)
+        best_pick = (prediction or {}).get("best_pick") or ((prediction or {}).get("picks") or [{}])[0]
+        summary = _match_summary(doc)
+        rows.append(
+            {
+                **summary,
+                "match_date": match_date,
+                "time_context": doc.get("time_context"),
+                "lifecycle": doc.get("lifecycle"),
+                "enriched": bool(doc.get("enriched_at")),
+                "manual_match": bool(doc.get("manual_match")),
+                "predicted": bool(prediction),
+                "prediction": prediction,
+                "best_pick": best_pick if best_pick else None,
+                "data_quality": {
+                    "has_sofascore_detail": bool(doc.get("sofascore_detail")),
+                    "has_web_context": bool((doc.get("web_context") or {}).get("snippets")),
+                    "has_raw_sporty": bool(doc.get("raw_sporty")),
+                    "has_raw_sofascore": bool(doc.get("raw_sofascore_event") or doc.get("sofascore_event")),
+                },
+            }
+        )
+
+    rows.sort(
+        key=lambda item: (
+            int((item.get("best_pick") or {}).get("confidence") or 0),
+            1 if item.get("predicted") else 0,
+            1 if item.get("enriched") else 0,
+            -_sort_start(item.get("start_time")),
+        ),
+        reverse=True,
+    )
+    return {
+        "status": "success",
+        "date": today,
+        "count": len(rows),
+        "summary": {
+            "upcoming": len(rows),
+            "enriched": sum(1 for item in rows if item["enriched"]),
+            "predicted": sum(1 for item in rows if item["predicted"]),
+            "matched_sofascore": sum(1 for item in rows if item.get("sofascore_id")),
+        },
+        "matches": rows,
+    }
+
+
+@router.post("/matches/purge-ghosts")
+def purge_ghost_matches_endpoint():
+    """Delete stale not-started matches from the buffer whose kick-off has passed."""
+    from app.buffer import purge_ghost_matches
+    from app.mongo_store import cleanup_buffer
+    purged = purge_ghost_matches()
+    cleanup = cleanup_buffer()
+    return {
+        "status": "success",
+        "purged_ghosts": purged,
+        "deleted_finished": cleanup.get("deleted_finished", 0),
+        "deleted_90_plus": cleanup.get("deleted_90_plus", 0),
+        "deleted_stale": cleanup.get("deleted_stale_unenriched", 0),
+    }
 
 
 @router.post("/matches/cleanup")
@@ -344,6 +464,253 @@ def get_buffer_status():
         "status": "success",
         "scheduler": scheduler_status(),
         "buffer": get_buffer_stats(),
+    }
+
+
+@router.get("/analytics/clv")
+def get_clv_analytics(days: int = Query(default=30, ge=1, le=365)):
+    """
+    Closing Line Value analytics.
+    avg_clv > 0 means you're consistently beating the closing price = real edge.
+    """
+    from app.clv import get_clv_summary
+    return {"status": "success", **get_clv_summary(days=days)}
+
+
+@router.post("/analytics/clv/compute")
+def compute_clv_now(match_date: Optional[str] = None):
+    """Force-compute CLV for a specific date (defaults to today)."""
+    from datetime import date
+    from app.clv import compute_clv_for_date
+    target = match_date or date.today().isoformat()
+    result = compute_clv_for_date(target)
+    return {"status": "success", **result}
+
+
+@router.get("/analytics/calibration")
+def get_calibration():
+    """Historical win rate per pick_type × confidence band. Used to size stakes."""
+    from app.confidence_calibrator import get_calibration_table
+    return {"status": "success", "calibration": get_calibration_table()}
+
+
+@router.post("/analytics/calibration/rebuild")
+def rebuild_calibration_endpoint():
+    """Force-rebuild the calibration table from all graded predictions."""
+    from app.confidence_calibrator import rebuild_calibration
+    result = rebuild_calibration()
+    return {"status": "success", **result}
+
+
+@router.get("/analytics/odds-patterns")
+def get_odds_pattern_stats():
+    """Aggregate stats on odds movement patterns and their historical win rates."""
+    from app.odds_pattern import pattern_stats
+    return {"status": "success", **pattern_stats()}
+
+
+@router.get("/analytics/odds-patterns/{match_id}")
+def get_match_pattern_signal(match_id: str):
+    """Get the odds pattern signal for a specific match."""
+    from app.odds_pattern import pattern_signal
+    from urllib.parse import unquote
+    signal = pattern_signal(unquote(match_id))
+    return {"status": "success", "match_id": match_id, "signal": signal}
+
+
+@router.get("/analytics/regime")
+def get_regime_info(tournament: str = Query(default=""), category: str = Query(default="")):
+    """Look up the liquidity regime for a tournament name."""
+    from app.regime import get_regime, TIER_1, TIER_2, TIER_3, TIER_4
+    regime = get_regime(tournament, category)
+    return {
+        "status":    "success",
+        "tournament": tournament,
+        "tier":       regime.tier,
+        "name":       regime.name,
+        "min_confidence":  regime.min_confidence,
+        "edge_threshold":  regime.edge_threshold,
+        "stake_cap":       regime.stake_cap,
+        "description":     regime.description,
+    }
+
+
+@router.get("/analytics/regime/tiers")
+def get_all_tiers():
+    """Return all regime tier definitions."""
+    from app.regime import TIER_1, TIER_2, TIER_3, TIER_4
+    return {
+        "status": "success",
+        "tiers": [
+            {k: getattr(t, k) for k in
+             ["tier", "name", "min_confidence", "edge_threshold", "stake_cap", "description"]}
+            for t in [TIER_1, TIER_2, TIER_3, TIER_4]
+        ],
+    }
+
+
+@router.post("/results/grade")
+def grade_results(hours_back: int = 24):
+    """
+    Fetch finished results from SportyBet, grade pending predictions,
+    and archive matched buffer rows to MongoDB.
+    """
+    import time as _time
+    import json
+    from app.sportybet_client import fetch_results
+    from app.league_memory import DB_PATH, _init_db, _grade_pick
+    from app.mongo_store import archive_finished_match_from_buffer
+    import sqlite3
+
+    now_ms   = int(_time.time() * 1000)
+    start_ms = now_ms - (hours_back * 3_600_000)
+
+    try:
+        results = fetch_results(start_ms, now_ms, count=500)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"SportyBet results fetch failed: {exc}")
+
+    result_map = {
+        str(r["id"]): r
+        for r in results
+        if r.get("score", {}).get("home") is not None
+    }
+
+    _init_db()
+    graded = archived = skipped = 0
+
+    # grade pending predictions
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        pending = conn.execute(
+            "select id, match_id, match_name, league_name, pick_type, selection, "
+            "confidence, signals_json, "
+            "(select match_date from match_buffer where match_id=ph.match_id limit 1) as match_date "
+            "from prediction_history ph "
+            "where graded_at is null and pick_type != 'no_bet'"
+        ).fetchall()
+
+    for row in pending:
+        result = result_map.get(str(row["match_id"]))
+        if not result:
+            skipped += 1
+            continue
+        score = result["score"]
+        outcome = _grade_pick(row["pick_type"], row["selection"], score["home"], score["away"])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "update prediction_history set result=?, final_home=?, final_away=?, "
+                "graded_at=current_timestamp where id=?",
+                (outcome, score["home"], score["away"], row["id"]),
+            )
+            conn.commit()
+        # store signal outcomes in MongoDB
+        try:
+            from app.mongo_store import store_signal_outcomes, is_configured
+            if is_configured():
+                signals = json.loads(row["signals_json"]) if row["signals_json"] else []
+                tournament = row["league_name"] or ""
+                country = tournament.split(" - ")[0].strip() if " - " in tournament else ""
+                store_signal_outcomes(
+                    match_id=str(row["match_id"]),
+                    match_name=row["match_name"],
+                    tournament=tournament,
+                    country=country,
+                    match_date=row["match_date"],
+                    signals=signals,
+                    result=outcome,
+                    pick_type=row["pick_type"],
+                    selection=row["selection"],
+                    confidence=row["confidence"],
+                )
+        except Exception:
+            pass
+        graded += 1
+
+    # archive buffer rows that now have a result
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        buffer_rows = conn.execute(
+            "select match_id from match_buffer where is_finished=0"
+        ).fetchall()
+
+    for row in buffer_rows:
+        if str(row["match_id"]) not in result_map:
+            continue
+        score = result_map[str(row["match_id"])]["score"]
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "update match_buffer set period='Ended', score_home=?, score_away=?, "
+                "is_live=0, is_finished=1 where match_id=?",
+                (str(score["home"]), str(score["away"]), row["match_id"]),
+            )
+            conn.commit()
+        try:
+            archive_finished_match_from_buffer(str(row["match_id"]))
+            archived += 1
+        except Exception:
+            pass
+
+    return {
+        "status": "ok",
+        "results_fetched": len(results),
+        "predictions_graded": graded,
+        "predictions_skipped": skipped,
+        "matches_archived": archived,
+        "signal_stats": _grade_signal_stats(graded),
+    }
+
+
+@router.get("/predictions/odds-only")
+def get_odds_only_predictions():
+    """
+    Fast predictions using only 1x2 odds — no SofaScore required.
+    Runs on every buffered match that has odds, including unenriched ones.
+    Useful as a baseline when enrichment hasn't run yet.
+    """
+    from app.odds_predictor import odds_only_prediction
+    from datetime import date
+
+    today = date.today().isoformat()
+    docs = get_buffered_matches(today, limit=500)
+    predictions = []
+    for doc in docs:
+        pred = odds_only_prediction(doc)
+        if pred:
+            predictions.append(pred)
+
+    predictions.sort(
+        key=lambda p: (p.get("picks") or [{}])[0].get("confidence", 0),
+        reverse=True,
+    )
+    return {
+        "status": "success",
+        "date": today,
+        "count": len(predictions),
+        "predictions": predictions,
+    }
+
+
+@router.get("/analytics/signals")
+def get_signal_analytics(
+    country: str = "",
+    tournament: str = "",
+    min_samples: int = 5,
+):
+    """
+    Signal win rate analytics.
+    Scope: whole DB (default), filtered by country, or filtered by tournament.
+    """
+    from app.mongo_store import get_signal_stats, is_configured
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="MongoDB not configured")
+    return {
+        "status": "success",
+        **get_signal_stats(
+            country=country or None,
+            tournament=tournament or None,
+            min_samples=min_samples,
+        ),
     }
 
 
@@ -550,6 +917,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
             "diagnostics": web.get("diagnostics"),
         },
         "time_context": doc.get("time_context"),
+        "lifecycle": doc.get("lifecycle"),
         "manual_match": bool(doc.get("manual_match")),
         "raw_sporty": doc.get("raw_sporty"),
         "raw_sofascore_event": doc.get("raw_sofascore_event"),
@@ -630,6 +998,24 @@ def _is_live_doc(doc: dict[str, Any]) -> bool:
     return bool(period and period not in ("Not started", "Not start", "FT", "AET", "Finished", "Ended", ""))
 
 
+def _is_finished_doc(doc: dict[str, Any]) -> bool:
+    period = str(doc.get("period") or "").lower()
+    if period in {"ft", "finished", "ended", "aet", "ap", "full time"}:
+        return True
+    status = doc.get("status") or {}
+    if isinstance(status, dict):
+        return status.get("type") == "finished" or status.get("code") == 100
+    return str(status).lower() in {"finished", "ended"}
+
+
+def _sort_start(value: Any) -> int:
+    try:
+        number = int(value)
+        return number if number > 1e10 else number * 1000
+    except (TypeError, ValueError):
+        return 0
+
+
 def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
     detail = doc.get("sofascore_detail") or {}
     form = detail.get("pregameForm") or detail.get("pregame_form") or {}
@@ -662,6 +1048,7 @@ def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
         "has_lineups": bool(detail.get("lineups")),
         "has_last_matches": bool(detail.get("home_last_matches") or detail.get("away_last_matches")),
         "has_web_context": bool(doc.get("web_context")),
+        "lifecycle": doc.get("lifecycle"),
     }
 
 
@@ -714,3 +1101,18 @@ def _latest_prediction(match_id: str) -> dict[str, Any] | None:
         return None
     history = list_prediction_history(limit=1, match_id=match_id).get("predictions") or []
     return history[0] if history else None
+
+
+def _grade_signal_stats(graded: int) -> dict[str, Any]:
+    """Quick signal win rate summary from MongoDB after grading."""
+    if graded == 0:
+        return {}
+    try:
+        from app.mongo_store import get_signal_stats, is_configured
+        if not is_configured():
+            return {}
+        stats = get_signal_stats(min_samples=3)
+        top = stats.get("signals", [])[:5]
+        return {"top_signals": top, "scope": "all"}
+    except Exception:
+        return {}

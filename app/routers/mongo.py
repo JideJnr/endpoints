@@ -88,9 +88,9 @@ def post_scan_live(limit: int = Query(default=200, ge=1, le=1000)):
 
 
 @router.post("/scan/enrich")
-def post_scan_enrich(batch_size: int = Query(default=30, ge=1, le=100)):
+def post_scan_enrich():
     try:
-        return job_enrich_worker(batch_size=batch_size)
+        return job_enrich_worker()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -110,6 +110,37 @@ def post_flush_to_mongo():
         return job_flush_to_mongo()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/purge-junk-predictions")
+def post_purge_junk_predictions():
+    """
+    One-time cleanup: delete all prediction_history rows that are:
+    - pick_type = 'no_bet'
+    - confidence < 55
+    - ungraded and older than today (stale pending that will never resolve)
+    """
+    import sqlite3
+    from app.league_memory import DB_PATH, _init_db
+    from datetime import date
+
+    _init_db()
+    today = date.today().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        r1 = conn.execute("delete from prediction_history where pick_type = 'no_bet'")
+        r2 = conn.execute("delete from prediction_history where confidence < 55")
+        r3 = conn.execute(
+            "delete from prediction_history where graded_at is null and date(created_at) < ?",
+            (today,),
+        )
+        conn.commit()
+    return {
+        "status": "ok",
+        "deleted_no_bet": r1.rowcount,
+        "deleted_low_confidence": r2.rowcount,
+        "deleted_stale_pending": r3.rowcount,
+        "total_deleted": r1.rowcount + r2.rowcount + r3.rowcount,
+    }
 
 
 @router.post("/cleanup")
