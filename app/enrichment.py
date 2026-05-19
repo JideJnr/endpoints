@@ -11,7 +11,7 @@ from urllib import error, request
 from app.league_memory import store_enriched_matches
 from app.market import snapshot_odds
 from app.normalise import normalise
-from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
+from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, is_usable_event_for_mode
 from app.sportybet_client import fetch_live_and_upcoming_matches_post
 from app.web_context import search_match_context
 
@@ -37,7 +37,10 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     target_date = match_date or dt.today().isoformat()
 
     sporty_matches = fetch_live_and_upcoming_matches_post()[:limit]
-    sofa_events = fetch_all_scheduled_events(target_date)
+    sofa_events = [
+        event for event in fetch_all_scheduled_events(target_date)
+        if is_usable_event_for_mode(event, live=False)
+    ]
 
     # ── Step 1: fuzzy + HF match all sporty → sofa (fast, CPU-bound) ──────────
     matched_pairs: list[tuple[dict, dict | None, float]] = []
@@ -240,11 +243,84 @@ def _fuzzy_match(sporty: dict[str, Any], sofa_events: list[dict[str, Any]]) -> t
     best = None
     best_score = 0.0
     for event in sofa_events:
-        score = _name_score(name, event.get("name") or "")
+        score = _event_score(sporty, event)
         if score > best_score:
             best = event
             best_score = score
     return best, best_score
+
+
+def _event_score(sporty: dict[str, Any], event: dict[str, Any]) -> float:
+    sporty_name = sporty.get("name") or ""
+    sofa_name = event.get("name") or ""
+    name_score = _name_score(sporty_name, sofa_name)
+
+    sporty_home = sporty.get("home_team") or _split_team(sporty_name, 0)
+    sporty_away = sporty.get("away_team") or _split_team(sporty_name, 1)
+    sofa_home = (event.get("home_team") or {}).get("name") or _split_team(sofa_name, 0)
+    sofa_away = (event.get("away_team") or {}).get("name") or _split_team(sofa_name, 1)
+    direct = (_name_score(sporty_home, sofa_home) + _name_score(sporty_away, sofa_away)) / 2
+    flipped = (_name_score(sporty_home, sofa_away) + _name_score(sporty_away, sofa_home)) / 2
+    team_score = max(direct, flipped)
+
+    tournament_score = _token_score(
+        normalise(str(sporty.get("tournament") or "")),
+        normalise(str((event.get("tournament") or {}).get("name") or "")),
+    )
+    country_score = _country_score(sporty, event)
+    score = (name_score * 0.50) + (team_score * 0.38) + (tournament_score * 0.07) + (country_score * 0.05)
+
+    time_penalty = _time_penalty(sporty.get("start_time"), event.get("start_timestamp"))
+    score = max(0.0, score - time_penalty)
+    if time_penalty >= 0.25 and team_score < 0.92:
+        score = min(score, 0.64)
+    return round(score, 3)
+
+
+def _split_team(name: str, index: int) -> str:
+    parts = normalise(name).split(" vs ")
+    return parts[index] if len(parts) == 2 else ""
+
+
+def _country_score(sporty: dict[str, Any], event: dict[str, Any]) -> float:
+    sporty_country = normalise(str(sporty.get("category") or sporty.get("country") or ""))
+    raw = event.get("raw_event") or {}
+    tournament = raw.get("tournament") if isinstance(raw, dict) else {}
+    category = tournament.get("category") if isinstance(tournament, dict) else {}
+    country = category.get("country") if isinstance(category, dict) else {}
+    sofa_country = normalise(str(
+        (country or {}).get("name")
+        or (category or {}).get("name")
+        or event.get("category")
+        or ""
+    ))
+    if not sporty_country or not sofa_country:
+        return 0.5
+    return 1.0 if sporty_country == sofa_country else _token_score(sporty_country, sofa_country)
+
+
+def _time_penalty(sporty_start: Any, sofa_start: Any) -> float:
+    if not sporty_start or not sofa_start:
+        return 0.0
+    try:
+        sporty_ts = float(sporty_start)
+        if sporty_ts > 1e12:
+            sporty_ts /= 1000
+        sofa_ts = float(sofa_start)
+        if sofa_ts > 1e12:
+            sofa_ts /= 1000
+        diff_minutes = abs(sporty_ts - sofa_ts) / 60
+    except (TypeError, ValueError):
+        return 0.0
+    if diff_minutes <= 20:
+        return 0.0
+    if diff_minutes <= 90:
+        return 0.04
+    if diff_minutes <= 240:
+        return 0.12
+    if diff_minutes <= 720:
+        return 0.25
+    return 0.40
 
 
 def _name_score(sporty_name: str, sofa_name: str) -> float:

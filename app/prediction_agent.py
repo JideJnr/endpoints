@@ -132,12 +132,19 @@ def predict_sofascore_event(
 
     goal_pressure = _goal_pressure(home_form, away_form, event, signals)
     live_chase_pressure = _live_chase_pressure(event, home_power, goal_pressure, signals)
+    btts_pressure = _btts_pressure(home_form, away_form)
+    if goal_pressure <= 6 and home_form.get("sample_size") and away_form.get("sample_size"):
+        picks.append(_pick("goals", "Under 3.5 goals", 62 + min(10, 8 - int(goal_pressure)), "recent final scores lean low enough for under 3.5"))
+    if goal_pressure <= 3 and home_form.get("sample_size") and away_form.get("sample_size"):
+        picks.append(_pick("goals", "Under 2.5 goals", 57 + min(10, 5 - int(goal_pressure)), "low scoring and conceding profile from previous matches"))
     if goal_pressure >= 10:
         picks.append(_pick("goals", "Over 1.5 goals", 60 + min(goal_pressure, 20), "both teams show goal trend"))
     if goal_pressure >= 18:
         picks.append(_pick("goals", "Over 2.5 goals", 52 + min(goal_pressure, 22), "high combined scoring/conceding trend"))
-    if _btts_pressure(home_form, away_form) >= 12:
-        picks.append(_pick("goals", "Both teams to score", 52 + min(_btts_pressure(home_form, away_form), 18), "both sides regularly score and concede"))
+    if btts_pressure >= 12:
+        picks.append(_pick("goals", "Both teams to score", 52 + min(btts_pressure, 18), "both sides regularly score and concede"))
+    elif btts_pressure <= 5 and home_form.get("sample_size") and away_form.get("sample_size"):
+        picks.append(_pick("goals", "Both teams to score - No", 56 + min(10, 6 - int(btts_pressure)), "recent finals do not support both teams scoring"))
 
     # Fallback goal pick from odds when no form data
     if not picks and not home_form.get("sample_size"):

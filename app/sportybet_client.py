@@ -19,6 +19,18 @@ POST_HEADERS = {
 }
 
 
+_session = requests.Session()
+_session.trust_env = False
+
+
+def _get(url: str, **kwargs):
+    return _session.get(url, **kwargs)
+
+
+def _post(url: str, **kwargs):
+    return _session.post(url, **kwargs)
+
+
 def fetch_live_matches() -> list[dict]:
     params = {
         "sportId": "sr:sport:1",
@@ -26,7 +38,7 @@ def fetch_live_matches() -> list[dict]:
         "withOneUpMarket": "true",
         "_t": int(time.time() * 1000),
     }
-    response = requests.get(SPORTYBET_URL, params=params, headers=HEADERS, timeout=10, proxies={"http": None, "https": None})
+    response = _get(SPORTYBET_URL, params=params, headers=HEADERS, timeout=10)
     response.raise_for_status()
     groups = response.json().get("data", [])
     matches = []
@@ -44,14 +56,17 @@ def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
     }
     if is_live is not None:
         payload["isLive"] = is_live
-    response = requests.post(SPORTYBET_POST_URL, json=payload, headers=POST_HEADERS, timeout=15, proxies={"http": None, "https": None})
+    response = _post(SPORTYBET_POST_URL, json=payload, headers=POST_HEADERS, timeout=15)
     response.raise_for_status()
     tournaments = response.json().get("data", {}).get("tournaments", [])
     matches = []
     for tournament in tournaments:
         group = {
             "name": tournament.get("name"),
-            "categoryName": tournament.get("sport", {}).get("category", {}).get("name"),
+            "categoryName": (
+                tournament.get("sport", {}).get("category", {}).get("name")
+                or tournament.get("category", {}).get("name")
+            ),
         }
         for event in tournament.get("events", []):
             matches.append(_parse_event(event, group))
@@ -83,10 +98,7 @@ def fetch_results(start_time_ms: int, end_time_ms: int, count: int = 200, last_i
         "endTime": end_time_ms,
         "_t": int(time.time() * 1000),
     }
-    response = requests.get(
-        SPORTYBET_RESULTS_URL, params=params, headers=HEADERS,
-        timeout=15, proxies={"http": None, "https": None}
-    )
+    response = _get(SPORTYBET_RESULTS_URL, params=params, headers=HEADERS, timeout=15)
     response.raise_for_status()
     tournaments = response.json().get("data", {}).get("tournaments", [])
     results = []
@@ -106,6 +118,8 @@ def _parse_result(event: dict, group: dict) -> dict:
     score_parts = (event.get("setScore") or "").split(":")
     home = int(score_parts[0]) if len(score_parts) == 2 and score_parts[0].isdigit() else None
     away = int(score_parts[1]) if len(score_parts) == 2 and score_parts[1].isdigit() else None
+    event_category = (event.get("sport") or {}).get("category") or {}
+    event_tournament = event_category.get("tournament") or {}
     return {
         "id":         event.get("eventId"),
         "name":       f"{event.get('homeTeamName')} vs {event.get('awayTeamName')}",
@@ -114,8 +128,8 @@ def _parse_result(event: dict, group: dict) -> dict:
         "score":      {"home": home, "away": away},
         "period":     event.get("matchStatus"),
         "start_time": event.get("estimateStartTime"),
-        "tournament": group.get("name"),
-        "category":   group.get("categoryName"),
+        "tournament": group.get("name") or event_tournament.get("name"),
+        "category":   group.get("categoryName") or event_category.get("name"),
         "status":     event.get("status"),
     }
 
@@ -124,6 +138,8 @@ def _parse_event(event: dict, group: dict) -> dict:
     score_parts = (event.get("setScore") or "").split(":")
     home_score = score_parts[0] if len(score_parts) == 2 else None
     away_score = score_parts[1] if len(score_parts) == 2 else None
+    event_category = (event.get("sport") or {}).get("category") or {}
+    event_tournament = event_category.get("tournament") or {}
 
     return {
         "id": event.get("eventId"),
@@ -138,8 +154,8 @@ def _parse_event(event: dict, group: dict) -> dict:
         "home_red_cards": _first_present(event, "homeRedCards", "homeRedCard", "homeTeamRedCards"),
         "away_red_cards": _first_present(event, "awayRedCards", "awayRedCard", "awayTeamRedCards"),
         "start_time": event.get("estimateStartTime"),
-        "tournament": group.get("name"),
-        "category": group.get("categoryName"),
+        "tournament": group.get("name") or event_tournament.get("name"),
+        "category": group.get("categoryName") or event_category.get("name"),
         "venue": event.get("fixtureVenue", {}).get("name"),
         "markets": [_parse_market(m) for m in event.get("markets", [])],
         "raw_event": event,

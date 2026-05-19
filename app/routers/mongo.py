@@ -95,6 +95,19 @@ def post_scan_enrich():
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.post("/scan/match-and-enrich")
+def post_match_and_enrich(count: int = Query(default=12, ge=1, le=50)):
+    """Date-aware manual run for the upcoming analytics page."""
+    try:
+        from app.buffer import run_date_aware_enrichment
+
+        ingest = job_ingest_upcoming(limit=500)
+        enrich = run_date_aware_enrichment(count=count)
+        return {"status": "success", "ingest": ingest, "enrich": enrich}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.post("/scan/finished")
 def post_scan_finished(match_date: Optional[str] = None, limit: int = Query(default=1000, ge=1, le=2000)):
     try:

@@ -306,7 +306,7 @@ def list_countries_from_memory() -> dict[str, Any]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            select league_key, max(league_name) as league_name, count(*) as matches
+            select league_key, max(league_name) as league_name, max(country_name) as country_name, count(*) as matches
             from matches
             group by league_key
             order by league_name
@@ -314,7 +314,11 @@ def list_countries_from_memory() -> dict[str, Any]:
         ).fetchall()
     countries: dict[str, dict[str, Any]] = {}
     for row in rows:
-        country = _country_from_league(row["league_name"])
+        country = row["country_name"] or _country_from_league(row["league_name"])
+        if not _is_country_like(country):
+            country = _country_from_league(row["league_name"])
+        if not _is_country_like(country):
+            country = "Global"
         key = normalize_league(country)
         countries.setdefault(key, {"id": key, "name": country, "leagues": [], "match_count": 0})
         countries[key]["leagues"].append({
@@ -323,7 +327,11 @@ def list_countries_from_memory() -> dict[str, Any]:
             "match_count": row["matches"],
         })
         countries[key]["match_count"] += row["matches"]
-    return {"countries": list(countries.values())}
+    ordered = sorted(
+        countries.values(),
+        key=lambda item: (item["name"] in {"Global", "International"}, item["name"]),
+    )
+    return {"countries": ordered}
 
 
 def get_country_from_memory(country_id: str) -> dict[str, Any]:
@@ -396,7 +404,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
         return
     best_pick = (prediction.get("picks") or [{}])[0]
     league_name = _league_from_match(prediction)
-    country_name = _country_from_league(league_name)
+    country_name = _country_from_match(prediction, league_name)
 
     # ── Fix 3: skip junk predictions ───────────────────────────────────────────
     # Don't pollute prediction_history with no_bet or sub-55% confidence picks.
@@ -523,7 +531,9 @@ def weighted_finished_match_memory(match: dict[str, Any]) -> dict[str, Any]:
         "home_win_rate": 0.0,
         "draw_rate": 0.0,
         "away_win_rate": 0.0,
+        "over_1_5_rate": 0.0,
         "over_2_5_rate": 0.0,
+        "over_3_5_rate": 0.0,
         "btts_rate": 0.0,
         "avg_goals": 0.0,
     }
@@ -563,7 +573,7 @@ def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> di
         row = conn.execute("select * from prediction_history where id = ?", (prediction_id,)).fetchone()
         if not row:
             return {"graded": False, "reason": "not found"}
-        result = _grade_pick(row["pick_type"], row["selection"], final_home, final_away)
+        result = _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         conn.execute(
             "update prediction_history set result = ?, final_home = ?, final_away = ?, graded_at = current_timestamp where id = ?",
             (result, final_home, final_away, prediction_id),
@@ -582,24 +592,28 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            select id, match_id, pick_type, selection
+            select id, match_id, match_name, pick_type, selection
             from prediction_history
             where graded_at is null
               and date(created_at) = ?
             """,
             (match_date,),
         ).fetchall()
+        sofa_ids_by_match = _sofascore_ids_for_predictions(conn, [str(row["match_id"]) for row in rows])
 
     graded = skipped = 0
     for row in rows:
-        event = finished.get(str(row["match_id"]))
+        match_id = str(row["match_id"])
+        event = finished.get(match_id)
+        if not event:
+            event = next((finished.get(sofa_id) for sofa_id in sofa_ids_by_match.get(match_id, []) if finished.get(sofa_id)), None)
         if not event:
             skipped += 1
             continue
         score = event.get("score") or {}
         final_home = _to_int(score.get("home"), 0)
         final_away = _to_int(score.get("away"), 0)
-        result = _grade_pick(row["pick_type"], row["selection"], final_home, final_away)
+        result = _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 "update prediction_history set result = ?, final_home = ?, final_away = ?, graded_at = current_timestamp where id = ?",
@@ -609,6 +623,44 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         graded += 1
 
     return {"graded": graded, "skipped": skipped, "date": match_date}
+
+
+def _sofascore_ids_for_predictions(conn: sqlite3.Connection, match_ids: list[str]) -> dict[str, list[str]]:
+    """Map prediction SportyBet ids back to saved SofaScore ids from the buffer."""
+    if not match_ids:
+        return {}
+    placeholders = ",".join("?" for _ in match_ids)
+    mapping: dict[str, list[str]] = {match_id: [] for match_id in match_ids}
+    try:
+        rows = conn.execute(
+            f"""
+            select match_id, raw_enriched
+            from match_buffer
+            where match_id in ({placeholders})
+            """,
+            tuple(match_ids),
+        ).fetchall()
+    except Exception:
+        return mapping
+
+    for row in rows:
+        match_id = str(row["match_id"])
+        try:
+            doc = json.loads(row["raw_enriched"] or "{}")
+        except Exception:
+            doc = {}
+        candidates = [
+            doc.get("sofascore_id"),
+            (doc.get("sofascore_event") or {}).get("id") if isinstance(doc.get("sofascore_event"), dict) else None,
+            (doc.get("sofascore_detail") or {}).get("id") if isinstance(doc.get("sofascore_detail"), dict) else None,
+            ((doc.get("sofascore_detail") or {}).get("raw_event") or {}).get("id") if isinstance(doc.get("sofascore_detail"), dict) else None,
+        ]
+        for value in candidates:
+            if value is not None:
+                sofa_id = str(value)
+                if sofa_id not in mapping.setdefault(match_id, []):
+                    mapping[match_id].append(sofa_id)
+    return mapping
 
 
 def get_grading_metrics() -> dict[str, Any]:
@@ -686,6 +738,10 @@ def get_grading_metrics() -> dict[str, Any]:
 
 
 def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: int) -> str:
+    return _grade_pick_for_match(pick_type, selection, home, away, None)
+
+
+def _grade_pick_for_match(pick_type: str | None, selection: str | None, home: int, away: int, match_name: str | None = None) -> str:
     total = home + away
     sel = (selection or "").lower()
     pt = (pick_type or "").lower()
@@ -694,12 +750,20 @@ def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: i
         return "void"
 
     if pt == "goals":
+        if "under 3.5" in sel:
+            return "win" if total < 4 else "loss"
+        if "under 2.5" in sel:
+            return "win" if total < 3 else "loss"
+        if "under 1.5" in sel:
+            return "win" if total < 2 else "loss"
         if "over 2.5" in sel:
             return "win" if total > 2 else "loss"
         if "over 1.5" in sel:
             return "win" if total > 1 else "loss"
         if "over 0.5" in sel:
             return "win" if total > 0 else "loss"
+        if ("both teams to score" in sel or "btts" in sel) and (" no" in sel or "- no" in sel):
+            return "win" if not (home > 0 and away > 0) else "loss"
         if "both teams to score" in sel or "btts" in sel:
             return "win" if home > 0 and away > 0 else "loss"
         return "void"
@@ -709,10 +773,21 @@ def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: i
             return "win" if total > 0 else "loss"
         return "void"
 
-    if pt in ("match_result", "double_chance", "market_value"):
+    if pt in ("match_result", "double_chance", "market_value", "ensemble_1x2", "value_bet"):
         sel_lower = sel
+        if "home or draw" in sel_lower or "draw or home" in sel_lower or sel_lower.strip() == "1x":
+            return "win" if home >= away else "loss"
+        if "away or draw" in sel_lower or "draw or away" in sel_lower or sel_lower.strip() == "x2":
+            return "win" if away >= home else "loss"
+        if "home or away" in sel_lower or "away or home" in sel_lower or sel_lower.strip() == "12":
+            return "win" if home != away else "loss"
         # Handle "{Team} or draw protection" and "{Team} double chance"
         if "or draw" in sel_lower or "double chance" in sel_lower:
+            picked_side = _side_from_selection_and_match(sel_lower, match_name)
+            if picked_side == "home":
+                return "win" if home >= away else "loss"
+            if picked_side == "away":
+                return "win" if away >= home else "loss"
             # These are home-or-draw / away-or-draw style picks
             # Try to detect which side from context
             if "home" in sel_lower:
@@ -730,6 +805,26 @@ def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: i
         return "void"
 
     return "void"
+
+
+def _side_from_selection_and_match(selection: str, match_name: str | None) -> str | None:
+    if not match_name or " vs " not in match_name:
+        return None
+    home_name, away_name = [part.strip().lower() for part in match_name.split(" vs ", 1)]
+    sel = selection.lower()
+    if home_name and home_name in sel:
+        return "home"
+    if away_name and away_name in sel:
+        return "away"
+    home_tokens = [part for part in re.split(r"\W+", home_name) if len(part) >= 4]
+    away_tokens = [part for part in re.split(r"\W+", away_name) if len(part) >= 4]
+    home_hits = sum(1 for token in home_tokens if token in sel)
+    away_hits = sum(1 for token in away_tokens if token in sel)
+    if home_hits > away_hits:
+        return "home"
+    if away_hits > home_hits:
+        return "away"
+    return None
 
 
 def list_prediction_history(limit: int = 200, match_id: str | None = None) -> dict[str, Any]:
@@ -1342,7 +1437,7 @@ def _upsert_match(
             home_goals if is_finished else None,
             away_goals if is_finished else None,
             1 if is_finished else 0,
-            _country_from_league(league),
+            _country_from_match(match, league),
         ),
     )
 
@@ -1695,15 +1790,41 @@ def _snapshot_memory_row(row: sqlite3.Row) -> dict[str, Any]:
 def _league_from_match(match: dict[str, Any]) -> str:
     tournament = match.get("tournament")
     if isinstance(tournament, dict):
-        return tournament.get("name") or tournament.get("uniqueTournament", {}).get("name") or ""
+        tournament_name = tournament.get("name") or tournament.get("uniqueTournament", {}).get("name") or ""
+        category = tournament.get("category") or {}
+        category_text = category.get("name") if isinstance(category, dict) else ""
+        if category_text and tournament_name and not tournament_name.lower().startswith(str(category_text).lower() + " "):
+            return f"{category_text} {tournament_name}".strip()
+        return tournament_name
     if match.get("league_name"):
         return str(match.get("league_name"))
-    category = match.get("category")
+    category = match.get("category") or match.get("country")
+    if not category:
+        raw_sporty = match.get("raw_sporty") or {}
+        raw_event = raw_sporty.get("raw_event") or match.get("raw_event") or {}
+        category = ((raw_event.get("sport") or {}).get("category") or {}).get("name")
     category_text = str(category or "").strip()
     tournament_text = str(tournament or "").strip()
     if category_text and tournament_text.lower().startswith(category_text.lower() + " "):
         return tournament_text
     return " ".join(part for part in [category_text, tournament_text] if part).strip()
+
+
+def _country_from_match(match: dict[str, Any], league_name: str | None = None) -> str:
+    for value in (match.get("country"), match.get("country_name"), match.get("category")):
+        if value:
+            return str(value)
+    tournament = match.get("tournament")
+    if isinstance(tournament, dict):
+        category = tournament.get("category") or {}
+        if isinstance(category, dict) and category.get("name"):
+            return str(category.get("name"))
+    raw_sporty = match.get("raw_sporty") or {}
+    raw_event = raw_sporty.get("raw_event") or match.get("raw_event") or {}
+    category = ((raw_event.get("sport") or {}).get("category") or {}).get("name")
+    if category:
+        return str(category)
+    return _country_from_league(league_name)
 
 
 def _match_fingerprint(league: str, match: dict[str, Any]) -> str:
@@ -1879,6 +2000,8 @@ def _snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
+    picks = json.loads(row["picks_json"] or "[]")
+    stored_best = picks[0] if picks else {}
     return {
         "id": row["id"],
         "source": row["source"],
@@ -1886,13 +2009,14 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
         "match_name": row["match_name"],
         "league_name": row["league_name"],
         "best_pick": {
-            "type": row["pick_type"],
-            "selection": row["selection"],
-            "confidence": row["confidence"],
-            "reason": row["reason"],
+            **stored_best,
+            "type": stored_best.get("type") or row["pick_type"],
+            "selection": stored_best.get("selection") or row["selection"],
+            "confidence": stored_best.get("confidence") or row["confidence"],
+            "reason": stored_best.get("reason") or row["reason"],
         },
         "signals": json.loads(row["signals_json"] or "[]"),
-        "picks": json.loads(row["picks_json"] or "[]"),
+        "picks": picks,
         "created_at": row["created_at"],
     }
 
@@ -1902,19 +2026,40 @@ def _country_from_league(league_name: str | None) -> str:
     countries = {
         "argentina", "australia", "austria", "belgium", "brazil", "bulgaria",
         "canada", "chile", "china", "colombia", "croatia", "czech republic",
-        "denmark", "ecuador", "england", "finland", "france", "germany",
+        "denmark", "ecuador", "egypt", "england", "finland", "france", "germany",
         "ghana", "greece", "india", "indonesia", "ireland", "israel",
-        "italy", "japan", "kenya", "mexico", "morocco", "netherlands",
-        "nigeria", "norway", "paraguay", "peru", "poland", "portugal",
+        "international", "italy", "japan", "kenya", "kuwait", "liberia", "mexico", "morocco", "netherlands",
+        "nigeria", "norway", "oman", "paraguay", "peru", "poland", "portugal",
         "romania", "russia", "saudi arabia", "scotland", "serbia",
-        "south africa", "south korea", "spain", "sweden", "switzerland",
-        "turkey", "ukraine", "uruguay", "usa", "united states", "wales",
+        "senegal", "south africa", "south korea", "spain", "sweden", "switzerland",
+        "togo", "turkey", "ukraine", "uruguay", "usa", "united states", "wales",
     }
     lower = text.lower()
     for country in sorted(countries, key=len, reverse=True):
         if lower == country or lower.startswith(country + " ") or f" {country} " in f" {lower} ":
             return "USA" if country in {"usa", "united states"} else country.title()
     return "Global"
+
+
+def _is_country_like(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"global", "international"}:
+        return True
+    countries = {
+        "argentina", "australia", "austria", "belgium", "brazil", "bulgaria",
+        "canada", "chile", "china", "colombia", "croatia", "czech republic",
+        "denmark", "ecuador", "egypt", "england", "finland", "france", "germany",
+        "ghana", "greece", "india", "indonesia", "ireland", "israel",
+        "italy", "japan", "kenya", "kuwait", "liberia", "mexico", "morocco",
+        "netherlands", "nigeria", "norway", "oman", "paraguay", "peru",
+        "poland", "portugal", "romania", "russia", "saudi arabia", "scotland",
+        "senegal", "serbia", "south africa", "south korea", "spain", "sweden",
+        "switzerland", "togo", "turkey", "ukraine", "uruguay", "usa",
+        "united states", "wales",
+    }
+    return normalized in countries
 
 
 def _prediction_scope_stats(conn: sqlite3.Connection, where: str, params: tuple[Any, ...]) -> dict[str, Any]:
@@ -1949,7 +2094,9 @@ def _finished_scope_stats(conn: sqlite3.Connection, where: str, params: tuple[An
             sum(case when final_home_goals > final_away_goals then 1 else 0 end) as home_wins,
             sum(case when final_home_goals = final_away_goals then 1 else 0 end) as draws,
             sum(case when final_away_goals > final_home_goals then 1 else 0 end) as away_wins,
+            sum(case when final_home_goals + final_away_goals > 1 then 1 else 0 end) as over_1_5,
             sum(case when final_home_goals + final_away_goals > 2 then 1 else 0 end) as over_2_5,
+            sum(case when final_home_goals + final_away_goals > 3 then 1 else 0 end) as over_3_5,
             sum(case when final_home_goals > 0 and final_away_goals > 0 then 1 else 0 end) as btts,
             avg(final_home_goals + final_away_goals) as avg_goals
         from matches
@@ -1970,7 +2117,9 @@ def _finished_scope_stats(conn: sqlite3.Connection, where: str, params: tuple[An
         "home_win_rate": rate("home_wins"),
         "draw_rate": rate("draws"),
         "away_win_rate": rate("away_wins"),
+        "over_1_5_rate": rate("over_1_5"),
         "over_2_5_rate": rate("over_2_5"),
+        "over_3_5_rate": rate("over_3_5"),
         "btts_rate": rate("btts"),
         "avg_goals": round(float(row["avg_goals"] or 0), 3),
     }

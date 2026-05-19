@@ -40,7 +40,72 @@ _HOME_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-_session = requests.Session(impersonate="chrome124")
+def _new_session() -> requests.Session:
+    session = requests.Session(impersonate="chrome124")
+    # Some Windows/dev environments set HTTP(S)_PROXY to 127.0.0.1:9.
+    # SofaScore requests must bypass that or candidate scans fail before
+    # reaching SofaScore at all.
+    session.trust_env = False
+    return session
+
+
+_session = _new_session()
+
+TERMINAL_STATUS_TYPES = {
+    "abandoned",
+    "awarded",
+    "canceled",
+    "cancelled",
+    "finished",
+    "interrupted",
+    "postponed",
+    "suspended",
+    "walkover",
+}
+TERMINAL_STATUS_WORDS = (
+    "abandoned",
+    "awarded",
+    "canceled",
+    "cancelled",
+    "ended",
+    "finished",
+    "interrupted",
+    "postponed",
+    "suspended",
+    "walkover",
+)
+LIVE_STATUS_TYPES = {"inprogress", "live"}
+
+
+def _status_text(event: dict) -> tuple[str, str]:
+    status = event.get("status") or {}
+    status_type = str(status.get("type") or "").lower().replace(" ", "").replace("_", "")
+    description = str(status.get("description") or "").lower()
+    return status_type, description
+
+
+def is_terminal_event(event: dict) -> bool:
+    """True for SofaScore events that should not be matched as upcoming/live."""
+    status_type, description = _status_text(event)
+    if status_type in TERMINAL_STATUS_TYPES:
+        return True
+    return any(word in description for word in TERMINAL_STATUS_WORDS)
+
+
+def is_usable_event_for_mode(event: dict, live: bool = False) -> bool:
+    """
+    Gate SofaScore candidates by match mode.
+
+    Prematch enrichment should only consider schedulable events. Live enrichment
+    should only consider in-play events. Terminal states like postponed/canceled
+    are excluded from both so stale SofaScore fixtures cannot be attached.
+    """
+    status_type, _ = _status_text(event)
+    if is_terminal_event(event):
+        return False
+    if live:
+        return status_type in LIVE_STATUS_TYPES
+    return status_type not in LIVE_STATUS_TYPES
 
 
 def _get(url: str) -> requests.Response:
@@ -52,7 +117,7 @@ def _get(url: str) -> requests.Response:
         return resp
     except Exception:
         # rebuild session, warm cookies via homepage, then retry once
-        _session = requests.Session(impersonate="chrome124")
+        _session = _new_session()
         try:
             _session.get("https://www.sofascore.com/", headers=_HOME_HEADERS, timeout=10)
         except Exception:

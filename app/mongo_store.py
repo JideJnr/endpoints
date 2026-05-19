@@ -134,6 +134,17 @@ def list_finished_matches(match_date: str | None = None, limit: int = 200) -> li
     return list(_get_db()["finished_matches"].find(query, {"_id": 0}).limit(limit))
 
 
+def get_finished_match(match_id: str) -> dict[str, Any] | None:
+    if not is_configured():
+        return None
+    doc = _get_db()["finished_matches"].find_one({"_id": str(match_id)})
+    if not doc:
+        return None
+    doc["_id"] = str(doc.get("_id") or match_id)
+    doc["archive_source"] = "mongodb"
+    return doc
+
+
 def get_team_finished_matches(team_id: str | int, limit: int = 15) -> list[dict[str, Any]]:
     """
     Fetch finished matches for a team from MongoDB.

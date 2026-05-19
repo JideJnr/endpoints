@@ -283,6 +283,7 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
     - Finished matches and already-fully-enriched matches are skipped entirely
     """
     _init_db()
+    cutoff_ts_ms = (datetime.now(timezone.utc).timestamp() - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
@@ -291,6 +292,8 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
             select match_id, raw_sporty, raw_enriched, is_live, match_date
             from match_buffer
             where is_finished = 0
+              and (is_live = 1 or match_date is null or match_date >= date('now'))
+              and (start_time is null or cast(start_time as real) >= ?)
               and (
                 enriched_at is null
                 or sofascore_id is null
@@ -302,7 +305,7 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
               start_time asc
             limit ?
             """,
-            (limit,),
+            (cutoff_ts_ms, limit),
         ).fetchall()
     return [
         {
@@ -376,7 +379,9 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
     result = []
     for row in rows:
         if row["raw_enriched"]:
-            result.append(json.loads(row["raw_enriched"]))
+            doc = json.loads(row["raw_enriched"])
+            sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
+            result.append(_ensure_country_fields(doc, sporty))
         else:
             # not yet enriched — return raw sporty data so frontend isn't empty
             sporty = json.loads(row["raw_sporty"])
@@ -397,7 +402,9 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
     if not row:
         return None
     if row["raw_enriched"]:
-        return json.loads(row["raw_enriched"])
+        doc = json.loads(row["raw_enriched"])
+        sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
+        return _ensure_country_fields(doc, sporty)
     return _sporty_to_summary(json.loads(row["raw_sporty"]))
 
 
@@ -420,7 +427,9 @@ def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
     result = []
     for row in rows:
         if row["raw_enriched"]:
-            result.append(json.loads(row["raw_enriched"]))
+            doc = json.loads(row["raw_enriched"])
+            sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
+            result.append(_ensure_country_fields(doc, sporty))
         else:
             result.append(_sporty_to_summary(json.loads(row["raw_sporty"])))
     return result
@@ -674,6 +683,177 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
     }
 
 
+def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
+    """
+    Enrich pending SportyBet rows in kickoff order.
+
+    SofaScore event lists are fetched once per required date, then each match
+    is matched, detailed, enriched, and predicted one after another. This is
+    the manual page action: predictable, date-aware, and gentle on SofaScore.
+    """
+    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
+    from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
+    from app.web_context import search_match_context
+    from app.time_context import match_time_context
+
+    queue = get_unenriched_batch(count)
+    if not queue:
+        return {"status": "idle", "pending": 0, "processed": []}
+
+    date_keys: list[str] = []
+    live_needed = False
+    for item in queue:
+        live_needed = live_needed or item.get("is_live", False)
+        for date_key in _sofascore_date_candidates(item["sporty"], item.get("match_date")):
+            if date_key not in date_keys:
+                date_keys.append(date_key)
+
+    sofa_cache: dict[str, list[dict]] = {}
+    date_errors: dict[str, str] = {}
+    for date_key in date_keys:
+        try:
+            sofa_cache[date_key] = fetch_all_scheduled_events(date_key)
+        except Exception as exc:
+            sofa_cache[date_key] = []
+            date_errors[date_key] = str(exc)
+
+    live_events: list[dict] = []
+    live_error = None
+    if live_needed:
+        try:
+            live_events = fetch_live_events()
+        except Exception as exc:
+            live_error = str(exc)
+
+    processed: list[dict[str, Any]] = []
+    matched = unmatched = llm_used = stored = predicted = 0
+
+    for item in queue:
+        sporty = item["sporty"]
+        existing = item.get("existing") or {}
+        sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
+        saved_sofa_id = existing.get("sofascore_id")
+        sofa = None
+        score = 0.0
+        source = "none"
+
+        if saved_sofa_id:
+            sofa = next((event for event in sofa_events if str(event.get("id")) == str(saved_sofa_id)), None)
+            if not sofa and isinstance(existing.get("sofascore_event"), dict):
+                sofa = existing["sofascore_event"]
+            score = float(existing.get("match_score") or 1.0)
+            source = "saved"
+        else:
+            sofa, score = _fuzzy_match(sporty, sofa_events)
+            source = "fuzzy"
+            if score < FUZZY_THRESHOLD:
+                if score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
+                    llm_sofa = _llm_match(sporty, sofa_events)
+                    if llm_sofa:
+                        sofa = llm_sofa
+                        source = "llm"
+                        llm_used += 1
+                    else:
+                        sofa = None
+                else:
+                    sofa = None
+
+        if sofa:
+            matched += 1
+        else:
+            unmatched += 1
+
+        detail = None
+        if sofa:
+            try:
+                detail = fetch_event_detail(sofa)
+            except Exception as exc:
+                detail = None
+                source = f"{source}:detail_failed:{exc}"
+
+        try:
+            web_context = search_match_context(
+                sporty.get("home_team") or "",
+                sporty.get("away_team") or "",
+                sporty.get("tournament") or "",
+            )
+        except Exception:
+            web_context = {"query": "", "snippets": [], "scraped": []}
+
+        time_context = match_time_context({**sporty, "sofascore_event": sofa})
+        now = datetime.now(timezone.utc).isoformat()
+        doc = {
+            **existing,
+            "sportybet_id":      sporty.get("id"),
+            "sportybet_name":    sporty.get("name"),
+            "match_date":        time_context.get("local_date") or item["match_date"],
+            "tournament":        sporty.get("tournament"),
+            "category":          sporty.get("category"),
+            "start_time":        sporty.get("start_time"),
+            "period":            sporty.get("period"),
+            "played_seconds":    sporty.get("played_seconds"),
+            "score":             sporty.get("score"),
+            "venue":             sporty.get("venue"),
+            "sportybet_markets": sporty.get("markets", []),
+            "sofascore_id":      sofa.get("id") if sofa else None,
+            "sofascore_name":    sofa.get("name") if sofa else None,
+            "sofascore_event":   sofa,
+            "sofascore_detail":  detail,
+            "web_context":       web_context,
+            "match_score":       round(score, 3),
+            "match_source":      source,
+            "manual_match":      bool(existing.get("manual_match")),
+            "raw_sporty":        sporty,
+            "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
+            "time_context":      time_context,
+            "enriched_at":       now,
+        }
+
+        snapshot_odds(doc)
+        try:
+            from app.enriched_prediction import predict_enriched_match
+            from app.league_memory import record_prediction
+
+            prediction = predict_enriched_match(doc)
+            doc["prediction"] = prediction
+            record_prediction(prediction)
+            predicted += 1
+        except Exception as exc:
+            doc["prediction_error"] = str(exc)
+            print(f"[buffer] sequential prediction failed for {item['match_id']}: {exc}")
+
+        doc["lifecycle"] = _lifecycle_state(doc)
+        store_enriched(item["match_id"], doc)
+        stored += 1
+        processed.append({
+            "sportybet_id": item["match_id"],
+            "name": sporty.get("name"),
+            "match_date": doc.get("match_date"),
+            "sofascore_id": doc.get("sofascore_id"),
+            "matched": bool(sofa),
+            "has_detail": bool(detail),
+            "predicted": bool(doc.get("prediction")),
+            "prediction_error": doc.get("prediction_error"),
+            "score": round(score, 3),
+            "source": source,
+        })
+
+    return {
+        "status": "ok",
+        "requested": count,
+        "processed_count": len(processed),
+        "dates_scanned": date_keys,
+        "date_errors": date_errors,
+        "live_error": live_error,
+        "matched": matched,
+        "unmatched": unmatched,
+        "llm_fallback": llm_used,
+        "stored": stored,
+        "predicted": predicted,
+        "processed": processed,
+    }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _sporty_to_summary(m: dict[str, Any]) -> dict[str, Any]:
@@ -688,7 +868,7 @@ def _sporty_to_summary(m: dict[str, Any]) -> dict[str, Any]:
         "home_team":      parts[0].strip() if len(parts) == 2 else name,
         "away_team":      parts[1].strip() if len(parts) == 2 else "",
         "tournament":     m.get("tournament"),
-        "category":       m.get("category"),
+        "category":       _country_from_sporty(m),
         "start_time":     m.get("start_time"),
         "period":         m.get("period"),
         "played_seconds": m.get("played_seconds"),
@@ -703,10 +883,40 @@ def _sporty_to_summary(m: dict[str, Any]) -> dict[str, Any]:
     return doc
 
 
+def _ensure_country_fields(doc: dict[str, Any], sporty: dict[str, Any] | None = None) -> dict[str, Any]:
+    country = doc.get("category") or _country_from_sporty(doc) or _country_from_sporty(sporty or {})
+    if country:
+        doc["category"] = country
+        doc["country"] = country
+    return doc
+
+
+def _country_from_sporty(m: dict[str, Any]) -> str | None:
+    if not m:
+        return None
+    category = m.get("category") or m.get("country")
+    if category:
+        return str(category)
+    raw_event = m.get("raw_event") or {}
+    sport_category = (raw_event.get("sport") or {}).get("category") or {}
+    if sport_category.get("name"):
+        return str(sport_category.get("name"))
+    raw_group = m.get("raw_group") or {}
+    if raw_group.get("categoryName"):
+        return str(raw_group.get("categoryName"))
+    sofa_event = m.get("sofascore_event") or {}
+    tournament = sofa_event.get("tournament") or {}
+    sofa_category = tournament.get("category") or {}
+    if sofa_category.get("name"):
+        return str(sofa_category.get("name"))
+    return None
+
+
 def _merge_enriched(raw_sporty: dict[str, Any], existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Preserve sticky user-matched SofaScore state while refreshing volatile match data."""
     merged = {**existing, **incoming}
     merged["raw_sporty"] = raw_sporty or incoming.get("raw_sporty") or existing.get("raw_sporty")
+    _ensure_country_fields(merged, raw_sporty)
     if existing.get("manual_match") and existing.get("sofascore_id"):
         merged["manual_match"] = True
         merged["manual_matched_at"] = existing.get("manual_matched_at")
@@ -832,11 +1042,15 @@ def _candidate_sofascore_events(
     sofa_cache: dict[str, list[dict]],
     live_events: list[dict],
 ) -> list[dict]:
+    from app.sofascore_client import is_usable_event_for_mode
+
     events: list[dict] = []
     seen: set[str] = set()
 
     if item.get("is_live"):
         for event in live_events:
+            if not is_usable_event_for_mode(event, live=True):
+                continue
             eid = str(event.get("id") or "")
             if eid and eid not in seen:
                 events.append(event)
@@ -844,6 +1058,8 @@ def _candidate_sofascore_events(
 
     for d in _sofascore_date_candidates(item["sporty"], item.get("match_date")):
         for event in sofa_cache.get(d, []):
+            if not is_usable_event_for_mode(event, live=False):
+                continue
             eid = str(event.get("id") or "")
             if eid and eid not in seen:
                 events.append(event)
