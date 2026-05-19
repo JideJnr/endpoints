@@ -171,7 +171,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         (doc.get("tournament") or "") + " " + (doc.get("category") or "")
     )
 
-    market_picks = _market_selector_picks(doc, ensemble, poisson, dixon, finished_memory)
+    market_picks = _market_selector_picks(doc, ensemble, poisson, dixon, finished_memory, rules)
+    goal_selector_context = _goal_selector_context(ensemble, poisson, dixon, finished_memory, rules)
+    if goal_selector_context:
+        signals.append({
+            "name": "goal_environment",
+            "value": goal_selector_context,
+            "impact": -6 if goal_selector_context.get("profile") == "hot" else -2 if goal_selector_context.get("profile") == "warm" else 2,
+        })
     live_prior = {**ensemble, "probabilities": _blended_model_probabilities(ensemble, poisson, dixon)}
     live_picks = _live_inplay_picks(doc, detail, rules, live_prior, finished_memory, odds_movement) if is_live else []
     if live_picks:
@@ -537,28 +544,21 @@ def _combined_picks(
     value_bets: list[dict[str, Any]],
     market_picks: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Build final prematch picks from one selector."""
     picks = []
     picks.extend(market_picks or [])
-    if ensemble and not ensemble.get("error") and float(ensemble.get("confidence") or 0) >= 55:
-        picks.append({
-            "type": "ensemble_1x2",
-            "selection": ensemble["prediction"],
-            "confidence": round(float(ensemble["confidence"])),
-            "reason": f"Weighted model blend using {', '.join(ensemble.get('models_used') or [])}",
-        })
-    # Add rules picks, excluding no_bet
-    for pick in (rules.get("picks") or []):
-        if pick.get("type") != "no_bet":
-            picks.append(pick)
     if value_bets:
         top = value_bets[0]
-        picks.insert(0, {
+        value_pick = {
             "type": "value_bet",
             "selection": top["selection"],
             "confidence": round(top["kelly"]["probability"] * 100),
             "reason": f"{top['kelly']['edge_percent']}% model edge, stake {top['kelly']['stake_per_100']} per 100",
-        })
-    # If nothing meaningful, add a low-confidence ensemble pick rather than no_bet
+        }
+        existing = {_norm_market_key(str(p.get("selection") or "")) for p in picks}
+        if not picks or _norm_market_key(str(top["selection"])) in existing:
+            picks.insert(0, value_pick)
+    # If the single selector cannot make a market call, fall back to ensemble.
     if not picks and ensemble and not ensemble.get("error"):
         picks.append({
             "type": "ensemble_1x2",
@@ -864,7 +864,7 @@ def _live_market_pressure(odds_movement: dict[str, Any]) -> dict[str, Any]:
         market_pull = str((pull_info if isinstance(pull_info, dict) else {}).get("direction") or market.get("direction") or "").lower()
         change = abs(
             _to_float((pull_info if isinstance(pull_info, dict) else {}).get("implied_change_percent"))
-            or _to_float((market.get("movement") or {}).get("percent"))
+            or _to_float((market.get("movement") if isinstance(market.get("movement"), dict) else {}).get("percent"))
             or _to_float(market.get("odds_change_percent"))
             or 0
         )
@@ -1008,6 +1008,7 @@ def _market_selector_picks(
     poisson: dict[str, Any] | None,
     dixon: dict[str, Any] | None,
     finished_memory: dict[str, Any] | None,
+    rules: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Let data choose the best market instead of forcing one bet shape.
 
@@ -1031,6 +1032,7 @@ def _market_selector_picks(
     under_3_5 = _under_probability(poisson, dixon, 3.5)
     under_1_5 = _under_probability(poisson, dixon, 1.5)
     avg_goals = float(memory.get("avg_goals") or 0)
+    goal_env = _goal_environment(rules or {}, memory, over_2_5, btts)
 
     home_mem = float(memory.get("home_win_rate") or 0) * 100
     draw_mem = float(memory.get("draw_rate") or 0) * 100
@@ -1059,8 +1061,16 @@ def _market_selector_picks(
         picks.append(_selector_pick("goals", "Under 1.5 goals", under_1_5, "previous final scores point to a very low total"))
     if under_2_5 >= 56 and (not avg_goals or avg_goals <= 2.55):
         picks.append(_selector_pick("goals", "Under 2.5 goals", under_2_5, "goal model and finished database lean under"))
-    if under_3_5 >= 64 and (not avg_goals or avg_goals <= 3.15):
-        picks.append(_selector_pick("goals", "Under 3.5 goals", under_3_5, "score distribution keeps four-goal game unlikely"))
+    if _allow_under_3_5(under_3_5, avg_goals, goal_env):
+        picks.append({
+            **_selector_pick(
+                "goals",
+                "Under 3.5 goals",
+                min(under_3_5, goal_env["confidence_cap"]),
+                goal_env["under_reason"],
+            ),
+            "evidence": {"goal_environment": goal_env},
+        })
     if over_2_5 >= 58 and avg_goals >= 2.65:
         picks.append(_selector_pick("goals", "Over 2.5 goals", over_2_5, "model goals and historical finals both run high"))
     if btts >= 58:
@@ -1115,6 +1125,102 @@ def _under_probability(poisson: dict[str, Any] | None, dixon: dict[str, Any] | N
     if line == 2.5:
         return round(100 - over_2_5, 1)
     return 0.0
+
+
+def _goal_selector_context(
+    ensemble: dict[str, Any],
+    poisson: dict[str, Any] | None,
+    dixon: dict[str, Any] | None,
+    finished_memory: dict[str, Any] | None,
+    rules: dict[str, Any] | None,
+) -> dict[str, Any]:
+    model_probs = _blended_model_probabilities(ensemble, poisson, dixon)
+    memory = (finished_memory or {}).get("blended") or {}
+    samples = int((finished_memory or {}).get("samples") or 0)
+    sample_factor = min(1.0, samples / 120)
+    over_2_5 = _blend_rate(float(model_probs.get("over_2_5") or 0), float(memory.get("over_2_5_rate") or 0) * 100, sample_factor)
+    btts = _blend_rate(float(model_probs.get("btts") or 0), float(memory.get("btts_rate") or 0) * 100, sample_factor)
+    context = _goal_environment(rules or {}, memory, over_2_5, btts)
+    context["under_3_5_probability"] = _under_probability(poisson, dixon, 3.5)
+    context["under_3_5_allowed"] = _allow_under_3_5(
+        float(context["under_3_5_probability"]),
+        float(memory.get("avg_goals") or 0),
+        context,
+    )
+    return context
+
+
+def _goal_environment(
+    rules: dict[str, Any],
+    memory: dict[str, Any],
+    over_2_5: float,
+    btts: float,
+) -> dict[str, Any]:
+    goal_pressure = 0.0
+    for signal in rules.get("signals") or []:
+        if signal.get("name") == "goal_pressure":
+            goal_pressure = _to_float(signal.get("value")) or 0.0
+            break
+
+    avg_goals = float(memory.get("avg_goals") or 0)
+    memory_over = float(memory.get("over_2_5_rate") or 0) * 100
+    memory_btts = float(memory.get("btts_rate") or 0) * 100
+    blended_over = max(over_2_5, memory_over)
+    blended_btts = max(btts, memory_btts)
+
+    hot_reasons: list[str] = []
+    if goal_pressure >= 24:
+        hot_reasons.append("recent team goal pressure is high")
+    if avg_goals >= 3.05:
+        hot_reasons.append("finished database average is above three goals")
+    if blended_over >= 58:
+        hot_reasons.append("over 2.5 environment is active")
+    if blended_btts >= 63:
+        hot_reasons.append("both-team scoring rate is elevated")
+
+    warm_reasons: list[str] = []
+    if 19 <= goal_pressure < 24:
+        warm_reasons.append("recent team goal pressure is not fully calm")
+    if 2.75 <= avg_goals < 3.05:
+        warm_reasons.append("database average is near the danger zone")
+
+    if hot_reasons:
+        confidence_cap = 68
+        profile = "hot"
+    elif warm_reasons:
+        confidence_cap = 78
+        profile = "warm"
+    else:
+        confidence_cap = 90
+        profile = "calm"
+
+    return {
+        "profile": profile,
+        "goal_pressure": goal_pressure,
+        "avg_goals": avg_goals,
+        "over_2_5": blended_over,
+        "btts": blended_btts,
+        "hot_reasons": hot_reasons,
+        "warm_reasons": warm_reasons,
+        "confidence_cap": confidence_cap,
+        "under_reason": (
+            "low goal model is backed by calm recent totals and database memory"
+            if profile == "calm"
+            else "under 3.5 only passes with reduced confidence because goal environment is mixed"
+        ),
+    }
+
+
+def _allow_under_3_5(under_3_5: float, avg_goals: float, goal_env: dict[str, Any]) -> bool:
+    profile = goal_env.get("profile")
+    over_2_5 = float(goal_env.get("over_2_5") or 0)
+    btts = float(goal_env.get("btts") or 0)
+
+    if profile == "hot":
+        return under_3_5 >= 92 and (not avg_goals or avg_goals <= 2.45) and over_2_5 <= 45 and btts <= 52
+    if profile == "warm":
+        return under_3_5 >= 84 and (not avg_goals or avg_goals <= 2.65) and over_2_5 <= 52 and btts <= 58
+    return under_3_5 >= 76 and (not avg_goals or avg_goals <= 2.85) and over_2_5 <= 55 and btts <= 60
 
 
 def _poisson_probability(lam: float, goals: int) -> float:
@@ -1173,17 +1279,31 @@ def _model_signals(
     if ensemble and not ensemble.get("error"):
         signals.append({"name": "ensemble_model", "value": ensemble, "impact": round((ensemble.get("confidence", 50) - 50) / 2, 2)})
     web = doc.get("web_context") or {}
+    snippets = web.get("snippets") or []
+    scraped = web.get("scraped") or []
+    attempts = web.get("attempts") or []
+    web_impact = 0
+    if web.get("error") or web.get("disabled"):
+        web_impact = -1
+    elif snippets or scraped:
+        web_impact = min(4, len(snippets) + (2 if scraped else 0))
     signals.append(
         {
             "name": "web_context",
             "value": {
                 "query": web.get("query"),
-                "snippets": len(web.get("snippets") or []),
-                "scraped": len(web.get("scraped") or []),
+                "snippets": len(snippets),
+                "scraped": len(scraped),
+                "attempts": attempts,
+                "source_titles": [
+                    item.get("title")
+                    for item in snippets[:3]
+                    if isinstance(item, dict) and item.get("title")
+                ],
                 "error": web.get("error"),
                 "disabled": web.get("disabled"),
             },
-            "impact": 0,
+            "impact": web_impact,
         }
     )
     return signals

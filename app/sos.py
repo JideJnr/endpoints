@@ -59,8 +59,10 @@ def analyse_schedule(team_id: int, last_n: int = 10) -> dict[str, Any]:
         result = "W" if goals_for > goals_against else "D" if goals_for == goals_against else "L"
         raw_form.append(result)
 
-        tournament = event.get("tournament") or {}
-        tier = _league_tier(tournament.get("name", ""))
+        raw_t = event.get("tournament") or {}
+        tournament = raw_t if isinstance(raw_t, dict) else {}
+        t_name = tournament.get("name") or (raw_t if isinstance(raw_t, str) else "")
+        tier = _league_tier(t_name)
         tiers.append(tier)
         standing = _opponent_standing(opponent_id, tournament.get("tournament_id"), event.get("season_id"))
         bucket = _opponent_bucket(standing.get("position"), standing.get("total_teams"))

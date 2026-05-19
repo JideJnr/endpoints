@@ -22,6 +22,7 @@ from app.buffer import (
     get_buffer_stats,
     purge_ghost_matches,
 )
+from app.activity_log import record_activity
 
 
 _scheduler = None
@@ -34,6 +35,7 @@ def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
     from app.market import snapshot_odds
     from app.buffer import purge_ghost_matches
 
+    record_activity("Fetching upcoming SportyBet matches", job="ingest_upcoming", status="running")
     matches = fetch_upcoming_matches_post()[:limit]
     groups = _group_matches_by_local_date(matches)
     ingested = 0
@@ -53,6 +55,12 @@ def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
     purged = purge_ghost_matches()
     dates = sorted(groups)
     print(f"[scheduler] ingest_upcoming: {ingested} matches buffered across {len(dates)} date(s) | {snapped} odds snapped | {purged} ghosts purged")
+    record_activity(
+        f"Upcoming ingest finished: {ingested} new, {snapped} odds snapshots",
+        job="ingest_upcoming",
+        status="ok",
+        details={"dates": dates, "ingested": ingested, "odds_snapshots": snapped, "purged": purged},
+    )
     return {"status": "ok", "job": "ingest_upcoming", "dates": dates, "ingested": ingested, "odds_snapshots": snapped, "purged": purged}
 
 
@@ -61,6 +69,7 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
     from app.league_memory import observe_matches
     from app.market import snapshot_odds
 
+    record_activity("Fetching live SportyBet matches", job="ingest_live", status="running")
     matches = fetch_live_matches_post()[:limit]
 
     # add brand-new live matches not yet in buffer
@@ -88,6 +97,12 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
     observe_matches("sportybet", matches)
 
     print(f"[scheduler] ingest_live: {len(matches)} from api | {new_count} new | {patched} patched | {snapped} odds snapped")
+    record_activity(
+        f"Live ingest finished: {len(matches)} from API, {patched} patched",
+        job="ingest_live",
+        status="ok",
+        details={"live_count": len(matches), "new": new_count, "patched": patched, "odds_snapshots": snapped},
+    )
     return {
         "status": "ok",
         "job": "ingest_live",
@@ -101,12 +116,13 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
 def job_enrich_worker() -> dict[str, Any]:
     """
     Enrichment worker: picks up a batch of unenriched/stale matches and enriches them.
-    Runs every 2 minutes — processes ENRICH_BATCH_SIZE matches per run.
-    Prioritises: live matches first, then never-enriched, then stale upcoming.
+    Runs every 30 sec — processes today + live matches first, then tomorrow, then future.
     """
+    record_activity("Looking for the next match to enrich", job="enrich_worker", status="running")
     result = run_enrichment_worker(batch_size=1)
     if result.get("status") == "idle":
         print("[scheduler] enrich_worker: nothing to enrich")
+        record_activity("Enrichment worker idle: no pending match", job="enrich_worker", status="idle")
     else:
         print(
             f"[scheduler] enrich_worker: "
@@ -116,7 +132,59 @@ def job_enrich_worker() -> dict[str, Any]:
             f"predicted={result.get('predicted')} "
             f"llm={result.get('llm_fallback')}"
         )
+        record_activity(
+            f"Enrichment worker finished: {result.get('matched')} matched, {result.get('predicted')} predicted",
+            job="enrich_worker",
+            status="ok",
+            details={k: result.get(k) for k in ("batch", "matched", "unmatched", "stored", "predicted", "llm_fallback")},
+        )
     return result
+
+
+def job_enrich_future() -> dict[str, Any]:
+    """
+    Future-match enrichment: once per hour, enrich upcoming fixtures beyond
+    tomorrow so SofaScore H2H, standings, and team form are pre-populated
+    before kick-off. Uses a larger batch since these are low-urgency.
+    """
+    from app.league_memory import DB_PATH, _init_db
+    from app.buffer import _init_buffer_table
+    import sqlite3 as _sqlite3
+
+    _init_db()
+    with _sqlite3.connect(DB_PATH) as conn:
+        _init_buffer_table(conn)
+        pending = conn.execute(
+            """
+            select count(*) from future_match_buffer
+            where is_finished = 0
+              and (enriched_at is null or sofascore_id is null or sofascore_id = '')
+              and (
+                json_extract(raw_enriched, '$.sofascore_match_status') is null
+                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
+                or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= strftime('%s','now')
+              )
+            """,
+            (),
+        ).fetchone()[0]
+
+    if not pending:
+        return {"status": "idle", "future_pending": 0}
+
+    record_activity("Future enrichment checking next pending fixture", job="enrich_future", status="running")
+    result = run_enrichment_worker(batch_size=1)
+    print(
+        f"[scheduler] enrich_future: future_pending={pending} "
+        f"processed={result.get('batch')} matched={result.get('matched')} "
+        f"stored={result.get('stored')}"
+    )
+    record_activity(
+        f"Future enrichment finished: {result.get('matched')} matched",
+        job="enrich_future",
+        status="ok",
+        details={"future_pending": pending, **{k: result.get(k) for k in ("batch", "matched", "stored", "predicted")}},
+    )
+    return {**result, "future_pending": pending}
 
 
 def job_archive_finished(match_date: str | None = None, limit: int = 1000) -> dict[str, Any]:
@@ -312,15 +380,26 @@ def start_scheduler():
         misfire_grace_time=60,
     )
 
-    # enrichment worker — every 90 sec, processes a batch
+    # enrichment worker — every 30 sec, processes today/live first
     scheduler.add_job(
         _safe(job_enrich_worker),
         IntervalTrigger(seconds=30),
         id="enrich_worker",
-        name="Enrichment + prediction worker",
+        name="Enrichment + prediction worker (live + today)",
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=120,
+    )
+
+    # future enrichment — every 1 hour, enriches fixtures beyond tomorrow
+    scheduler.add_job(
+        _safe(job_enrich_future),
+        IntervalTrigger(hours=1),
+        id="enrich_future",
+        name="Future match enrichment (SofaScore pre-match data)",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=600,
     )
 
     # flush to mongo — every 2 min
@@ -382,7 +461,8 @@ def start_scheduler():
     print("[scheduler] started — running forever, no frontend required")
     print("[scheduler]   ingest_live      every 30 sec  (scores + periods)")
     print("[scheduler]   ingest_upcoming  every  2 min  (new matches)")
-    print("[scheduler]   enrich_worker    every 30 sec  (SofaScore + web + predict)")
+    print("[scheduler]   enrich_worker    every 30 sec  (live + today — SofaScore + predict)")
+    print("[scheduler]   enrich_future    every  1 hr   (future fixtures — pre-match data)")
     print("[scheduler]   flush_to_mongo   every  2 min  (buffer → MongoDB)")
     print("[scheduler]   archive_finished every 15 min  (finished → MongoDB)")
     print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
@@ -425,6 +505,7 @@ def _safe(fn):
             return fn(*args, **kwargs)
         except Exception as exc:
             print(f"[scheduler] {fn.__name__} failed: {exc}")
+            record_activity(f"{fn.__name__} failed: {exc}", job=fn.__name__, status="error")
     return wrapper
 
 

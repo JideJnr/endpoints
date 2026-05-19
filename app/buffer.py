@@ -41,6 +41,12 @@ WEB_WORKERS = 10
 # How many matches to enrich per worker cycle
 ENRICH_BATCH_SIZE = 10
 
+# If SofaScore does not appear to carry a prematch fixture, do not keep trying
+# it every scheduler tick. It will be retried later so late SofaScore listings
+# can still attach before kick-off.
+NO_MATCH_RETRY_MINUTES = 180
+NO_MATCH_MIN_RETRY_LIVE_MINUTES = 15
+
 
 # ── Table init ────────────────────────────────────────────────────────────────
 
@@ -68,6 +74,36 @@ def _init_buffer_table(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_buffer_date    on match_buffer(match_date)")
     conn.execute("create index if not exists idx_buffer_live    on match_buffer(is_live)")
     conn.execute("create index if not exists idx_buffer_enrich  on match_buffer(enriched_at)")
+    conn.execute("""
+        create table if not exists future_match_buffer (
+            match_id        text primary key,
+            match_date      text,
+            tournament      text,
+            category        text,
+            name            text,
+            start_time      integer,
+            period          text,
+            score_home      text,
+            score_away      text,
+            is_live         integer not null default 0,
+            is_finished     integer not null default 0,
+            ingested_at     text not null default current_timestamp,
+            enriched_at     text,
+            sofascore_id    text,
+            raw_sporty      text not null,
+            raw_enriched    text
+        )
+    """)
+    conn.execute("create index if not exists idx_future_buffer_date    on future_match_buffer(match_date)")
+    conn.execute("create index if not exists idx_future_buffer_enrich  on future_match_buffer(enriched_at)")
+
+
+def _buffer_table_for(match_date: str | None, is_live: int = 0) -> str:
+    """Hot buffer keeps live/today/tomorrow. Later fixtures live in a lower-priority buffer."""
+    if is_live:
+        return "match_buffer"
+    tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
+    return "future_match_buffer" if match_date and match_date > tomorrow else "match_buffer"
 
 
 # ── Phase 1: Ingest ───────────────────────────────────────────────────────────
@@ -116,14 +152,18 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             if _is_ghost_match(m.get("start_time"), period):
                 continue
 
+            table = _buffer_table_for(match_date, is_live)
+            other_table = "future_match_buffer" if table == "match_buffer" else "match_buffer"
+            conn.execute(f"delete from {other_table} where match_id = ?", (match_id,))
+
             # only count genuinely new rows
             exists = conn.execute(
-                "select 1 from match_buffer where match_id = ?", (match_id,)
+                f"select 1 from {table} where match_id = ?", (match_id,)
             ).fetchone()
 
             conn.execute(
-                """
-                insert into match_buffer (
+                f"""
+                insert into {table} (
                     match_id, match_date, tournament, category, name,
                     start_time, period, score_home, score_away,
                     is_live, is_finished, ingested_at, raw_sporty
@@ -277,41 +317,69 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
 
 def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]:
     """
-    Returns matches that need enrichment:
-    - Never enriched (enriched_at IS NULL)
-    - Enriched but sofascore_detail is missing (matched but detail fetch failed)
-    - Finished matches and already-fully-enriched matches are skipped entirely
+    Returns matches that need enrichment, in priority order:
+      1. Live matches (always first)
+      2. Today's unenriched matches
+      3. Tomorrow's unenriched matches
+      4. Future matches (beyond tomorrow) — enriched once per day, not every cycle
+
+    Future matches are included so SofaScore can match them to their actual
+    fixture and pre-populate H2H, standings, and team form ahead of kick-off.
+    They are deprioritised so live/today matches are never delayed.
     """
     _init_db()
-    cutoff_ts_ms = (datetime.now(timezone.utc).timestamp() - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
+    today = date_cls.today().isoformat()
+    tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
+
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            select match_id, raw_sporty, raw_enriched, is_live, match_date
-            from match_buffer
+        query = """
+            select match_id, raw_sporty, raw_enriched, is_live, match_date, ? as source_table
+            from {table}
             where is_finished = 0
-              and (is_live = 1 or match_date is null or match_date >= date('now'))
               and (start_time is null or cast(start_time as real) >= ?)
               and (
                 enriched_at is null
                 or sofascore_id is null
                 or sofascore_id = ''
               )
+              and (
+                json_extract(raw_enriched, '$.sofascore_match_status') is null
+                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
+                or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= ?
+              )
+        """
+        rows = conn.execute(
+            (query.format(table="match_buffer") + """
             order by
               is_live desc,
+              case when match_date = ? then 0 when match_date = ? then 1 else 2 end asc,
               case when enriched_at is null then 0 else 1 end asc,
               start_time asc
             limit ?
-            """,
-            (cutoff_ts_ms, limit),
+            """),
+            ("match_buffer", cutoff_ts_ms, now_ts, today, tomorrow, limit),
         ).fetchall()
+        if len(rows) < limit:
+            future_rows = conn.execute(
+                (query.format(table="future_match_buffer") + """
+                order by
+                  case when enriched_at is null then 0 else 1 end asc,
+                  start_time asc
+                limit ?
+                """),
+                ("future_match_buffer", cutoff_ts_ms, now_ts, limit - len(rows)),
+            ).fetchall()
+            rows = list(rows) + list(future_rows)
     return [
         {
             "match_id": row["match_id"],
             "is_live": bool(row["is_live"]),
             "match_date": row["match_date"],
+            "source_table": row["source_table"],
             "sporty": json.loads(row["raw_sporty"]),
             "existing": json.loads(row["raw_enriched"]) if row["raw_enriched"] else None,
         }
@@ -325,14 +393,18 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
+        table = "match_buffer"
         row = conn.execute("select raw_sporty, raw_enriched from match_buffer where match_id = ?", (match_id,)).fetchone()
+        if not row:
+            table = "future_match_buffer"
+            row = conn.execute("select raw_sporty, raw_enriched from future_match_buffer where match_id = ?", (match_id,)).fetchone()
         if row:
             raw_sporty = json.loads(row[0]) if row[0] else {}
             existing = json.loads(row[1]) if row[1] else {}
             doc = _merge_enriched(raw_sporty, existing, doc)
         conn.execute(
-            """
-            update match_buffer set
+            f"""
+            update {table} set
                 enriched_at  = ?,
                 sofascore_id = ?,
                 raw_enriched = ?
@@ -365,16 +437,26 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
         if match_date:
             clauses.append("match_date = ?")
             params.append(match_date)
-        rows = conn.execute(
+        hot_rows = conn.execute(
             f"""
-            select raw_enriched, raw_sporty, is_live, enriched_at
+            select raw_enriched, raw_sporty, is_live, enriched_at, match_date, 0 as future_priority, start_time
             from match_buffer
             where {" and ".join(clauses)}
-            order by is_live desc, start_time asc
-            limit ?
             """,
-            (*params, limit),
+            tuple(params),
         ).fetchall()
+        future_rows = conn.execute(
+            f"""
+            select raw_enriched, raw_sporty, is_live, enriched_at, match_date, 1 as future_priority, start_time
+            from future_match_buffer
+            where {" and ".join(clauses)}
+            """,
+            tuple(params),
+        ).fetchall()
+        rows = sorted(
+            list(hot_rows) + list(future_rows),
+            key=lambda row: (row["future_priority"], -int(row["is_live"] or 0), int(row["start_time"] or 0)),
+        )[:limit]
 
     result = []
     for row in rows:
@@ -385,7 +467,9 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
         else:
             # not yet enriched — return raw sporty data so frontend isn't empty
             sporty = json.loads(row["raw_sporty"])
-            result.append(_sporty_to_summary(sporty))
+            doc = _sporty_to_summary(sporty)
+            doc["match_date"] = row["match_date"]
+            result.append(doc)
     return result
 
 
@@ -396,16 +480,23 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "select raw_enriched, raw_sporty from match_buffer where match_id = ?",
+            "select raw_enriched, raw_sporty, match_date from match_buffer where match_id = ?",
             (str(match_id),),
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                "select raw_enriched, raw_sporty, match_date from future_match_buffer where match_id = ?",
+                (str(match_id),),
+            ).fetchone()
     if not row:
         return None
     if row["raw_enriched"]:
         doc = json.loads(row["raw_enriched"])
         sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
         return _ensure_country_fields(doc, sporty)
-    return _sporty_to_summary(json.loads(row["raw_sporty"]))
+    doc = _sporty_to_summary(json.loads(row["raw_sporty"]))
+    doc["match_date"] = row["match_date"]
+    return doc
 
 
 def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
@@ -437,18 +528,26 @@ def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
 
 def purge_ghost_matches() -> int:
     """
-    Remove matches from the buffer whose kick-off time has passed by more than
-    GHOST_MATCH_GRACE_MINUTES but are still showing as 'Not start'.
-    These are postponed, cancelled, or data-gap matches that will never go live.
-    Returns the number of rows deleted.
+    Remove stale matches from the buffer:
+    1. 'Not start' matches whose kick-off passed GHOST_MATCH_GRACE_MINUTES ago
+    2. Stuck-live matches from past dates that never transitioned to finished
+       (match_date < today and is_live=1 and is_finished=0)
+    3. Far-future matches beyond MAX_FUTURE_DAYS that have already been enriched
+       once — they'll be re-ingested and re-enriched closer to their date.
+       Unmatched far-future matches are kept so enrichment can try them.
+    Returns total rows deleted.
     """
     _init_db()
     now_ts = datetime.now(timezone.utc).timestamp()
-    cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000  # ms threshold
+    cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
+    today = date_cls.today().isoformat()
+    max_future = (date_cls.today() + timedelta(days=MAX_FUTURE_DAYS)).isoformat()
 
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
-        result = conn.execute(
+
+        # 1. Ghost not-started: kick-off passed but never went live
+        r1 = conn.execute(
             """
             delete from match_buffer
             where is_live = 0
@@ -459,10 +558,43 @@ def purge_ghost_matches() -> int:
             """,
             (cutoff_ts_ms,),
         )
+
+        # 2. Stuck-live: match_date is in the past but still flagged is_live=1
+        r2 = conn.execute(
+            """
+            delete from match_buffer
+            where is_live = 1
+              and is_finished = 0
+              and match_date < ?
+            """,
+            (today,),
+        )
+
+        # 3. Far-future already enriched: keep unmatched ones so enrichment
+        #    can still try to find them on SofaScore; only drop enriched ones
+        #    that are beyond MAX_FUTURE_DAYS (they'll be re-ingested fresh)
+        r3 = conn.execute(
+            """
+            delete from future_match_buffer
+            where is_live = 0
+              and is_finished = 0
+              and match_date > ?
+              and enriched_at is not null
+              and sofascore_id is not null
+              and sofascore_id != ''
+            """,
+            (max_future,),
+        )
+
         conn.commit()
-    deleted = result.rowcount
+
+    deleted = r1.rowcount + r2.rowcount + r3.rowcount
     if deleted:
-        print(f"[buffer] purge_ghost_matches: removed {deleted} stale not-started matches")
+        print(
+            f"[buffer] purge_ghost_matches: removed {deleted} total "
+            f"(ghost_not_started={r1.rowcount}, stuck_live={r2.rowcount}, "
+            f"far_future_re-enriched={r3.rowcount})"
+        )
     return deleted
 
 
@@ -474,9 +606,11 @@ def get_buffer_stats() -> dict[str, Any]:
     with sqlite3.connect(DB_PATH) as conn:
         _init_buffer_table(conn)
         total       = conn.execute("select count(*) from match_buffer").fetchone()[0]
+        future_total = conn.execute("select count(*) from future_match_buffer").fetchone()[0]
         today_count = conn.execute("select count(*) from match_buffer where match_date = ?", (today,)).fetchone()[0]
         live_count  = conn.execute("select count(*) from match_buffer where is_live = 1").fetchone()[0]
         enriched    = conn.execute("select count(*) from match_buffer where enriched_at is not null").fetchone()[0]
+        future_enriched = conn.execute("select count(*) from future_match_buffer where enriched_at is not null").fetchone()[0]
         pending     = conn.execute(
             """
             select count(*) from match_buffer
@@ -485,18 +619,43 @@ def get_buffer_stats() -> dict[str, Any]:
                 or sofascore_id is null
                 or sofascore_id = ''
             )
+              and (
+                json_extract(raw_enriched, '$.sofascore_match_status') is null
+                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
+                or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= strftime('%s','now')
+              )
+            """
+        ).fetchone()[0]
+        future_pending = conn.execute(
+            """
+            select count(*) from future_match_buffer
+            where is_finished = 0 and (
+                enriched_at is null
+                or sofascore_id is null
+                or sofascore_id = ''
+            )
+              and (
+                json_extract(raw_enriched, '$.sofascore_match_status') is null
+                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
+                or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= strftime('%s','now')
+              )
             """
         ).fetchone()[0]
         last_ingest = conn.execute("select max(ingested_at) from match_buffer").fetchone()[0]
         last_enrich = conn.execute("select max(enriched_at) from match_buffer").fetchone()[0]
 
     return {
-        "total_buffered": total,
+        "total_buffered": total + future_total,
+        "hot_buffered": total,
+        "future_buffered": future_total,
         "today": today_count,
         "live": live_count,
         "upcoming": today_count - live_count,
-        "enriched": enriched,
-        "pending_enrichment": pending,
+        "enriched": enriched + future_enriched,
+        "future_enriched": future_enriched,
+        "pending_enrichment": pending + future_pending,
+        "hot_pending_enrichment": pending,
+        "future_pending_enrichment": future_pending,
         "last_ingested_at": last_ingest,
         "last_enriched_at": last_enrich,
     }
@@ -514,6 +673,7 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.web_context import search_match_context
     from app.time_context import match_time_context
+    from app.activity_log import record_activity
     from datetime import date
 
     batch = get_unenriched_batch(batch_size)
@@ -549,6 +709,14 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
     for item in batch:
         sporty = item["sporty"]
         existing = item.get("existing") or {}
+        match_name = sporty.get("name") or item.get("match_id")
+        record_activity(
+            f"Matching SofaScore for {match_name}",
+            job="enrich_worker",
+            status="running",
+            match_id=str(item.get("match_id") or ""),
+            match_name=match_name,
+        )
         sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
         saved_sofa_id = existing.get("sofascore_id")
         sofa = None
@@ -580,6 +748,24 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
                 unmatched += 1
         else:
             matched += 1
+        if sofa:
+            record_activity(
+                f"SofaScore matched: {match_name}",
+                job="enrich_worker",
+                status="matched",
+                match_id=str(item.get("match_id") or ""),
+                match_name=match_name,
+                details={"sofascore_id": sofa.get("id"), "score": round(score, 3)},
+            )
+        else:
+            record_activity(
+                f"No confident SofaScore match for {match_name}",
+                job="enrich_worker",
+                status="waiting",
+                match_id=str(item.get("match_id") or ""),
+                match_name=match_name,
+                details={"best_score": round(score, 3), "retry_minutes": NO_MATCH_RETRY_MINUTES},
+            )
 
         pairs.append((item, sofa, score))
 
@@ -631,6 +817,10 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
         web_context = web_contexts.get(i, {"query": "", "snippets": [], "scraped": []})
         time_context = match_time_context({**sporty, "sofascore_event": sofa})
 
+        match_status = "matched" if sofa else "no_match"
+        retry_minutes = NO_MATCH_MIN_RETRY_LIVE_MINUTES if item.get("is_live") else NO_MATCH_RETRY_MINUTES
+        retry_after_ts = (datetime.now(timezone.utc) + timedelta(minutes=retry_minutes)).timestamp()
+
         doc = {
             **existing,
             "sportybet_id":      sporty.get("id"),
@@ -650,6 +840,12 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             "sofascore_detail":  detail,
             "web_context":       web_context,
             "match_score":       round(score, 3),
+            "sofascore_match_status": match_status,
+            "sofascore_candidate_count": len(sofa_events),
+            "sofascore_best_score": round(score, 3),
+            "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
+            "sofascore_no_match_at": None if sofa else now,
+            "sofascore_retry_after_ts": None if sofa else retry_after_ts,
             "manual_match":      bool(existing.get("manual_match")),
             "raw_sporty":        sporty,
             "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
@@ -658,16 +854,35 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
         }
 
         snapshot_odds(doc)
-        try:
-            from app.enriched_prediction import predict_enriched_match
-            from app.league_memory import record_prediction
+        if sofa:
+            try:
+                from app.enriched_prediction import predict_enriched_match
+                from app.league_memory import record_prediction
 
-            prediction = predict_enriched_match(doc)
-            doc["prediction"] = prediction
-            record_prediction(prediction)
-            predicted += 1
-        except Exception as exc:
-            print(f"[buffer] auto prediction failed for {item['match_id']}: {exc}")
+                prediction = predict_enriched_match(doc)
+                doc["prediction"] = prediction
+                record_prediction(prediction)
+                predicted += 1
+                record_activity(
+                    f"Prediction completed for {sporty.get('name') or item['match_id']}",
+                    job="enrich_worker",
+                    status="predicted",
+                    match_id=str(item.get("match_id") or ""),
+                    match_name=sporty.get("name"),
+                    details={"sofascore_id": doc.get("sofascore_id")},
+                )
+            except Exception as exc:
+                print(f"[buffer] auto prediction failed for {item['match_id']}: {exc}")
+                record_activity(
+                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {exc}",
+                    job="enrich_worker",
+                    status="error",
+                    match_id=str(item.get("match_id") or ""),
+                    match_name=sporty.get("name"),
+                )
+        else:
+            doc["prediction"] = None
+            doc["prediction_error"] = "Prediction deferred until a confident SofaScore match is found."
         doc["lifecycle"] = _lifecycle_state(doc)
         store_enriched(item["match_id"], doc)
         stored += 1
@@ -682,7 +897,6 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
         "predicted": predicted,
     }
 
-
 def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
     """
     Enrich pending SportyBet rows in kickoff order.
@@ -695,6 +909,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.web_context import search_match_context
     from app.time_context import match_time_context
+    from app.activity_log import record_activity
 
     queue = get_unenriched_batch(count)
     if not queue:
@@ -731,6 +946,14 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
     for item in queue:
         sporty = item["sporty"]
         existing = item.get("existing") or {}
+        match_name = sporty.get("name") or item.get("match_id")
+        record_activity(
+            f"Matching SofaScore for {match_name}",
+            job="date_aware_enrichment",
+            status="running",
+            match_id=str(item.get("match_id") or ""),
+            match_name=match_name,
+        )
         sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
         saved_sofa_id = existing.get("sofascore_id")
         sofa = None
@@ -760,8 +983,24 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
 
         if sofa:
             matched += 1
+            record_activity(
+                f"SofaScore matched: {match_name}",
+                job="date_aware_enrichment",
+                status="matched",
+                match_id=str(item.get("match_id") or ""),
+                match_name=match_name,
+                details={"sofascore_id": sofa.get("id"), "score": round(score, 3), "source": source},
+            )
         else:
             unmatched += 1
+            record_activity(
+                f"No confident SofaScore match for {match_name}",
+                job="date_aware_enrichment",
+                status="waiting",
+                match_id=str(item.get("match_id") or ""),
+                match_name=match_name,
+                details={"best_score": round(score, 3), "source": source},
+            )
 
         detail = None
         if sofa:
@@ -782,6 +1021,9 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
 
         time_context = match_time_context({**sporty, "sofascore_event": sofa})
         now = datetime.now(timezone.utc).isoformat()
+        match_status = "matched" if sofa else "no_match"
+        retry_minutes = NO_MATCH_MIN_RETRY_LIVE_MINUTES if item.get("is_live") else NO_MATCH_RETRY_MINUTES
+        retry_after_ts = (datetime.now(timezone.utc) + timedelta(minutes=retry_minutes)).timestamp()
         doc = {
             **existing,
             "sportybet_id":      sporty.get("id"),
@@ -802,6 +1044,12 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "web_context":       web_context,
             "match_score":       round(score, 3),
             "match_source":      source,
+            "sofascore_match_status": match_status,
+            "sofascore_candidate_count": len(sofa_events),
+            "sofascore_best_score": round(score, 3),
+            "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
+            "sofascore_no_match_at": None if sofa else now,
+            "sofascore_retry_after_ts": None if sofa else retry_after_ts,
             "manual_match":      bool(existing.get("manual_match")),
             "raw_sporty":        sporty,
             "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
@@ -810,17 +1058,36 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         }
 
         snapshot_odds(doc)
-        try:
-            from app.enriched_prediction import predict_enriched_match
-            from app.league_memory import record_prediction
+        if sofa:
+            try:
+                from app.enriched_prediction import predict_enriched_match
+                from app.league_memory import record_prediction
 
-            prediction = predict_enriched_match(doc)
-            doc["prediction"] = prediction
-            record_prediction(prediction)
-            predicted += 1
-        except Exception as exc:
-            doc["prediction_error"] = str(exc)
-            print(f"[buffer] sequential prediction failed for {item['match_id']}: {exc}")
+                prediction = predict_enriched_match(doc)
+                doc["prediction"] = prediction
+                record_prediction(prediction)
+                predicted += 1
+                record_activity(
+                    f"Prediction completed for {sporty.get('name') or item['match_id']}",
+                    job="date_aware_enrichment",
+                    status="predicted",
+                    match_id=str(item.get("match_id") or ""),
+                    match_name=sporty.get("name"),
+                    details={"sofascore_id": doc.get("sofascore_id")},
+                )
+            except Exception as exc:
+                doc["prediction_error"] = str(exc)
+                print(f"[buffer] sequential prediction failed for {item['match_id']}: {exc}")
+                record_activity(
+                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {exc}",
+                    job="date_aware_enrichment",
+                    status="error",
+                    match_id=str(item.get("match_id") or ""),
+                    match_name=sporty.get("name"),
+                )
+        else:
+            doc["prediction"] = None
+            doc["prediction_error"] = "Prediction deferred until a confident SofaScore match is found."
 
         doc["lifecycle"] = _lifecycle_state(doc)
         store_enriched(item["match_id"], doc)
@@ -832,7 +1099,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "sofascore_id": doc.get("sofascore_id"),
             "matched": bool(sofa),
             "has_detail": bool(detail),
-            "predicted": bool(doc.get("prediction")),
+            "predicted": bool(sofa and doc.get("prediction")),
             "prediction_error": doc.get("prediction_error"),
             "score": round(score, 3),
             "source": source,
@@ -981,6 +1248,12 @@ def _is_90_plus(played_seconds: Any) -> bool:
 
 # Grace period after kick-off before we consider a non-live match as ghost/abandoned
 GHOST_MATCH_GRACE_MINUTES = 120  # 2 hours past start_time
+
+# How many days ahead to keep already-enriched future fixtures in the buffer.
+# Unmatched/unenriched future matches are always kept so enrichment can try them.
+# Once enriched, matches beyond this window are dropped and re-ingested fresh
+# closer to their date (SofaScore data changes as kick-off approaches).
+MAX_FUTURE_DAYS = 14
 
 
 def _is_ghost_match(start_time: Any, period: str | None) -> bool:

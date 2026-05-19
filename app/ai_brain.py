@@ -18,8 +18,9 @@ def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None
     of what has worked before — not just the current match in isolation.
     Falls back to deterministic review when no model is running.
     """
+    safe_detail = detail if isinstance(detail, dict) else {}
     memory_context = _build_memory_context(prediction)
-    prompt_payload = _compact_prediction(prediction, detail, memory_context)
+    prompt_payload = _compact_prediction(prediction, safe_detail, memory_context)
     provider = get_settings().ai_provider
     providers = ["huggingface", "ollama"] if provider == "auto" else [provider]
     for name in providers:

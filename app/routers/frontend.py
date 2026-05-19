@@ -132,7 +132,16 @@ def get_sofascore_candidates(sportybet_id: str):
         key=lambda item: item["score"],
         reverse=True,
     )
-    candidates = [item for item in candidate_pool if float(item.get("score") or 0) >= 0.58]
+    min_score = 0.58 if live else 0.70
+    candidates = [item for item in candidate_pool if float(item.get("score") or 0) >= min_score]
+    best_score = float(candidate_pool[0].get("score") or 0) if candidate_pool else 0.0
+    reason = None
+    if not candidates:
+        reason = (
+            "no_usable_sofascore_events_found"
+            if not candidate_pool
+            else "best_candidate_below_prematch_confidence_threshold"
+        )
     return {
         "status": "success",
         "sportybet_id": sportybet_id,
@@ -141,7 +150,10 @@ def get_sofascore_candidates(sportybet_id: str):
         "mode": "live" if live else "prematch",
         "count": len(candidates),
         "rejected_low_score": len(candidate_pool) - len(candidates),
-        "min_score": 0.58,
+        "candidate_pool": len(candidate_pool),
+        "best_score": round(best_score, 3),
+        "min_score": min_score,
+        "reason": reason,
         "candidates": candidates,
     }
 
@@ -281,6 +293,7 @@ def get_predictions_today():
     """Return today's latest predictions per match, sorted by confidence desc. Excludes no_bet."""
     from datetime import date, datetime, timedelta
     from app.league_memory import list_prediction_history, DB_PATH, _init_db
+    from app.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     today = date.today().isoformat()
@@ -302,8 +315,13 @@ def get_predictions_today():
     try:
         with _sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = _sqlite3.Row
+            _init_buffer_table(conn)
             rows = conn.execute(
-                "select match_id, period, is_live, is_finished from match_buffer"
+                """
+                select match_id, period, is_live, is_finished from match_buffer
+                union all
+                select match_id, period, is_live, is_finished from future_match_buffer
+                """
             ).fetchall()
             for row in rows:
                 buffer_status[str(row["match_id"])] = {
@@ -320,6 +338,8 @@ def get_predictions_today():
         mid = str(p.get("match_id") or "")
         if not mid or mid in seen:
             continue
+        if p.get("result") or p.get("graded_at"):
+            continue
         # Skip no_bet picks
         picks = p.get("picks") or []
         real_picks = [pk for pk in picks if pk.get("type") != "no_bet"]
@@ -334,6 +354,8 @@ def get_predictions_today():
         p["period"]      = status.get("period") or p.get("period")
         p["is_live"]     = status.get("is_live", False)
         p["is_finished"] = status.get("is_finished", False)
+        if p["is_finished"] or _is_finished_doc(p):
+            continue
 
         # Attach regime info + filter picks that don't meet regime threshold
         try:
@@ -356,7 +378,7 @@ def get_predictions_today():
         seen[mid] = p
     sorted_preds = sorted(
         seen.values(),
-        key=lambda x: int((x.get("best_pick") or {}).get("confidence") or 0),
+        key=lambda x: str(x.get("created_at") or ""),
         reverse=True,
     )
 
@@ -504,11 +526,22 @@ def cleanup_finished_matches():
 @router.get("/buffer/status")
 def get_buffer_status():
     """Scheduler health + buffer counts. Use to verify background jobs are running."""
+    from app.activity_log import get_activity
+
     return {
         "status": "success",
         "scheduler": scheduler_status(),
         "buffer": get_buffer_stats(),
+        "activity": get_activity(limit=12),
     }
+
+
+@router.get("/system/activity")
+def get_system_activity(limit: int = Query(default=30, ge=1, le=120)):
+    """Small live activity log for the Settings page."""
+    from app.activity_log import get_activity
+
+    return {"status": "success", **get_activity(limit=limit)}
 
 
 @router.get("/analytics/clv")
@@ -1156,6 +1189,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "away_team": _away_team(doc),
         "tournament": doc.get("tournament"),
         "category": doc.get("category"),
+        "match_date": doc.get("match_date") or (doc.get("time_context") or {}).get("local_date"),
         "start_time": doc.get("start_time"),
         "period": doc.get("period"),
         "played_seconds": doc.get("played_seconds"),

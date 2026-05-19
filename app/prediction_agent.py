@@ -95,7 +95,9 @@ def predict_sofascore_event(
     away = event.get("away_team") or event.get("awayTeam") or {}
     status = event.get("status", {})
     score = event.get("score", {})
-    tournament = event.get("tournament", {})
+    raw_tournament = event.get("tournament", {})
+    tournament = raw_tournament if isinstance(raw_tournament, dict) else {}
+    tournament_name = tournament.get("name") or (raw_tournament if isinstance(raw_tournament, str) else "")
 
     signals: list[dict[str, Any]] = []
     picks: list[dict[str, Any]] = []
@@ -118,7 +120,7 @@ def predict_sofascore_event(
     total_goals = _to_int(score.get("home"), 0) + _to_int(score.get("away"), 0)
     minute = _event_minute(event)
     is_live = status.get("type") == "inprogress"
-    late_goal_league = _is_high_late_goal_league(tournament.get("name"))
+    late_goal_league = _is_high_late_goal_league(tournament_name)
     memory_signal = late_goal_memory_signal(event)
     memory_boost = _late_goal_memory_boost(memory_signal, signals)
 
@@ -133,8 +135,22 @@ def predict_sofascore_event(
     goal_pressure = _goal_pressure(home_form, away_form, event, signals)
     live_chase_pressure = _live_chase_pressure(event, home_power, goal_pressure, signals)
     btts_pressure = _btts_pressure(home_form, away_form)
-    if goal_pressure <= 6 and home_form.get("sample_size") and away_form.get("sample_size"):
-        picks.append(_pick("goals", "Under 3.5 goals", 62 + min(10, 8 - int(goal_pressure)), "recent final scores lean low enough for under 3.5"))
+    home_over35 = float(home_form.get("over_3_5_rate") or 0)
+    away_over35 = float(away_form.get("over_3_5_rate") or 0)
+    avg_total = (
+        float(home_form.get("avg_total_goals") or 0) + float(away_form.get("avg_total_goals") or 0)
+    ) / 2
+    four_goal_rate = (home_over35 + away_over35) / 2
+    calm_under_env = (
+        home_form.get("sample_size")
+        and away_form.get("sample_size")
+        and goal_pressure <= 12
+        and avg_total <= 2.65
+        and four_goal_rate <= 0.22
+    )
+    if calm_under_env:
+        confidence = 61 + min(10, max(0, 12 - int(goal_pressure))) + min(4, int((0.25 - four_goal_rate) * 20))
+        picks.append(_pick("goals", "Under 3.5 goals", confidence, "recent finals are low and four-goal volatility is limited"))
     if goal_pressure <= 3 and home_form.get("sample_size") and away_form.get("sample_size"):
         picks.append(_pick("goals", "Under 2.5 goals", 57 + min(10, 5 - int(goal_pressure)), "low scoring and conceding profile from previous matches"))
     if goal_pressure >= 10:
@@ -161,7 +177,7 @@ def predict_sofascore_event(
 
     if is_live and minute >= 70 and late_goal_league and total_goals <= 2:
         picks.append(_pick("live_goals", "Late goal watch", 61 + memory_boost, "league profile plus learned late-goal memory"))
-        signals.append({"name": "late_goal_league", "value": tournament.get("name"), "impact": 7})
+        signals.append({"name": "late_goal_league", "value": tournament_name, "impact": 7})
 
     if live_chase_pressure >= 12:
         picks.append(_pick("live_goals", "Next goal / Over 0.5 live", 62 + min(live_chase_pressure, 12) + memory_boost, "close scoreline plus chasing pressure"))
@@ -261,23 +277,30 @@ def _team_history_features(team_id: int | None, history: list[dict[str, Any]]) -
     results = []
     btts = []
     over_25 = []
+    over_35 = []
+    totals = []
     for match in finished:
         is_home = match.get("home_team", {}).get("id") == team_id
         home_goals = _to_int(match.get("score", {}).get("home"), 0)
         away_goals = _to_int(match.get("score", {}).get("away"), 0)
+        total_goals = home_goals + away_goals
         gf = home_goals if is_home else away_goals
         ga = away_goals if is_home else home_goals
         goals_for.append(gf)
         goals_against.append(ga)
         btts.append(gf > 0 and ga > 0)
-        over_25.append(gf + ga > 2)
+        over_25.append(total_goals > 2)
+        over_35.append(total_goals > 3)
+        totals.append(total_goals)
         results.append("W" if gf > ga else "D" if gf == ga else "L")
 
     return {
         "sample_size": len(finished),
         "avg_goals_for": round(mean(goals_for), 2),
         "avg_goals_against": round(mean(goals_against), 2),
+        "avg_total_goals": round(mean(totals), 2),
         "over_2_5_rate": round(sum(over_25) / len(over_25), 2),
+        "over_3_5_rate": round(sum(over_35) / len(over_35), 2),
         "btts_rate": round(sum(btts) / len(btts), 2),
         "form": results,
         "form_points": sum(3 if r == "W" else 1 if r == "D" else 0 for r in results),
@@ -319,6 +342,13 @@ def _common_opponent_edge(
         if own == opp: return 1
         return 0
 
+    def _goal_diff(event: dict[str, Any], team: str) -> int:
+        h = event.get("home_team", {}).get("name") or event.get("homeTeam", {}).get("name") or ""
+        score = event.get("score") or {}
+        hs = _to_int(score.get("home"), 0)
+        as_ = _to_int(score.get("away"), 0)
+        return (hs - as_) if h.lower() == team.lower() else (as_ - hs)
+
     def _norm(name: str) -> str:
         return name.lower().strip()[:8]
 
@@ -334,8 +364,10 @@ def _common_opponent_edge(
         pts = _result_pts(ev, home_name)
         if pts < 0:
             continue
-        if key not in home_opp or pts > home_opp[key]["pts"]:
-            home_opp[key] = {"pts": pts, "opp": opp, "event": ev}
+        gd = _goal_diff(ev, home_name)
+        rating = pts + (gd * 0.35)
+        if key not in home_opp or rating > home_opp[key]["rating"]:
+            home_opp[key] = {"pts": pts, "gd": gd, "rating": rating, "opp": opp, "event": ev}
 
     away_opp: dict[str, dict] = {}
     for ev in away_history:
@@ -348,8 +380,10 @@ def _common_opponent_edge(
         pts = _result_pts(ev, away_name)
         if pts < 0:
             continue
-        if key not in away_opp or pts > away_opp[key]["pts"]:
-            away_opp[key] = {"pts": pts, "opp": opp, "event": ev}
+        gd = _goal_diff(ev, away_name)
+        rating = pts + (gd * 0.35)
+        if key not in away_opp or rating > away_opp[key]["rating"]:
+            away_opp[key] = {"pts": pts, "gd": gd, "rating": rating, "opp": opp, "event": ev}
 
     shared_keys = set(home_opp) & set(away_opp)
     if not shared_keys:
@@ -357,21 +391,32 @@ def _common_opponent_edge(
 
     home_total = 0
     away_total = 0
+    home_gd = 0
+    away_gd = 0
+    home_rating = 0.0
+    away_rating = 0.0
     comparisons = []
     for key in shared_keys:
         h_entry = home_opp[key]
         a_entry = away_opp[key]
         home_total += h_entry["pts"]
         away_total += a_entry["pts"]
+        home_gd += h_entry["gd"]
+        away_gd += a_entry["gd"]
+        home_rating += h_entry["rating"]
+        away_rating += a_entry["rating"]
         comparisons.append({
             "opponent": h_entry["opp"],
             "home_pts": h_entry["pts"],
             "away_pts": a_entry["pts"],
+            "home_goal_diff": h_entry["gd"],
+            "away_goal_diff": a_entry["gd"],
+            "winner": "home" if h_entry["rating"] > a_entry["rating"] else "away" if a_entry["rating"] > h_entry["rating"] else "even",
             "home_event": h_entry["event"],
             "away_event": a_entry["event"],
         })
 
-    raw_edge = home_total - away_total
+    raw_edge = home_rating - away_rating
     edge = round(max(-12, min(12, raw_edge * 1.5)), 2)
 
     if abs(edge) >= 1.5:
@@ -381,11 +426,18 @@ def _common_opponent_edge(
                 "shared_opponents": len(shared_keys),
                 "home_points": home_total,
                 "away_points": away_total,
+                "home_goal_diff": home_gd,
+                "away_goal_diff": away_gd,
+                "home_rating": round(home_rating, 2),
+                "away_rating": round(away_rating, 2),
                 "comparisons": [
                     {
                         "opponent": c["opponent"],
                         "home_result": _pts_label(c["home_pts"]),
                         "away_result": _pts_label(c["away_pts"]),
+                        "home_goal_diff": c["home_goal_diff"],
+                        "away_goal_diff": c["away_goal_diff"],
+                        "winner": c["winner"],
                         "home_score": _score_str(c["home_event"]),
                         "away_score": _score_str(c["away_event"]),
                         "home_date": _event_date(c["home_event"]),
@@ -577,7 +629,7 @@ def _goal_pressure(home_form: dict[str, Any], away_form: dict[str, Any], event: 
         + away_form.get("avg_goals_against", 0)
     ) * 4
     pressure += (home_form.get("over_2_5_rate", 0) + away_form.get("over_2_5_rate", 0)) * 8
-    if _is_high_late_goal_league((event.get("tournament") or {}).get("name")):
+    if _is_high_late_goal_league(_tournament_name(event)):
         pressure += 3
     signals.append({"name": "goal_pressure", "value": round(pressure, 2), "impact": round(pressure, 2)})
     return pressure
@@ -738,3 +790,11 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _tournament_name(event: dict[str, Any]) -> str:
+    """Safely extract tournament name whether it's a string or a dict."""
+    t = event.get("tournament") or ""
+    if isinstance(t, dict):
+        return str(t.get("name") or "")
+    return str(t)
