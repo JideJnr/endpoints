@@ -256,6 +256,19 @@ def fetch_live_and_upcoming_matches_post() -> list[dict]:
     return live + [match for match in upcoming if match.get("id") not in seen]
 
 
+# Backward-compatible aliases for older routers/deploys.
+def fetch_live_matches() -> list[dict]:
+    return fetch_live_matches_post()
+
+
+def fetch_upcoming_matches() -> list[dict]:
+    return fetch_upcoming_matches_post()
+
+
+def fetch_live_and_upcoming_matches() -> list[dict]:
+    return fetch_live_and_upcoming_matches_post()
+
+
 def fetch_results(start_time_ms: int, end_time_ms: int, count: int = 200, last_id: str = "") -> list[dict]:
     """Fetch finished match results from SportyBet for a time window."""
     params = {
