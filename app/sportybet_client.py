@@ -59,6 +59,11 @@ def _new_session() -> cffi_requests.Session:
     else:
         session = cffi_requests.Session()
     session.trust_env = False
+    # Optional residential proxy — set SPORTYBET_PROXY in Render env vars
+    # e.g. http://user:pass@residential-proxy-host:port
+    proxy = os.getenv("SPORTYBET_PROXY")
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
     return session
 
 

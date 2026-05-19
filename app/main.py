@@ -92,7 +92,9 @@ def _run_initial_enrichment():
 
 
 @app.get("/health")
+@app.head("/health")
 def health():
+    """Health check — supports both GET and HEAD for uptime monitors."""
     return {"status": "ok"}
 
 

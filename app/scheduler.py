@@ -247,6 +247,33 @@ def job_prune_mongo(keep_days: int = 90) -> dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
+def job_keep_alive() -> dict[str, Any]:
+    """
+    Ping our own /health endpoint every 10 minutes to prevent Render free tier
+    from spinning down the server. Without this, the dyno sleeps after 15 min
+    of inactivity and the next request gets a cold-start 405/timeout.
+    """
+    import os
+    from urllib import request as urllib_request, error as urllib_error
+
+    # Self-URL: set RENDER_EXTERNAL_URL in Render env vars (auto-set by Render)
+    # or fall back to the known endpoint.
+    base = (
+        os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("PREDICTX_SELF_URL")
+        or "https://endpoints-dtfx.onrender.com"
+    ).rstrip("/")
+
+    url = f"{base}/health"
+    try:
+        req = urllib_request.Request(url, method="GET")
+        with urllib_request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+        return {"status": "ok", "pinged": url, "response": status}
+    except urllib_error.URLError as exc:
+        return {"status": "error", "pinged": url, "error": str(exc)}
+
+
 # ── Scheduler setup ───────────────────────────────────────────────────────────
 
 def start_scheduler():
@@ -339,6 +366,17 @@ def start_scheduler():
         misfire_grace_time=3600,
     )
 
+    # keep-alive ping — every 10 min to prevent Render free tier sleep
+    scheduler.add_job(
+        _safe(job_keep_alive),
+        IntervalTrigger(minutes=10),
+        id="keep_alive",
+        name="Self-ping to prevent Render cold starts",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
+    )
+
     scheduler.start()
     _scheduler = scheduler
     print("[scheduler] started — running forever, no frontend required")
@@ -349,6 +387,7 @@ def start_scheduler():
     print("[scheduler]   archive_finished every 15 min  (finished → MongoDB)")
     print("[scheduler]   grade_predictions every  6 hrs  (analytics + ELO)")
     print("[scheduler]   prune_mongo      every  7 days (remove matches >90 days old)")
+    print("[scheduler]   keep_alive       every 10 min  (prevent Render cold start)")
     return scheduler
 
 
