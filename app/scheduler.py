@@ -156,23 +156,30 @@ def job_flush_to_mongo() -> dict[str, Any]:
     return {"flush": flush_result, "cleanup": cleanup_result, "ghost_purged": ghost_deleted}
 
 def job_grade_predictions() -> dict[str, Any]:
-    """Auto-grade yesterday's predictions against finished SofaScore results."""
+    """Auto-grade recent predictions and refresh learning tables."""
     from datetime import date, timedelta
 
     from app.elo import record_match_result_once
     from app.league_memory import get_grading_metrics, grade_predictions_for_date
     from app.sofascore_client import fetch_all_scheduled_events
 
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    target_dates = [(date.today() - timedelta(days=days)).isoformat() for days in range(0, 4)]
     try:
-        events = fetch_all_scheduled_events(yesterday)
-        result = grade_predictions_for_date(yesterday, events)
-        finished = [event for event in events if (event.get("status") or {}).get("type") == "finished"]
+        by_date = []
+        total_graded = 0
+        total_skipped = 0
         elo_updated = 0
-        for event in finished:
-            elo_result = record_match_result_once("sofascore", event)
-            if elo_result.get("updated"):
-                elo_updated += 1
+        for target_date in target_dates:
+            events = fetch_all_scheduled_events(target_date)
+            result = grade_predictions_for_date(target_date, events)
+            finished = [event for event in events if (event.get("status") or {}).get("type") == "finished"]
+            for event in finished:
+                elo_result = record_match_result_once("sofascore", event)
+                if elo_result.get("updated"):
+                    elo_updated += 1
+            total_graded += int(result.get("graded") or 0)
+            total_skipped += int(result.get("skipped") or 0)
+            by_date.append({"date": target_date, **result, "finished": len(finished)})
         metrics = get_grading_metrics()
 
         # Rebuild confidence calibration from updated win/loss history
@@ -182,30 +189,45 @@ def job_grade_predictions() -> dict[str, Any]:
         except Exception as exc:
             cal_result = {"error": str(exc)}
 
+        # Run self-learning cycle and optimise ensemble weights.
+        try:
+            from app.weight_optimiser import optimise_ensemble_weights
+            learn_result = optimise_ensemble_weights()
+        except Exception as exc:
+            learn_result = {"error": str(exc)}
+
         # Grade odds patterns for yesterday
         try:
             from app.odds_pattern import grade_patterns_for_date
-            pattern_result = grade_patterns_for_date(yesterday)
+            pattern_result = {"by_date": [{"date": d, **grade_patterns_for_date(d)} for d in target_dates]}
         except Exception as exc:
             pattern_result = {"error": str(exc)}
 
         # Compute CLV for yesterday — fill closing odds + attach results
         try:
             from app.clv import compute_clv_for_date
-            clv_result = compute_clv_for_date(yesterday)
+            clv_result = {"by_date": [{"date": d, **compute_clv_for_date(d)} for d in target_dates]}
         except Exception as exc:
             clv_result = {"error": str(exc)}
 
+        try:
+            from app.mongo_store import cleanup_buffer
+            cleanup_result = cleanup_buffer()
+        except Exception as exc:
+            cleanup_result = {"error": str(exc)}
+
         print(
-            f"[scheduler] grade_predictions: graded={result.get('graded')} "
+            f"[scheduler] grade_predictions: graded={total_graded} skipped={total_skipped} "
             f"elo_updated={elo_updated} win_rate={metrics.get('win_percent')}% "
             f"calibration_bands={cal_result.get('bands_updated', 0)} "
-            f"patterns_graded={pattern_result.get('graded_patterns', 0)} "
-            f"clv_updated={clv_result.get('clv_entries_updated', 0)}"
+            f"signals_learned={(learn_result.get('learning') or {}).get('signal_updates', 0)} "
+            f"model_weights={(learn_result.get('learning') or {}).get('model_weight_updates', 0)} "
+            f"cleanup_finished={cleanup_result.get('deleted_finished')}"
         )
-        return {**result, "metrics": metrics, "elo_updated": elo_updated,
+        return {"status": "success", "dates": by_date, "graded": total_graded, "skipped": total_skipped,
+                "metrics": metrics, "elo_updated": elo_updated,
                 "calibration": cal_result, "patterns": pattern_result,
-                "clv": clv_result}
+                "clv": clv_result, "learning": learn_result, "cleanup": cleanup_result}
     except Exception as exc:
         print(f"[scheduler] grade_predictions failed: {exc}")
         return {"status": "error", "error": str(exc)}

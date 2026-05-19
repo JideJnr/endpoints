@@ -3,13 +3,40 @@ from __future__ import annotations
 from typing import Any
 
 
-WEIGHTS = {
+# Hardcoded fallback weights — overridden by learned weights when enough data exists
+_BASE_WEIGHTS = {
     "dixon_coles": 0.30,
     "elo": 0.25,
     "poisson": 0.15,
     "rules": 0.20,
     "groq": 0.10,
 }
+
+# Module-level cache so we don't hit SQLite on every prediction
+_cached_weights: dict[str, float] | None = None
+_cache_hits = 0
+_CACHE_REFRESH_EVERY = 50  # refresh learned weights every N predictions
+
+
+def _get_weights() -> dict[str, float]:
+    """Return learned weights if available, else hardcoded defaults."""
+    global _cached_weights, _cache_hits
+    _cache_hits += 1
+    if _cached_weights is None or _cache_hits % _CACHE_REFRESH_EVERY == 0:
+        try:
+            from app.self_learner import get_learned_weights
+            learned = get_learned_weights()
+            if learned:
+                _cached_weights = learned
+                return _cached_weights
+        except Exception:
+            pass
+        _cached_weights = dict(_BASE_WEIGHTS)
+    return _cached_weights
+
+
+# Keep WEIGHTS accessible for backward compatibility
+WEIGHTS = _BASE_WEIGHTS
 
 
 def ensemble_prediction(
@@ -20,6 +47,7 @@ def ensemble_prediction(
     rules_pick: str,
     groq: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    weights = _get_weights()
     scores = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
     total_weight = 0.0
 
@@ -31,7 +59,7 @@ def ensemble_prediction(
         total_weight += weight
 
     if dixon and dixon.get("probabilities"):
-        _add(dixon["probabilities"], WEIGHTS["dixon_coles"])
+        _add(dixon["probabilities"], weights.get("dixon_coles", 0.30))
     if elo:
         draw_estimate = max(5, 30 - abs(float(elo["home_win_probability"]) - 50) * 0.4)
         _add(
@@ -40,22 +68,22 @@ def ensemble_prediction(
                 "draw": draw_estimate,
                 "away_win": elo["away_win_probability"],
             },
-            WEIGHTS["elo"],
+            weights.get("elo", 0.25),
         )
     if poisson and poisson.get("probabilities"):
-        _add(poisson["probabilities"], WEIGHTS["poisson"])
+        _add(poisson["probabilities"], weights.get("poisson", 0.15))
 
     rules_prob = max(0, min(100, rules_confidence))
     pick = (rules_pick or "").lower()
     if "home" in pick:
-        _add({"home_win": rules_prob, "draw": 10, "away_win": 100 - rules_prob}, WEIGHTS["rules"])
+        _add({"home_win": rules_prob, "draw": 10, "away_win": 100 - rules_prob}, weights.get("rules", 0.20))
     elif "away" in pick:
-        _add({"home_win": 100 - rules_prob, "draw": 10, "away_win": rules_prob}, WEIGHTS["rules"])
+        _add({"home_win": 100 - rules_prob, "draw": 10, "away_win": rules_prob}, weights.get("rules", 0.20))
     elif "draw" in pick:
-        _add({"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}, WEIGHTS["rules"])
+        _add({"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}, weights.get("rules", 0.20))
 
     if groq and groq.get("probabilities"):
-        _add(groq["probabilities"], WEIGHTS["groq"])
+        _add(groq["probabilities"], weights.get("groq", 0.10))
 
     if total_weight == 0:
         return {"error": "no models available"}
@@ -69,6 +97,8 @@ def ensemble_prediction(
         "probabilities": scores,
         "prediction": best.replace("_", " ").title(),
         "confidence": round(scores[best], 1),
+        "weights_used": weights,
+        "weights_source": "learned" if _cached_weights and _cached_weights != _BASE_WEIGHTS else "default",
         "models_used": [
             name
             for name, value in {

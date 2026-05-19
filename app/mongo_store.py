@@ -307,6 +307,26 @@ def cleanup_buffer() -> dict[str, Any]:
     ghost_cutoff_ms = (now_ts - 120 * 60) * 1000
 
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows_to_archive = conn.execute(
+            """
+            select match_id from match_buffer
+            where is_finished = 1
+               or lower(period) in ('ft','finished','ended','aet','ap','full time','after penalties','after extra time')
+               or (is_live = 1 and cast(json_extract(raw_sporty, '$.played_seconds') as integer) >= 5400)
+            """
+        ).fetchall()
+    for row in rows_to_archive:
+        try:
+            if is_configured():
+                archive_finished_match_from_buffer(str(row["match_id"]))
+            else:
+                from app.buffer import _archive_finished_locally
+                _archive_finished_locally(str(row["match_id"]))
+        except Exception:
+            pass
+
+    with sqlite3.connect(DB_PATH) as conn:
         # Delete rows explicitly marked finished
         r1 = conn.execute("delete from match_buffer where is_finished = 1")
         # Delete rows whose period string indicates finished

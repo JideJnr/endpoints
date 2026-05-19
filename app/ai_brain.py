@@ -12,15 +12,99 @@ DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 
 
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Optional AI supervisor. Falls back to deterministic review when no local model is running."""
-    prompt_payload = _compact_prediction(prediction, detail)
+    """
+    AI supervisor with memory-aware reasoning.
+    Injects historical accuracy context so the LLM reasons with knowledge
+    of what has worked before — not just the current match in isolation.
+    Falls back to deterministic review when no model is running.
+    """
+    memory_context = _build_memory_context(prediction)
+    prompt_payload = _compact_prediction(prediction, detail, memory_context)
     provider = get_settings().ai_provider
     providers = ["huggingface", "ollama"] if provider == "auto" else [provider]
     for name in providers:
         ai = _provider_review(name, prompt_payload)
         if ai:
+            ai["memory_context_used"] = bool(memory_context)
             return ai
-    return _rule_review(prediction)
+    return _rule_review(prediction, memory_context)
+
+
+def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build a memory block from the self-learner and CLV data.
+    This gives the AI brain historical awareness:
+      - Which signals are hot/cold right now
+      - How accurate the system has been in this league
+      - Whether CLV is positive (are we beating the market?)
+      - Auto-tuned model weights
+    """
+    context: dict[str, Any] = {}
+
+    try:
+        from app.self_learner import get_signal_weights, get_league_accuracy, get_top_signals, get_learned_weights, get_learning_summary
+        league = prediction.get("league_name") or prediction.get("tournament") or ""
+        if isinstance(league, dict):
+            league = league.get("name") or ""
+
+        # Signal weights for this league
+        signal_weights = get_signal_weights(league)
+        if signal_weights:
+            context["signal_weights"] = signal_weights
+
+        # League accuracy profile
+        league_acc = get_league_accuracy(league)
+        if league_acc.get("known"):
+            context["league_accuracy"] = league_acc
+
+        # Top performing signals globally
+        top_signals = get_top_signals(limit=5)
+        if top_signals:
+            context["top_signals_globally"] = [
+                {"signal": s["signal"], "win_rate": s["win_rate"], "verdict": s["verdict"]}
+                for s in top_signals[:5]
+            ]
+
+        summary = get_learning_summary()
+        cold = summary.get("bottom_signals") or []
+        if cold:
+            context["cold_signals_globally"] = [
+                {"signal": s.get("signal"), "win_rate": s.get("win_rate"), "samples": s.get("samples")}
+                for s in cold[:5]
+            ]
+
+        # Current model weights (auto-tuned)
+        context["model_weights"] = get_learned_weights()
+
+    except Exception:
+        pass
+
+    try:
+        from app.clv import get_clv_summary
+        clv = get_clv_summary(days=14)
+        avg_clv = clv.get("avg_clv_percent")
+        if avg_clv is not None:
+            context["clv_14d"] = {
+                "avg_clv_percent": avg_clv,
+                "edge_quality": clv.get("edge_quality"),
+                "positive_clv_rate": clv.get("positive_clv_rate"),
+            }
+    except Exception:
+        pass
+
+    try:
+        from app.confidence_calibrator import get_calibration_table
+        cal = get_calibration_table()
+        if cal:
+            context["calibration"] = [
+                {"band": c.get("band"), "win_rate": c.get("win_rate"), "samples": c.get("samples")}
+                for c in (cal if isinstance(cal, list) else [])
+                if (c.get("samples") or 0) >= 10
+            ][:6]
+    except Exception:
+        pass
+
+    return context
 
 
 def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -91,7 +175,7 @@ def _ollama_review(payload: dict[str, Any]) -> dict[str, Any] | None:
     return _review_result("ollama", model, parsed)
 
 
-def _rule_review(prediction: dict[str, Any]) -> dict[str, Any]:
+def _rule_review(prediction: dict[str, Any], memory_context: dict[str, Any] | None = None) -> dict[str, Any]:
     best = (prediction.get("picks") or [{}])[0]
     signals = prediction.get("signals") or []
     confidence = _to_int(best.get("confidence"), 50)
@@ -112,19 +196,41 @@ def _rule_review(prediction: dict[str, Any]) -> dict[str, Any]:
         risks.append("limited cross-league context")
 
     adjustment = min(5, len(positive) * 2) - min(6, len(negative) * 3)
+
+    # Memory-aware adjustment: boost/suppress based on historical signal performance
+    if memory_context:
+        signal_weights = memory_context.get("signal_weights") or {}
+        for sig in signals:
+            name = sig.get("name") or ""
+            weight_adj = signal_weights.get(name)
+            if weight_adj is not None:
+                # Positive weight_adj = signal historically reliable → small boost
+                adjustment += round(weight_adj * 3)
+
+        # CLV awareness: if we're beating the market, be slightly less conservative
+        clv_data = memory_context.get("clv_14d") or {}
+        if clv_data.get("avg_clv_percent", 0) > 2:
+            adjustment += 1
+        elif clv_data.get("avg_clv_percent", 0) < -2:
+            adjustment -= 1
+            risks.append("recent CLV is negative — system may be overpaying")
+
+    adjustment = max(-8, min(8, adjustment))
+
     return {
         "provider": "rules",
-        "model": "deterministic-supervisor",
+        "model": "deterministic-supervisor-v2",
         "status": status,
         "verdict": best.get("selection"),
         "confidence_adjustment": adjustment,
         "risks": risks,
         "reasons": [signal.get("name") for signal in signals[:5]],
+        "memory_context_used": bool(memory_context),
     }
 
 
-def _compact_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None) -> dict[str, Any]:
-    return {
+def _compact_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None, memory_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {
         "match": prediction.get("name"),
         "tournament": prediction.get("tournament"),
         "score": prediction.get("score"),
@@ -137,6 +243,9 @@ def _compact_prediction(prediction: dict[str, Any], detail: dict[str, Any] | Non
         "poisson": prediction.get("poisson"),
         "strength_of_schedule": prediction.get("strength_of_schedule"),
     }
+    if memory_context:
+        payload["memory_context"] = memory_context
+    return payload
 
 
 def _review_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -144,7 +253,12 @@ def _review_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "You are PredictX AI Brain, a cautious football prediction reviewer. "
+                "You are PredictX AI Brain, a cautious football prediction reviewer with memory. "
+                "You receive the current match signals AND a memory_context block showing what has "
+                "historically worked: signal win rates, league accuracy, CLV trend, and model weights. "
+                "Use memory_context to calibrate your confidence adjustment — if a signal has a 65%+ "
+                "win rate historically, trust it more. If a signal has <40% win rate, flag it as a risk. "
+                "If CLV is positive, the system is beating the market — be less conservative. "
                 "Use the supplied rule-engine signals only. Do not invent team news, injuries, or odds. "
                 "Return only compact JSON with keys: status, verdict, confidence_adjustment, risks, reasons. "
                 "confidence_adjustment must be an integer from -8 to 8."

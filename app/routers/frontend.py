@@ -1476,3 +1476,149 @@ def _grade_signal_stats(graded: int) -> dict[str, Any]:
         return {"top_signals": top, "scope": "all"}
     except Exception:
         return {}
+
+
+# ── Brain / Self-Learning Analytics ──────────────────────────────────────────
+
+@router.get("/analytics/brain/summary")
+def get_brain_summary():
+    """
+    Full summary of what the system has learned from its own prediction history.
+    Shows signal win rates, league accuracy, auto-tuned model weights, and CLV trend.
+    This is the 'consciousness' view — what the system knows about itself.
+    """
+    from app.self_learner import get_learning_summary
+    summary = get_learning_summary()
+    return {"status": "success", **summary}
+
+
+@router.post("/analytics/brain/learn")
+def trigger_learning_cycle():
+    """
+    Manually trigger a self-learning cycle.
+    Normally runs automatically after every grading cycle (every 6 hours).
+    Use this to force an immediate update after manual grading.
+    """
+    from app.self_learner import run_learning_cycle
+    result = run_learning_cycle()
+    return {"status": "success", **result}
+
+
+@router.get("/analytics/brain/signals")
+def get_brain_signal_weights(league: str = Query(default="")):
+    """
+    Return learned signal weights — which signals are hot/cold.
+    Optionally filter by league to get league-specific weights.
+    """
+    from app.self_learner import get_top_signals, get_signal_weights
+    top = get_top_signals(limit=30)
+    league_weights = get_signal_weights(league) if league else {}
+    return {
+        "status": "success",
+        "league": league or "global",
+        "top_signals": top,
+        "league_weights": league_weights,
+    }
+
+
+@router.get("/analytics/brain/league/{league_name}")
+def get_brain_league_profile(league_name: str):
+    """
+    Return the system's learned accuracy profile for a specific league.
+    Shows win rate per pick type, calibration gap, and whether the system
+    is over/under-confident in this league.
+    """
+    from app.self_learner import get_league_accuracy
+    from urllib.parse import unquote
+    result = get_league_accuracy(unquote(league_name))
+    return {"status": "success", **result}
+
+
+@router.get("/analytics/brain/model-weights")
+def get_brain_model_weights():
+    """
+    Return the current auto-tuned ensemble model weights.
+    Shows how much each model (Poisson, Dixon-Coles, ELO, Rules, Groq)
+    has been adjusted based on historical accuracy.
+    """
+    from app.self_learner import get_learned_weights
+    weights = get_learned_weights()
+    return {
+        "status": "success",
+        "weights": weights,
+        "note": "These weights are auto-tuned from graded prediction history. "
+                "Default weights are used until enough data is available.",
+    }
+
+
+@router.get("/analytics/brain/grades/{team_id}")
+def get_team_sofascore_grades(team_id: str, last_n: int = Query(default=5, ge=1, le=20)):
+    """
+    Return SofaScore rating trend for a team.
+    Shows whether the team is improving or declining based on player ratings.
+    """
+    from app.sofascore_grades import get_team_rating_trend
+    result = get_team_rating_trend(team_id, last_n=last_n)
+    return {"status": "success", **result}
+
+
+@router.get("/analytics/brain/health")
+def get_brain_health():
+    """
+    Full brain health check — shows all learning systems and their status.
+    Use this to verify the self-learning pipeline is working end-to-end.
+    """
+    from app.self_learner import get_learning_summary, get_learned_weights
+    from app.clv import get_clv_summary
+    from app.confidence_calibrator import get_calibration_table
+
+    health: dict[str, Any] = {"status": "success"}
+
+    try:
+        summary = get_learning_summary()
+        health["self_learner"] = {
+            "status": "ok",
+            "signals_learned": summary.get("signals_learned", 0),
+            "leagues_profiled": summary.get("leagues_profiled", 0),
+            "model_weights_tuned": len(summary.get("model_weights", [])),
+        }
+    except Exception as exc:
+        health["self_learner"] = {"status": "error", "detail": str(exc)}
+
+    try:
+        weights = get_learned_weights()
+        defaults = {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "groq": 0.10}
+        health["ensemble_weights"] = {
+            "status": "ok",
+            "weights": weights,
+            "source": "learned" if any(abs(float(weights.get(k, 0)) - v) > 0.001 for k, v in defaults.items()) else "default",
+        }
+    except Exception as exc:
+        health["ensemble_weights"] = {"status": "error", "detail": str(exc)}
+
+    try:
+        clv = get_clv_summary(days=14)
+        health["clv"] = {
+            "status": "ok",
+            "avg_clv_14d": clv.get("avg_clv_percent"),
+            "edge_quality": clv.get("edge_quality"),
+            "total_entries": clv.get("total_entries"),
+        }
+    except Exception as exc:
+        health["clv"] = {"status": "error", "detail": str(exc)}
+
+    try:
+        cal = get_calibration_table()
+        health["calibration"] = {
+            "status": "ok",
+            "bands": len(cal) if isinstance(cal, list) else 0,
+        }
+    except Exception as exc:
+        health["calibration"] = {"status": "error", "detail": str(exc)}
+
+    # Overall brain score
+    ok_count = sum(1 for v in health.values() if isinstance(v, dict) and v.get("status") == "ok")
+    total = sum(1 for v in health.values() if isinstance(v, dict) and "status" in v)
+    health["brain_score"] = f"{ok_count}/{total} systems healthy"
+
+    return health

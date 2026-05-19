@@ -116,6 +116,51 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
 
+    # ── SofaScore grade signal ────────────────────────────────────────────────
+    grade_adj = 0
+    try:
+        from app.sofascore_grades import grade_signal_for_match
+        match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
+        match_date_str = doc.get("match_date")
+        grade_sig = grade_signal_for_match(detail, match_id=match_id_str, match_date=match_date_str)
+        if grade_sig.get("available"):
+            grade_adj = int(grade_sig.get("impact") or 0)
+            signals.append(grade_sig)
+    except Exception:
+        pass
+
+    # ── Learned signal weight adjustments ────────────────────────────────────
+    # Apply self-learner knowledge: boost signals that historically work,
+    # suppress signals that historically mislead — per league.
+    learned_signal_adj = 0
+    try:
+        from app.self_learner import get_signal_weights
+        league = doc.get("tournament") or doc.get("category") or ""
+        if isinstance(league, dict):
+            league = league.get("name") or ""
+        learned_weights = get_signal_weights(league)
+        if learned_weights:
+            for sig in signals:
+                name = sig.get("name") or ""
+                weight_adj = learned_weights.get(name)
+                if weight_adj is not None and abs(weight_adj) > 0.1:
+                    # Scale: weight_adj of +1.0 → +3 confidence, -1.0 → -3
+                    contribution = round(weight_adj * 3)
+                    learned_signal_adj += contribution
+            learned_signal_adj = max(-8, min(8, learned_signal_adj))
+            if learned_signal_adj != 0:
+                signals.append({
+                    "name": "learned_signal_adjustment",
+                    "value": {
+                        "league": league,
+                        "adjustment": learned_signal_adj,
+                        "signals_weighted": len(learned_weights),
+                    },
+                    "impact": learned_signal_adj,
+                })
+    except Exception:
+        pass
+
     # Time-decay for live matches
     minute = rules.get("minute") or 0
     is_live = bool(detail.get("status", {}).get("type") == "inprogress") or bool(
@@ -156,8 +201,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             cal = calibrate_confidence(pick.get("type") or "match_result", raw_conf)
             memory = weighted_prediction_memory(doc, pick.get("type"), pick.get("selection"))
             memory_adj = int(memory.get("confidence_adjustment") or 0)
+            pick_learned_adj = _learned_signal_adjustment_for_pick(doc, signals, pick.get("type"))
             # Apply pattern and market movement adjustment on top.
-            cal_conf = min(99, max(1, cal["adjusted_confidence"] + pattern_adj + market_adj + memory_adj + database_adj))
+            cal_conf = min(99, max(1, cal["adjusted_confidence"] + pattern_adj + market_adj + memory_adj + database_adj + grade_adj + pick_learned_adj))
             # Apply regime tier penalty (Tier 4 gets -5)
             tier_penalty = {1: 0, 2: 0, 3: 0, 4: -5}.get(regime.tier, 0)
             cal_conf = min(99, max(1, cal_conf + tier_penalty))
@@ -177,6 +223,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "regime_name":       regime.name,
                 "regime_stake_cap":  regime.stake_cap,
                 "memory_weighting":   memory,
+                "learned_signal_adjustment": pick_learned_adj,
             }
             if memory.get("blended_win_rate") is not None:
                 signals.append({
@@ -659,6 +706,31 @@ def _memory_goal_pressure(memory: dict[str, Any]) -> float:
     avg_goals = _to_float(blended.get("avg_goals")) or 0
     over_25 = _to_float(blended.get("over_2_5_rate")) or 0
     return avg_goals * 5 + over_25 * 10
+
+
+def _learned_signal_adjustment_for_pick(
+    doc: dict[str, Any],
+    signals: list[dict[str, Any]],
+    pick_type: str | None,
+) -> int:
+    """Apply self-learner feedback scoped by league and market type."""
+    try:
+        from app.self_learner import get_signal_weights
+
+        league = doc.get("tournament") or doc.get("category") or ""
+        if isinstance(league, dict):
+            league = league.get("name") or ""
+        weights = get_signal_weights(league, pick_type or "unknown")
+        adjustment = 0
+        for signal in signals:
+            weight_adj = weights.get(signal.get("name") or "")
+            if weight_adj is not None and abs(weight_adj) > 0.1:
+                impact = _to_float(signal.get("impact")) or 1.0
+                direction = 1 if impact >= 0 else -1
+                adjustment += round(float(weight_adj) * 3 * direction)
+        return max(-8, min(8, adjustment))
+    except Exception:
+        return 0
 
 
 def _live_prematch_prior(ensemble: dict[str, Any]) -> dict[str, float]:
