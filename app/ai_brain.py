@@ -239,6 +239,8 @@ def _compact_prediction(prediction: dict[str, Any], detail: dict[str, Any] | Non
         "top_picks": (prediction.get("picks") or [])[:3],
         "signals": (prediction.get("signals") or [])[:10],
         "features": prediction.get("features"),
+        "data_sources": (detail or {}).get("data_sources") or prediction.get("data_sources"),
+        "sportybet_detail": (detail or {}).get("sportybet_detail"),
         "h2h": (detail or {}).get("h2h"),
         "web_context": (detail or {}).get("web_context") or prediction.get("web_context"),
         "poisson": prediction.get("poisson"),

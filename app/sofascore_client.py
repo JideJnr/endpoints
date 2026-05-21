@@ -5,6 +5,7 @@ from curl_cffi import requests
 
 SOFASCORE_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/unique-tournament/{tournament_id}/scheduled-events/{date}"
 SOFASCORE_ALL_URL = "https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
+SOFASCORE_EVENT_URL = "https://www.sofascore.com/api/v1/event/{event_id}"
 SOFASCORE_LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 SOFASCORE_TEAM_HISTORY_URL = "https://www.sofascore.com/api/v1/team/{team_id}/events/last/{page}"
 SOFASCORE_STANDINGS_URL = "https://www.sofascore.com/api/v1/tournament/{tournament_id}/season/{season_id}/standings/total"
@@ -137,6 +138,13 @@ def fetch_all_scheduled_events(date: str) -> list[dict]:
     url = SOFASCORE_ALL_URL.format(date=date)
     events = _get(url).json().get("events", [])
     return [_parse_event(e) for e in events]
+
+
+def fetch_event(event_id) -> dict:
+    """Fetch one SofaScore event directly by id."""
+    url = SOFASCORE_EVENT_URL.format(event_id=event_id)
+    event = _get(url).json().get("event", {})
+    return _parse_event(event) if event else {}
 
 
 def fetch_live_events() -> list[dict]:

@@ -3,6 +3,8 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
+from app.match_state import classify_match_state
+
 from app.league_memory import late_goal_memory_signal
 from app.league_strength import league_strength_edge
 
@@ -222,6 +224,7 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
     total_goals = home_goals + away_goals
     tournament = match.get("tournament") or ""
     category = match.get("category") or ""
+    is_live_sporty = bool(classify_match_state(match).get("is_live"))
     odds = _sporty_main_odds(match)
     memory_signal = late_goal_memory_signal(match)
     memory_boost = _late_goal_memory_boost(memory_signal, signals)
@@ -229,7 +232,7 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
     if odds:
         fav = max(odds, key=lambda item: item["implied_probability"])
         signals.append({"name": "market_favorite", "value": fav["name"], "impact": round(fav["implied_probability"] * 20, 2)})
-        if fav["implied_probability"] >= 0.58:
+        if is_live_sporty and fav["implied_probability"] >= 0.58:
             picks.append(_pick("market_value", f"{fav['name']} side protection", 58 + int((fav["implied_probability"] - 0.58) * 60), "market shows clear favorite"))
 
     if minute >= 70 and total_goals <= 2 and _is_high_late_goal_league(f"{category} {tournament}"):
@@ -247,7 +250,6 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
     if not picks:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available live data"))
 
-    is_live_sporty = bool(match.get("period") and match.get("period") not in ("Not start", "Not started", ""))
     late_goal_league_sporty = _is_high_late_goal_league(f"{category} {tournament}")
     picks = _apply_time_decay(picks, minute, is_live_sporty, late_goal_league_sporty)
 

@@ -8,7 +8,7 @@ per-confidence-band accuracy rates. These are used to:
   2. Decide when to "double down" — i.e. when historical accuracy in a band
      is high enough to warrant a higher stake multiplier
 
-Calibration bands: 50-59, 60-69, 70-79, 80-89, 90+
+Calibration bands: 50-59, 60-69, 70-79, 80+
 Minimum samples before trusting a band: MIN_SAMPLES (default 10)
 
 Usage:
@@ -30,6 +30,25 @@ from app.league_memory import DB_PATH, _init_db
 MIN_SAMPLES = 10          # bands with fewer samples are not adjusted
 BLEND_WEIGHT = 0.4        # how much historical accuracy pulls the raw confidence
                           # 0 = no adjustment, 1 = fully replace with historical rate
+
+
+UNIQUE_GRADED_HISTORY = """
+    select *
+    from (
+        select
+            ph.*,
+            row_number() over (
+                partition by match_id, pick_type, selection
+                order by datetime(coalesce(graded_at, created_at)) desc, id desc
+            ) as rn
+        from prediction_history ph
+        where graded_at is not null
+          and result in ('win', 'loss')
+          and pick_type not in ('no_bet')
+          and confidence is not null
+    )
+    where rn = 1
+"""
 
 
 # ── Table ─────────────────────────────────────────────────────────────────────
@@ -57,28 +76,36 @@ def rebuild_calibration() -> dict[str, Any]:
     Call this after grading runs (scheduler does it every 6 hrs).
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_calibration_table(conn)
         conn.row_factory = sqlite3.Row
+        conn.execute("delete from confidence_calibration")
 
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             select
                 pick_type,
-                -- bucket into 10-point bands, cap at 90
-                min(90, (confidence / 10) * 10) as band_low,
+                -- bucket into 10-point bands, cap at 80 so top band is 80+
+                min(80, (confidence / 10) * 10) as band_low,
                 count(*) as samples,
                 sum(case when result = 'win'  then 1 else 0 end) as wins,
                 sum(case when result = 'loss' then 1 else 0 end) as losses
-            from prediction_history
-            where graded_at is not null
-              and result in ('win', 'loss')
-              and pick_type not in ('no_bet')
-              and confidence is not null
+            from ({UNIQUE_GRADED_HISTORY})
             group by pick_type, band_low
         """).fetchall()
 
+        global_rows = conn.execute(f"""
+            select
+                '__global__' as pick_type,
+                min(80, (confidence / 10) * 10) as band_low,
+                count(*) as samples,
+                sum(case when result = 'win'  then 1 else 0 end) as wins,
+                sum(case when result = 'loss' then 1 else 0 end) as losses
+            from ({UNIQUE_GRADED_HISTORY})
+            group by band_low
+        """).fetchall()
+
         updated = 0
-        for row in rows:
+        for row in list(rows) + list(global_rows):
             total = (row['wins'] or 0) + (row['losses'] or 0)
             win_rate = round(row['wins'] / total, 4) if total > 0 else None
             conn.execute("""
@@ -109,9 +136,9 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
       - win_rate: historical win rate for this band (None if not enough data)
       - samples: how many graded predictions back this band
     """
-    band_low = min(90, (raw_confidence // 10) * 10)
+    band_low = min(80, (raw_confidence // 10) * 10)
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_calibration_table(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute("""
@@ -129,6 +156,19 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
             """, (band_low,)).fetchone()
             if row_generic and (row_generic['samples'] or 0) >= MIN_SAMPLES:
                 row = row_generic
+
+        # Final fallback: all settled predictions in this confidence band.
+        # This is the system-level learning loop, so every model benefits from
+        # the observed fact that high-confidence bands are currently performing
+        # much better than low-confidence bands.
+        if not row or (row['samples'] or 0) < MIN_SAMPLES:
+            row_global = conn.execute("""
+                select samples, wins, losses, win_rate
+                from confidence_calibration
+                where pick_type = '__global__' and band_low = ?
+            """, (band_low,)).fetchone()
+            if row_global and (row_global['samples'] or 0) >= MIN_SAMPLES:
+                row = row_global
 
     if not row or (row['samples'] or 0) < MIN_SAMPLES:
         return {
@@ -155,7 +195,7 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
         "win_rate": round(win_rate * 100, 1),
         "samples": row['samples'],
         "calibrated": True,
-        "band": f"{band_low}-{band_low + 9}%",
+        "band": "80%+" if band_low >= 80 else f"{band_low}-{band_low + 9}%",
     }
 
 
@@ -164,7 +204,7 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
 def get_calibration_table() -> list[dict[str, Any]]:
     """Return the full calibration table sorted by pick_type, band."""
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_calibration_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
@@ -175,7 +215,7 @@ def get_calibration_table() -> list[dict[str, Any]]:
     return [
         {
             "pick_type":    row["pick_type"],
-            "band":         f"{row['band_low']}-{row['band_low'] + 9}%",
+            "band":         "80%+" if int(row["band_low"] or 0) >= 80 else f"{row['band_low']}-{row['band_low'] + 9}%",
             "band_low":     row["band_low"],
             "samples":      row["samples"],
             "wins":         row["wins"],

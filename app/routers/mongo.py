@@ -11,9 +11,13 @@ from app.scheduler import (
     job_enrich_worker,
     job_archive_finished,
     job_flush_to_mongo,
+    job_live_priority,
+    get_live_priority_mode,
+    set_live_priority_mode,
     scheduler_status,
     start_scheduler,
     stop_scheduler,
+    run_job_with_guard,
 )
 
 
@@ -74,7 +78,7 @@ def post_scheduler_stop():
 @router.post("/scan/upcoming")
 def post_scan_upcoming(limit: int = Query(default=500, ge=1, le=1000)):
     try:
-        return job_ingest_upcoming(limit=limit)
+        return run_job_with_guard(job_ingest_upcoming, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -82,7 +86,28 @@ def post_scan_upcoming(limit: int = Query(default=500, ge=1, le=1000)):
 @router.post("/scan/live")
 def post_scan_live(limit: int = Query(default=200, ge=1, le=1000)):
     try:
-        return job_ingest_live(limit=limit)
+        return run_job_with_guard(job_ingest_live, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/scan/refresh-odds")
+def post_refresh_buffer_odds(limit: int = Query(default=500, ge=1, le=1000)):
+    """Refresh live and upcoming SportyBet state, update buffer odds, and snapshot movement."""
+    try:
+        from app.buffer import refresh_sporty_buffer_scope
+
+        live = refresh_sporty_buffer_scope("live", limit=min(limit, 1000))
+        upcoming = refresh_sporty_buffer_scope("upcoming", limit=min(limit, 1000))
+        return {
+            "status": "success",
+            "live": live,
+            "upcoming": upcoming,
+            "fetched": int(live.get("fetched") or 0) + int(upcoming.get("fetched") or 0),
+            "patched": int(live.get("patched") or 0) + int(upcoming.get("patched") or 0),
+            "ingested": int(live.get("ingested") or 0) + int(upcoming.get("ingested") or 0),
+            "odds_snapshotted": int(live.get("odds_snapshotted") or 0) + int(upcoming.get("odds_snapshotted") or 0),
+        }
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -90,7 +115,35 @@ def post_scan_live(limit: int = Query(default=200, ge=1, le=1000)):
 @router.post("/scan/enrich")
 def post_scan_enrich():
     try:
-        return job_enrich_worker()
+        return run_job_with_guard(job_enrich_worker)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/scan/live-priority")
+def post_scan_live_priority(
+    count: int = Query(default=30, ge=1, le=80),
+    limit: int = Query(default=500, ge=1, le=1000),
+):
+    try:
+        return run_job_with_guard(job_live_priority, count=count, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/live-priority")
+def get_live_priority():
+    try:
+        return {"status": "success", **get_live_priority_mode()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/live-priority")
+def post_live_priority(payload: dict = Body(...)):
+    try:
+        enabled = bool(payload.get("enabled"))
+        return {"status": "success", **set_live_priority_mode(enabled)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -101,7 +154,7 @@ def post_match_and_enrich(count: int = Query(default=12, ge=1, le=50)):
     try:
         from app.buffer import run_date_aware_enrichment
 
-        ingest = job_ingest_upcoming(limit=500)
+        ingest = run_job_with_guard(job_ingest_upcoming, limit=500)
         enrich = run_date_aware_enrichment(count=count)
         return {"status": "success", "ingest": ingest, "enrich": enrich}
     except Exception as e:
@@ -111,7 +164,7 @@ def post_match_and_enrich(count: int = Query(default=12, ge=1, le=50)):
 @router.post("/scan/finished")
 def post_scan_finished(match_date: Optional[str] = None, limit: int = Query(default=1000, ge=1, le=2000)):
     try:
-        return job_archive_finished(match_date=match_date, limit=limit)
+        return run_job_with_guard(job_archive_finished, match_date=match_date, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -120,18 +173,21 @@ def post_scan_finished(match_date: Optional[str] = None, limit: int = Query(defa
 def post_flush_to_mongo():
     """Flush live/upcoming enriched buffer rows to MongoDB."""
     try:
-        return job_flush_to_mongo()
+        return run_job_with_guard(job_flush_to_mongo)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/purge-junk-predictions")
-def post_purge_junk_predictions():
+def post_purge_junk_predictions(confirm: bool = False):
     """
-    One-time cleanup: delete all prediction_history rows that are:
+    Inspect junk prediction rows by default. Pass confirm=true to delete rows that are:
     - pick_type = 'no_bet'
     - confidence < 55
     - ungraded and older than today (stale pending that will never resolve)
+
+    Prediction history is learning data, so this endpoint is intentionally
+    non-destructive unless the caller explicitly confirms the purge.
     """
     import sqlite3
     from app.league_memory import DB_PATH, _init_db
@@ -139,20 +195,32 @@ def post_purge_junk_predictions():
 
     _init_db()
     today = date.today().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        r1 = conn.execute("delete from prediction_history where pick_type = 'no_bet'")
-        r2 = conn.execute("delete from prediction_history where confidence < 55")
-        r3 = conn.execute(
-            "delete from prediction_history where graded_at is null and date(created_at) < ?",
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        no_bet = conn.execute("select count(*) from prediction_history where pick_type = 'no_bet'").fetchone()[0]
+        low_confidence = conn.execute("select count(*) from prediction_history where confidence < 55").fetchone()[0]
+        stale_pending = conn.execute(
+            "select count(*) from prediction_history where graded_at is null and date(created_at) < ?",
             (today,),
-        )
-        conn.commit()
+        ).fetchone()[0]
+        deleted_no_bet = deleted_low_confidence = deleted_stale_pending = 0
+        if confirm:
+            deleted_no_bet = conn.execute("delete from prediction_history where pick_type = 'no_bet'").rowcount
+            deleted_low_confidence = conn.execute("delete from prediction_history where confidence < 55").rowcount
+            deleted_stale_pending = conn.execute(
+                "delete from prediction_history where graded_at is null and date(created_at) < ?",
+                (today,),
+            ).rowcount
+            conn.commit()
     return {
         "status": "ok",
-        "deleted_no_bet": r1.rowcount,
-        "deleted_low_confidence": r2.rowcount,
-        "deleted_stale_pending": r3.rowcount,
-        "total_deleted": r1.rowcount + r2.rowcount + r3.rowcount,
+        "confirmed": confirm,
+        "candidate_no_bet": no_bet,
+        "candidate_low_confidence": low_confidence,
+        "candidate_stale_pending": stale_pending,
+        "deleted_no_bet": deleted_no_bet,
+        "deleted_low_confidence": deleted_low_confidence,
+        "deleted_stale_pending": deleted_stale_pending,
+        "total_deleted": deleted_no_bet + deleted_low_confidence + deleted_stale_pending,
     }
 
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import random
 import time
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -254,6 +254,52 @@ def fetch_live_and_upcoming_matches_post() -> list[dict]:
     upcoming = fetch_upcoming_matches_post()
     seen = {match.get("id") for match in live}
     return live + [match for match in upcoming if match.get("id") not in seen]
+
+
+def fetch_match_info(match_id: str) -> dict[str, Any]:
+    """
+    Fetch one SportyBet event by id from the same API endpoint the live/upcoming
+    pages use. This is endpoint-only lookup: no page HTML parsing.
+    """
+    match_id = str(match_id)
+    calls = (
+        ("live", True),
+        ("upcoming", False),
+        ("all", None),
+    )
+    errors: list[str] = []
+    for scope, is_live in calls:
+        try:
+            matches = fetch_matches_post(is_live=is_live)
+        except Exception as exc:
+            errors.append(f"{scope}: {exc}")
+            continue
+        match = next((item for item in matches if str(item.get("id") or "") == match_id), None)
+        if match:
+            payload: dict[str, Any] = {"sportId": "sr:sport:1", "pageSize": 300}
+            if is_live is not None:
+                payload["isLive"] = is_live
+            return {
+                "found": True,
+                "match_id": match_id,
+                "scope": scope,
+                "api_endpoint": SPORTYBET_POST_URL,
+                "request_payload": payload,
+                "match": match,
+                "source": "sportybet_endpoint",
+            }
+    return {
+        "found": False,
+        "match_id": match_id,
+        "scope": None,
+        "api_endpoint": SPORTYBET_POST_URL,
+        "request_payloads_tried": [
+            {"sportId": "sr:sport:1", "pageSize": 300, **({} if is_live is None else {"isLive": is_live})}
+            for _, is_live in calls
+        ],
+        "errors": errors,
+        "source": "sportybet_endpoint",
+    }
 
 
 # Backward-compatible aliases for older routers/deploys.

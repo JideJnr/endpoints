@@ -254,38 +254,88 @@ def get_performance_analytics():
 
 @router.get("/analytics/roi")
 def get_roi_analysis():
-    """Flat-stake ROI proxy, grouped by confidence band."""
+    """ROI analysis.
+
+    Real ROI needs entry odds. When odds are missing, expose win-rate and
+    break-even odds instead of treating every win as a 1.00 return.
+    """
     import sqlite3
     from app.league_memory import DB_PATH, _init_db
 
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            select pick_type, selection, confidence, result
-            from prediction_history
-            where graded_at is not null and pick_type != 'no_bet'
+            select
+                ph.match_id,
+                ph.pick_type,
+                ph.selection,
+                ph.confidence,
+                ph.result,
+                (
+                    select ce.entry_odds
+                    from clv_entries ce
+                    where ce.match_id = ph.match_id
+                      and ce.pick_type = ph.pick_type
+                      and ce.selection = ph.selection
+                      and ce.entry_odds is not null
+                    order by ce.created_at desc
+                    limit 1
+                ) as entry_odds
+            from prediction_history ph
+            where ph.graded_at is not null
+              and ph.pick_type != 'no_bet'
             """
         ).fetchall()
 
-    total_staked = len(rows)
-    total_returned = sum(1.0 if row["result"] == "win" else 0.0 for row in rows)
-    roi = round((total_returned - total_staked) / total_staked * 100, 2) if total_staked else 0
-    bands: dict[str, list[bool]] = {"50-59": [], "60-69": [], "70-79": [], "80+": []}
+    settled = [row for row in rows if row["result"] in ("win", "loss")]
+    wins = sum(1 for row in settled if row["result"] == "win")
+    losses = sum(1 for row in settled if row["result"] == "loss")
+    voids = sum(1 for row in rows if row["result"] == "void")
+    settled_count = wins + losses
+    win_rate = wins / settled_count if settled_count else 0.0
+    break_even_odds = round(1 / win_rate, 3) if win_rate else None
+
+    odds_rows = [row for row in settled if row["entry_odds"] and float(row["entry_odds"]) > 1]
+    odds_staked = len(odds_rows)
+    odds_returned = sum(float(row["entry_odds"]) if row["result"] == "win" else 0.0 for row in odds_rows)
+    odds_roi = round((odds_returned - odds_staked) / odds_staked * 100, 2) if odds_staked else None
+
+    # Backward-compatible field for the frontend: prefer real odds ROI when
+    # available; otherwise show an even-money unit proxy, clearly marked below.
+    even_money_roi = round((wins - settled_count) / settled_count * 100, 2) if settled_count else 0
+    roi = odds_roi if odds_roi is not None else even_money_roi
+
+    bands: dict[str, list[sqlite3.Row]] = {"50-59": [], "60-69": [], "70-79": [], "80+": []}
     for row in rows:
+        if row["result"] not in ("win", "loss"):
+            continue
         confidence = row["confidence"] or 0
         band = "80+" if confidence >= 80 else "70-79" if confidence >= 70 else "60-69" if confidence >= 60 else "50-59"
-        bands[band].append(row["result"] == "win")
+        bands[band].append(row)
 
     return {
         "status": "success",
-        "total_predictions": total_staked,
+        "total_predictions": len(rows),
+        "settled_predictions": settled_count,
+        "wins": wins,
+        "losses": losses,
+        "voids": voids,
+        "win_rate": round(win_rate * 100, 1) if settled_count else 0,
         "roi_percent": roi,
+        "roi_basis": "entry_odds" if odds_roi is not None else "even_money_proxy",
+        "entry_odds_covered": odds_staked,
+        "odds_roi_percent": odds_roi,
+        "even_money_roi_percent": even_money_roi,
+        "break_even_average_odds": break_even_odds,
+        "note": "True ROI requires entry odds. Voids are excluded from stake; missing odds rows use win-rate/break-even context only.",
         "by_confidence": {
             band: {
                 "count": len(results),
-                "win_rate": round(sum(results) / len(results) * 100, 1) if results else 0,
+                "wins": sum(1 for row in results if row["result"] == "win"),
+                "losses": sum(1 for row in results if row["result"] == "loss"),
+                "win_rate": round(sum(1 for row in results if row["result"] == "win") / len(results) * 100, 1) if results else 0,
             }
             for band, results in bands.items()
         },

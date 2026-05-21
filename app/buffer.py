@@ -32,6 +32,7 @@ from typing import Any
 
 from app.league_memory import DB_PATH, _init_db
 from app.market import snapshot_odds
+from app.match_state import classify_match_state
 from app.normalise import normalise
 
 # How many SofaScore detail calls to run in parallel
@@ -51,6 +52,12 @@ NO_MATCH_MIN_RETRY_LIVE_MINUTES = 15
 # ── Table init ────────────────────────────────────────────────────────────────
 
 def _init_buffer_table(conn: sqlite3.Connection) -> None:
+    conn.execute("pragma busy_timeout = 30000")
+    try:
+        conn.execute("pragma journal_mode = wal")
+        conn.execute("pragma synchronous = normal")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""
         create table if not exists match_buffer (
             match_id        text primary key,
@@ -122,7 +129,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     from datetime import date as _date
     today = _date.today().isoformat()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         count = 0
         for m in matches:
@@ -132,15 +139,12 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
 
             score = m.get("score") or {}
             period = m.get("period") or "Not start"
-            is_live = 1 if (period and period not in ("Not start", "", None)) else 0
-            is_finished = 1 if _is_finished_period(period) else 0
+            state = classify_match_state(m)
+            is_live = 1 if state.get("is_live") else 0
+            is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
 
             # finished matches are handled by patch_live_scores on transition — skip here
             if is_finished:
-                continue
-
-            # 90+ minutes — treat as done, skip entirely
-            if _is_90_plus(m.get("played_seconds")):
                 continue
 
             # Reject matches dated before today that are not currently live
@@ -191,6 +195,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                     is_live, is_finished, now, json.dumps(m),
                 ),
             )
+            _sync_enriched_sporty_fields(conn, table, match_id, m, match_date, is_live, is_finished)
             if not exists:
                 count += 1
         conn.commit()
@@ -207,7 +212,7 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         count = 0
         for m in matches:
@@ -216,11 +221,11 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                 continue
             score = m.get("score") or {}
             period = m.get("period") or ""
-            is_live = 1 if (period and period not in ("Not start", "", None)) else 0
-            is_finished = 1 if _is_finished_period(period) else 0
-            is_90_plus = _is_90_plus(m.get("played_seconds"))
+            state = classify_match_state(m)
+            is_live = 1 if state.get("is_live") else 0
+            is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
 
-            if is_finished or is_90_plus:
+            if is_finished:
                 # write final score into both raw_sporty and raw_enriched before archiving
                 # write final score into both raw_sporty and raw_enriched before archiving
                 conn.execute(
@@ -308,6 +313,7 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                         match_id,
                     ),
                 )
+            _sync_enriched_sporty_fields(conn, "match_buffer", match_id, m, _date_from_start_time(m.get("start_time")), is_live, is_finished)
             count += 1
         conn.commit()
     return count
@@ -315,7 +321,12 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
 
 # ── Phase 2: Enrichment queue ─────────────────────────────────────────────────
 
-def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]:
+def get_unenriched_batch(
+    limit: int = ENRICH_BATCH_SIZE,
+    live_only: bool = False,
+    future_only: bool = False,
+    force_live_retry: bool = False,
+) -> list[dict[str, Any]]:
     """
     Returns matches that need enrichment, in priority order:
       1. Live matches (always first)
@@ -323,9 +334,8 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
       3. Tomorrow's unenriched matches
       4. Future matches (beyond tomorrow) — enriched once per day, not every cycle
 
-    Future matches are included so SofaScore can match them to their actual
-    fixture and pre-populate H2H, standings, and team form ahead of kick-off.
-    They are deprioritised so live/today matches are never delayed.
+    Future matches are normally included only after the hot queue. The
+    scheduled future lane can request them explicitly with future_only=True.
     """
     _init_db()
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -333,37 +343,70 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
     today = date_cls.today().isoformat()
     tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
-        query = """
-            select match_id, raw_sporty, raw_enriched, is_live, match_date, ? as source_table
-            from {table}
-            where is_finished = 0
-              and (start_time is null or cast(start_time as real) >= ?)
-              and (
-                enriched_at is null
-                or sofascore_id is null
-                or sofascore_id = ''
-              )
-              and (
+        live_clause = "and is_live = 1" if live_only and not future_only else ""
+        stale_clause = "or (is_live = 1 and enriched_at < datetime('now', '-2 minutes'))"
+        retry_clause = "1 = 1" if force_live_retry else """
+              (
                 json_extract(raw_enriched, '$.sofascore_match_status') is null
                 or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
                 or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= ?
               )
         """
-        rows = conn.execute(
-            (query.format(table="match_buffer") + """
-            order by
-              is_live desc,
-              case when match_date = ? then 0 when match_date = ? then 1 else 2 end asc,
-              case when enriched_at is null then 0 else 1 end asc,
-              start_time asc
-            limit ?
-            """),
-            ("match_buffer", cutoff_ts_ms, now_ts, today, tomorrow, limit),
-        ).fetchall()
-        if len(rows) < limit:
+        query = f"""
+            select match_id, raw_sporty, raw_enriched, is_live, match_date, ? as source_table
+            from {{table}}
+            where is_finished = 0
+              and (start_time is null or cast(start_time as real) >= ?)
+              {live_clause}
+              and (
+                enriched_at is null
+                or sofascore_id is null
+                or sofascore_id = ''
+                {stale_clause}
+              )
+              and {retry_clause}
+        """
+        rows = []
+        if not future_only:
+            hot_params = (
+                ("match_buffer", cutoff_ts_ms, today, tomorrow, limit)
+                if force_live_retry
+                else ("match_buffer", cutoff_ts_ms, now_ts, today, tomorrow, limit)
+            )
+            rows = conn.execute(
+                (query.format(table="match_buffer") + """
+                order by
+                  is_live desc,
+                  case when match_date = ? then 0 when match_date = ? then 1 else 2 end asc,
+                  case
+                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%reserve%' then 8
+                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%u20%' then 8
+                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%u19%' then 8
+                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%friendly%' then 7
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%champions league%' then 0
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%premier league%' then 1
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%laliga%' then 1
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%serie a%' then 1
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%bundesliga%' then 1
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%ligue 1%' then 1
+                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%europa league%' then 1
+                    else 4
+                  end asc,
+                  case when enriched_at is null then 0 else 1 end asc,
+                  start_time asc
+                limit ?
+                """),
+                hot_params,
+            ).fetchall()
+        if (future_only or len(rows) < limit) and not live_only:
+            future_params = (
+                ("future_match_buffer", cutoff_ts_ms, limit - len(rows))
+                if force_live_retry
+                else ("future_match_buffer", cutoff_ts_ms, now_ts, limit - len(rows))
+            )
             future_rows = conn.execute(
                 (query.format(table="future_match_buffer") + """
                 order by
@@ -371,7 +414,7 @@ def get_unenriched_batch(limit: int = ENRICH_BATCH_SIZE) -> list[dict[str, Any]]
                   start_time asc
                 limit ?
                 """),
-                ("future_match_buffer", cutoff_ts_ms, now_ts, limit - len(rows)),
+                future_params,
             ).fetchall()
             rows = list(rows) + list(future_rows)
     return [
@@ -391,7 +434,7 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     """Write the enriched document back into the buffer row."""
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         table = "match_buffer"
         row = conn.execute("select raw_sporty, raw_enriched from match_buffer where match_id = ?", (match_id,)).fetchone()
@@ -429,7 +472,7 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
     so the frontend always gets something even before enrichment runs.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
         clauses = ["is_finished = 0"]
@@ -463,20 +506,20 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
         if row["raw_enriched"]:
             doc = json.loads(row["raw_enriched"])
             sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
-            result.append(_ensure_country_fields(doc, sporty))
+            result.append(_finalize_buffer_doc(_ensure_country_fields(doc, sporty), sporty))
         else:
             # not yet enriched — return raw sporty data so frontend isn't empty
             sporty = json.loads(row["raw_sporty"])
             doc = _sporty_to_summary(sporty)
             doc["match_date"] = row["match_date"]
-            result.append(doc)
+            result.append(_finalize_buffer_doc(doc, sporty))
     return result
 
 
 def get_buffered_match(match_id: str) -> dict[str, Any] | None:
     """Returns the enriched doc for a single match, or raw sporty if not yet enriched."""
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -493,16 +536,16 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
     if row["raw_enriched"]:
         doc = json.loads(row["raw_enriched"])
         sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
-        return _ensure_country_fields(doc, sporty)
+        return _finalize_buffer_doc(_ensure_country_fields(doc, sporty), sporty)
     doc = _sporty_to_summary(json.loads(row["raw_sporty"]))
     doc["match_date"] = row["match_date"]
-    return doc
+    return _finalize_buffer_doc(doc, json.loads(row["raw_sporty"]))
 
 
 def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
     """All currently live matches from the buffer."""
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -520,10 +563,100 @@ def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
         if row["raw_enriched"]:
             doc = json.loads(row["raw_enriched"])
             sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
-            result.append(_ensure_country_fields(doc, sporty))
+            doc = _finalize_buffer_doc(_ensure_country_fields(doc, sporty), sporty)
+            if doc.get("is_live"):
+                result.append(doc)
         else:
-            result.append(_sporty_to_summary(json.loads(row["raw_sporty"])))
+            sporty = json.loads(row["raw_sporty"])
+            doc = _finalize_buffer_doc(_sporty_to_summary(sporty), sporty)
+            if doc.get("is_live"):
+                result.append(doc)
     return result
+
+
+def refresh_sporty_buffer_scope(scope: str = "upcoming", limit: int = 500) -> dict[str, Any]:
+    """Pull fresh SportyBet state and update buffered odds/time/status before prediction."""
+    from app.market import snapshot_odds
+    from app.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
+
+    scope = "live" if str(scope).lower() == "live" else "upcoming"
+    matches = (fetch_live_matches_post() if scope == "live" else fetch_upcoming_matches_post())[:limit]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for match in matches:
+        grouped.setdefault(_date_from_start_time(match.get("start_time")), []).append(match)
+
+    patched = patch_live_scores(matches) if scope == "live" else 0
+    ingested = 0
+    for match_date, rows in grouped.items():
+        ingested += ingest_matches(rows, match_date)
+
+    snapshotted = 0
+    for match in matches:
+        doc = get_buffered_match(str(match.get("id") or ""))
+        if doc:
+            try:
+                snapshotted += 1 if snapshot_odds(doc) else 0
+            except Exception:
+                pass
+    return {
+        "scope": scope,
+        "fetched": len(matches),
+        "ingested": ingested,
+        "patched": patched,
+        "odds_snapshotted": snapshotted,
+    }
+
+
+def refresh_sporty_match_state(match_id: str) -> dict[str, Any]:
+    """Refresh one buffered match from SportyBet before enrichment/prediction."""
+    from app.market import snapshot_odds
+    from app.sportybet_client import fetch_match_info
+
+    match_id = str(match_id)
+    info = fetch_match_info(match_id)
+    refreshed = info.get("match") if info.get("found") else None
+    scope = info.get("scope")
+    if not refreshed:
+        _mark_missing_from_sporty(match_id)
+        return {
+            "active": False,
+            "match_id": match_id,
+            "scope": None,
+            "reason": "not_found_in_fresh_sporty",
+            "sporty_endpoint": info.get("api_endpoint"),
+            "errors": info.get("errors") or [],
+        }
+
+    match_date = _date_from_start_time(refreshed.get("start_time"))
+    if scope == "live":
+        patch_live_scores([refreshed])
+    ingest_matches([refreshed], match_date)
+    doc = get_buffered_match(match_id)
+    snapshotted = False
+    if doc:
+        try:
+            snapshotted = snapshot_odds(doc)
+        except Exception:
+            snapshotted = False
+
+    state = classify_match_state(refreshed)
+    period = refreshed.get("period") or ""
+    is_live = bool(state.get("is_live"))
+    is_finished = bool(state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
+    return {
+        "active": not is_finished and (scope != "live" or is_live),
+        "match_id": match_id,
+        "scope": scope,
+        "is_live": scope == "live" and is_live and not is_finished,
+        "is_finished": is_finished,
+        "match_state": state,
+        "period": period,
+        "match_date": match_date,
+        "start_time": refreshed.get("start_time"),
+        "odds_snapshotted": snapshotted,
+        "sporty_endpoint": info.get("api_endpoint"),
+        "source": info.get("source"),
+    }
 
 
 def purge_ghost_matches() -> int:
@@ -541,9 +674,7 @@ def purge_ghost_matches() -> int:
     now_ts = datetime.now(timezone.utc).timestamp()
     cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
     today = date_cls.today().isoformat()
-    max_future = (date_cls.today() + timedelta(days=MAX_FUTURE_DAYS)).isoformat()
-
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
 
         # 1. Ghost not-started: kick-off passed but never went live
@@ -570,30 +701,27 @@ def purge_ghost_matches() -> int:
             (today,),
         )
 
-        # 3. Far-future already enriched: keep unmatched ones so enrichment
-        #    can still try to find them on SofaScore; only drop enriched ones
-        #    that are beyond MAX_FUTURE_DAYS (they'll be re-ingested fresh)
-        r3 = conn.execute(
+        # 3. Non-live rows that already failed SofaScore matching and passed
+        #    their retry window should leave the hot queue. Live rows are kept
+        #    because late listings and direct match repair can still happen.
+        #    Future rows are kept and retried by the future enrichment lane.
+        r4 = conn.execute(
             """
-            delete from future_match_buffer
+            delete from match_buffer
             where is_live = 0
               and is_finished = 0
-              and match_date > ?
-              and enriched_at is not null
-              and sofascore_id is not null
-              and sofascore_id != ''
-            """,
-            (max_future,),
+              and json_extract(raw_enriched, '$.sofascore_match_status') = 'no_match'
+              and coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= strftime('%s','now')
+            """
         )
-
         conn.commit()
 
-    deleted = r1.rowcount + r2.rowcount + r3.rowcount
+    deleted = r1.rowcount + r2.rowcount + r4.rowcount
     if deleted:
         print(
             f"[buffer] purge_ghost_matches: removed {deleted} total "
             f"(ghost_not_started={r1.rowcount}, stuck_live={r2.rowcount}, "
-            f"far_future_re-enriched={r3.rowcount})"
+            f"no_match_hot={r4.rowcount}, no_match_future=0)"
         )
     return deleted
 
@@ -603,7 +731,7 @@ def get_buffer_stats() -> dict[str, Any]:
     _init_db()
     from datetime import date
     today = date.today().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         total       = conn.execute("select count(*) from match_buffer").fetchone()[0]
         future_total = conn.execute("select count(*) from future_match_buffer").fetchone()[0]
@@ -643,19 +771,86 @@ def get_buffer_stats() -> dict[str, Any]:
         ).fetchone()[0]
         last_ingest = conn.execute("select max(ingested_at) from match_buffer").fetchone()[0]
         last_enrich = conn.execute("select max(enriched_at) from match_buffer").fetchone()[0]
+        no_sofa_match = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and json_extract(raw_enriched, '$.sofascore_match_status') = 'no_match'
+            """
+        ).fetchone()[0]
+        needs_enrichment = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and enriched_at is null
+            """
+        ).fetchone()[0]
+        ready = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and json_extract(raw_enriched, '$.sofascore_detail') is not null
+              and json_extract(raw_enriched, '$.prediction_error') is null
+            """
+        ).fetchone()[0]
+        deferred = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and json_extract(raw_enriched, '$.prediction_error') is not null
+            """
+        ).fetchone()[0]
+        stale_live = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and is_live = 1
+              and (
+                ingested_at is null
+                or datetime(ingested_at) < datetime('now', '-5 minutes')
+              )
+            """
+        ).fetchone()[0]
+        hot_upcoming = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and is_live = 0
+              and (start_time is null or cast(start_time as real) > (strftime('%s','now') - 7200) * 1000)
+            """
+        ).fetchone()[0]
 
     return {
         "total_buffered": total + future_total,
+        "visible_buffered": total,
         "hot_buffered": total,
         "future_buffered": future_total,
         "today": today_count,
         "live": live_count,
-        "upcoming": today_count - live_count,
+        "upcoming": hot_upcoming,
         "enriched": enriched + future_enriched,
+        "hot_enriched": enriched,
         "future_enriched": future_enriched,
-        "pending_enrichment": pending + future_pending,
+        # Legacy field kept for callers, but now intentionally excludes the
+        # low-priority future queue so it no longer looks like an urgent fault.
+        "pending_enrichment": pending,
         "hot_pending_enrichment": pending,
         "future_pending_enrichment": future_pending,
+        "needs_enrichment": needs_enrichment,
+        "no_sofa_match": no_sofa_match,
+        "ready": ready,
+        "deferred": deferred,
+        "stale_live": stale_live,
+        "future_queued": future_total,
+        "queue_labels": {
+            "upcoming": hot_upcoming,
+            "future_queued": future_total,
+            "needs_enrichment": needs_enrichment,
+            "no_sofa_match": no_sofa_match,
+            "ready": ready,
+            "deferred": deferred,
+            "stale_live": stale_live,
+        },
         "last_ingested_at": last_ingest,
         "last_enriched_at": last_enrich,
     }
@@ -663,7 +858,13 @@ def get_buffer_stats() -> dict[str, Any]:
 
 # ── Enrichment worker ─────────────────────────────────────────────────────────
 
-def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]:
+def run_enrichment_worker(
+    batch_size: int = ENRICH_BATCH_SIZE,
+    live_only: bool = False,
+    future_only: bool = False,
+    force_live_retry: bool = False,
+    fetch_web_context: bool = True,
+) -> dict[str, Any]:
     """
     Pick up a batch of unenriched/stale matches and enrich them.
     Called by the scheduler — runs continuously in background.
@@ -676,7 +877,12 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
     from app.activity_log import record_activity
     from datetime import date
 
-    batch = get_unenriched_batch(batch_size)
+    batch = get_unenriched_batch(
+        batch_size,
+        live_only=live_only,
+        future_only=future_only,
+        force_live_retry=force_live_retry,
+    )
     if not batch:
         return {"status": "idle", "pending": 0}
 
@@ -718,6 +924,7 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             match_name=match_name,
         )
         sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
+        item["sofascore_candidate_count"] = len(sofa_events)
         saved_sofa_id = existing.get("sofascore_id")
         sofa = None
         score = 0.0
@@ -733,8 +940,10 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
 
         sofa, score = _fuzzy_match(sporty, sofa_events)
 
-        if score < FUZZY_THRESHOLD:
-            if score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
+        threshold = 0.62 if item.get("is_live") else FUZZY_THRESHOLD
+        llm_threshold = 0.55 if item.get("is_live") else LLM_FALLBACK_THRESHOLD
+        if score < threshold:
+            if score >= llm_threshold and not _is_junk(sporty.get("name") or ""):
                 llm_sofa = _llm_match(sporty, sofa_events)
                 if llm_sofa:
                     sofa = llm_sofa
@@ -797,13 +1006,14 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             return idx, {"query": "", "snippets": [], "scraped": []}
 
     web_contexts: dict[int, dict] = {}
-    needs_web = [(i, item["sporty"]) for i, (item, _, _) in enumerate(pairs)]
+    if fetch_web_context:
+        needs_web = [(i, item["sporty"]) for i, (item, _, _) in enumerate(pairs)]
 
-    with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
-        futures = {pool.submit(_fetch_web, i, sporty): i for i, sporty in needs_web}
-        for future in as_completed(futures):
-            idx, ctx = future.result()
-            web_contexts[idx] = ctx
+        with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
+            futures = {pool.submit(_fetch_web, i, sporty): i for i, sporty in needs_web}
+            for future in as_completed(futures):
+                idx, ctx = future.result()
+                web_contexts[idx] = ctx
 
     # assemble and store
     now = datetime.now(timezone.utc).isoformat()
@@ -815,6 +1025,7 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
         existing = item.get("existing") or {}
         detail = details.get(i)
         web_context = web_contexts.get(i, {"query": "", "snippets": [], "scraped": []})
+        match_state = classify_match_state(sporty)
         time_context = match_time_context({**sporty, "sofascore_event": sofa})
 
         match_status = "matched" if sofa else "no_match"
@@ -833,6 +1044,9 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             "played_seconds":    sporty.get("played_seconds"),
             "score":             sporty.get("score"),
             "venue":             sporty.get("venue"),
+            "sportybet_detail":  _sporty_detail_doc(sporty),
+            "sportybet_data_status": "available",
+            "data_sources":      _data_sources(sofa, detail, sporty),
             "sportybet_markets": sporty.get("markets", []),
             "sofascore_id":      sofa.get("id") if sofa else None,
             "sofascore_name":    sofa.get("name") if sofa else None,
@@ -841,7 +1055,7 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             "web_context":       web_context,
             "match_score":       round(score, 3),
             "sofascore_match_status": match_status,
-            "sofascore_candidate_count": len(sofa_events),
+            "sofascore_candidate_count": int(item.get("sofascore_candidate_count") or 0),
             "sofascore_best_score": round(score, 3),
             "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
             "sofascore_no_match_at": None if sofa else now,
@@ -850,18 +1064,17 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
             "raw_sporty":        sporty,
             "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
             "time_context":      time_context,
+            "match_state":       match_state,
             "enriched_at":       now,
         }
 
         snapshot_odds(doc)
-        if sofa:
-            try:
-                from app.enriched_prediction import predict_enriched_match
-                from app.league_memory import record_prediction
+        if sofa or item.get("is_live"):
+            from app.prediction_flow import apply_prediction_state
 
-                prediction = predict_enriched_match(doc)
-                doc["prediction"] = prediction
-                record_prediction(prediction)
+            state = apply_prediction_state(doc, match_id=str(item.get("match_id") or ""))
+            readiness = state.get("readiness") or {}
+            if state.get("status") == "predicted":
                 predicted += 1
                 record_activity(
                     f"Prediction completed for {sporty.get('name') or item['match_id']}",
@@ -869,12 +1082,21 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
                     status="predicted",
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
-                    details={"sofascore_id": doc.get("sofascore_id")},
+                    details={"sofascore_id": doc.get("sofascore_id"), "assurance": readiness.get("assurance")},
                 )
-            except Exception as exc:
-                print(f"[buffer] auto prediction failed for {item['match_id']}: {exc}")
+            elif state.get("status") == "deferred":
                 record_activity(
-                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {exc}",
+                    f"Prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
+                    job="enrich_worker",
+                    status="waiting",
+                    match_id=str(item.get("match_id") or ""),
+                    match_name=sporty.get("name"),
+                    details=readiness,
+                )
+            else:
+                print(f"[buffer] auto prediction failed for {item['match_id']}: {state.get('error')}")
+                record_activity(
+                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
                     job="enrich_worker",
                     status="error",
                     match_id=str(item.get("match_id") or ""),
@@ -882,7 +1104,13 @@ def run_enrichment_worker(batch_size: int = ENRICH_BATCH_SIZE) -> dict[str, Any]
                 )
         else:
             doc["prediction"] = None
-            doc["prediction_error"] = "Prediction deferred until a confident SofaScore match is found."
+            from app.enriched_prediction import prediction_readiness
+
+            readiness = prediction_readiness(doc)
+            doc["prediction_readiness"] = readiness
+            doc["prediction_error"] = (
+                "Minimum SportyBet enrichment completed; prediction deferred until a confident SofaScore match is found."
+            )
         doc["lifecycle"] = _lifecycle_state(doc)
         store_enriched(item["match_id"], doc)
         stored += 1
@@ -955,6 +1183,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             match_name=match_name,
         )
         sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
+        item["sofascore_candidate_count"] = len(sofa_events)
         saved_sofa_id = existing.get("sofascore_id")
         sofa = None
         score = 0.0
@@ -969,17 +1198,19 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         else:
             sofa, score = _fuzzy_match(sporty, sofa_events)
             source = "fuzzy"
-            if score < FUZZY_THRESHOLD:
-                if score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
-                    llm_sofa = _llm_match(sporty, sofa_events)
-                    if llm_sofa:
-                        sofa = llm_sofa
-                        source = "llm"
-                        llm_used += 1
-                    else:
-                        sofa = None
+        threshold = 0.62 if item.get("is_live") else FUZZY_THRESHOLD
+        llm_threshold = 0.55 if item.get("is_live") else LLM_FALLBACK_THRESHOLD
+        if score < threshold:
+            if score >= llm_threshold and not _is_junk(sporty.get("name") or ""):
+                llm_sofa = _llm_match(sporty, sofa_events)
+                if llm_sofa:
+                    sofa = llm_sofa
+                    source = "llm"
+                    llm_used += 1
                 else:
                     sofa = None
+            else:
+                sofa = None
 
         if sofa:
             matched += 1
@@ -1036,6 +1267,9 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "played_seconds":    sporty.get("played_seconds"),
             "score":             sporty.get("score"),
             "venue":             sporty.get("venue"),
+            "sportybet_detail":  _sporty_detail_doc(sporty),
+            "sportybet_data_status": "available",
+            "data_sources":      _data_sources(sofa, detail, sporty),
             "sportybet_markets": sporty.get("markets", []),
             "sofascore_id":      sofa.get("id") if sofa else None,
             "sofascore_name":    sofa.get("name") if sofa else None,
@@ -1045,7 +1279,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "match_score":       round(score, 3),
             "match_source":      source,
             "sofascore_match_status": match_status,
-            "sofascore_candidate_count": len(sofa_events),
+            "sofascore_candidate_count": int(item.get("sofascore_candidate_count") or 0),
             "sofascore_best_score": round(score, 3),
             "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
             "sofascore_no_match_at": None if sofa else now,
@@ -1054,18 +1288,17 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "raw_sporty":        sporty,
             "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
             "time_context":      time_context,
+            "match_state":       match_state,
             "enriched_at":       now,
         }
 
         snapshot_odds(doc)
-        if sofa:
-            try:
-                from app.enriched_prediction import predict_enriched_match
-                from app.league_memory import record_prediction
+        if sofa or item.get("is_live"):
+            from app.prediction_flow import apply_prediction_state
 
-                prediction = predict_enriched_match(doc)
-                doc["prediction"] = prediction
-                record_prediction(prediction)
+            state = apply_prediction_state(doc, match_id=str(item.get("match_id") or ""))
+            readiness = state.get("readiness") or {}
+            if state.get("status") == "predicted":
                 predicted += 1
                 record_activity(
                     f"Prediction completed for {sporty.get('name') or item['match_id']}",
@@ -1073,13 +1306,21 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                     status="predicted",
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
-                    details={"sofascore_id": doc.get("sofascore_id")},
+                    details={"sofascore_id": doc.get("sofascore_id"), "assurance": readiness.get("assurance")},
                 )
-            except Exception as exc:
-                doc["prediction_error"] = str(exc)
-                print(f"[buffer] sequential prediction failed for {item['match_id']}: {exc}")
+            elif state.get("status") == "deferred":
                 record_activity(
-                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {exc}",
+                    f"Prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
+                    job="date_aware_enrichment",
+                    status="waiting",
+                    match_id=str(item.get("match_id") or ""),
+                    match_name=sporty.get("name"),
+                    details=readiness,
+                )
+            else:
+                print(f"[buffer] sequential prediction failed for {item['match_id']}: {state.get('error')}")
+                record_activity(
+                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
                     job="date_aware_enrichment",
                     status="error",
                     match_id=str(item.get("match_id") or ""),
@@ -1087,7 +1328,13 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                 )
         else:
             doc["prediction"] = None
-            doc["prediction_error"] = "Prediction deferred until a confident SofaScore match is found."
+            from app.enriched_prediction import prediction_readiness
+
+            readiness = prediction_readiness(doc)
+            doc["prediction_readiness"] = readiness
+            doc["prediction_error"] = (
+                "Minimum SportyBet enrichment completed; prediction deferred until a confident SofaScore match is found."
+            )
 
         doc["lifecycle"] = _lifecycle_state(doc)
         store_enriched(item["match_id"], doc)
@@ -1141,6 +1388,9 @@ def _sporty_to_summary(m: dict[str, Any]) -> dict[str, Any]:
         "played_seconds": m.get("played_seconds"),
         "score":          score,
         "venue":          m.get("venue"),
+        "sportybet_detail": _sporty_detail_doc(m),
+        "sportybet_data_status": "available" if m else "missing",
+        "data_sources":   _data_sources(None, None, m),
         "odds_1x2":       _extract_1x2(m.get("markets", [])),
         "raw_sporty":     m,
         "has_sofascore":  False,
@@ -1155,7 +1405,80 @@ def _ensure_country_fields(doc: dict[str, Any], sporty: dict[str, Any] | None = 
     if country:
         doc["category"] = country
         doc["country"] = country
+    if sporty and not doc.get("sportybet_detail"):
+        doc["sportybet_detail"] = _sporty_detail_doc(sporty)
+    if not doc.get("data_sources"):
+        doc["data_sources"] = _data_sources(doc.get("sofascore_event"), doc.get("sofascore_detail"), doc.get("raw_sporty") or sporty or doc)
     return doc
+
+
+def _finalize_buffer_doc(doc: dict[str, Any], sporty: dict[str, Any] | None = None) -> dict[str, Any]:
+    source_doc = {**(sporty or {}), **doc}
+    if sporty and "raw_sporty" not in source_doc:
+        source_doc["raw_sporty"] = sporty
+    state = classify_match_state(source_doc)
+    doc["match_state"] = state
+    doc["is_live"] = bool(state.get("is_live"))
+    doc["is_finished"] = bool(state.get("is_finished") or doc.get("is_finished"))
+    if not doc.get("time_context"):
+        try:
+            from app.time_context import match_time_context
+
+            doc["time_context"] = match_time_context(source_doc)
+        except Exception:
+            pass
+    return doc
+
+
+def _sporty_detail_doc(sporty: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalized SportyBet detail block used as a first-class enrichment source."""
+    if not sporty:
+        return {}
+    score = sporty.get("score") or {}
+    markets = sporty.get("markets") or []
+    return {
+        "source": "sportybet",
+        "id": str(sporty.get("id") or ""),
+        "name": sporty.get("name"),
+        "home_team": sporty.get("home_team"),
+        "away_team": sporty.get("away_team"),
+        "tournament": sporty.get("tournament"),
+        "category": _country_from_sporty(sporty),
+        "start_time": sporty.get("start_time"),
+        "period": sporty.get("period"),
+        "played_seconds": sporty.get("played_seconds"),
+        "score": score,
+        "period_scores": sporty.get("period_scores"),
+        "status": sporty.get("status"),
+        "home_red_cards": sporty.get("home_red_cards"),
+        "away_red_cards": sporty.get("away_red_cards"),
+        "venue": sporty.get("venue"),
+        "markets": markets,
+        "market_count": len(markets),
+        "odds_1x2": _extract_1x2(markets),
+        "raw_event": sporty.get("raw_event"),
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _data_sources(sofa: dict[str, Any] | None, detail: dict[str, Any] | None, sporty: dict[str, Any] | None) -> dict[str, Any]:
+    markets = (sporty or {}).get("markets") or []
+    return {
+        "sportybet": {
+            "available": bool(sporty),
+            "detail": bool(sporty),
+            "markets": bool(markets),
+            "market_count": len(markets),
+            "live_clock": bool(classify_match_state(sporty or {}).get("is_live")),
+        },
+        "sofascore": {
+            "available": bool(sofa or detail),
+            "matched": bool(sofa),
+            "detail": bool(detail),
+            "statistics": bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics")),
+            "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
+        },
+    }
 
 
 def _country_from_sporty(m: dict[str, Any]) -> str | None:
@@ -1183,6 +1506,16 @@ def _merge_enriched(raw_sporty: dict[str, Any], existing: dict[str, Any], incomi
     """Preserve sticky user-matched SofaScore state while refreshing volatile match data."""
     merged = {**existing, **incoming}
     merged["raw_sporty"] = raw_sporty or incoming.get("raw_sporty") or existing.get("raw_sporty")
+    merged["sportybet_detail"] = incoming.get("sportybet_detail") or _sporty_detail_doc(merged.get("raw_sporty") or raw_sporty)
+    merged["sportybet_data_status"] = (
+        incoming.get("sportybet_data_status")
+        or ("available" if merged.get("sportybet_detail") else existing.get("sportybet_data_status") or "missing")
+    )
+    merged["data_sources"] = incoming.get("data_sources") or _data_sources(
+        merged.get("sofascore_event"),
+        merged.get("sofascore_detail"),
+        merged.get("raw_sporty"),
+    )
     _ensure_country_fields(merged, raw_sporty)
     if existing.get("manual_match") and existing.get("sofascore_id"):
         merged["manual_match"] = True
@@ -1195,18 +1528,103 @@ def _merge_enriched(raw_sporty: dict[str, Any], existing: dict[str, Any], incomi
     return merged
 
 
+def _sync_enriched_sporty_fields(
+    conn: sqlite3.Connection,
+    table: str,
+    match_id: str,
+    sporty: dict[str, Any],
+    match_date: str,
+    is_live: int,
+    is_finished: int,
+) -> None:
+    from app.time_context import match_time_context
+
+    row = conn.execute(f"select raw_enriched from {table} where match_id = ?", (match_id,)).fetchone()
+    if not row or not row[0]:
+        return
+    try:
+        doc = json.loads(row[0])
+    except Exception:
+        return
+    score = sporty.get("score") or {}
+    state = classify_match_state(sporty)
+    doc.update({
+        "sportybet_id": str(sporty.get("id") or doc.get("sportybet_id") or match_id),
+        "sportybet_name": sporty.get("name") or doc.get("sportybet_name") or doc.get("name"),
+        "name": sporty.get("name") or doc.get("name"),
+        "home_team": sporty.get("home_team") or doc.get("home_team"),
+        "away_team": sporty.get("away_team") or doc.get("away_team"),
+        "tournament": sporty.get("tournament") or doc.get("tournament"),
+        "category": sporty.get("category") or doc.get("category"),
+        "start_time": sporty.get("start_time") or doc.get("start_time"),
+        "match_date": match_date or doc.get("match_date"),
+        "period": sporty.get("period") or doc.get("period"),
+        "played_seconds": sporty.get("played_seconds"),
+        "score": score,
+        "score_home": score.get("home"),
+        "score_away": score.get("away"),
+        "home_red_cards": sporty.get("home_red_cards"),
+        "away_red_cards": sporty.get("away_red_cards"),
+        "sportybet_detail": _sporty_detail_doc(sporty),
+        "sportybet_data_status": "available",
+        "data_sources": _data_sources(doc.get("sofascore_event"), doc.get("sofascore_detail"), sporty),
+        "sportybet_markets": sporty.get("markets") or doc.get("sportybet_markets") or doc.get("markets") or [],
+        "markets": sporty.get("markets") or doc.get("markets") or [],
+        "odds_1x2": _extract_1x2(sporty.get("markets") or doc.get("markets") or []),
+        "raw_sporty": sporty,
+        "is_live": bool(is_live),
+        "is_finished": bool(is_finished),
+        "match_state": state,
+        "time_context": match_time_context({**sporty, "sofascore_event": doc.get("sofascore_event")}),
+        "sporty_refreshed_at": datetime.now(timezone.utc).isoformat(),
+    })
+    doc["lifecycle"] = _lifecycle_state(doc)
+    conn.execute(f"update {table} set raw_enriched = ? where match_id = ?", (json.dumps(doc), match_id))
+
+
+def _mark_missing_from_sporty(match_id: str) -> None:
+    _init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        _init_buffer_table(conn)
+        for table in ("match_buffer", "future_match_buffer"):
+            row = conn.execute(f"select raw_enriched from {table} where match_id = ?", (str(match_id),)).fetchone()
+            if not row or not row[0]:
+                continue
+            try:
+                doc = json.loads(row[0])
+            except Exception:
+                doc = {}
+            doc["sporty_active"] = False
+            doc["sportybet_data_status"] = "missing"
+            doc["data_sources"] = _data_sources(doc.get("sofascore_event"), doc.get("sofascore_detail"), None)
+            doc["sporty_missing_at"] = now
+            conn.execute(f"update {table} set raw_enriched = ? where match_id = ?", (json.dumps(doc), str(match_id)))
+        conn.commit()
+
+
+def _date_from_start_time(start_time: Any) -> str:
+    try:
+        ts = float(start_time)
+        if ts > 1e12:
+            ts /= 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+    except Exception:
+        return date_cls.today().isoformat()
+
+
 def _lifecycle_state(doc: dict[str, Any]) -> dict[str, Any]:
-    period = str(doc.get("period") or "")
-    is_live = bool(period and period not in ("Not start", "Not started", "FT", "AET", "Finished", "Ended", ""))
-    is_finished = _is_finished_period(period) or bool(doc.get("is_finished"))
+    state = classify_match_state(doc)
+    is_live = bool(state.get("is_live"))
+    is_finished = bool(state.get("is_finished") or state.get("state") in {"postponed", "cancelled"} or doc.get("is_finished"))
     prediction = doc.get("prediction") or {}
     graded = bool(prediction.get("result") or doc.get("graded_at"))
     archived = bool(doc.get("archived_at") or doc.get("finished_at"))
     stages = {
         "discovered": bool(doc.get("sportybet_id") or doc.get("id")),
         "matched": bool(doc.get("sofascore_id") or doc.get("sofascore_event")),
-        "enriched": bool(doc.get("enriched_at") or doc.get("sofascore_detail") or doc.get("web_context")),
-        "predicted": bool(prediction or doc.get("predicted")),
+        "enriched": bool(doc.get("enriched_at") and (doc.get("sofascore_detail") or doc.get("sportybet_detail"))),
+        "predicted": bool(prediction and not doc.get("prediction_error")),
         "live": is_live,
         "finished": is_finished,
         "graded": graded,
@@ -1215,7 +1633,7 @@ def _lifecycle_state(doc: dict[str, Any]) -> dict[str, Any]:
     order = ["archived", "graded", "finished", "live", "predicted", "enriched", "matched", "discovered"]
     current = next((stage for stage in order if stages.get(stage)), "unknown")
     missing = [stage for stage in ("matched", "enriched", "predicted", "graded", "archived") if not stages.get(stage)]
-    return {"current": current, "stages": stages, "missing": missing}
+    return {"current": current, "state": state.get("state"), "match_state": state, "stages": stages, "missing": missing}
 
 
 def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1236,6 +1654,24 @@ def _is_finished_period(period: str | None) -> bool:
         return False
     p = period.lower().strip()
     return p in ("ft", "finished", "ended", "aet", "ap", "full time", "after penalties", "after extra time")
+
+
+def _is_not_started_period(period: str | None) -> bool:
+    if not period:
+        return True
+    return period.lower().strip().replace("_", " ") in {
+        "",
+        "not start",
+        "not started",
+        "notstart",
+        "notstarted",
+        "scheduled",
+        "ns",
+    }
+
+
+def _is_live_period(period: str | None) -> bool:
+    return bool(period) and not _is_not_started_period(period) and not _is_finished_period(period)
 
 
 def _is_90_plus(played_seconds: Any) -> bool:
@@ -1262,7 +1698,7 @@ def _is_ghost_match(start_time: Any, period: str | None) -> bool:
     kick-off was more than GHOST_MATCH_GRACE_MINUTES ago.
     These are matches that never went live — postponed, cancelled, or data gaps.
     """
-    if period and period not in ("Not start", "Not started", "", None):
+    if not _is_not_started_period(period):
         return False  # it did kick off, not a ghost
     if not start_time:
         return False
@@ -1354,7 +1790,7 @@ def _try_archive_finished(match_id: str) -> None:
         print(f"[buffer] archive failed for {match_id}: {exc}")
         # Last resort: ensure is_finished=1 so get_buffered_matches filters it out
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 conn.execute("update match_buffer set is_finished = 1 where match_id = ?", (match_id,))
                 conn.commit()
         except Exception:
@@ -1365,7 +1801,7 @@ def _archive_finished_locally(match_id: str) -> None:
     """Write finished match to local SQLite finished_matches table and delete from buffer."""
     import json as _json
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_buffer_table(conn)
         # Ensure finished_matches table exists
         conn.execute("""

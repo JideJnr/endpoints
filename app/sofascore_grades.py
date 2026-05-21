@@ -161,7 +161,7 @@ def store_match_grades(
     _init_db()
     stored = 0
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_grades_table(conn)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -204,7 +204,7 @@ def get_team_rating_trend(team_id: str, last_n: int = 5) -> dict[str, Any]:
     Returns: avg_rating, trend ('improving'/'declining'/'stable'), delta
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_grades_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""

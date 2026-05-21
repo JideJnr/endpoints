@@ -37,6 +37,23 @@ from typing import Any
 
 from app.league_memory import DB_PATH, _init_db
 
+UNIQUE_GRADED_HISTORY = """
+    select *
+    from (
+        select
+            ph.*,
+            row_number() over (
+                partition by match_id, pick_type, selection
+                order by datetime(coalesce(graded_at, created_at)) desc, id desc
+            ) as rn
+        from prediction_history ph
+        where graded_at is not null
+          and result in ('win', 'loss')
+          and pick_type != 'no_bet'
+    )
+    where rn = 1
+"""
+
 MIN_SAMPLES = 15          # minimum graded predictions before trusting a signal
 BLEND_WEIGHT = 0.45       # how much learned accuracy pulls the raw signal weight
                           # 0 = no adjustment, 1 = fully replace with learned rate
@@ -111,19 +128,17 @@ def run_learning_cycle() -> dict[str, Any]:
     Call this after every grading run.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 
-        # Pull all graded predictions with their signals
-        rows = conn.execute("""
+        # Pull one settled row per match + pick. Live refreshes can record the
+        # same pick repeatedly, but learning should only count the outcome once.
+        rows = conn.execute(f"""
             select
                 match_id, league_name, country_name, pick_type,
                 selection, confidence, result, signals_json, created_at
-            from prediction_history
-            where graded_at is not null
-              and result in ('win', 'loss')
-              and pick_type != 'no_bet'
+            from ({UNIQUE_GRADED_HISTORY})
             order by created_at desc
         """).fetchall()
 
@@ -198,7 +213,7 @@ def run_learning_cycle() -> dict[str, Any]:
     league_updates = 0
     model_updates = 0
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -333,7 +348,7 @@ def get_signal_weights(league: str | None = None, pick_type: str | None = None) 
     Used by enriched_prediction.py to adjust signal impacts.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 
@@ -372,7 +387,7 @@ def get_learned_weights() -> dict[str, float]:
     Falls back to hardcoded defaults if not enough data yet.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -398,7 +413,7 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
     """
     _init_db()
     league_key = _norm_league(league)
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
@@ -431,7 +446,7 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
 def get_top_signals(limit: int = 20) -> list[dict[str, Any]]:
     """Return the highest and lowest performing signals globally."""
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
@@ -461,7 +476,7 @@ def get_top_signals(limit: int = 20) -> list[dict[str, Any]]:
 def get_learning_summary() -> dict[str, Any]:
     """Full summary of what the system has learned. Used by analytics endpoints."""
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 

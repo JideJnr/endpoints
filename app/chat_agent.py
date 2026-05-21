@@ -341,7 +341,7 @@ def _minute_bucket(minute: int) -> str:
 
 def _memory_for(league: str, bucket: str, state: str) -> dict[str, dict[str, Any]]:
     key = normalize_league(league)
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         exact = conn.execute(
             """

@@ -27,7 +27,8 @@ def snapshot_odds(doc: dict[str, Any]) -> bool:
     snapshot_time = datetime.now(timezone.utc).isoformat()
     wrote_any = False
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _ensure_tables(conn)
         if odds.get("home"):
             conn.execute(
@@ -91,7 +92,8 @@ def snapshot_odds(doc: dict[str, Any]) -> bool:
 
 def get_movement(match_id: str) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _ensure_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -166,7 +168,8 @@ def get_all_movements(match_date: str | None = None) -> list[dict[str, Any]]:
     if match_date:
         query += " where match_date = ?"
         params = (match_date,)
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         rows = conn.execute(query, params).fetchall()
     return [get_movement(row[0]) for row in rows]
 

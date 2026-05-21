@@ -11,8 +11,10 @@ from urllib import error, request
 from app.league_memory import store_enriched_matches
 from app.market import snapshot_odds
 from app.normalise import normalise
+from app.match_state import classify_match_state
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, is_usable_event_for_mode
 from app.sportybet_client import fetch_live_and_upcoming_matches_post
+from app.time_context import match_time_context
 from app.web_context import search_match_context
 
 
@@ -104,7 +106,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             return idx, {"query": "", "snippets": [], "scraped": []}
 
     # Only run web search for matched matches (has sofa detail = worth enriching)
-    needs_web = [(i, sporty) for i, (sporty, sofa, _) in enumerate(matched_pairs) if sofa]
+    needs_web = [(i, sporty) for i, (sporty, _, _) in enumerate(matched_pairs)]
 
     with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
         futures = {pool.submit(_fetch_web, i, sporty): i for i, sporty in needs_web}
@@ -121,6 +123,9 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     for i, (sporty, sofa, score) in enumerate(matched_pairs):
         detail = details.get(i)
         web_context = web_contexts.get(i, {"query": "", "snippets": [], "scraped": []})
+        match_state = classify_match_state(sporty)
+        time_context = match_time_context({**sporty, "sofascore_event": sofa})
+        match_status = "matched" if sofa else "no_match"
 
         doc = {
             "sportybet_id": sporty.get("id"),
@@ -132,12 +137,24 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "period": sporty.get("period"),
             "score": sporty.get("score"),
             "venue": sporty.get("venue"),
+            "sportybet_detail": _sporty_detail_doc(sporty),
+            "sportybet_data_status": "available",
             "sportybet_markets": sporty.get("markets", []),
+            "markets": sporty.get("markets", []),
+            "data_sources": _data_sources(sofa, detail, sporty),
             "sofascore_id": sofa.get("id") if sofa else None,
             "sofascore_name": sofa.get("name") if sofa else None,
+            "sofascore_event": sofa,
             "sofascore_detail": detail,
+            "sofascore_match_status": match_status,
+            "sofascore_no_match_at": None if sofa else now,
+            "minimum_enrichment_status": "full_provider_match" if sofa else "sporty_only",
             "web_context": web_context,
             "match_score": round(score, 3),
+            "raw_sporty": sporty,
+            "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
+            "time_context": time_context,
+            "match_state": match_state,
             "enriched_at": now,
         }
         documents.append(doc)
@@ -166,6 +183,52 @@ def _hf_token() -> str | None:
         or os.getenv("HUGGINGFACE_HUB_TOKEN")
         or os.getenv("HUGGING_FACE_HUB_TOKEN")
     )
+
+
+def _sporty_detail_doc(sporty: dict[str, Any] | None) -> dict[str, Any]:
+    if not sporty:
+        return {}
+    markets = sporty.get("markets") or []
+    return {
+        "source": "sportybet",
+        "id": str(sporty.get("id") or ""),
+        "name": sporty.get("name"),
+        "home_team": sporty.get("home_team"),
+        "away_team": sporty.get("away_team"),
+        "tournament": sporty.get("tournament"),
+        "category": sporty.get("category"),
+        "start_time": sporty.get("start_time"),
+        "period": sporty.get("period"),
+        "played_seconds": sporty.get("played_seconds"),
+        "score": sporty.get("score") or {},
+        "period_scores": sporty.get("period_scores"),
+        "status": sporty.get("status"),
+        "venue": sporty.get("venue"),
+        "markets": markets,
+        "market_count": len(markets),
+        "raw_event": sporty.get("raw_event"),
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _data_sources(sofa: dict[str, Any] | None, detail: dict[str, Any] | None, sporty: dict[str, Any] | None) -> dict[str, Any]:
+    markets = (sporty or {}).get("markets") or []
+    return {
+        "sportybet": {
+            "available": bool(sporty),
+            "detail": bool(sporty),
+            "fresh": True,
+            "markets": bool(markets),
+            "market_count": len(markets),
+        },
+        "sofascore": {
+            "available": bool(sofa or detail),
+            "matched": bool(sofa),
+            "detail": bool(detail),
+            "statistics": bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics")),
+            "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
+        },
+    }
 
 
 def _llm_match(sporty: dict[str, Any], sofa_events: list[dict[str, Any]]) -> dict[str, Any] | None:

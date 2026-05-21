@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.match_state import classify_match_state
+
 
 DEFAULT_LOCAL_TZ = "Africa/Lagos"
 
@@ -116,6 +118,7 @@ def match_time_context(match: dict[str, Any], local_tz: str | None = None) -> di
         "now_utc": now_utc.isoformat(),
         "now_local": now_local.isoformat(),
         "start_raw": start_time,
+        "match_state": classify_match_state(match, now=now_utc),
     }
     if dt_utc:
         start_local = dt_utc.astimezone(local_zone)

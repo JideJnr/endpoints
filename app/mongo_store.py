@@ -55,7 +55,7 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
     from app.market import get_movement
 
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "select match_id, match_date, raw_enriched, raw_sporty from match_buffer where match_id = ?",
@@ -107,6 +107,10 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
         "away_last_matches":   detail.get("away_last_matches") or [],
         "h2h":                 detail.get("h2h"),
         "standings":           detail.get("standings"),
+        "sportybet_detail":    doc.get("sportybet_detail") or {},
+        "sportybet_data_status": doc.get("sportybet_data_status"),
+        "data_sources":        doc.get("data_sources") or {},
+        "raw_sporty":          doc.get("raw_sporty") or {},
         "sportybet_markets":   doc.get("sportybet_markets") or doc.get("markets") or [],
     }
 
@@ -306,7 +310,7 @@ def cleanup_buffer() -> dict[str, Any]:
     # 2-hour grace period in ms
     ghost_cutoff_ms = (now_ts - 120 * 60) * 1000
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows_to_archive = conn.execute(
             """
@@ -326,7 +330,7 @@ def cleanup_buffer() -> dict[str, Any]:
         except Exception:
             pass
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         # Delete rows explicitly marked finished
         r1 = conn.execute("delete from match_buffer where is_finished = 1")
         # Delete rows whose period string indicates finished
@@ -417,7 +421,7 @@ def _latest_prediction(match_id: str) -> dict[str, Any] | None:
     try:
         from app.league_memory import DB_PATH, _init_db
         _init_db()
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "select pick_type, selection, confidence, reason from prediction_history where match_id = ? order by created_at desc limit 1",

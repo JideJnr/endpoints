@@ -33,7 +33,7 @@ def kelly_fraction(probability: float, decimal_odds: float, fraction: float = 0.
         "full_kelly": round(full_kelly, 4),
         "quarter_kelly": round(fractional_kelly, 4),
         "stake_per_100": round(fractional_kelly * 100, 2),
-        "value_bet": edge > 0,
+        "value_bet": edge > 3,
         "recommendation": "bet" if edge > 3 else "skip",
     }
 

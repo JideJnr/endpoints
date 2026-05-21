@@ -15,6 +15,7 @@ from app.buffer import (
 )
 from app.league_memory import list_prediction_history
 from app.market import get_movement
+from app.match_state import classify_match_state
 from app.scheduler import scheduler_status
 
 
@@ -64,6 +65,36 @@ def get_today_match_detail(sportybet_id: str):
             return archived
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
     return _match_detail(doc)
+
+
+@router.get("/matches/{sportybet_id}/sporty-info")
+def get_match_sporty_info(sportybet_id: str):
+    """Fetch fresh SportyBet endpoint data for one match and merge it into buffer."""
+    from app.buffer import refresh_sporty_match_state
+    from app.sportybet_client import fetch_match_info
+
+    try:
+        info = fetch_match_info(sportybet_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not info.get("found"):
+        raise HTTPException(status_code=404, detail=info)
+
+    refresh = {}
+    try:
+        refresh = refresh_sporty_match_state(sportybet_id)
+    except Exception as exc:
+        refresh = {"status": "error", "detail": str(exc)}
+
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "endpoint": info.get("api_endpoint"),
+        "scope": info.get("scope"),
+        "request_payload": info.get("request_payload"),
+        "match": info.get("match"),
+        "buffer_refresh": refresh,
+    }
 
 
 @router.get("/matches/{sportybet_id}/sofascore-candidates")
@@ -241,49 +272,81 @@ def match_sofascore_candidate(
 @router.post("/predictions/refresh")
 def refresh_predictions_today():
     """
-    Clear today's prediction history, re-enrich all buffered matches,
-    and re-run predictions. Call this after engine changes.
+    Re-enrich all buffered matches and append fresh predictions.
+    Prediction history is immutable because grading/learning depends on what the
+    engine actually said at the time.
     """
     from datetime import date
-    from app.league_memory import DB_PATH, _init_db
-    from app.buffer import get_buffered_matches
-    from app.enriched_prediction import predict_enriched_match
-    from app.league_memory import record_prediction
-    import sqlite3 as _sqlite3
+    from app.league_memory import _init_db
+    from app.buffer import get_buffered_match, get_buffered_matches, refresh_sporty_buffer_scope, refresh_sporty_match_state, store_enriched
+    from app.prediction_flow import apply_prediction_state
 
     today = date.today().isoformat()
     _init_db()
 
-    # 1. Delete today's prediction history so we get a clean slate
-    with _sqlite3.connect(DB_PATH) as conn:
-        deleted = conn.execute(
-            "delete from prediction_history where date(created_at) = ?", (today,)
-        ).rowcount
-        conn.commit()
+    # 1. Refresh SportyBet state before rebuilding predictions.
+    refresh_state = {"live": None, "upcoming": None}
+    for scope in ("live", "upcoming"):
+        try:
+            refresh_state[scope] = refresh_sporty_buffer_scope(scope)
+        except Exception as exc:
+            refresh_state[scope] = {"status": "error", "error": str(exc)}
 
-    # 2. Re-predict all buffered matches for today
+    # 2. Re-enrich active buffered matches before predicting so odds/Sofa/detail stay in sync.
     docs = get_buffered_matches(today, limit=500)
     predicted = 0
     errors = 0
+    enriched = 0
+    skipped_inactive = 0
     for doc in docs:
+        match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
         try:
-            prediction = predict_enriched_match(doc)
-            record_prediction({
-                **prediction,
-                "match_id": doc.get("sportybet_id") or doc.get("id"),
-                "match_date": today,
-                "source": "enriched_ensemble",
-            })
-            predicted += 1
+            if not match_id:
+                errors += 1
+                continue
+            try:
+                state = refresh_sporty_match_state(match_id)
+                if not state.get("active"):
+                    skipped_inactive += 1
+                    continue
+            except Exception:
+                state = {}
+            try:
+                from app.match_enrichment import enrich_buffered_match
+
+                enrich_buffered_match(match_id)
+                enriched += 1
+                doc = get_buffered_match(match_id) or doc
+            except HTTPException as exc:
+                if exc.status_code == 409:
+                    skipped_inactive += 1
+                    continue
+            except Exception:
+                pass
+            state = apply_prediction_state(
+                doc,
+                match_id=match_id,
+                match_date=today,
+                source="enriched_ensemble",
+            )
+            store_enriched(match_id, doc)
+            if state.get("status") == "predicted":
+                predicted += 1
+            else:
+                errors += 1
         except Exception as exc:
             errors += 1
 
     return {
         "status": "success",
         "date": today,
-        "deleted_old": deleted,
+        "sporty_refresh": refresh_state,
+        "deleted_old": 0,
+        "history_policy": "append_only",
+        "enriched": enriched,
         "predicted": predicted,
         "errors": errors,
+        "skipped_inactive": skipped_inactive,
         "total_matches": len(docs),
     }
 
@@ -291,52 +354,54 @@ def refresh_predictions_today():
 @router.get("/predictions/today")
 def get_predictions_today():
     """Return today's latest predictions per match, sorted by confidence desc. Excludes no_bet."""
-    from datetime import date, datetime, timedelta
-    from app.league_memory import list_prediction_history, DB_PATH, _init_db
+    from datetime import date
+    from app.league_memory import DB_PATH, _init_db
     from app.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     today = date.today().isoformat()
-    all_preds = list_prediction_history(limit=2000).get("predictions") or []
-    cutoff = datetime.now() - timedelta(hours=36)
-    today_preds = []
-    for prediction in all_preds:
-        created_raw = str(prediction.get("created_at") or "")
-        try:
-            created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            created_at = None
-        if created_at and created_at >= cutoff:
-            today_preds.append(prediction)
+    today_preds = _list_recent_dashboard_predictions(hours=36, limit=800)
 
     # Build a lookup of match_id → buffer status (period, is_live, is_finished)
     _init_db()
     buffer_status: dict[str, dict] = {}
     try:
-        with _sqlite3.connect(DB_PATH) as conn:
+        with _sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.row_factory = _sqlite3.Row
             _init_buffer_table(conn)
             rows = conn.execute(
                 """
-                select match_id, period, is_live, is_finished from match_buffer
+                select match_id, period, is_live, is_finished, raw_sporty, raw_enriched from match_buffer
                 union all
-                select match_id, period, is_live, is_finished from future_match_buffer
+                select match_id, period, is_live, is_finished, raw_sporty, raw_enriched from future_match_buffer
                 """
             ).fetchall()
             for row in rows:
+                doc = {}
+                try:
+                    import json as _json
+                    doc = _json.loads(row["raw_enriched"] or row["raw_sporty"] or "{}")
+                except Exception:
+                    doc = {"period": row["period"], "is_finished": bool(row["is_finished"])}
+                state = classify_match_state(doc)
                 buffer_status[str(row["match_id"])] = {
                     "period":      row["period"],
-                    "is_live":     bool(row["is_live"]),
-                    "is_finished": bool(row["is_finished"]),
+                    "is_live":     bool(state.get("is_live")),
+                    "is_finished": bool(row["is_finished"] or state.get("is_finished")),
+                    "match_state": state,
                 }
     except Exception:
         pass
+
+    role_rows = _load_role_memory_rows()
 
     # Keep latest prediction per match_id (list is already ordered by created_at desc)
     seen: dict[str, dict] = {}
     for p in today_preds:
         mid = str(p.get("match_id") or "")
         if not mid or mid in seen:
+            continue
+        if mid not in buffer_status:
             continue
         if p.get("result") or p.get("graded_at"):
             continue
@@ -346,8 +411,9 @@ def get_predictions_today():
         if not real_picks:
             continue
         p = {**p, "picks": real_picks}
-        # Update best_pick to the highest confidence real pick
-        best = max(real_picks, key=lambda pk: int(pk.get("confidence") or 0))
+        _backfill_role_learning(p, real_picks, mid, role_rows)
+        # Prefer the backend learned primary/secondary decision, then confidence.
+        best = _learned_best_pick(real_picks)
         p["best_pick"] = best
         # Attach live/period status from buffer
         status = buffer_status.get(mid, {})
@@ -370,7 +436,8 @@ def get_predictions_today():
             ]
             if regime_picks:
                 p["picks"] = regime_picks
-                best = max(regime_picks, key=lambda pk: int(pk.get("confidence") or 0))
+                _backfill_role_learning(p, regime_picks, mid, role_rows)
+                best = _learned_best_pick(regime_picks)
                 p["best_pick"] = best
         except Exception:
             pass
@@ -399,12 +466,20 @@ def get_predictions_today():
     }
 
 
+def _list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list[dict[str, Any]]:
+    """Compatibility wrapper for older local imports."""
+    from app.current_predictions import list_recent_dashboard_predictions
+
+    return list_recent_dashboard_predictions(hours=hours, limit=limit)
+
+
 @router.get("/matches/upcoming-enriched-predicted")
 def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=1000)):
     """Upcoming buffered matches with enrichment and latest prediction status."""
     from datetime import date
-    from app.buffer import get_buffered_matches
+    from app.buffer import get_buffered_matches, refresh_sporty_buffer_scope
     from app.league_memory import list_prediction_history
+    from app.enriched_prediction import prediction_readiness
 
     today = date.today().isoformat()
     docs = get_buffered_matches(limit=limit)
@@ -425,6 +500,9 @@ def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=100
             continue
         match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
         prediction = latest_by_match.get(match_id)
+        readiness = prediction_readiness(doc)
+        if prediction and not readiness["ready"]:
+            prediction = None
         best_pick = (prediction or {}).get("best_pick") or ((prediction or {}).get("picks") or [{}])[0]
         summary = _match_summary(doc)
         rows.append(
@@ -433,9 +511,10 @@ def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=100
                 "match_date": match_date,
                 "time_context": doc.get("time_context"),
                 "lifecycle": doc.get("lifecycle"),
-                "enriched": bool(doc.get("enriched_at")),
+                "enriched": bool(readiness.get("has_detail")),
                 "manual_match": bool(doc.get("manual_match")),
                 "predicted": bool(prediction),
+                "prediction_readiness": readiness,
                 "prediction": prediction,
                 "best_pick": best_pick if best_pick else None,
                 "data_quality": {
@@ -497,7 +576,7 @@ def cleanup_finished_matches():
     # First pass: archive any is_finished=1 rows that weren't cleaned up
     _init_db()
     archived = 0
-    with _sqlite3.connect(DB_PATH) as conn:
+    with _sqlite3.connect(DB_PATH, timeout=30) as conn:
         rows = conn.execute(
             "select match_id from match_buffer where is_finished = 1"
         ).fetchall()
@@ -542,6 +621,14 @@ def get_system_activity(limit: int = Query(default=30, ge=1, le=120)):
     from app.activity_log import get_activity
 
     return {"status": "success", **get_activity(limit=limit)}
+
+
+@router.get("/system/audit")
+def get_system_audit(limit: int = Query(default=200, ge=20, le=1000)):
+    """Operational contract audit for ingest, enrichment, prediction, grading, and jobs."""
+    from app.system_audit import prediction_system_audit
+
+    return prediction_system_audit(limit=limit)
 
 
 @router.get("/analytics/clv")
@@ -636,7 +723,8 @@ def grade_results(hours_back: int = 24):
     import json
     from datetime import date as _date, timedelta as _timedelta
     from app.sportybet_client import fetch_results
-    from app.league_memory import DB_PATH, _init_db, _grade_pick_for_match, grade_predictions_for_date
+    from app.league_memory import DB_PATH, _init_db, _grade_pick_for_match, grade_overdue_predictions, grade_predictions_for_date
+    from app.prediction_audit import grading_reason
     from app.mongo_store import archive_finished_match_from_buffer
     from app.sofascore_client import fetch_all_scheduled_events
     import sqlite3
@@ -659,7 +747,7 @@ def grade_results(hours_back: int = 24):
     graded = archived = skipped = 0
 
     # grade pending predictions
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         pending = conn.execute(
             "select id, match_id, match_name, league_name, pick_type, selection, "
@@ -675,12 +763,14 @@ def grade_results(hours_back: int = 24):
             skipped += 1
             continue
         score = result["score"]
-        outcome = _grade_pick_for_match(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
-        with sqlite3.connect(DB_PATH) as conn:
+        grade_info = grading_reason(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
+        outcome = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
+        grade_info["result"] = outcome
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.execute(
                 "update prediction_history set result=?, final_home=?, final_away=?, "
-                "graded_at=current_timestamp where id=?",
-                (outcome, score["home"], score["away"], row["id"]),
+                "grading_reason_json=?, graded_at=current_timestamp where id=?",
+                (outcome, score["home"], score["away"], json.dumps(grade_info), row["id"]),
             )
             conn.commit()
         # store signal outcomes in MongoDB
@@ -707,7 +797,7 @@ def grade_results(hours_back: int = 24):
         graded += 1
 
     # archive buffer rows that now have a result
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         buffer_rows = conn.execute(
             "select match_id from match_buffer where is_finished=0"
@@ -717,7 +807,7 @@ def grade_results(hours_back: int = 24):
         if str(row["match_id"]) not in result_map:
             continue
         score = result_map[str(row["match_id"])]["score"]
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.execute(
                 "update match_buffer set period='Ended', score_home=?, score_away=?, "
                 "is_live=0, is_finished=1 where match_id=?",
@@ -743,6 +833,8 @@ def grade_results(hours_back: int = 24):
         except Exception as exc:
             sofascore["errors"][target_date] = str(exc)
 
+    overdue = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
+
     return {
         "status": "ok",
         "results_fetched": len(results),
@@ -751,9 +843,26 @@ def grade_results(hours_back: int = 24):
         "sofascore_predictions_graded": sofascore["graded"],
         "sofascore_predictions_skipped": sofascore["skipped"],
         "sofascore": sofascore,
+        "overdue": overdue,
         "matches_archived": archived,
-        "signal_stats": _grade_signal_stats(graded + sofascore["graded"]),
+        "signal_stats": _grade_signal_stats(graded + sofascore["graded"] + int(overdue.get("graded") or 0)),
     }
+
+
+@router.post("/results/grade-overdue")
+def grade_overdue_results(hours_after_kickoff: float = 2.0, limit: int = 500):
+    """Grade all pending matches that are past kickoff+N hours, skipping true live matches."""
+    from app.league_memory import grade_overdue_predictions
+
+    return grade_overdue_predictions(hours_after_kickoff=hours_after_kickoff, limit=limit)
+
+
+@router.post("/results/grade-match/{match_id:path}")
+def grade_one_match_result(match_id: str, hours_back: int = 72):
+    """Check SportyBet/SofaScore for one match result and grade its prediction rows."""
+    from app.league_memory import check_and_grade_match_result
+
+    return check_and_grade_match_result(match_id, hours_back=hours_back)
 
 
 @router.get("/predictions/odds-only")
@@ -809,20 +918,159 @@ def get_signal_analytics(
     }
 
 
+@router.get("/analytics/signal-matches")
+def get_signal_matches(
+    signal_name: str = Query(default="consensus_longshot_value"),
+    result: str = Query(default=""),
+    limit: int = Query(default=300, ge=1, le=1000),
+):
+    """List matches carrying a specific learned signal, with grading summary."""
+    import json
+    import sqlite3
+    from app.league_memory import DB_PATH, _init_db
+
+    signal_name = str(signal_name or "consensus_longshot_value")
+    result = result if isinstance(result, str) else ""
+    limit = int(limit) if isinstance(limit, int) else 300
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        if signal_name == "consensus_longshot_value":
+            rows = conn.execute(
+                """
+                select id, match_id, match_name, league_name, country_name, pick_type,
+                       selection, confidence, reason, result, final_home, final_away,
+                       graded_at, created_at, context_json, signals_json
+                from (
+                    select
+                        pch.*,
+                        row_number() over (
+                            partition by match_id, pick_type, selection, coalesce(role, 'candidate')
+                            order by
+                                case when graded_at is not null then 0 else 1 end,
+                                datetime(coalesce(graded_at, created_at)) desc,
+                                id desc
+                        ) as rn
+                    from prediction_candidate_history pch
+                    where pick_type = 'consensus_longshot_value'
+                      and (? = '' or result = ?)
+                )
+                where rn = 1
+                order by created_at desc
+                limit ?
+                """,
+                (result, result, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select id, match_id, match_name, league_name, country_name, pick_type,
+                       selection, confidence, reason, result, final_home, final_away,
+                       graded_at, created_at, '{}' as context_json, signals_json
+                from (
+                    select
+                        ph.*,
+                        row_number() over (
+                            partition by match_id, pick_type, selection
+                            order by
+                                case when graded_at is not null then 0 else 1 end,
+                                datetime(coalesce(graded_at, created_at)) desc,
+                                id desc
+                        ) as rn
+                    from prediction_history ph
+                    where signals_json like ?
+                      and (? = '' or result = ?)
+                )
+                where rn = 1
+                order by created_at desc
+                limit ?
+                """,
+                (f'%"{signal_name}"%', result, result, limit),
+            ).fetchall()
+
+    items = []
+    for row in rows:
+        try:
+            context = json.loads(row["context_json"] or "{}")
+        except Exception:
+            context = {}
+        signal_value = context.get("signal") if isinstance(context.get("signal"), dict) else {}
+        market_intent = context.get("market_intent") if isinstance(context.get("market_intent"), dict) else signal_value.get("market_intent") if isinstance(signal_value, dict) else {}
+        items.append({
+            "id": row["id"],
+            "match_id": row["match_id"],
+            "match_name": row["match_name"],
+            "league_name": row["league_name"],
+            "country_name": row["country_name"],
+            "pick_type": row["pick_type"],
+            "selection": row["selection"],
+            "confidence": row["confidence"],
+            "reason": row["reason"],
+            "result": row["result"],
+            "final_home": row["final_home"],
+            "final_away": row["final_away"],
+            "graded": bool(row["graded_at"]),
+            "created_at": row["created_at"],
+            "signal": signal_value,
+            "market_intent": market_intent or {},
+            "market_family": (market_intent or {}).get("family") or signal_value.get("market_family"),
+            "market": (market_intent or {}).get("market") or signal_value.get("market"),
+        })
+    graded = [item for item in items if item["result"] in {"win", "loss"}]
+    wins = sum(1 for item in graded if item["result"] == "win")
+    losses = sum(1 for item in graded if item["result"] == "loss")
+    return {
+        "status": "success",
+        "signal_name": signal_name,
+        "label": "Consensus longshot value" if signal_name == "consensus_longshot_value" else signal_name.replace("_", " ").title(),
+        "count": len(items),
+        "graded": len(graded),
+        "wins": wins,
+        "losses": losses,
+        "accuracy": round(wins / len(graded) * 100, 1) if graded else None,
+        "items": items,
+    }
+
+
 @router.get("/analytics/model-explorer")
 def get_model_explorer(
     preset: str = Query(default="all"),
     model: str = Query(default="all"),
+    pick_type: str = Query(default=""),
+    selection_key: str = Query(default=""),
     min_samples: int = Query(default=1, ge=1, le=100),
     limit: int = Query(default=2000, ge=1, le=5000),
 ):
     """Prediction history grouped by pick/model so the UI can rank by accuracy."""
     import json
     import sqlite3
+    from app.market_intent import classify_market_intent
     from app.league_memory import DB_PATH, _init_db
 
-    def _pick_family(pick_type: str, selection: str) -> str:
+    def _pick_family(pick_type: str, selection: str, market_intent: dict[str, Any] | None = None) -> str:
+        intent = market_intent or classify_market_intent(pick_type, selection)
+        market = str(intent.get("market") or "")
+        direction = str(intent.get("direction") or "")
         text = f"{pick_type} {selection}".lower()
+        if str(pick_type or "").lower() == "consensus_longshot_value":
+            return "longshot_value"
+        if market == "live_match_winner":
+            return "live_match_winner"
+        if market == "live_team_to_score":
+            return "live_team_to_score"
+        if market == "btts":
+            return "low_scoring" if direction == "no" else "goals"
+        if market in {"total_goals", "live_total_goals", "live_next_goal"}:
+            return "low_scoring" if direction == "under" else "goals"
+        if market == "double_chance":
+            return "double_chance"
+        if market == "1x2":
+            if direction in {"home", "away", "draw"}:
+                return direction
+        if "live_match_winner" in text or "live winner" in text:
+            return "live_match_winner"
+        if "live_team_to_score" in text or "next team to score" in text:
+            return "live_team_to_score"
         if "under" in text or "btts no" in text or "both teams to score - no" in text:
             return "low_scoring"
         if "over" in text or "both teams to score" in text or "goal" in text:
@@ -839,8 +1087,53 @@ def get_model_explorer(
             return "value"
         return pick_type or "other"
 
-    def _normalise_selection(selection: str) -> str:
+    def _norm_text(value: str) -> str:
+        return " ".join(
+            "".join(ch.lower() if ch.isalnum() else " " for ch in str(value or "")).split()
+        )
+
+    def _match_sides(match_name: str) -> tuple[str, str]:
+        raw = str(match_name or "")
+        if " vs " in raw:
+            home, away = raw.split(" vs ", 1)
+        elif " v " in raw:
+            home, away = raw.split(" v ", 1)
+        else:
+            return "", ""
+        return _norm_text(home), _norm_text(away)
+
+    def _side_from_team_selection(selection: str, match_name: str) -> str:
+        text = _norm_text(selection)
+        home, away = _match_sides(match_name)
+        if home and home in text:
+            return "home"
+        if away and away in text:
+            return "away"
+        return ""
+
+    def _normalise_selection(selection: str, match_name: str = "", pick_type: str = "") -> str:
         text = " ".join(str(selection or "").lower().replace("-", " ").split())
+        pick_type = str(pick_type or "").lower()
+        if pick_type == "live_match_winner" or "live winner" in text:
+            side = _side_from_team_selection(selection, match_name)
+            suffix = "_lean" if "lean" in text else ""
+            if side:
+                return f"{side}_live_winner{suffix}"
+            if "draw protection" in text:
+                return "live_draw_protection"
+            return f"live_winner{suffix}"
+        if pick_type == "live_team_to_score" or "next team to score" in text:
+            side = _side_from_team_selection(selection, match_name)
+            if side:
+                return f"{side}_next_team_to_score"
+            return "next_team_to_score"
+        if "or draw protection" in text or "double chance" in text:
+            side = _side_from_team_selection(selection, match_name)
+            if side == "home":
+                return "home_or_draw"
+            if side == "away":
+                return "away_or_draw"
+            return "team_or_draw"
         aliases = {
             "home win": "home",
             "home": "home",
@@ -867,8 +1160,8 @@ def get_model_explorer(
         }
         return aliases.get(text, text)
 
-    def _display_selection(selection: str) -> str:
-        normal = _normalise_selection(selection)
+    def _display_selection(selection: str, match_name: str = "", pick_type: str = "") -> str:
+        normal = _normalise_selection(selection, match_name, pick_type)
         labels = {
             "home": "Home Win",
             "away": "Away Win",
@@ -878,6 +1171,17 @@ def get_model_explorer(
             "home_or_away": "Home or Away",
             "btts_yes": "Both Teams To Score",
             "btts_no": "Both Teams To Score - No",
+            "home_next_team_to_score": "Home Next Team To Score",
+            "away_next_team_to_score": "Away Next Team To Score",
+            "next_team_to_score": "Next Team To Score",
+            "home_live_winner": "Home Live Winner",
+            "away_live_winner": "Away Live Winner",
+            "home_live_winner_lean": "Home Live Winner Lean",
+            "away_live_winner_lean": "Away Live Winner Lean",
+            "live_winner": "Live Winner",
+            "live_winner_lean": "Live Winner Lean",
+            "live_draw_protection": "Live Draw Protection",
+            "team_or_draw": "Team or Draw",
         }
         return labels.get(normal, selection or "Pick")
 
@@ -893,19 +1197,29 @@ def get_model_explorer(
             "database": {"finished_database_memory", "prediction_memory"},
             "odds": {"odds_edge", "odds_progression", "odds_pattern"},
             "rules": {"goal_pressure", "h2h_edge", "league_position_edge", "recent_history_edge", "common_opponent_edge"},
+            "longshot": {"consensus_longshot_value"},
         }
         return bool(names & aliases.get(model_name, {model_name}))
 
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            select id, match_id, match_name, league_name, country_name, pick_type,
-                   selection, confidence, reason, result, graded_at, created_at,
-                   signals_json
-            from prediction_history
-            where pick_type != 'no_bet'
+            select *
+            from (
+                select id, match_id, match_name, league_name, country_name, pick_type,
+                       selection, confidence, reason, result, graded_at, created_at,
+                       signals_json, '{}' as context_json, 'primary' as role, 'prediction_history' as source_table
+                from prediction_history
+                where pick_type != 'no_bet'
+                union all
+                select id, match_id, match_name, league_name, country_name, pick_type,
+                       selection, confidence, reason, result, graded_at, created_at,
+                       signals_json, context_json, coalesce(role, 'candidate') as role, 'candidate_history' as source_table
+                from prediction_candidate_history
+                where pick_type != 'no_bet'
+            )
             order by created_at desc
             limit ?
             """,
@@ -916,11 +1230,20 @@ def get_model_explorer(
     raw_count = 0
     for row in rows:
         signals = json.loads(row["signals_json"] or "[]")
+        try:
+            context = json.loads(row["context_json"] or "{}")
+        except Exception:
+            context = {}
+        market_intent = context.get("market_intent") if isinstance(context.get("market_intent"), dict) else classify_market_intent(row["pick_type"] or "", row["selection"] or "")
         raw_count += 1
-        normal_selection = _normalise_selection(row["selection"] or "")
-        display_selection = _display_selection(row["selection"] or "")
-        family = _pick_family(row["pick_type"] or "", display_selection)
+        normal_selection = _normalise_selection(row["selection"] or "", row["match_name"] or "", row["pick_type"] or "")
+        display_selection = _display_selection(row["selection"] or "", row["match_name"] or "", row["pick_type"] or "")
+        family = _pick_family(row["pick_type"] or "", display_selection, market_intent)
         if preset != "all" and family != preset:
+            continue
+        if pick_type and str(row["pick_type"] or "") != pick_type:
+            continue
+        if selection_key and normal_selection != selection_key:
             continue
         if not _uses_model(signals, model):
             continue
@@ -938,11 +1261,21 @@ def get_model_explorer(
             "reason": row["reason"],
             "result": row["result"],
             "graded": bool(row["graded_at"]),
+            "role": row["role"] or "candidate",
+            "source_table": row["source_table"],
             "created_at": row["created_at"],
             "family": family,
+            "market_intent": market_intent,
+            "market_family": market_intent.get("family"),
+            "market": market_intent.get("market"),
             "models_used": sorted({str(s.get("name") or "") for s in signals if s.get("name")}),
         }
-        dedupe_key = (str(row["match_id"] or ""), str(row["pick_type"] or ""), normal_selection)
+        dedupe_key = (
+            str(row["match_id"] or ""),
+            str(row["pick_type"] or ""),
+            normal_selection,
+            str(row["role"] or "candidate"),
+        )
         existing = filtered_by_key.get(dedupe_key)
         if not existing:
             filtered_by_key[dedupe_key] = item
@@ -966,7 +1299,10 @@ def get_model_explorer(
             "pending": 0,
             "avg_confidence": 0.0,
             "models_used": set(),
+            "roles": {},
             "recent": [],
+            "previous": [],
+            "upcoming": [],
         })
         group["total"] += 1
         group["avg_confidence"] += float(item["confidence"] or 0)
@@ -977,8 +1313,23 @@ def get_model_explorer(
                 group["wins"] += 1
             elif item["result"] == "loss":
                 group["losses"] += 1
+            if len(group["previous"]) < 20:
+                group["previous"].append(item)
         else:
             group["pending"] += 1
+            if len(group["upcoming"]) < 20:
+                group["upcoming"].append(item)
+        role = item.get("role") or "candidate"
+        role_bucket = group["roles"].setdefault(role, {"total": 0, "graded": 0, "wins": 0, "losses": 0, "pending": 0})
+        role_bucket["total"] += 1
+        if item["graded"]:
+            role_bucket["graded"] += 1
+            if item["result"] == "win":
+                role_bucket["wins"] += 1
+            elif item["result"] == "loss":
+                role_bucket["losses"] += 1
+        else:
+            role_bucket["pending"] += 1
         if len(group["recent"]) < 8:
             group["recent"].append(item)
 
@@ -988,6 +1339,20 @@ def get_model_explorer(
         group["accuracy"] = round(group["wins"] / group["graded"] * 100, 1) if group["graded"] else None
         group["avg_confidence"] = round(group["avg_confidence"] / group["total"], 1) if group["total"] else 0
         group["models_used"] = sorted(group["models_used"])
+        for role_stats in group["roles"].values():
+            role_stats["accuracy"] = round(role_stats["wins"] / role_stats["graded"] * 100, 1) if role_stats["graded"] else None
+        primary_acc = (group["roles"].get("primary") or {}).get("accuracy")
+        secondary_acc = (group["roles"].get("secondary") or group["roles"].get("alternative") or {}).get("accuracy")
+        group["role_signal"] = {
+            "primary_accuracy": primary_acc,
+            "secondary_accuracy": secondary_acc,
+            "primary_edge": round(primary_acc - secondary_acc, 1) if primary_acc is not None and secondary_acc is not None else None,
+            "guidance": (
+                "promote_primary" if primary_acc is not None and secondary_acc is not None and primary_acc - secondary_acc >= 8
+                else "secondary_caution" if secondary_acc is not None and secondary_acc < 48
+                else "neutral"
+            ),
+        }
         summary.append(group)
 
     summary.sort(key=lambda g: (g["sample_ready"], g["accuracy"] or -1, g["graded"], g["avg_confidence"]), reverse=True)
@@ -997,6 +1362,8 @@ def get_model_explorer(
         "status": "success",
         "preset": preset,
         "model": model,
+        "pick_type": pick_type,
+        "selection_key": selection_key,
         "min_samples": min_samples,
         "count": len(filtered),
         "summary": {
@@ -1012,167 +1379,96 @@ def get_model_explorer(
         },
         "groups": summary,
         "recent": filtered[:50],
-        "presets": ["all", "low_scoring", "goals", "home", "away", "draw", "double_chance", "value"],
-        "models": ["all", "poisson", "dixon_coles", "elo", "ensemble", "database", "odds", "rules"],
+        "previous": [item for item in filtered if item.get("graded")][:80],
+        "upcoming": [item for item in filtered if not item.get("graded")][:80],
+        "presets": ["all", "low_scoring", "goals", "home", "away", "draw", "double_chance", "value", "longshot_value", "live_team_to_score", "live_match_winner"],
+        "models": ["all", "poisson", "dixon_coles", "elo", "ensemble", "database", "odds", "rules", "longshot"],
     }
 
 
 @router.post("/matches/{sportybet_id}/enrich")
-def enrich_single_match(sportybet_id: str):
+def enrich_match_endpoint(sportybet_id: str):
     """Force-enrich a single match using saved manual SofaScore match when present."""
-    from app.buffer import get_buffered_match, store_enriched
-    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events, is_usable_event_for_mode
-    from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
-    from app.web_context import search_match_context
-    from app.market import snapshot_odds
-    from app.time_context import match_time_context
-    from datetime import date, datetime, timezone
-
-    doc = get_buffered_match(sportybet_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found in buffer")
-
-    sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
-    match_date = doc.get("match_date") or date.today().isoformat()
-    saved_sofa_id = doc.get("sofascore_id")
-    sofa = None
-    score = 0.0
-    source = "auto"
-
-    if saved_sofa_id:
-        sofa = _find_sofascore_event(str(saved_sofa_id), match_date, _is_live_doc(doc), fetch_live_events, fetch_all_scheduled_events)
-        if not sofa and isinstance(doc.get("sofascore_event"), dict):
-            sofa = doc["sofascore_event"]
-        score = _candidate_score(sofa, doc) if sofa else float(doc.get("match_score") or 1.0)
-        source = "manual"
-    else:
-        try:
-            sofa_events = fetch_live_events() if _is_live_doc(doc) else fetch_all_scheduled_events(match_date)
-            sofa_events = [
-                event for event in sofa_events
-                if is_usable_event_for_mode(event, live=_is_live_doc(doc))
-            ]
-        except Exception:
-            sofa_events = []
-
-        sofa, score = _fuzzy_match(sporty, sofa_events)
-        if score < FUZZY_THRESHOLD and score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
-            sofa = _llm_match(sporty, sofa_events) or sofa
-
-    detail = None
-    if sofa:
-        try:
-            detail = fetch_event_detail(sofa)
-        except Exception:
-            pass
-
-    web_context = {}
     try:
-        web_context = search_match_context(
-            _home_team(sporty),
-            _away_team(sporty),
-            sporty.get("tournament") or "",
-        )
-    except Exception:
-        pass
+        from app.match_enrichment import MatchEnrichmentError, enrich_buffered_match
 
-    now = datetime.now(timezone.utc).isoformat()
-    enriched_doc = {
-        **doc,
-        **sporty,
-        "sportybet_id":      sporty.get("id") or sportybet_id,
-        "sportybet_name":    sporty.get("sportybet_name") or sporty.get("name"),
-        "match_date":        match_date,
-        "sofascore_id":      sofa.get("id") if sofa else None,
-        "sofascore_name":    sofa.get("name") if sofa else None,
-        "sofascore_event":   sofa,
-        "sofascore_detail":  detail,
-        "web_context":       web_context,
-        "match_score":       round(score, 3),
-        "match_source":      source,
-        "manual_match":      bool(saved_sofa_id),
-        "manual_matched_at":  doc.get("manual_matched_at"),
-        "raw_sporty":        doc.get("raw_sporty") or sporty,
-        "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
-        "time_context":      match_time_context({**sporty, "sofascore_event": sofa}),
-        "enriched_at":       now,
-    }
-
-    snapshot_odds(enriched_doc)
-    store_enriched(sportybet_id, enriched_doc)
-    try:
-        from app.enriched_prediction import predict_enriched_match
-        from app.league_memory import record_prediction
-
-        record_prediction(predict_enriched_match(enriched_doc))
-    except Exception:
-        pass
-
-    return {
-        "status": "success",
-        "sportybet_id": sportybet_id,
-        "matched_sofascore": bool(sofa),
-        "sofascore_id": sofa.get("id") if sofa else None,
-        "fuzzy_score": round(score, 3),
-        "match_source": source,
-        "has_detail": bool(detail),
-        "has_web_context": bool(web_context.get("snippets")),
-        "web_context_query": web_context.get("query"),
-        "enriched_at": now,
-    }
+        return enrich_buffered_match(sportybet_id)
+    except MatchEnrichmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 @router.post("/matches/{sportybet_id}/predict")
 def predict_single_match(sportybet_id: str):
     """Run every available model on the richest available match data."""
-    from app.buffer import get_buffered_match
-    from app.enriched_prediction import predict_enriched_match
-    from app.ai_brain import oversee_prediction
-    from app.league_memory import record_prediction
+    from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
+    from app.enriched_prediction import prediction_readiness
+    from app.prediction_flow import apply_prediction_state
     from datetime import date
+
+    refresh_state = refresh_sporty_match_state(sportybet_id)
+    if not refresh_state.get("active"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Prediction blocked because the match is not active after fresh SportyBet odds/time check",
+                "refresh": refresh_state,
+            },
+        )
 
     doc = get_buffered_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
 
-    if not doc.get("sofascore_detail") and (doc.get("sofascore_id") or not doc.get("enriched_at")):
-        try:
-            enrich_single_match(sportybet_id)
-            doc = get_buffered_match(sportybet_id) or doc
-        except Exception:
-            pass
-
     try:
-        prediction = predict_enriched_match(doc)
-        brain = oversee_prediction(prediction, doc)
-        prediction["ai_brain"] = brain
-        adj = int(brain.get("confidence_adjustment") or 0)
-        if adj:
-            for pick in prediction.get("picks") or []:
-                pick["confidence"] = max(1, min(95, int(pick.get("confidence", 50)) + adj))
-        prediction["signals"].append({
-            "name": "ai_brain_review",
-            "value": brain,
-            "impact": adj,
-        })
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
+        from app.match_enrichment import enrich_buffered_match
 
-    # try to save to history
-    try:
-        record_prediction({
-            **prediction,
-            "match_id": sportybet_id,
-            "match_date": doc.get("match_date") or date.today().isoformat(),
-            "source": "enriched_ensemble",
-        })
+        enrich_buffered_match(sportybet_id)
+        doc = get_buffered_match(sportybet_id) or doc
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise
     except Exception:
         pass
 
-    return {"status": "success", "sportybet_id": sportybet_id, "prediction": prediction}
+    readiness = prediction_readiness(doc)
+    if not readiness["ready"]:
+        doc["prediction"] = None
+        doc["prediction_error"] = "Prediction deferred until full signal is ready" + (
+            f": {', '.join(readiness.get('missing') or [])}" if readiness.get("missing") else ""
+        )
+        doc["prediction_readiness"] = readiness
+        store_enriched(sportybet_id, doc)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Prediction deferred until full signal is ready",
+                "readiness": readiness,
+            },
+        )
+
+    state = apply_prediction_state(
+        doc,
+            match_id=sportybet_id,
+            match_date=doc.get("match_date") or date.today().isoformat(),
+            source="enriched_ensemble",
+            attach_brain=True,
+    )
+    store_enriched(sportybet_id, doc)
+    if state.get("status") == "deferred":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Prediction deferred until full signal is ready", "readiness": state.get("readiness")},
+        )
+    if state.get("status") == "error":
+        raise HTTPException(status_code=500, detail=state.get("message") or "Prediction failed")
+
+    return {"status": "success", "sportybet_id": sportybet_id, "sporty_refresh": refresh_state, "prediction": state.get("prediction")}
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
+    from app.enriched_prediction import prediction_readiness
+    from app.match_intelligence import build_match_intelligence
+
     detail = doc.get("sofascore_detail") or {}
     managers = detail.get("managers") or {}
     form = detail.get("pregameForm") or detail.get("pregame_form") or {}
@@ -1180,6 +1476,10 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
     away_form = form.get("awayTeam") or form.get("away_team") or {}
     web = doc.get("web_context") or {}
     sportybet_id = str(doc.get("sportybet_id") or doc.get("id") or "")
+    readiness = prediction_readiness(doc)
+    match_state = classify_match_state(doc)
+    current_prediction = _current_prediction_for_detail(sportybet_id, readiness, doc)
+    intelligence_doc = {**doc, "prediction": current_prediction, "prediction_readiness": readiness}
 
     return {
         "sportybet_id": sportybet_id,
@@ -1193,10 +1493,32 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "start_time": doc.get("start_time"),
         "period": doc.get("period"),
         "played_seconds": doc.get("played_seconds"),
-        "is_live": _is_live_doc(doc),
+        "is_live": bool(match_state.get("is_live")),
+        "is_finished": bool(match_state.get("is_finished") or _is_finished_doc(doc)),
+        "match_state": match_state,
         "score": doc.get("score"),
         "venue": doc.get("venue"),
         "enriched_at": doc.get("enriched_at"),
+        "data_sources": doc.get("data_sources") or {},
+        "prediction_readiness": readiness,
+        "source_summary": {
+            "sportybet": {
+                "available": bool(doc.get("sportybet_detail") or doc.get("raw_sporty")),
+                "markets": len(doc.get("sportybet_markets") or doc.get("markets") or []),
+                "active": doc.get("sporty_active", True),
+            },
+            "sofascore": {
+                "matched": bool(doc.get("sofascore_id") or doc.get("sofascore_event")),
+                "detail": bool(detail),
+                "status": doc.get("sofascore_match_status"),
+            },
+            "ready_for_prediction": bool(readiness.get("ready")),
+            "missing": readiness.get("missing") or [],
+        },
+        "sportybet_detail": doc.get("sportybet_detail") or {},
+        "sportybet_data_status": doc.get("sportybet_data_status"),
+        "has_sportybet_detail": bool(doc.get("sportybet_detail") or doc.get("raw_sporty")),
+        "has_sofascore": bool(detail),
         "odds_1x2": _extract_1x2(doc.get("sportybet_markets") or doc.get("markets") or []),
         "all_markets": doc.get("sportybet_markets") or doc.get("markets") or [],
         "home_manager": _manager_name(managers, "home"),
@@ -1230,7 +1552,15 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "raw_sporty": doc.get("raw_sporty"),
         "raw_sofascore_event": doc.get("raw_sofascore_event"),
         "odds_movement": get_movement(sportybet_id) if sportybet_id else {"snapshots": 0, "movement": None},
-        "prediction": _latest_prediction(sportybet_id),
+        "prediction": current_prediction,
+        "intelligence": build_match_intelligence(intelligence_doc),
+        "prediction_error": doc.get("prediction_error") or (
+            "Prediction deferred until full signal is ready"
+            + (f": {', '.join(readiness.get('missing') or [])}" if readiness.get("missing") else "")
+            if not readiness.get("ready")
+            else None
+        ),
+        "stale_prediction": _latest_prediction(sportybet_id) if not readiness.get("ready") else None,
         "raw": doc,
     }
 
@@ -1245,6 +1575,8 @@ def _archived_match_detail(match_id: str) -> dict[str, Any] | None:
         archived = None
     if not archived:
         archived = _local_finished_match(match_id)
+    if not archived:
+        return _history_match_detail(match_id)
     if not archived:
         return None
 
@@ -1264,6 +1596,9 @@ def _archived_match_detail(match_id: str) -> dict[str, Any] | None:
         "score": score,
         "sofascore_id": archived.get("sofascore_id") or detail.get("id"),
         "sofascore_detail": detail,
+        "sportybet_detail": archived.get("sportybet_detail") or {},
+        "sportybet_data_status": archived.get("sportybet_data_status"),
+        "data_sources": archived.get("data_sources") or {},
         "sportybet_markets": archived.get("sportybet_markets") or [],
         "web_context": archived.get("web_context") or {},
         "time_context": archived.get("time_context"),
@@ -1287,7 +1622,7 @@ def _local_finished_match(match_id: str) -> dict[str, Any] | None:
         from app.league_memory import DB_PATH, _init_db
 
         _init_db()
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "select raw_doc from finished_matches where match_id = ?",
@@ -1299,6 +1634,83 @@ def _local_finished_match(match_id: str) -> dict[str, Any] | None:
         doc["_id"] = str(match_id)
         doc["archive_source"] = "local_sqlite"
         return doc
+    except Exception:
+        return None
+
+
+def _history_match_detail(match_id: str) -> dict[str, Any] | None:
+    """Fallback for a match that has left buffers but still has prediction history."""
+    try:
+        import json
+        import sqlite3
+        from app.league_memory import DB_PATH, _init_db
+
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                select match_id, sportybet_id, sofascore_id, match_name, league_name,
+                       country_name, pick_type, selection, confidence, reason,
+                       signals_json, picks_json, result, final_home, final_away, created_at
+                from prediction_history
+                where match_id = ? or sportybet_id = ? or sofascore_id = ?
+                order by created_at desc
+                limit 1
+                """,
+                (str(match_id), str(match_id), str(match_id)),
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    """
+                    select match_id, sportybet_id, sofascore_id, match_name, league_name,
+                           country_name, pick_type, selection, confidence, reason,
+                           signals_json, '[]' as picks_json, result, final_home, final_away, created_at
+                    from prediction_candidate_history
+                    where match_id = ? or sportybet_id = ? or sofascore_id = ?
+                    order by created_at desc
+                    limit 1
+                    """,
+                    (str(match_id), str(match_id), str(match_id)),
+                ).fetchone()
+        if not row:
+            return None
+        match_name = row["match_name"] or str(match_id)
+        teams = [part.strip() for part in match_name.replace(" v ", " vs ").split(" vs ", 1)]
+        home = teams[0] if teams else None
+        away = teams[1] if len(teams) > 1 else None
+        score = None
+        if row["final_home"] is not None and row["final_away"] is not None:
+            score = {"home": row["final_home"], "away": row["final_away"]}
+        prediction = {
+            "match_id": row["match_id"],
+            "pick_type": row["pick_type"],
+            "selection": row["selection"],
+            "confidence": row["confidence"],
+            "reason": row["reason"],
+            "signals": json.loads(row["signals_json"] or "[]"),
+            "picks": json.loads(row["picks_json"] or "[]"),
+            "result": row["result"],
+            "created_at": row["created_at"],
+        }
+        return {
+            "sportybet_id": row["sportybet_id"] or row["match_id"] or str(match_id),
+            "sofascore_id": row["sofascore_id"],
+            "id": row["match_id"] or str(match_id),
+            "name": match_name,
+            "sportybet_name": match_name,
+            "home_team": home,
+            "away_team": away,
+            "tournament": row["league_name"],
+            "category": row["country_name"],
+            "period": "Archived history",
+            "is_finished": bool(score),
+            "score": score,
+            "prediction": prediction,
+            "lifecycle": {"state": "history", "stages": {"predicted": True}, "missing": ["buffer", "full_archive"]},
+            "archive_source": "prediction_history",
+            "raw": {"prediction_history": prediction},
+        }
     except Exception:
         return None
 
@@ -1354,6 +1766,47 @@ def _candidate_summary(event: dict[str, Any], doc: dict[str, Any], match_date: s
     }
 
 
+def _learned_best_pick(picks: list[dict[str, Any]]) -> dict[str, Any]:
+    from app.pick_roles import learned_best_pick
+
+    return learned_best_pick(picks)
+
+
+def _load_role_memory_rows() -> dict[tuple[str, str], list[dict[str, Any]]]:
+    from app.pick_roles import load_role_memory_rows
+
+    return load_role_memory_rows()
+
+
+def _backfill_role_learning(
+    prediction: dict[str, Any],
+    picks: list[dict[str, Any]],
+    match_id: str,
+    role_rows: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
+) -> None:
+    from app.pick_roles import backfill_role_learning
+
+    backfill_role_learning(prediction, picks, match_id, role_rows)
+
+
+def _fast_role_memory(
+    league: str,
+    country: str,
+    pick_type: str,
+    selection: str,
+    role_rows: dict[tuple[str, str], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    from app.pick_roles import fast_role_memory
+
+    return fast_role_memory(league, country, pick_type, selection, role_rows)
+
+
+def _attach_fast_learned_decision(picks: list[dict[str, Any]]) -> None:
+    from app.pick_roles import attach_fast_learned_decision
+
+    attach_fast_learned_decision(picks)
+
+
 def _candidate_score(event: dict[str, Any], doc: dict[str, Any]) -> float:
     try:
         from app.enrichment import _event_score
@@ -1388,18 +1841,12 @@ def _scoreline(score: dict[str, Any]) -> str | None:
 
 
 def _is_live_doc(doc: dict[str, Any]) -> bool:
-    period = doc.get("period")
-    return bool(period and period not in ("Not started", "Not start", "FT", "AET", "Finished", "Ended", ""))
+    return bool(classify_match_state(doc).get("is_live"))
 
 
 def _is_finished_doc(doc: dict[str, Any]) -> bool:
-    period = str(doc.get("period") or "").lower()
-    if period in {"ft", "finished", "ended", "aet", "ap", "full time"}:
-        return True
-    status = doc.get("status") or {}
-    if isinstance(status, dict):
-        return status.get("type") == "finished" or status.get("code") == 100
-    return str(status).lower() in {"finished", "ended"}
+    state = classify_match_state(doc)
+    return bool(doc.get("is_finished") or state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
 
 
 def _sort_start(value: Any) -> int:
@@ -1411,76 +1858,33 @@ def _sort_start(value: Any) -> int:
 
 
 def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
-    detail = doc.get("sofascore_detail") or {}
-    form = detail.get("pregameForm") or detail.get("pregame_form") or {}
-    home_form = form.get("homeTeam") or form.get("home_team") or {}
-    away_form = form.get("awayTeam") or form.get("away_team") or {}
+    from app.match_view import match_summary
 
-    return {
-        "sportybet_id": str(doc.get("sportybet_id") or doc.get("id") or ""),
-        "sofascore_id": doc.get("sofascore_id"),
-        "name": doc.get("sportybet_name") or doc.get("name"),
-        "home_team": _home_team(doc),
-        "away_team": _away_team(doc),
-        "tournament": doc.get("tournament"),
-        "category": doc.get("category"),
-        "start_time": doc.get("start_time"),
-        "period": doc.get("period"),
-        "played_seconds": doc.get("played_seconds"),
-        "score": doc.get("score"),
-        "venue": doc.get("venue"),
-        "enriched_at": doc.get("enriched_at"),
-        "home_form": home_form.get("form"),
-        "away_form": away_form.get("form"),
-        "home_position": home_form.get("position"),
-        "away_position": away_form.get("position"),
-        "odds_1x2": _extract_1x2(doc.get("sportybet_markets") or doc.get("markets") or []),
-        "has_sofascore": bool(detail),
-        "has_h2h": bool(detail.get("h2h")),
-        "has_standings": bool(detail.get("standings")),
-        "has_statistics": bool(detail.get("statistics")),
-        "has_lineups": bool(detail.get("lineups")),
-        "has_last_matches": bool(detail.get("home_last_matches") or detail.get("away_last_matches")),
-        "has_web_context": bool(doc.get("web_context")),
-        "lifecycle": doc.get("lifecycle"),
-    }
+    return match_summary(doc)
 
 
 def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    for market in markets:
-        name = (market.get("name") or "").lower()
-        if market.get("id") == "1" or "1x2" in name or name == "match result":
-            odds = {selection.get("name"): selection.get("odds") for selection in market.get("selections", [])}
-            return {
-                "home": odds.get("Home") or odds.get("1"),
-                "draw": odds.get("Draw") or odds.get("X"),
-                "away": odds.get("Away") or odds.get("2"),
-            }
-    return {}
+    from app.match_view import extract_1x2
+
+    return extract_1x2(markets)
 
 
 def _home_team(doc: dict[str, Any]) -> str:
-    team = doc.get("home_team")
-    if isinstance(team, dict):
-        return team.get("name") or ""
-    if team:
-        return str(team)
-    return _team_from_name(doc, 0)
+    from app.match_view import home_team
+
+    return home_team(doc)
 
 
 def _away_team(doc: dict[str, Any]) -> str:
-    team = doc.get("away_team")
-    if isinstance(team, dict):
-        return team.get("name") or ""
-    if team:
-        return str(team)
-    return _team_from_name(doc, 1)
+    from app.match_view import away_team
+
+    return away_team(doc)
 
 
 def _team_from_name(doc: dict[str, Any], index: int) -> str:
-    name = doc.get("sportybet_name") or doc.get("name") or ""
-    parts = [part.strip() for part in name.split(" vs ", 1)]
-    return parts[index] if len(parts) > index else ""
+    from app.match_view import team_from_name
+
+    return team_from_name(doc, index)
 
 
 def _manager_name(managers: dict[str, Any], side: str) -> str | None:
@@ -1488,6 +1892,30 @@ def _manager_name(managers: dict[str, Any], side: str) -> str | None:
     alt_key = "home_manager" if side == "home" else "away_manager"
     manager = managers.get(key) or managers.get(alt_key) or {}
     return manager.get("name") if isinstance(manager, dict) else None
+
+
+def _current_prediction_for_detail(match_id: str, readiness: dict[str, Any], doc: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if not readiness.get("ready"):
+        return None
+    current_state = classify_match_state(doc or {})
+    current = (doc or {}).get("prediction")
+    if isinstance(current, dict) and current.get("picks"):
+        if _prediction_mode_conflicts(current, current_state):
+            return None
+        return current
+    latest = _latest_prediction(match_id)
+    if latest and _prediction_mode_conflicts(latest, current_state):
+        return None
+    return latest
+
+
+def _prediction_mode_conflicts(prediction: dict[str, Any], match_state: dict[str, Any]) -> bool:
+    if match_state.get("is_live"):
+        return False
+    picks = prediction.get("picks") or []
+    if prediction.get("live_inplay"):
+        return True
+    return any(str(pick.get("type") or "").startswith("live_") for pick in picks if isinstance(pick, dict))
 
 
 def _latest_prediction(match_id: str) -> dict[str, Any] | None:

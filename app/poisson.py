@@ -114,7 +114,7 @@ def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
         import sqlite3 as _sqlite3
         import json as _json
         _init_db()
-        with _sqlite3.connect(DB_PATH) as conn:
+        with _sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.row_factory = _sqlite3.Row
             # Check if finished_matches table exists (MongoDB stub may not have it)
             tables = {r[0] for r in conn.execute("select name from sqlite_master where type='table'").fetchall()}

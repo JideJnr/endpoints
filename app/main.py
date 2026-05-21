@@ -23,12 +23,21 @@ async def lifespan(app: FastAPI):
             print(f"[startup] buffer cleanup: removed {result.get('deleted_finished')} finished, {result.get('deleted_stale_unenriched')} stale")
     except Exception as exc:
         print(f"[startup] buffer cleanup failed: {exc}")
-    if settings.environment != "test":
-        start_scheduler()
-        _run_initial_enrichment()
-    yield
-    from app.scheduler import stop_scheduler
-    stop_scheduler()
+    try:
+        from app.job_state import recover_abandoned_jobs
+        recovery = recover_abandoned_jobs(stale_after_seconds=180)
+        if recovery.get("recovered"):
+            print(f"[startup] recovered abandoned jobs: {recovery.get('jobs')}")
+    except Exception as exc:
+        print(f"[startup] job recovery failed: {exc}")
+    try:
+        if settings.environment != "test":
+            start_scheduler()
+        yield
+    finally:
+        await _close_live_websockets()
+        from app.scheduler import stop_scheduler
+        stop_scheduler(wait=True)
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
@@ -51,44 +60,15 @@ app.include_router(mongo.router)
 connected_clients: list[WebSocket] = []
 
 
-def _run_initial_enrichment():
-    """
-    On startup: immediately ingest matches into the buffer so the frontend
-    has data right away. Enrichment worker will pick them up within 2 minutes.
-    The thread is daemonized so it won't block server shutdown.
-    """
-    import threading
-    from app.scheduler import job_ingest_upcoming, job_ingest_live
-
-    _shutdown = threading.Event()
-
-    def _boot():
-        print("[startup] ingesting upcoming matches into buffer...")
+async def _close_live_websockets() -> None:
+    for websocket in list(connected_clients):
         try:
-            if _shutdown.is_set():
-                return
-            result = job_ingest_upcoming()
-            print(f"[startup] upcoming ingest done: {result.get('ingested', 0)} buffered")
-        except Exception as exc:
-            print(f"[startup] upcoming ingest failed: {exc}")
-        try:
-            if _shutdown.is_set():
-                return
-            result = job_ingest_live()
-            print(f"[startup] live ingest done: {result.get('live_count', 0)} live matches")
-        except Exception as exc:
-            print(f"[startup] live ingest failed: {exc}")
-        try:
-            if _shutdown.is_set():
-                return
-            from app.scheduler import job_enrich_worker
-            result = job_enrich_worker()
-            print(f"[startup] first enrichment batch done: {result.get('stored', 0)} enriched")
-        except Exception as exc:
-            print(f"[startup] first enrichment batch failed: {exc}")
-
-    t = threading.Thread(target=_boot, daemon=True, name="startup-ingest")
-    t.start()
+            await websocket.close(code=1001)
+        except Exception:
+            pass
+        finally:
+            if websocket in connected_clients:
+                connected_clients.remove(websocket)
 
 
 @app.get("/health")
@@ -129,18 +109,25 @@ async def websocket_live(websocket: WebSocket):
     try:
         while True:
             from app.buffer import get_live_buffered_matches
-            from app.routers.frontend import _match_summary
+            from app.match_view import match_summary
 
             matches = get_live_buffered_matches(limit=50)
             await websocket.send_json(
                 {
                     "type": "live_update",
                     "count": len(matches),
-                    "matches": [_match_summary(match) for match in matches],
+                    "matches": [match_summary(match) for match in matches],
                 }
             )
             await asyncio.sleep(5)
     except WebSocketDisconnect:
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+    except asyncio.CancelledError:
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+        raise
+    except Exception:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 

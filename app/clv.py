@@ -93,7 +93,8 @@ def record_clv_entry(
     if not entry_odds:
         return False
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         # Avoid duplicate entries for the same match+selection on the same day
         existing = conn.execute("""
@@ -116,24 +117,85 @@ def record_clv_entry(
 
 def _get_current_odds(match_id: str, selection: str) -> float | None:
     """Get the most recent odds snapshot for a selection."""
-    sel = selection.lower()
-    col_map = {
-        "home": "home_odds", "1": "home_odds",
-        "draw": "draw_odds", "x": "draw_odds",
-        "away": "away_odds", "2": "away_odds",
-    }
-    col = col_map.get(sel)
-    if not col:
-        return None
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
+        col = _primary_odds_column(selection)
+        if col:
+            row = conn.execute(f"""
+                select {col} from odds_snapshots
+                where match_id = ? and {col} is not null
+                order by snapshot_time desc
+                limit 1
+            """, (str(match_id),)).fetchone()
+            if row and row[0]:
+                return float(row[0])
+        return _get_market_odds(conn, str(match_id), selection)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(f"""
-            select {col} from odds_snapshots
-            where match_id = ? and {col} is not null
+
+def _primary_odds_column(selection: str) -> str | None:
+    sel = _norm_key(selection)
+    if sel in {"home", "1", "home win", "home to win"}:
+        return "home_odds"
+    if sel in {"draw", "x"}:
+        return "draw_odds"
+    if sel in {"away", "2", "away win", "away to win"}:
+        return "away_odds"
+    return None
+
+
+def _get_market_odds(conn: sqlite3.Connection, match_id: str, selection: str) -> float | None:
+    aliases = _selection_aliases(selection)
+    if not aliases:
+        return None
+    try:
+        rows = conn.execute(
+            """
+            select market_name, specifier, selection_name, odds
+            from odds_market_snapshots
+            where match_id = ? and odds is not null
             order by snapshot_time desc
-            limit 1
-        """, (str(match_id),)).fetchone()
-    return float(row[0]) if row and row[0] else None
+            limit 500
+            """,
+            (match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    for row in rows:
+        market_name = str(row[0] or "")
+        specifier = str(row[1] or "")
+        selection_name = str(row[2] or "")
+        candidates = {
+            _norm_key(selection_name),
+            _norm_key(f"{selection_name} {specifier}"),
+            _norm_key(f"{selection_name} {market_name}"),
+            _norm_key(f"{market_name} {specifier} {selection_name}"),
+        }
+        if candidates & aliases:
+            return float(row[3])
+    return None
+
+
+def _selection_aliases(selection: str) -> set[str]:
+    text = _norm_key(selection)
+    aliases = {text}
+    if "home or draw" in text or text == "1x":
+        aliases.update({"home or draw", "1x", "1 x"})
+    if "away or draw" in text or "draw or away" in text or text == "x2":
+        aliases.update({"away or draw", "draw or away", "x2", "x 2"})
+    if "home or away" in text or text == "12":
+        aliases.update({"home or away", "12", "1 2"})
+    if "both teams" in text or "btts" in text:
+        aliases.update({"both teams to score", "btts yes"} if "no" not in text else {"both teams to score no", "btts no", "no"})
+    for line in ("0.5", "1.5", "2.5", "3.5", "4.5"):
+        if line in text and "under" in text:
+            aliases.update({f"under {line}", f"under {line} goals", f"total under {line}"})
+        if line in text and "over" in text:
+            aliases.update({f"over {line}", f"over {line} goals", f"total over {line}"})
+    return {_norm_key(alias) for alias in aliases if alias}
+
+
+def _norm_key(value: str) -> str:
+    return " ".join(str(value or "").lower().replace("-", " ").replace("/", " ").split())
 
 
 # ── Compute CLV after matches close ───────────────────────────────────────────
@@ -147,7 +209,8 @@ def compute_clv_for_date(match_date: str) -> dict[str, Any]:
     Returns count of entries updated.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         conn.row_factory = sqlite3.Row
 
@@ -197,22 +260,17 @@ def compute_clv_for_date(match_date: str) -> dict[str, Any]:
 
 def _get_closing_odds(conn: sqlite3.Connection, match_id: str, selection: str) -> float | None:
     """Get the last odds snapshot — this is the closing line."""
-    sel = selection.lower()
-    col_map = {
-        "home": "home_odds", "1": "home_odds",
-        "draw": "draw_odds", "x": "draw_odds",
-        "away": "away_odds", "2": "away_odds",
-    }
-    col = col_map.get(sel)
-    if not col:
-        return None
-    row = conn.execute(f"""
-        select {col} from odds_snapshots
-        where match_id = ? and {col} is not null
-        order by snapshot_time desc
-        limit 1
-    """, (match_id,)).fetchone()
-    return float(row[0]) if row and row[0] else None
+    col = _primary_odds_column(selection)
+    if col:
+        row = conn.execute(f"""
+            select {col} from odds_snapshots
+            where match_id = ? and {col} is not null
+            order by snapshot_time desc
+            limit 1
+        """, (match_id,)).fetchone()
+        if row and row[0]:
+            return float(row[0])
+    return _get_market_odds(conn, match_id, selection)
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
@@ -227,7 +285,8 @@ def get_clv_summary(days: int = 30) -> dict[str, Any]:
       - recent: last 20 entries
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         conn.row_factory = sqlite3.Row
 
@@ -389,7 +448,8 @@ def clv_stake_multiplier(pick_type: str, confidence: int) -> float:
     whether you're finding real edges, not just getting lucky.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         conn.row_factory = sqlite3.Row
         band_low = min(90, (confidence // 10) * 10)
