@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as dt, datetime, timezone
 from difflib import SequenceMatcher
@@ -13,6 +15,7 @@ from app.market import snapshot_odds
 from app.normalise import normalise
 from app.match_state import classify_match_state
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, is_usable_event_for_mode
+from app.sportradar_client import fetch_match_intelligence
 from app.sportybet_client import fetch_live_and_upcoming_matches_post
 from app.time_context import match_time_context
 from app.web_context import search_match_context
@@ -27,9 +30,10 @@ DETAIL_WORKERS = 2
 WEB_WORKERS = 4
 
 JUNK_MARKERS = (
-    " srl", " u21", " u20", " u19", " u18", " u23",
-    "reserves", " ii ", " b ", "women", "wfc", "ladies",
-    "esports", "simulated", "virtual",
+    " srl",
+    "esports",
+    "simulated",
+    "virtual",
 )
 
 
@@ -116,12 +120,23 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
 
     print(f"[enrichment] web context fetched: {len(web_contexts)}/{len(needs_web)}")
 
+    def _fetch_sportradar(idx: int, sporty: dict) -> tuple[int, dict]:
+        return idx, fetch_match_intelligence(sporty.get("id"))
+
+    sportradar_details: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
+        futures = {pool.submit(_fetch_sportradar, i, sporty): i for i, (sporty, _, _) in enumerate(matched_pairs)}
+        for future in as_completed(futures):
+            idx, sportradar = future.result()
+            sportradar_details[idx] = sportradar
+
     # ── Step 4: assemble documents + snapshot odds ────────────────────────────
     now = datetime.now(timezone.utc).isoformat()
     documents = []
 
     for i, (sporty, sofa, score) in enumerate(matched_pairs):
         detail = details.get(i)
+        sportradar_detail = sportradar_details.get(i) or {}
         web_context = web_contexts.get(i, {"query": "", "snippets": [], "scraped": []})
         match_state = classify_match_state(sporty)
         time_context = match_time_context({**sporty, "sofascore_event": sofa})
@@ -141,11 +156,16 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "sportybet_data_status": "available",
             "sportybet_markets": sporty.get("markets", []),
             "markets": sporty.get("markets", []),
-            "data_sources": _data_sources(sofa, detail, sporty),
+            "data_sources": _data_sources(sofa, detail, sporty, sportradar_detail),
+            "sportradar_detail": sportradar_detail,
             "sofascore_id": sofa.get("id") if sofa else None,
             "sofascore_name": sofa.get("name") if sofa else None,
             "sofascore_event": sofa,
             "sofascore_detail": detail,
+            "home_last_matches": (detail or {}).get("home_last_matches") or [],
+            "away_last_matches": (detail or {}).get("away_last_matches") or [],
+            "standings": (detail or {}).get("standings") or [],
+            "league_table": (detail or {}).get("standings") or [],
             "sofascore_match_status": match_status,
             "sofascore_no_match_at": None if sofa else now,
             "minimum_enrichment_status": "full_provider_match" if sofa else "sporty_only",
@@ -211,7 +231,12 @@ def _sporty_detail_doc(sporty: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _data_sources(sofa: dict[str, Any] | None, detail: dict[str, Any] | None, sporty: dict[str, Any] | None) -> dict[str, Any]:
+def _data_sources(
+    sofa: dict[str, Any] | None,
+    detail: dict[str, Any] | None,
+    sporty: dict[str, Any] | None,
+    sportradar: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     markets = (sporty or {}).get("markets") or []
     return {
         "sportybet": {
@@ -227,6 +252,12 @@ def _data_sources(sofa: dict[str, Any] | None, detail: dict[str, Any] | None, sp
             "detail": bool(detail),
             "statistics": bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics")),
             "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
+        },
+        "sportradar": {
+            "available": bool((sportradar or {}).get("available")),
+            "detail": bool((sportradar or {}).get("match")),
+            "standings": bool((sportradar or {}).get("standings")),
+            "error": (sportradar or {}).get("error") or (sportradar or {}).get("standings_error"),
         },
     }
 
@@ -322,8 +353,8 @@ def _event_score(sporty: dict[str, Any], event: dict[str, Any]) -> float:
     sporty_away = sporty.get("away_team") or _split_team(sporty_name, 1)
     sofa_home = (event.get("home_team") or {}).get("name") or _split_team(sofa_name, 0)
     sofa_away = (event.get("away_team") or {}).get("name") or _split_team(sofa_name, 1)
-    direct = (_name_score(sporty_home, sofa_home) + _name_score(sporty_away, sofa_away)) / 2
-    flipped = (_name_score(sporty_home, sofa_away) + _name_score(sporty_away, sofa_home)) / 2
+    direct = (_team_name_score(sporty_home, sofa_home) + _team_name_score(sporty_away, sofa_away)) / 2
+    flipped = (_team_name_score(sporty_home, sofa_away) + _team_name_score(sporty_away, sofa_home)) / 2
     team_score = max(direct, flipped)
 
     tournament_score = _token_score(
@@ -334,6 +365,11 @@ def _event_score(sporty: dict[str, Any], event: dict[str, Any]) -> float:
     score = (name_score * 0.50) + (team_score * 0.38) + (tournament_score * 0.07) + (country_score * 0.05)
 
     time_penalty = _time_penalty(sporty.get("start_time"), event.get("start_timestamp"))
+    if time_penalty == 0 and country_score >= 0.75:
+        if team_score >= 0.92:
+            score = max(score, 0.82)
+        elif team_score >= 0.86:
+            score = max(score, 0.78)
     score = max(0.0, score - time_penalty)
     if time_penalty >= 0.25 and team_score < 0.92:
         score = min(score, 0.64)
@@ -396,6 +432,50 @@ def _name_score(sporty_name: str, sofa_name: str) -> float:
         SequenceMatcher(None, source, flipped).ratio(),
         _token_score(source, target),
         _token_score(source, flipped),
+    )
+
+
+def _team_name_score(sporty_name: str, sofa_name: str) -> float:
+    base = _name_score(sporty_name, sofa_name)
+    source = _team_tokens(sporty_name)
+    target = _team_tokens(sofa_name)
+    if not source or not target:
+        return base
+    overlap = len(source & target)
+    union = len(source | target)
+    token_score = overlap / union if union else 0.0
+    coverage = max(overlap / len(source), overlap / len(target))
+    score = max(base, token_score)
+    if overlap and coverage >= 1.0:
+        score = max(score, 0.92)
+    elif overlap >= 2 and coverage >= 0.67:
+        score = max(score, 0.86)
+    elif overlap >= 1 and min(len(source), len(target)) == 1:
+        score = max(score, 0.82)
+    return min(1.0, score)
+
+
+def _team_tokens(name: str) -> set[str]:
+    noise = {
+        "club", "football", "futbol", "soccer", "team",
+        "fc", "cf", "cd", "sc", "ac", "afc", "if", "bk", "ec",
+        "ca", "sp", "mg", "ba", "am", "go", "ce",
+    }
+    connectors = {"de", "do", "da", "del", "della", "di", "du", "la", "le", "los", "las", "of", "the"}
+    words = [
+        word for word in re.findall(r"[a-z0-9]+", _ascii_fold(normalise(str(name or ""))))
+        if word not in noise and word not in connectors
+    ]
+    if "atl" in words and "tico" in words:
+        words = [word for word in words if word not in {"atl", "tico"}]
+        words.append("atletico")
+    return set(words)
+
+
+def _ascii_fold(value: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", value)
+        if not unicodedata.combining(ch)
     )
 
 

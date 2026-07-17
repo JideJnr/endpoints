@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from app.contextual_intelligence import builder_relationship_intelligence
 from app.league_memory import (
     betbuilder_pick_memory,
     get_enriched_match,
@@ -99,6 +100,12 @@ def get_logic():
                 "name": "Poisson Goal Model",
                 "description": "Calculates home/draw/away, BTTS, over 2.5 and top scorelines from recent team goals.",
                 "signals": ["home_lambda", "away_lambda", "scoreline_probability"],
+            },
+            {
+                "id": "dixon-coles-model",
+                "name": "Dixon-Coles Goal Model",
+                "description": "Applies a low-score correction over Poisson so 0-0, 1-0, 0-1, and 1-1 outcomes are priced more realistically.",
+                "signals": ["home_lambda", "away_lambda", "low_score_tau", "corrected_scoreline_probability"],
             },
             {
                 "id": "strength-of-schedule",
@@ -284,6 +291,13 @@ def get_predictions_history(limit: int = Query(default=200, ge=1, le=1000), matc
     return {"status": "success", **list_prediction_history(limit=limit, match_id=match_id)}
 
 
+@router.get("/predictions/decisions")
+def get_prediction_decisions(limit: int = Query(default=200, ge=1, le=1000), match_id: Optional[str] = None):
+    from app.league_memory import list_prediction_decisions
+
+    return {"status": "success", **list_prediction_decisions(limit=limit, match_id=match_id)}
+
+
 @router.get("/predictions/{match_id}")
 def get_prediction(
     match_id: str,
@@ -325,7 +339,7 @@ def _prediction_for_match_id(
         raise HTTPException(status_code=404, detail=f"Match {match_id} not found in active buffer")
 
     try:
-        enrich_buffered_match(match_id)
+        enrich_buffered_match(match_id, auto_predict=False)
         doc = get_buffered_match(match_id) or doc
     except MatchEnrichmentError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
@@ -557,6 +571,27 @@ def get_engine_metrics():
     }
 
 
+@router.get("/risk/desk")
+def get_risk_desk(limit: int = Query(default=200, ge=20, le=1000)):
+    from app.desk_analytics import desk_observability
+
+    return desk_observability(limit=limit)
+
+
+@router.get("/risk/backtest-gate")
+def get_risk_backtest_gate(limit: int = Query(default=1000, ge=50, le=10000), min_samples: int = Query(default=50, ge=10, le=1000)):
+    from app.desk_analytics import backtest_gate
+
+    return backtest_gate(limit=limit, min_samples=min_samples)
+
+
+@router.get("/risk/signal-attribution")
+def get_risk_signal_attribution(min_samples: int = Query(default=5, ge=1, le=100), limit: int = Query(default=5000, ge=100, le=20000)):
+    from app.desk_analytics import signal_attribution_report
+
+    return signal_attribution_report(min_samples=min_samples, limit=limit)
+
+
 @router.get("/engines/{engine_id}")
 def get_engine(engine_id: str):
     engines = _engines_with_state()
@@ -598,7 +633,8 @@ def post_run_enrich(date: Optional[str] = None, force: bool = False, limit: int 
 def post_run_predict(date: Optional[str] = None, limit: int = Query(default=20, ge=1, le=300)):
     target_date = date or dt.today().isoformat()
     docs = get_enriched_matches(target_date, limit=limit)
-    skipped = 0
+    skipped_not_ready = 0
+    skipped_already_predicted = 0
     if docs:
         from app.prediction_flow import apply_prediction_state
 
@@ -613,15 +649,18 @@ def post_run_predict(date: Optional[str] = None, limit: int = Query(default=20, 
             )
             if state.get("status") == "predicted":
                 predictions.append(state["prediction"])
+            elif state.get("status") == "skipped":
+                skipped_already_predicted += 1
             else:
-                skipped += 1
+                skipped_not_ready += 1
     else:
         predictions = _safe_predictions_for_date(target_date, limit=limit, include_history=True)
     return {
         "status": "success",
         "date": target_date,
         "new_predictions": len(predictions),
-        "skipped_not_ready": skipped,
+        "skipped_not_ready": skipped_not_ready,
+        "skipped_already_predicted": skipped_already_predicted,
         "value_bets": sum(1 for item in predictions if _is_value_prediction(item)),
         "predictions": predictions,
     }
@@ -934,11 +973,17 @@ def _choose_builder_combo(
             next_combined = combined * float(candidate["odds"])
             if next_combined > max_total_odds * 1.12:
                 continue
+            relationship = builder_relationship_intelligence(selections, candidate)
+            candidate_with_relationship = {
+                **candidate,
+                "builder_relationship": relationship,
+                "score": round(float(candidate.get("score") or 0) + float(relationship.get("score_adjustment") or 0), 2),
+            }
             next_states.append((
                 next_combined,
-                quality + float(candidate.get("score") or 0),
+                quality + float(candidate_with_relationship.get("score") or 0),
                 (*match_ids, candidate["match_id"]),
-                [*selections, candidate],
+                [*selections, candidate_with_relationship],
             ))
         next_states.sort(
             key=lambda state: (
@@ -992,9 +1037,18 @@ def _greedy_reach_builder_target(
         ]
         if not usable:
             break
+        scored = [
+            {
+                **item,
+                "builder_relationship": builder_relationship_intelligence(selected, item),
+            }
+            for item in usable
+        ]
+        for item in scored:
+            item["score"] = round(float(item.get("score") or 0) + float((item.get("builder_relationship") or {}).get("score_adjustment") or 0), 2)
         # Prefer the leg that gets us closest to target without crossing the ceiling.
         best = min(
-            usable,
+            scored,
             key=lambda item: (
                 abs(target_odds - combined * float(item.get("odds") or 1)),
                 -float(item.get("score") or 0),

@@ -64,6 +64,8 @@ def build_prediction_audit(prediction: dict[str, Any], doc: dict[str, Any] | Non
             "probabilities": ensemble.get("probabilities"),
         },
         "consensus": _consensus_snapshot(signals),
+        "contextual_intelligence": prediction.get("contextual_intelligence") or primary.get("contextual_intelligence") or {},
+        "risk_management": prediction.get("risk_management") or primary.get("risk_management") or {},
         "confidence": _confidence_snapshot(primary),
         "no_prediction": _no_prediction_snapshot(primary, readiness),
         "temporal": _temporal_snapshot(prediction, doc, time_context),
@@ -74,6 +76,21 @@ def build_prediction_audit(prediction: dict[str, Any], doc: dict[str, Any] | Non
             "regime": prediction.get("regime") or (primary.get("calibration") or {}).get("regime_name"),
         },
     }
+
+
+def build_pick_audit(prediction: dict[str, Any], pick: dict[str, Any], doc: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build an audit where the requested pick is the decision under review."""
+    picks = prediction.get("picks") or []
+    reordered = [pick, *[item for item in picks if item is not pick]]
+    audit = build_prediction_audit({**prediction, "picks": reordered}, doc)
+    audit["decision_pick"] = {
+        "type": pick.get("type"),
+        "selection": pick.get("selection") or pick.get("pick"),
+        "confidence": pick.get("confidence"),
+        "role": pick.get("role"),
+        "reason": pick.get("reason") or pick.get("reasoning"),
+    }
+    return audit
 
 
 def build_deferred_prediction_audit(doc: dict[str, Any], readiness: dict[str, Any]) -> dict[str, Any]:

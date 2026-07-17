@@ -38,5 +38,27 @@ def kelly_fraction(probability: float, decimal_odds: float, fraction: float = 0.
     }
 
 
-def kelly_for_prediction(confidence: int, decimal_odds: float) -> dict[str, Any]:
-    return kelly_fraction(confidence / 100, decimal_odds)
+def kelly_for_prediction(
+    confidence: int,
+    decimal_odds: float,
+    *,
+    calibrated_probability: float | None = None,
+) -> dict[str, Any]:
+    """Kelly sizing for predictions.
+
+    Confidence is model certainty/explainability, not a priced win probability.
+    Only a calibrated probability is safe to use for EV/Kelly.
+    """
+    if calibrated_probability is None:
+        return {
+            "confidence": confidence,
+            "probability": None,
+            "decimal_odds": decimal_odds,
+            "edge_percent": 0,
+            "full_kelly": 0,
+            "quarter_kelly": 0,
+            "stake_per_100": 0,
+            "value_bet": False,
+            "recommendation": "skip_no_calibrated_probability",
+        }
+    return kelly_fraction(calibrated_probability, decimal_odds)

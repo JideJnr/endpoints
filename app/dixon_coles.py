@@ -32,16 +32,17 @@ def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> d
     mu = max(mu, 0.3)
     lam = max(lam, 0.3)
 
-    home_win = draw = away_win = over_2_5 = btts = 0.0
+    home_win = draw = away_win = over_2_5 = btts = total_probability = 0.0
     scorelines: list[tuple[int, int, float]] = []
 
-    for home_goals in range(MAX_GOALS):
-        for away_goals in range(MAX_GOALS):
+    for home_goals in range(MAX_GOALS + 1):
+        for away_goals in range(MAX_GOALS + 1):
             probability = (
                 _poisson_prob(mu, home_goals)
                 * _poisson_prob(lam, away_goals)
                 * _tau(home_goals, away_goals, mu, lam, RHO)
             )
+            total_probability += probability
             if home_goals > away_goals:
                 home_win += probability
             elif home_goals == away_goals:
@@ -54,9 +55,8 @@ def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> d
                 btts += probability
             scorelines.append((home_goals, away_goals, round(probability * 100, 2)))
 
-    total_1x2 = home_win + draw + away_win
-    if total_1x2 <= 0:
-        total_1x2 = 1.0
+    if total_probability <= 0:
+        total_probability = 1.0
 
     return {
         "model": "dixon_coles",
@@ -65,11 +65,11 @@ def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> d
         "home_stats": home_stats,
         "away_stats": away_stats,
         "probabilities": {
-            "home_win": round(home_win / total_1x2 * 100, 1),
-            "draw": round(draw / total_1x2 * 100, 1),
-            "away_win": round(away_win / total_1x2 * 100, 1),
-            "over_2_5": round(over_2_5 * 100, 1),
-            "btts": round(btts * 100, 1),
+            "home_win": round(home_win / total_probability * 100, 1),
+            "draw": round(draw / total_probability * 100, 1),
+            "away_win": round(away_win / total_probability * 100, 1),
+            "over_2_5": round(over_2_5 / total_probability * 100, 1),
+            "btts": round(btts / total_probability * 100, 1),
         },
         "top_scorelines": [
             {"score": f"{home}-{away}", "probability": f"{probability}%"}

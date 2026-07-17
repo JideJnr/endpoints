@@ -80,22 +80,33 @@ def _warm_session() -> None:
     Visit the SportyBet homepage to pick up cookies and establish a
     realistic browsing session before hitting the API endpoints.
     Only runs once per session lifetime.
+
+    The homepage visit is done in a background thread so it never blocks
+    the main scheduler job. If it fails, we still proceed with the API call
+    (the session may work without cookies on some requests).
     """
     global _session_warmed
     if _session_warmed:
         return
-    try:
-        ua = random.choice(_USER_AGENTS)
-        _last_ua = ua
-        _get_session().get(
-            SPORTYBET_HOME_URL,
-            headers=_browser_headers(ua, referer="https://www.google.com/"),
-            timeout=12,
-        )
-        _session_warmed = True
-        time.sleep(random.uniform(0.4, 1.0))
-    except Exception:
-        _session_warmed = True  # don't retry warm-up on every call
+    # Mark as warmed immediately so concurrent callers don't all try at once.
+    # The background thread will finish the actual warmup.
+    _session_warmed = True
+
+    import threading
+
+    def _do_warm() -> None:
+        try:
+            ua = random.choice(_USER_AGENTS)
+            _get_session().get(
+                SPORTYBET_HOME_URL,
+                headers=_browser_headers(ua, referer="https://www.google.com/"),
+                timeout=8,
+            )
+            time.sleep(random.uniform(0.2, 0.5))
+        except Exception:
+            pass  # warmup failure is non-fatal
+
+    threading.Thread(target=_do_warm, daemon=True).start()
 
 
 def _browser_headers(ua: str | None = None, referer: str = "https://www.sportybet.com/ng/sport/football") -> dict:
@@ -122,7 +133,7 @@ def _browser_headers(ua: str | None = None, referer: str = "https://www.sportybe
 
 # ── Retry wrapper ─────────────────────────────────────────────────────────────
 
-def _post_with_retry(url: str, payload: dict, max_retries: int = 4) -> dict:
+def _post_with_retry(url: str, payload: dict, max_retries: int = 4, timeout: int = 20) -> dict:
     """
     POST with exponential backoff + session rotation on 403/429.
     On 403: rotate session (new TLS fingerprint + new UA) and retry.
@@ -140,7 +151,7 @@ def _post_with_retry(url: str, payload: dict, max_retries: int = 4) -> dict:
             headers = _browser_headers(ua)
             payload["_t"] = int(time.time() * 1000)
 
-            response = _get_session().post(url, json=payload, headers=headers, timeout=20)
+            response = _get_session().post(url, json=payload, headers=headers, timeout=timeout)
 
             if response.status_code == 403:
                 # Rotate session entirely — new TLS fingerprint
@@ -215,9 +226,47 @@ def _get_with_retry(url: str, params: dict, max_retries: int = 4) -> dict:
     )
 
 
+# ── List result cache ─────────────────────────────────────────────────────────
+# Prevents the scheduler from hammering SportyBet when a job fires faster than
+# the API can respond. The live ingest runs every 30s but the HTTP call alone
+# can take 8-20s when rate-limited. Without a cache, the next run starts a
+# fresh call that overlaps with the previous one.
+#
+# TTL rules:
+#   live (isLive=True):     20 seconds — fast enough to see score changes
+#   upcoming (isLive=False): 90 seconds — upcoming list barely changes between calls
+#   all (isLive=None):       45 seconds — mixed mode
+#
+# The cache lives in-process so it resets on restart (safe, no stale data risk).
+_MATCH_LIST_CACHE_TTL = {
+    True:  20,   # live
+    False: 90,   # upcoming
+    None:  45,   # all
+}
+_match_list_cache: dict[str | bool | None, tuple[float, list]] = {}
+
+
+def _match_list_cache_get(key: bool | None) -> list | None:
+    entry = _match_list_cache.get(key)
+    if entry and (time.monotonic() - entry[0]) < _MATCH_LIST_CACHE_TTL.get(key, 45):
+        return entry[1]
+    return None
+
+
+def _match_list_cache_set(key: bool | None, data: list) -> None:
+    _match_list_cache[key] = (time.monotonic(), data)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
+    # ── Return cached result if fresh enough ──────────────────────────────────
+    # List endpoints (live/upcoming) don't need a fresh HTTP call every time the
+    # scheduler fires. The cache TTL is short enough to not miss meaningful changes.
+    cached = _match_list_cache_get(is_live)
+    if cached is not None:
+        return cached
+
     payload = {
         "sportId": "sr:sport:1",
         "pageSize": 300,
@@ -225,7 +274,17 @@ def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
     if is_live is not None:
         payload["isLive"] = is_live
 
-    data = _post_with_retry(SPORTYBET_POST_URL, payload)
+    # Use 2 retries + 8s timeout for list fetches (not detail).
+    # Worst case: 2 × (8s + backoff) ≈ 20s max — well within the 30s scheduler interval.
+    # Previously: 4 retries × 20s timeout = up to 97s, causing job overlap.
+    data = _post_with_retry(SPORTYBET_POST_URL, payload, max_retries=2, timeout=8)
+    result = parse_events_response(data)
+    _match_list_cache_set(is_live, result)
+    return result
+
+
+def parse_events_response(data: dict[str, Any]) -> list[dict]:
+    """Normalize a raw SportyBet events response into buffer-ready match rows."""
     tournaments = data.get("data", {}).get("tournaments", [])
     matches = []
     for tournament in tournaments:

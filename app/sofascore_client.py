@@ -1,11 +1,14 @@
 import random
 import time
+from typing import Dict, List, Optional, Tuple
 
 from curl_cffi import requests
 
 SOFASCORE_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/unique-tournament/{tournament_id}/scheduled-events/{date}"
 SOFASCORE_ALL_URL = "https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
+SOFASCORE_SEARCH_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/search/all?q={query}"
 SOFASCORE_EVENT_URL = "https://www.sofascore.com/api/v1/event/{event_id}"
+SOFASCORE_SEARCH_URL = "https://www.sofascore.com/api/v1/search/all?q={query}"
 SOFASCORE_LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 SOFASCORE_TEAM_HISTORY_URL = "https://www.sofascore.com/api/v1/team/{team_id}/events/last/{page}"
 SOFASCORE_STANDINGS_URL = "https://www.sofascore.com/api/v1/tournament/{tournament_id}/season/{season_id}/standings/total"
@@ -40,6 +43,33 @@ _HOME_HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
+
+# ── List endpoint TTL cache ───────────────────────────────────────────────────
+# Prevents hammering the same list endpoint repeatedly within a single scheduler
+# cycle. The enrichment worker fires every 30 sec; without this cache, every
+# cycle re-fetches the full scheduled-events list even when nothing changed.
+#
+# TTL rules:
+#   - scheduled events (prematch): 60 seconds  — prematch lists barely change
+#   - live events: 20 seconds                  — live list changes minute-by-minute
+#
+# Only the list endpoints are cached here. Detail endpoints (statistics, incidents,
+# lineups) are NOT cached — they are always fetched fresh per match.
+
+_LIST_CACHE_TTL_SCHEDULED = 60   # seconds
+_LIST_CACHE_TTL_LIVE = 20        # seconds
+_list_cache: Dict[str, Tuple[float, list]] = {}  # key → (fetched_at, data)
+
+
+def _list_cache_get(key: str, ttl: float) -> Optional[list]:
+    entry = _list_cache.get(key)
+    if entry and (time.monotonic() - entry[0]) < ttl:
+        return entry[1]
+    return None
+
+
+def _list_cache_set(key: str, data: list) -> None:
+    _list_cache[key] = (time.monotonic(), data)
 
 def _new_session() -> requests.Session:
     session = requests.Session(impersonate="chrome124")
@@ -134,10 +164,172 @@ def fetch_scheduled_events(date: str, tournament_id: int = 17) -> list[dict]:
     return [_parse_event(e) for e in events]
 
 
+# ── Curated top-league unique-tournament IDs ─────────────────────────────────
+# These cover the leagues most commonly seen in SportyBet feeds.
+# New IDs are auto-learned from matched buffer matches and persisted in SQLite.
+_CORE_TOURNAMENT_IDS: Dict[int, str] = {
+    17:    "Premier League",
+    8:     "La Liga",
+    23:    "Serie A",
+    35:    "Bundesliga",
+    34:    "Ligue 1",
+    7:     "Champions League",
+    679:   "Europa League",
+    329:   "Conference League",
+    37:    "Championship",
+    44:    "Eredivisie",
+    238:   "Primeira Liga",
+    325:   "Super Lig",
+    203:   "Saudi Pro League",
+    955:   "MLS",
+    242:   "Brasileirao",
+    390:   "Argentine Primera",
+    406:   "Liga MX",
+    384:   "Premier League (old)",
+    480:   "World Cup",
+    679:   "Europa League",
+    17015: "Africa Cup of Nations",
+    11697: "AFCON Qualifying",
+    16736: "Bolivia Division Profesional",
+    1116:  "First League",
+    41654: "South Australia State League 1",
+    71304: "VPL 1",
+    160606: "Calcutta Premier Division",
+    173887: "U23 Victoria Premier League 1",
+}
+
+
+def _get_learned_tournament_ids() -> Dict[int, str]:
+    """Load auto-learned tournament IDs from SQLite."""
+    try:
+        from app.league_memory import DB_PATH, _init_db
+        import sqlite3 as _sqlite3
+        _init_db()
+        with _sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute("""
+                create table if not exists sofa_tournament_ids (
+                    tournament_id integer primary key,
+                    name text,
+                    last_seen text not null default current_timestamp
+                )
+            """)
+            rows = conn.execute("select tournament_id, name from sofa_tournament_ids").fetchall()
+            return {r[0]: r[1] for r in rows}
+    except Exception:
+        return {}
+
+
+def learn_tournament_id(tournament_id: int, name: str) -> None:
+    """Persist a newly discovered SofaScore unique-tournament ID."""
+    if not tournament_id:
+        return
+    try:
+        from app.league_memory import DB_PATH, _init_db
+        import sqlite3 as _sqlite3
+        _init_db()
+        with _sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute("""
+                create table if not exists sofa_tournament_ids (
+                    tournament_id integer primary key,
+                    name text,
+                    last_seen text not null default current_timestamp
+                )
+            """)
+            conn.execute("""
+                insert into sofa_tournament_ids (tournament_id, name, last_seen)
+                values (?, ?, current_timestamp)
+                on conflict(tournament_id) do update set
+                    name = excluded.name,
+                    last_seen = current_timestamp
+            """, (int(tournament_id), str(name or "")))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _fetch_tournament_events(tournament_id: int, date: str) -> list[dict]:
+    """Fetch scheduled events for one unique-tournament ID, return [] on any error."""
+    try:
+        url = SOFASCORE_TOURNAMENT_URL.format(tournament_id=tournament_id, date=date)
+        resp = _session.get(url, headers=HEADERS, timeout=12)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        return [_parse_event(e) for e in resp.json().get("events", [])]
+    except Exception:
+        return []
+
+
 def fetch_all_scheduled_events(date: str) -> list[dict]:
-    url = SOFASCORE_ALL_URL.format(date=date)
-    events = _get(url).json().get("events", [])
-    return [_parse_event(e) for e in events]
+    """Fetch scheduled events by tournament ID (global endpoint is dead).
+    Merges core league IDs + auto-learned IDs from matched buffer matches.
+    Fetches all in parallel, deduplicates by event ID.
+    """
+    cache_key = f"scheduled:{date}"
+    cached = _list_cache_get(cache_key, _LIST_CACHE_TTL_SCHEDULED)
+    if cached is not None:
+        return cached
+
+    # Try global endpoint first — works on some dates/regions
+    try:
+        url = SOFASCORE_ALL_URL.format(date=date)
+        resp = _session.get(url, headers=HEADERS, timeout=12)
+        if resp.status_code == 200:
+            events = [_parse_event(e) for e in resp.json().get("events", [])]
+            if events:
+                _list_cache_set(cache_key, events)
+                return events
+    except Exception:
+        pass
+
+    # Global endpoint failed — fetch by tournament ID
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    all_ids: Dict[int, str] = {**_CORE_TOURNAMENT_IDS, **_get_learned_tournament_ids()}
+
+    seen: set = set()
+    events: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = {pool.submit(_fetch_tournament_events, tid, date): tid for tid in all_ids}
+        for future in as_completed(futures):
+            for ev in future.result():
+                eid = ev.get("id")
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    events.append(ev)
+                    # auto-learn the tournament ID from each returned event
+                    t = ev.get("tournament") or {}
+                    tid = t.get("id")  # this is the unique-tournament id in parsed events
+                    tname = t.get("name")
+                    if tid and tid not in all_ids:
+                        learn_tournament_id(tid, tname)
+
+    _list_cache_set(cache_key, events)
+    return events
+
+
+def search_events(query: str, limit: int = 12) -> list[dict]:
+    """Search SofaScore events when scheduled-events misses a fixture."""
+    from urllib.parse import quote
+
+    if not query.strip():
+        return []
+    url = SOFASCORE_SEARCH_URL.format(query=quote(query.strip()))
+    results = _get(url).json().get("results", [])
+    events = []
+    seen = set()
+    for item in results:
+        if item.get("type") != "event":
+            continue
+        entity = item.get("entity") or {}
+        event_id = entity.get("id")
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        events.append(_parse_event(entity))
+        if len(events) >= limit:
+            break
+    return events
 
 
 def fetch_event(event_id) -> dict:
@@ -148,8 +340,13 @@ def fetch_event(event_id) -> dict:
 
 
 def fetch_live_events() -> list[dict]:
-    events = _get(SOFASCORE_LIVE_URL).json().get("events", [])
-    return [_parse_event(e) for e in events]
+    cache_key = "live"
+    cached = _list_cache_get(cache_key, _LIST_CACHE_TTL_LIVE)
+    if cached is not None:
+        return cached
+    events = [_parse_event(e) for e in _get(SOFASCORE_LIVE_URL).json().get("events", [])]
+    _list_cache_set(cache_key, events)
+    return events
 
 
 def fetch_team_history(team_id: int, page: int = 0) -> dict:
@@ -188,6 +385,10 @@ def fetch_standings(tournament_id: int, season_id: int) -> list[dict]:
 def fetch_event_detail(event: dict) -> dict:
     time.sleep(random.uniform(0.5, 1.5))  # jitter to avoid rate limiting
     event_id = event["id"]
+    if not event.get("season_id") or not ((event.get("tournament") or {}).get("tournament_id")):
+        fresh_event = fetch_event(event_id)
+        if fresh_event:
+            event = {**event, **{k: v for k, v in fresh_event.items() if v not in (None, {}, [])}}
     home_id = event["home_team"]["id"]
     away_id = event["away_team"]["id"]
     tournament_id = event["tournament"]["tournament_id"]
@@ -207,19 +408,78 @@ def fetch_event_detail(event: dict) -> dict:
         "lineups": safe(fetch_event_lineups, event_id),
         "pregame_form": safe(fetch_pregame_form, event_id),
         "managers": safe(fetch_managers, event_id),
-        "home_last_matches": safe(lambda tid: (
-            fetch_team_history(tid, 0).get("events", []) +
-            fetch_team_history(tid, 1).get("events", [])
-        ), home_id),
-        "away_last_matches": safe(lambda tid: (
-            fetch_team_history(tid, 0).get("events", []) +
-            fetch_team_history(tid, 1).get("events", [])
-        ), away_id),
+        "home_last_matches": _team_history_events(home_id),
+        "away_last_matches": _team_history_events(away_id),
         "home_featured_players": safe(fetch_featured_players, home_id),
         "away_featured_players": safe(fetch_featured_players, away_id),
         "odds_featured": safe(fetch_odds_featured, event_id),
         "standings": safe(fetch_standings, tournament_id, season_id),
     }
+
+
+def fetch_event_detail_live_refresh(event_id: int, existing_detail: dict) -> dict:
+    """
+    Lightweight live refresh for an already-enriched match.
+
+    Only fetches the three endpoints that change during a live match:
+      - statistics  (possession, shots, xG, corners, attacks)
+      - incidents   (goals, cards, substitutions)
+      - lineups     (current XI + substitutions made)
+
+    All static data (H2H, managers, team history, featured players, standings,
+    pre-game form, odds) is preserved from existing_detail — no API call needed
+    since they don't change during the match.
+
+    This replaces the full fetch_event_detail call for live match re-enrichment,
+    reducing per-cycle API calls from ~12 down to ~3 per live match.
+
+    Returns the merged detail dict with live fields updated.
+    """
+    def safe(fn, *args):
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    live_stats = safe(fetch_event_statistics, event_id)
+    live_incidents = safe(fetch_event_incidents, event_id)
+    live_lineups = safe(fetch_event_lineups, event_id)
+
+    # Merge: start from existing detail, overlay only the live-changing fields
+    updated = dict(existing_detail)
+    if live_stats is not None:
+        updated["statistics"] = live_stats
+    if live_incidents is not None:
+        updated["incidents"] = live_incidents
+    if live_lineups is not None:
+        updated["lineups"] = live_lineups
+
+    updated["live_refresh_at"] = time.time()
+    return updated
+
+
+def _team_history_events(team_id: Optional[int], pages: int = 2) -> list[dict]:
+    """Return all available history pages without dropping page 0 when page 1 is absent."""
+    if not team_id:
+        return []
+    events: list[dict] = []
+    seen: set[str] = set()
+    for page in range(max(1, pages)):
+        try:
+            data = fetch_team_history(team_id, page)
+        except Exception:
+            if page == 0:
+                return events
+            break
+        page_events = data.get("events") or []
+        for event in page_events:
+            eid = str(event.get("id") or "")
+            if eid and eid not in seen:
+                events.append(event)
+                seen.add(eid)
+        if not data.get("has_next_page"):
+            break
+    return events
 
 
 def _parse_standing_row(row: dict) -> dict:

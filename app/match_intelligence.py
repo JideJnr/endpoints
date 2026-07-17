@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.contextual_intelligence import build_contextual_intelligence
 from app.match_state import classify_match_state
 from app.prediction_audit import build_prediction_audit, build_deferred_prediction_audit
 from app.time_context import match_time_context
@@ -11,6 +12,16 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
     """Canonical match object for operations, UI, and debugging."""
     prediction = doc.get("prediction") if isinstance(doc.get("prediction"), dict) else None
     readiness = doc.get("prediction_readiness") or {}
+    stored_contextual = (
+        prediction.get("contextual_intelligence")
+        if prediction and isinstance(prediction.get("contextual_intelligence"), dict)
+        else {}
+    )
+    contextual = (
+        stored_contextual
+        if stored_contextual.get("learned_performance")
+        else build_contextual_intelligence(doc, prediction or {})
+    )
     return {
         "version": "match_intelligence_v1",
         "provider_ids": {
@@ -38,6 +49,7 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
             "missing": readiness.get("missing") or [],
             "error": doc.get("prediction_error"),
             "current_pick": (prediction.get("picks") or [{}])[0] if prediction else None,
+            "contextual": contextual,
             "audit": (
                 prediction.get("audit")
                 if prediction and isinstance(prediction.get("audit"), dict)
@@ -49,6 +61,7 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
         "learning": {
             "role_decision": (prediction or {}).get("learned_role_decision"),
             "regime": (prediction or {}).get("regime"),
+            "risk_management": (prediction or {}).get("risk_management"),
         },
         "lifecycle": doc.get("lifecycle") or {},
     }

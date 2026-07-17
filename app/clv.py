@@ -45,6 +45,8 @@ from typing import Any
 
 from app.league_memory import DB_PATH, _init_db
 
+CLV_MIN_SAMPLES = 25
+
 
 # ── Table ─────────────────────────────────────────────────────────────────────
 
@@ -143,20 +145,50 @@ def _primary_odds_column(selection: str) -> str | None:
     return None
 
 
-def _get_market_odds(conn: sqlite3.Connection, match_id: str, selection: str) -> float | None:
+def _get_market_odds(
+    conn: sqlite3.Connection,
+    match_id: str,
+    selection: str,
+    *,
+    before_time: str | None = None,
+) -> float | None:
     aliases = _selection_aliases(selection)
     if not aliases:
         return None
     try:
+        table = "odds_market_changes"
+        try:
+            conn.execute("select 1 from odds_market_changes limit 1")
+            exists = conn.execute(
+                "select 1 from odds_market_changes where match_id = ? limit 1",
+                (match_id,),
+            ).fetchone()
+            if not exists:
+                # Only fall back if the legacy table still exists.
+                legacy = conn.execute(
+                    "select 1 from sqlite_master where type='table' and name='odds_market_snapshots'",
+                ).fetchone()
+                if legacy:
+                    table = "odds_market_snapshots"
+                else:
+                    return None
+        except sqlite3.OperationalError:
+            table = "odds_market_snapshots"
+        cutoff_clause = ""
+        params: list[Any] = [match_id]
+        if before_time:
+            cutoff_clause = "and datetime(snapshot_time) <= datetime(?)"
+            params.append(before_time)
         rows = conn.execute(
-            """
+            f"""
             select market_name, specifier, selection_name, odds
-            from odds_market_snapshots
+            from {table}
             where match_id = ? and odds is not null
+              {cutoff_clause}
             order by snapshot_time desc
             limit 500
             """,
-            (match_id,),
+            params,
         ).fetchall()
     except sqlite3.OperationalError:
         return None
@@ -223,7 +255,8 @@ def compute_clv_for_date(match_date: str) -> dict[str, Any]:
 
         updated = 0
         for row in pending:
-            closing = _get_closing_odds(conn, str(row["match_id"]), row["selection"])
+            kickoff = _match_kickoff_iso(conn, str(row["match_id"]))
+            closing = _get_closing_odds(conn, str(row["match_id"]), row["selection"], before_time=kickoff)
             if not closing:
                 continue
 
@@ -258,19 +291,54 @@ def compute_clv_for_date(match_date: str) -> dict[str, Any]:
     return {"date": match_date, "clv_entries_updated": updated}
 
 
-def _get_closing_odds(conn: sqlite3.Connection, match_id: str, selection: str) -> float | None:
+def _get_closing_odds(
+    conn: sqlite3.Connection,
+    match_id: str,
+    selection: str,
+    *,
+    before_time: str | None = None,
+) -> float | None:
     """Get the last odds snapshot — this is the closing line."""
     col = _primary_odds_column(selection)
     if col:
+        cutoff_clause = ""
+        params: list[Any] = [match_id]
+        if before_time:
+            cutoff_clause = "and datetime(snapshot_time) <= datetime(?)"
+            params.append(before_time)
         row = conn.execute(f"""
             select {col} from odds_snapshots
             where match_id = ? and {col} is not null
+              {cutoff_clause}
             order by snapshot_time desc
             limit 1
-        """, (match_id,)).fetchone()
+        """, params).fetchone()
         if row and row[0]:
             return float(row[0])
-    return _get_market_odds(conn, match_id, selection)
+    return _get_market_odds(conn, match_id, selection, before_time=before_time)
+
+
+def _match_kickoff_iso(conn: sqlite3.Connection, match_id: str) -> str | None:
+    for table in ("match_buffer", "future_match_buffer"):
+        try:
+            row = conn.execute(f"select start_time from {table} where match_id = ? limit 1", (match_id,)).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if row and row[0] not in (None, ""):
+            return _to_utc_iso(row[0])
+    return None
+
+
+def _to_utc_iso(value: Any) -> str | None:
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            timestamp = float(value)
+            if timestamp > 1e10:
+                timestamp /= 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
@@ -466,7 +534,7 @@ def clv_stake_multiplier(pick_type: str, confidence: int) -> float:
               and min(90, (confidence / 10) * 10) = ?
         """, (pick_type, band_low)).fetchone()
 
-    if not row or (row["samples"] or 0) < 5:
+    if not row or (row["samples"] or 0) < CLV_MIN_SAMPLES:
         return 1.0  # not enough data
 
     avg_clv = float(row["avg_clv"] or 0)

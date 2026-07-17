@@ -37,6 +37,21 @@ def prediction_system_audit(limit: int = 200) -> dict[str, Any]:
             where graded_at is null
             """
         ).fetchone()[0]
+        pending_decisions = conn.execute(
+            """
+            select count(distinct match_id)
+            from prediction_decision_log
+            where graded_at is null
+            """
+        ).fetchone()[0]
+        recent_no_pick = conn.execute(
+            """
+            select count(*)
+            from prediction_decision_log
+            where decision_type in ('no_bet', 'deferred')
+              and datetime(created_at) >= datetime('now', '-72 hours')
+            """
+        ).fetchone()[0]
         recent_rows = conn.execute(
             """
             select id, match_id, match_name, pick_type, selection, confidence, created_at
@@ -96,6 +111,8 @@ def prediction_system_audit(limit: int = 200) -> dict[str, Any]:
             "duplicate_buffer_rows": duplicate_buffer_rows,
             "pending_prediction_matches": pending_predictions,
             "pending_candidate_matches": pending_candidates,
+            "pending_decision_matches": pending_decisions,
+            "recent_no_pick_decisions": recent_no_pick,
             "expired_no_match_rows": no_match_ready,
             "historical_predictions_now_not_ready": len(unready_predictions),
             "stuck_jobs": len(stuck_jobs),
@@ -107,6 +124,7 @@ def prediction_system_audit(limit: int = 200) -> dict[str, Any]:
         "contract": {
             "prediction_current_view": "Only readiness=true buffer rows are shown as current predictions.",
             "history_policy": "prediction_history is append-only and used for grading/learning.",
+            "decision_policy": "prediction_decision_log records every published, no-bet, and deferred decision for audit and no-pick learning.",
             "production_prediction_path": "Sporty ingest -> Sofa/Sporty enrichment -> prediction_readiness -> apply_prediction_state -> grading.",
         },
     }

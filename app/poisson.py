@@ -123,11 +123,13 @@ def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
             rows = conn.execute(
                 """
                 select raw_json from finished_matches
-                where json_extract(raw_json, '$.home_team') = ?
-                   or json_extract(raw_json, '$.away_team') = ?
+                where json_extract(raw_json, '$.home_team_id') = ?
+                   or json_extract(raw_json, '$.away_team_id') = ?
+                   or json_extract(raw_json, '$.home_team.id') = ?
+                   or json_extract(raw_json, '$.away_team.id') = ?
                 order by rowid desc limit ?
                 """,
-                (team_id, team_id, limit),
+                (team_id, team_id, team_id, team_id, limit),
             ).fetchall()
         result = []
         for row in rows:

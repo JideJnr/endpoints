@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import sqlite3
+from collections import Counter
 from typing import Any
 
 from app.dixon_coles import run_dixon_coles
+from app.contextual_intelligence import apply_contextual_adjustment, build_contextual_intelligence
 from app.elo import elo_prediction
 from app.ensemble import ensemble_prediction
 from app.kelly import kelly_fraction
@@ -11,10 +14,37 @@ from app.market_intent import classify_market_intent, selection_key as market_se
 from app.match_state import classify_match_state
 from app.poisson import run_poisson
 from app.prediction_agent import predict_sofascore_event, predict_sporty_match
+from app.risk_manager import apply_risk_controls
 from app.time_context import match_time_context
+from app.config import get_settings
 
 
 LONGSHOT_MIN_DECIMAL_ODDS = 2.0
+
+NOISY_SUPPORT_SIGNALS = {
+    "goal_pressure",
+    "dixon_coles_model",
+    "poisson_model",
+    "elo_model",
+    "prediction_memory",
+    "odds_edge",
+}
+
+MODIFIER_ONLY_SIGNALS = {"learned_signal_adjustment"}
+
+BACKGROUND_CONTEXT_SIGNALS = {
+    "sportybet_detail_available",
+    "sportybet_markets_available",
+    "sofascore_detail_available",
+    "source_blend_full_signal_plus_sporty",
+    "source_blend_full_signal",
+    "source_blend_sportybet_market_signal",
+    "source_blend_sportybet_prematch_minimum",
+    "source_blend_sportybet_live_signal",
+    "web_context",
+}
+
+RISK_SIGNALS = {"risk_management", "red_card_state"}
 
 
 def _is_not_started_period(period: Any) -> bool:
@@ -58,61 +88,110 @@ def _played_seconds(value: Any) -> int:
         return 0
 
 
+def _provider_state(doc: dict[str, Any]) -> str:
+    source = str(doc.get("data_source") or "").strip().lower()
+    if source in {"sportybet", "sofascore", "both"}:
+        return source
+    sources = doc.get("data_sources") or {}
+    sporty = sources.get("sportybet") if isinstance(sources, dict) else {}
+    sofa = sources.get("sofascore") if isinstance(sources, dict) else {}
+    sporty_available = bool((sporty or {}).get("available") or doc.get("sportybet_detail") or doc.get("raw_sporty"))
+    sofa_available = bool((sofa or {}).get("available") or doc.get("sofascore_detail") or doc.get("sofascore_id"))
+    if sporty_available and sofa_available:
+        return "both"
+    if sofa_available:
+        return "sofascore"
+    return "sportybet" if sporty_available else "both"
+
+
+def _live_data_sources(doc: dict[str, Any], detail: dict[str, Any] | None = None) -> list[str]:
+    sources: list[str] = []
+    sporty_live = doc.get("live_data_sportybet") or {}
+    sofa_live = doc.get("live_data_sofascore") or {}
+    detail = detail or doc.get("sofascore_detail") or {}
+    if sporty_live or (doc.get("sportybet_markets") and _played_seconds(doc.get("played_seconds")) >= 300):
+        sources.append("sportybet")
+    if sofa_live or detail.get("statistics") or detail.get("match_statistics"):
+        sources.append("sofascore")
+    return sources
+
+
 def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
     """Strict data contract before any prediction is allowed."""
     detail = doc.get("sofascore_detail") or {}
     sporty_detail = doc.get("sportybet_detail") or {}
+    sportradar_detail = doc.get("sportradar_detail") or {}
     match_state = classify_match_state(doc)
     status = detail.get("status") or doc.get("status") or {}
     if not isinstance(status, dict):
         status = {"code": status}
     is_live = bool(match_state.get("is_live"))
+    if is_live:
+        detail = _hydrate_live_data_if_possible(doc, detail)
     home_history = detail.get("home_last_matches") or []
     away_history = detail.get("away_last_matches") or []
     home_sample = len([m for m in home_history if (m.get("status") or {}).get("type") == "finished"])
     away_sample = len([m for m in away_history if (m.get("status") or {}).get("type") == "finished"])
     markets = doc.get("sportybet_markets") or doc.get("markets") or sporty_detail.get("markets") or []
     has_sporty_baseline = bool((sporty_detail or doc.get("raw_sporty")) and markets and (doc.get("time_context") or match_time_context(doc)))
-    missing: list[str] = []
+    provider_state = _provider_state(doc)
+    needs_sofascore = provider_state in {"sofascore", "both"}
+    needs_sportybet = provider_state in {"sportybet", "both"}
+    live_sources = _live_data_sources(doc, detail) if is_live else []
+    clock_mature = _played_seconds(doc.get("played_seconds")) >= 5 * 60
+    prematch_missing: list[str] = []
     if match_state.get("state") not in {"prematch", "live"}:
-        missing.append(f"non_predictable_state:{match_state.get('state')}")
-    if doc.get("sofascore_match_status") != "matched" and not doc.get("sofascore_id"):
-        missing.append("confident_sofascore_match")
-    if not detail:
-        missing.append("sofascore_detail")
-    if home_sample < 3:
-        missing.append("home_recent_history")
-    if away_sample < 3:
-        missing.append("away_recent_history")
-    if not markets:
-        missing.append("sportybet_markets")
-    if not sporty_detail and not doc.get("raw_sporty"):
-        missing.append("sportybet_detail")
+        prematch_missing.append(f"non_predictable_state:{match_state.get('state')}")
+    if needs_sofascore and provider_state == "both" and doc.get("sofascore_match_status") != "matched" and not doc.get("sofascore_id"):
+        prematch_missing.append("confident_sofascore_match")
+    if needs_sofascore and not detail:
+        prematch_missing.append("sofascore_detail")
+    if needs_sofascore and home_sample < 3:
+        prematch_missing.append("home_recent_history")
+    if needs_sofascore and away_sample < 3:
+        prematch_missing.append("away_recent_history")
+    if needs_sportybet and not markets:
+        prematch_missing.append("sportybet_markets")
+    if needs_sportybet and not sporty_detail and not doc.get("raw_sporty"):
+        prematch_missing.append("sportybet_detail")
     if not (doc.get("time_context") or match_time_context(doc)):
-        missing.append("time_context")
-    if is_live and not (detail.get("statistics") or detail.get("match_statistics")):
-        missing.append("live_statistics")
-    if is_live and not detail and _played_seconds(doc.get("played_seconds")) < 5 * 60:
+        prematch_missing.append("time_context")
+    missing: list[str] = []
+    missing.extend(prematch_missing)
+    if is_live and live_sources and not clock_mature and prematch_missing:
         missing.append("live_clock_mature")
-    if is_live and markets and not detail and (doc.get("time_context") or match_time_context(doc)):
+    elif is_live and not live_sources and prematch_missing:
+        missing.append("live_statistics")
+    if markets and not detail and (doc.get("time_context") or match_time_context(doc)):
         # SportyBet-only live fallback is allowed after the clock matures.
+        # SportyBet-only prematch fallback is also a valid degraded mode: it
+        # may publish "avoid" or very low-assurance market reads, but it must
+        # still be auditable instead of leaving the match dead.
         # Once SofaScore is matched, keep the stricter enrichment contract so
         # a half-enriched match cannot publish a market-only pick as full signal.
+        removable = {
+            "confident_sofascore_match",
+            "sofascore_detail",
+            "home_recent_history",
+            "away_recent_history",
+            "live_statistics",
+        }
+        if not is_live or _played_seconds(doc.get("played_seconds")) >= 5 * 60:
+            removable.add("live_clock_mature")
         missing = [
             item for item in missing
-            if item not in {
-                "confident_sofascore_match",
-                "sofascore_detail",
-                "home_recent_history",
-                "away_recent_history",
-                "live_statistics",
-            }
+            if item not in removable
         ]
     ready = not missing
     assurance = "deferred"
+    prediction_mode = "live" if (is_live and live_sources and clock_mature and ready) else "prematch"
     if ready:
-        if is_live and not detail:
-            assurance = "sportybet_live_signal"
+        if prediction_mode == "live":
+            assurance = "live_" + "_".join(live_sources) + "_signal"
+        elif provider_state == "sportybet" and has_sporty_baseline:
+            assurance = "sportybet_market_signal"
+        elif provider_state == "sofascore" and detail:
+            assurance = "sofascore_form_signal"
         elif detail and sporty_detail:
             assurance = "full_signal_plus_sporty"
         elif detail:
@@ -127,19 +206,121 @@ def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
         "has_markets": bool(markets),
         "has_detail": bool(detail),
         "has_sportybet_detail": bool(sporty_detail or doc.get("raw_sporty")),
+        "has_sportradar": bool(sportradar_detail.get("available")),
         "minimum_enriched": bool(has_sporty_baseline or detail),
         "minimum_enrichment_status": (
             "full_provider_match"
-            if detail
-            else "sporty_only"
+            if provider_state == "both" and detail and has_sporty_baseline
+            else "sofascore_only"
+            if provider_state == "sofascore" and detail
+            else "sportybet_only"
             if has_sporty_baseline
             else "missing_baseline"
         ),
         "data_sources": doc.get("data_sources") or {},
+        "data_source": provider_state,
+        "live_data_sources": live_sources,
+        "live_stats_source": _live_stats_source(doc, live_sources),
+        "live_fetch_errors": doc.get("live_fetch_errors") or [],
+        "deferred_reason": ", ".join(missing),
         "is_live": is_live,
+        "prediction_mode": prediction_mode,
         "match_state": match_state,
         "assurance": assurance,
+        "blocking_reasons": _blocking_reasons(missing, doc, home_sample, away_sample, is_live, bool(doc.get("sofascore_id"))),
+        "readiness_score": _readiness_score(missing),
     }
+
+
+def _hydrate_live_data_if_possible(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
+    sofa_id = doc.get("sofascore_id") or detail.get("id")
+    errors: list[dict[str, str]] = list(doc.get("live_fetch_errors") or [])
+    if sofa_id and not _live_match_statistics(detail).get("has_stats"):
+        try:
+            from app.sofascore_client import fetch_event_incidents, fetch_event_lineups, fetch_event_statistics
+
+            statistics = fetch_event_statistics(int(sofa_id))
+            incidents = fetch_event_incidents(int(sofa_id))
+            lineups = fetch_event_lineups(int(sofa_id))
+            detail = dict(detail)
+            if statistics:
+                detail["statistics"] = statistics
+                doc["live_data_sofascore"] = {"statistics": statistics}
+            if incidents:
+                detail["incidents"] = incidents
+                doc.setdefault("live_data_sofascore", {})["incidents"] = incidents
+            if lineups:
+                detail["lineups"] = lineups
+                doc.setdefault("live_data_sofascore", {})["lineups"] = lineups
+            doc["sofascore_detail"] = detail
+        except Exception as exc:
+            errors.append({"source": "sofascore", "error": str(exc)})
+    sporty_id = str(doc.get("sportybet_id") or doc.get("id") or "")
+    if sporty_id and not doc.get("live_data_sportybet"):
+        try:
+            from app.sportybet_client import fetch_live_matches_post
+
+            for match in fetch_live_matches_post() or []:
+                if str(match.get("id") or match.get("eventId") or match.get("match_id") or "") == sporty_id:
+                    doc["live_data_sportybet"] = match
+                    if match.get("markets") and not doc.get("sportybet_markets"):
+                        doc["sportybet_markets"] = match.get("markets")
+                    break
+        except Exception as exc:
+            errors.append({"source": "sportybet", "error": str(exc)})
+    if errors:
+        doc["live_fetch_errors"] = errors
+    return detail
+
+
+def _live_stats_source(doc: dict[str, Any], live_sources: list[str]) -> str:
+    if "sofascore" in live_sources:
+        return "sofascore_api"
+    if "sportybet" in live_sources:
+        return "sportybet_api"
+    return "prematch_fallback" if doc.get("sofascore_id") else "none"
+
+
+def _blocking_reasons(
+    missing: list[str],
+    doc: dict[str, Any],
+    home_sample: int,
+    away_sample: int,
+    is_live: bool,
+    has_sofascore_id: bool,
+) -> list[dict[str, str]]:
+    descriptions = {
+        "sofascore_detail": ("SofaScore detail is missing.", "call fetch_event_detail(sofascore_id)"),
+        "home_recent_history": ("Home team has fewer than 3 finished recent matches.", "call fetch_team_history(home_team_id)"),
+        "away_recent_history": ("Away team has fewer than 3 finished recent matches.", "call fetch_team_history(away_team_id)"),
+        "sportybet_markets": ("SportyBet markets are missing.", "fetch SportyBet match markets"),
+        "sportybet_detail": ("SportyBet detail is missing.", "fetch SportyBet match detail"),
+        "time_context": ("Match time context is missing.", "compute match_time_context(match)"),
+        "live_statistics": ("Live statistics are not available yet.", "call fetch_event_statistics(sofascore_id)"),
+        "live_clock_mature": ("Live match clock is too early for fallback prediction.", "wait until at least 5 minutes are played"),
+    }
+    reasons: list[dict[str, str]] = []
+    for item in missing:
+        code = "sofascore_detail_missing" if item == "sofascore_detail" and has_sofascore_id else item
+        description, resolution = descriptions.get(item, (f"Missing required field: {item}.", f"populate {item}"))
+        if item == "home_recent_history":
+            description = f"Home team history sample is {home_sample}, below the required 3."
+        elif item == "away_recent_history":
+            description = f"Away team history sample is {away_sample}, below the required 3."
+        reasons.append({"code": code, "description": description, "resolution": resolution})
+    if is_live and has_sofascore_id and "sofascore" not in _live_data_sources(doc, doc.get("sofascore_detail") or {}) and "live_statistics" not in missing:
+        reasons.append({
+            "code": "live_stats_not_fetched",
+            "description": "Live match has a SofaScore ID but no live statistics were fetched.",
+            "resolution": "call fetch_event_statistics(sofascore_id)",
+        })
+    return reasons
+
+
+def _readiness_score(missing: list[str]) -> int:
+    total_required = 8
+    present = max(0, total_required - len(set(missing)))
+    return round(100 * present / total_required)
 
 
 def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
@@ -205,6 +386,8 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     )
     signals = list(rules.get("signals") or [])
     signals.extend(_source_quality_signals(doc, readiness))
+    if _provider_state(doc) == "sofascore" and not (doc.get("sportybet_markets") or doc.get("markets")):
+        signals.append({"name": "no_odds_data", "value": True, "impact": -2})
     signals.extend(_model_signals(poisson, dixon, elo, ensemble, doc))
     finished_memory: dict[str, Any] = {}
     close_strength_context: dict[str, Any] = {}
@@ -300,7 +483,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     # Scale: weight_adj of +1.0 → +3 confidence, -1.0 → -3
                     contribution = round(weight_adj * 3)
                     learned_signal_adj += contribution
-            learned_signal_adj = max(-8, min(8, learned_signal_adj))
+            learned_signal_adj = _cap_learned_signal_adjustment(signals, learned_signal_adj)
             if learned_signal_adj != 0:
                 signals.append({
                     "name": "learned_signal_adjustment",
@@ -318,6 +501,8 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     minute = rules.get("minute") or 0
     match_state = classify_match_state(doc)
     is_live = bool(match_state.get("is_live"))
+    live_data_sources = _live_data_sources(doc, detail) if is_live else []
+    live_stats_available = bool(live_data_sources or _live_match_statistics(detail).get("has_stats")) if is_live else False
     from app.prediction_agent import _apply_time_decay, _is_high_late_goal_league, _time_decay_multiplier
     late_goal_league = _is_high_late_goal_league(
         (doc.get("tournament") or "") + " " + (doc.get("category") or "")
@@ -351,7 +536,34 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         })
     picks = _combined_picks(rules, ensemble, value_bets, market_picks, doc)
     picks.extend(live_picks)
+    if is_live and live_stats_available:
+        _apply_live_stat_result_boosts(picks, detail, signals, minute)
     picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
+
+    # ── Confidence floor: ensure no non-no_bet pick is below 55 when ensemble ─
+    # probability for the pick's outcome is at least 45 %.
+    _DOMINANT_OUTCOME_THRESHOLD = 45.0
+    _CONFIDENCE_FLOOR = 55
+    probs = ensemble.get("probabilities") or {}
+    _outcome_prob_map = {
+        "home win": _to_float(probs.get("home_win")) or 0.0,
+        "away win": _to_float(probs.get("away_win")) or 0.0,
+        "draw": _to_float(probs.get("draw")) or 0.0,
+    }
+    for pick in picks:
+        if pick.get("type") == "no_bet":
+            continue
+        raw = int(pick.get("confidence") or 50)
+        sel_lower = str(pick.get("selection") or "").lower()
+        ensemble_p = 0.0
+        for outcome_key, op in _outcome_prob_map.items():
+            if outcome_key in sel_lower:
+                ensemble_p = op
+                break
+        floor_applied = ensemble_p >= _DOMINANT_OUTCOME_THRESHOLD and raw < _CONFIDENCE_FLOOR
+        if floor_applied:
+            pick["confidence"] = _CONFIDENCE_FLOOR
+        pick["confidence_floor_applied"] = floor_applied
     candidate_pool = [dict(pick) for pick in picks]
 
     # ── Calibration: adjust confidence based on historical win rates ──────────
@@ -381,6 +593,8 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             pick["calibration"] = {
                 "raw_confidence":    raw_conf,
                 "win_rate":          cal.get("win_rate"),
+                "calibrated_probability": cal.get("calibrated_probability"),
+                "probability_source": cal.get("probability_source"),
                 "samples":           cal.get("samples"),
                 "double_down":       cal.get("double_down", False),
                 "stake_multiplier":  capped_stake,
@@ -390,6 +604,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "regime_stake_cap":  regime.stake_cap,
                 "memory_weighting":   memory,
                 "learned_signal_adjustment": pick_learned_adj,
+                "confidence_floor_applied": bool(pick.get("confidence_floor_applied")),
             }
             if memory.get("blended_win_rate") is not None:
                 signals.append({
@@ -407,14 +622,57 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     pick["calibration"]["stake_source"] = "clv"
                 else:
                     pick["calibration"]["stake_source"] = "win_rate"
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                from app.health_counters import record_health_event
 
-    picks = _curate_picks(picks, doc)
+                record_health_event("enriched_prediction", "clv_stake_multiplier_failed", exc)
+    except Exception as exc:
+        from app.health_counters import record_health_event
+
+        record_health_event("enriched_prediction", "calibration_block_failed", exc)
+
+    contextual_intelligence = build_contextual_intelligence(
+        doc,
+        signals=signals,
+        picks=picks,
+        odds_movement=odds_movement,
+    )
+    signals.append({
+        "name": "contextual_intelligence",
+        "value": contextual_intelligence,
+        "impact": int(contextual_intelligence.get("confidence_adjustment") or 0),
+    })
+    picks = apply_contextual_adjustment(picks, contextual_intelligence)
+    if contextual_intelligence.get("no_prediction_recommended") and max([int(pick.get("confidence") or 0) for pick in picks] or [0]) < 78:
+        picks = [_pick("no_bet", "Avoid game", 50, "Contextual intelligence recommends no bet: " + "; ".join((contextual_intelligence.get("risk") or {}).get("reasons") or []))]
+
+    _attach_goal_environment_evidence(picks, goal_selector_context if isinstance(goal_selector_context, dict) else None)
+    picks = _curate_picks(picks, doc, signals=signals, odds_movement=odds_movement)
     rejected_picks = _rejected_pick_trace(candidate_pool, picks)
     _attach_stake_sizing(doc, picks)
+    risk_management = apply_risk_controls(
+        doc,
+        picks,
+        signals=signals,
+        contextual_intelligence=contextual_intelligence,
+        odds_movement=odds_movement,
+        models={
+            "poisson": poisson,
+            "dixon_coles": dixon,
+            "elo": elo,
+            "ensemble": ensemble,
+        },
+        readiness=readiness,
+    )
+    signals.append({
+        "name": "risk_management",
+        "value": risk_management,
+        "impact": -8 if risk_management.get("risk_level") == "high" else -3 if risk_management.get("risk_level") == "medium" else 1,
+        "role": "risk_signal",
+    })
+    _signal_roles(signals)
+    if picks and picks[0].get("type") == "no_bet" and picks[0].get("suppressed_picks"):
+        rejected_picks.extend(_rejected_pick_trace(picks[0].get("suppressed_picks") or [], []))
 
     prediction = {
         "match_id": doc.get("sportybet_id") or doc.get("id") or detail.get("id"),
@@ -427,7 +685,11 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         "time_context": doc.get("time_context") or match_time_context(doc),
         "match_state": match_state,
         "is_live": is_live,
-        "prediction_mode": "live" if is_live else "prematch",
+        "prediction_mode": "live" if (is_live and live_stats_available) else "prematch",
+        "live_data_sources": live_data_sources,
+        "live_stats_source": readiness.get("live_stats_source") or _live_stats_source(doc, live_data_sources),
+        "live_statistics_summary": _live_match_statistics(detail).get("box_score") if live_stats_available else {},
+        "data_source": _provider_state(doc),
         "teams": {
             "home": home or {"name": _team_name(doc, "home")},
             "away": away or {"name": _team_name(doc, "away")},
@@ -449,6 +711,8 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         "market_selector": market_picks,
         "live_inplay": live_picks,
         "signals": sorted(signals, key=lambda item: abs(item.get("impact") or 0), reverse=True),
+        "contextual_intelligence": contextual_intelligence,
+        "risk_management": risk_management,
         "learned_role_decision": (picks[0].get("learned_role_decision") if picks else None),
         "picks": picks,
         "candidate_pool_count": len(candidate_pool),
@@ -465,8 +729,11 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             "has_raw_sporty": bool(doc.get("raw_sporty")),
             "has_raw_sofascore": bool(doc.get("raw_sofascore_event") or doc.get("sofascore_event")),
             "manual_match": bool(doc.get("manual_match")),
+            "live_stats_available": live_stats_available,
+            "live_data_sources": live_data_sources,
         },
     }
+    _finalize_prediction_output(prediction, ensemble)
     return prediction
 
 
@@ -525,9 +792,12 @@ def _fallback_market_prediction(
     }
     rules = predict_sporty_match(sporty_doc)
     raw_picks = [dict(pick) for pick in (rules.get("picks") or [])]
-    picks = _curate_picks(raw_picks, doc)
+    raw_picks = _upgrade_over_1_5_to_over_2_5(raw_picks, rules.get("signals") or [])
+    picks = _curate_picks(raw_picks, doc, signals=list(rules.get("signals") or []), odds_movement={})
     match_state = classify_match_state(doc)
     is_live = bool(match_state.get("is_live"))
+    live_data_sources = _live_data_sources(doc, detail) if is_live else []
+    live_stats_available = bool(live_data_sources or _live_match_statistics(detail).get("has_stats")) if is_live else False
     odds_movement: dict[str, Any] = {}
     if is_live:
         try:
@@ -538,7 +808,7 @@ def _fallback_market_prediction(
             odds_movement = {}
     live_picks = _live_inplay_picks(doc, detail, rules, {}, {}, odds_movement) if is_live else []
     picks.extend(live_picks)
-    if not is_live:
+    if not is_live and _provider_state(doc) != "sportybet":
         picks = [
             _pick(
                 "no_bet",
@@ -547,10 +817,22 @@ def _fallback_market_prediction(
                 "Thin history fallback is not allowed to publish prematch market-favorite picks",
             )
         ]
+    contextual_intelligence = build_contextual_intelligence(
+        doc,
+        signals=list(rules.get("signals") or []),
+        picks=picks,
+        odds_movement=odds_movement,
+    )
+    picks = apply_contextual_adjustment(picks, contextual_intelligence)
     rejected_picks = _rejected_pick_trace(raw_picks, picks)
     _attach_stake_sizing(doc, picks)
     signals = list(rules.get("signals") or [])
     signals.extend(_source_quality_signals(doc, prediction_readiness(doc)))
+    signals.append({
+        "name": "contextual_intelligence",
+        "value": contextual_intelligence,
+        "impact": int(contextual_intelligence.get("confidence_adjustment") or 0),
+    })
     signals.append({
         "name": "data_depth",
         "value": {
@@ -561,10 +843,28 @@ def _fallback_market_prediction(
         },
         "impact": -5,
     })
-    return {
+    if _provider_state(doc) == "sportybet" and not detail:
+        signals.append({"name": "no_form_data", "value": True, "impact": -2})
+    risk_management = apply_risk_controls(
+        doc,
+        picks,
+        signals=signals,
+        contextual_intelligence=contextual_intelligence,
+        odds_movement=odds_movement,
+        models={},
+        readiness=prediction_readiness(doc),
+    )
+    signals.append({
+        "name": "risk_management",
+        "value": risk_management,
+        "impact": -8 if risk_management.get("risk_level") == "high" else -3 if risk_management.get("risk_level") == "medium" else 1,
+    })
+    if picks and picks[0].get("type") == "no_bet" and picks[0].get("suppressed_picks"):
+        rejected_picks.extend(_rejected_pick_trace(picks[0].get("suppressed_picks") or [], []))
+    prediction = {
         "match_id": doc.get("sportybet_id") or doc.get("id") or detail.get("id"),
         "name": doc.get("sportybet_name") or doc.get("name") or detail.get("name"),
-        "source": "sportybet_market_fallback",
+        "source": "sportybet_market_signal" if _provider_state(doc) == "sportybet" else "sportybet_market_fallback",
         "match_date": doc.get("match_date"),
         "tournament": doc.get("tournament") or ((detail.get("tournament") or {}).get("name") if isinstance(detail.get("tournament"), dict) else None),
         "category": doc.get("category") or _detail_country(detail),
@@ -572,7 +872,11 @@ def _fallback_market_prediction(
         "time_context": doc.get("time_context") or match_time_context(doc),
         "match_state": match_state,
         "is_live": is_live,
-        "prediction_mode": "live" if is_live else "prematch",
+        "prediction_mode": "live" if (is_live and live_stats_available) else "prematch",
+        "live_data_sources": live_data_sources,
+        "live_stats_source": _live_stats_source(doc, live_data_sources),
+        "live_statistics_summary": _live_match_statistics(detail).get("box_score") if live_stats_available else {},
+        "data_source": _provider_state(doc),
         "teams": {
             "home": detail.get("home_team") or {"name": _team_name(doc, "home")},
             "away": detail.get("away_team") or {"name": _team_name(doc, "away")},
@@ -587,6 +891,8 @@ def _fallback_market_prediction(
         "market_selector": [],
         "live_inplay": live_picks,
         "signals": sorted(signals, key=lambda item: abs(item.get("impact") or 0), reverse=True),
+        "contextual_intelligence": contextual_intelligence,
+        "risk_management": risk_management,
         "learned_role_decision": (picks[0].get("learned_role_decision") if picks else None),
         "picks": picks,
         "candidate_pool_count": len(raw_picks),
@@ -600,9 +906,62 @@ def _fallback_market_prediction(
             "has_raw_sporty": bool(doc.get("raw_sporty")),
             "has_raw_sofascore": bool(doc.get("raw_sofascore_event") or doc.get("sofascore_event")),
             "manual_match": bool(doc.get("manual_match")),
+            "live_stats_available": live_stats_available,
+            "live_data_sources": live_data_sources,
             "thin_history_fallback": True,
         },
     }
+    _finalize_prediction_output(prediction, {})
+    return prediction
+
+
+def _upgrade_over_1_5_to_over_2_5(
+    picks: list[dict[str, Any]],
+    signals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Conservative rule:
+    - If the model wants `Over 1.5 goals`, only upgrade to `Over 2.5 goals`
+      when goal pressure is strong enough (and optionally when market steam exists).
+
+    Rationale: our Over 1.5 history shows higher goal_pressure correlates with
+    total>=3 outcomes; Over 2.5 is a better expression of that stronger state.
+    """
+    if not picks:
+        return picks
+    settings = get_settings()
+    threshold = float(settings.over25_upgrade_goal_pressure or 0)
+    require_steam = bool(settings.over25_upgrade_requires_market_steam)
+
+    goal_pressure = 0.0
+    has_market_steam = False
+    for sig in signals or []:
+        if not isinstance(sig, dict):
+            continue
+        if sig.get("name") == "goal_pressure":
+            goal_pressure = _to_float(sig.get("impact")) or _to_float(sig.get("value")) or 0.0
+        if sig.get("name") == "market_steam":
+            has_market_steam = True
+
+    if goal_pressure < threshold:
+        return picks
+    if require_steam and not has_market_steam:
+        return picks
+
+    upgraded: list[dict[str, Any]] = []
+    for pick in picks:
+        if str(pick.get("type") or "").lower() == "goals" and str(pick.get("selection") or "").lower() == "over 1.5 goals":
+            confidence = int(pick.get("confidence") or 0)
+            # Over 2.5 is a higher bar; keep it conservative by shaving confidence.
+            upgraded.append({
+                **pick,
+                "selection": "Over 2.5 goals",
+                "confidence": max(55, min(95, confidence - 6)),
+                "reason": f"{pick.get('reason') or ''}; upgraded to over 2.5 due to goal_pressure {round(goal_pressure, 1)}",
+            })
+        else:
+            upgraded.append(pick)
+    return upgraded
 
 
 def _value_bets(
@@ -612,7 +971,10 @@ def _value_bets(
 ) -> list[dict[str, Any]]:
     if not model or model.get("error") or not model.get("probabilities"):
         return []
-    probs = model["probabilities"]
+    calibrated_probs = model.get("calibrated_probabilities") or (ensemble or {}).get("calibrated_probabilities")
+    if not calibrated_probs:
+        return []
+    probs = calibrated_probs
     markets = doc.get("sportybet_markets") or doc.get("markets") or []
     bets = []
     for market in markets:
@@ -625,12 +987,14 @@ def _value_bets(
                 continue
             selection_name = str(selection.get("name") or "")
             if selection_name in {"Home", "1"}:
-                probability = float(probs.get("home_win") or 0) / 100
+                probability = _probability_unit(probs.get("home_win") or probs.get("home"))
             elif selection_name in {"Draw", "X"}:
-                probability = float(probs.get("draw") or 0) / 100
+                probability = _probability_unit(probs.get("draw"))
             elif selection_name in {"Away", "2"}:
-                probability = float(probs.get("away_win") or 0) / 100
+                probability = _probability_unit(probs.get("away_win") or probs.get("away"))
             else:
+                continue
+            if probability is None:
                 continue
             kelly = kelly_fraction(probability, decimal)
             edge = float(kelly.get("edge_percent") or 0)
@@ -820,6 +1184,8 @@ def _consensus_longshot_value_signal(
         return None
 
     memory = _candidate_memory(doc, "consensus_longshot_value", selection)
+    if not _candidate_allowed(memory, min_win_rate=55, min_samples=15, require_samples=True):
+        return None
     return {
         "name": "consensus_longshot_value",
         "value": {
@@ -892,6 +1258,8 @@ def _consensus_longshot_market_pick_signal(
 
     selection = best["selection"]
     memory = _candidate_memory(doc, "consensus_longshot_value", selection)
+    if not _candidate_allowed(memory, min_win_rate=55, min_samples=15, require_samples=True):
+        return None
     intent = best["intent"]
     movement = (odds_movement or {}).get("strongest_pull") or {}
     support = ["market_selector", "model_memory"]
@@ -1190,17 +1558,24 @@ def _attach_stake_sizing(doc: dict[str, Any], picks: list[dict[str, Any]]) -> No
     for pick in picks:
         selection = str(pick.get("selection") or pick.get("pick") or "")
         decimal = _odds_for_pick(selection, odds_index)
-        probability = max(0.01, min(0.99, float(pick.get("confidence") or 0) / 100))
+        calibration = pick.get("calibration") if isinstance(pick.get("calibration"), dict) else {}
+        calibrated_probability = _to_float(calibration.get("calibrated_probability"))
+        probability = (
+            max(0.01, min(0.99, calibrated_probability))
+            if calibrated_probability is not None
+            else None
+        )
         stake_cap = float(((pick.get("calibration") or {}).get("stake_multiplier")) or 1.0)
         stake: dict[str, Any] = {
-            "probability": round(probability, 3),
+            "probability": round(probability, 3) if probability is not None else None,
+            "confidence": pick.get("confidence"),
             "decimal_odds": decimal,
-            "stake_source": "kelly" if decimal else "confidence_only",
+            "stake_source": "calibrated_kelly" if decimal and probability is not None else "no_calibrated_probability",
             "stake_cap_multiplier": stake_cap,
             "recommended": False,
             "stake_per_100": 0,
         }
-        if decimal and decimal > 1:
+        if decimal and decimal > 1 and probability is not None:
             kelly = kelly_fraction(probability, decimal)
             capped_per_100 = round(min(float(kelly.get("stake_per_100") or 0), stake_cap * 2.0), 2)
             stake.update({
@@ -1362,6 +1737,10 @@ def _live_inplay_picks(
     favorite = max(odds, key=odds.get) if odds else None
     prematch = _live_prematch_prior(ensemble)
     stats = _live_match_statistics(detail)
+    # Policy: never publish "live_*" picks without live statistics.
+    # A live match may still produce a prematch-style prediction via other paths.
+    if not stats.get("has_stats"):
+        return []
     market_live = _live_market_pressure(odds_movement or {})
     goal_pressure = _signal_value(rules.get("signals") or [], "goal_pressure")
     if goal_pressure <= 0:
@@ -1524,6 +1903,8 @@ def _source_quality_signals(doc: dict[str, Any], readiness: dict[str, Any] | Non
     sources = doc.get("data_sources") or {}
     sporty = sources.get("sportybet") or {}
     sofa = sources.get("sofascore") or {}
+    sportradar = sources.get("sportradar") or {}
+    sportradar_detail = doc.get("sportradar_detail") or {}
     signals: list[dict[str, Any]] = []
     if sporty.get("available"):
         signals.append({
@@ -1548,6 +1929,27 @@ def _source_quality_signals(doc: dict[str, Any], readiness: dict[str, Any] | Non
             "name": "sofascore_statistics_available",
             "value": {"statistics": True},
             "impact": 3,
+        })
+    if sportradar.get("available"):
+        summary = sportradar_detail.get("summary") or {}
+        evidence_count = sum(
+            1 for key in ("has_h2h", "has_form", "has_lineups", "has_statistics", "has_standings", "has_probability")
+            if summary.get(key)
+        )
+        signals.append({
+            "name": "sportradar_widget_available",
+            "value": {
+                "match_id": sportradar_detail.get("match_id"),
+                "summary": summary,
+                "standings": bool(sportradar.get("standings")),
+            },
+            "impact": min(4, 1 + evidence_count // 2),
+        })
+    elif sportradar.get("error"):
+        signals.append({
+            "name": "sportradar_widget_unavailable",
+            "value": {"error": sportradar.get("error")},
+            "impact": 0,
         })
     assurance = (readiness or {}).get("assurance")
     if assurance:
@@ -1611,6 +2013,56 @@ def _learned_signal_adjustment_for_pick(
         return 0
 
 
+def _cap_learned_signal_adjustment(signals: list[dict[str, Any]], adjustment: int) -> int:
+    if adjustment <= 0:
+        return max(-8, adjustment)
+    weak_support = 0
+    checked = 0
+    for signal in signals or []:
+        name = str(signal.get("name") or "")
+        if not name or name in BACKGROUND_CONTEXT_SIGNALS:
+            continue
+        stats = _global_signal_stats(name)
+        samples = int(stats.get("samples") or 0)
+        win_rate = _rate_percent(stats.get("win_rate"))
+        if samples >= 100 and win_rate is not None:
+            checked += 1
+            if win_rate < 63:
+                weak_support += 1
+    if checked and weak_support >= max(1, checked // 2):
+        return min(2, adjustment)
+    return max(-8, min(8, adjustment))
+
+
+def _global_signal_stats(signal_name: str) -> dict[str, Any]:
+    try:
+        from app.league_memory import DB_PATH, _init_db
+
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+            row = conn.execute(
+                """
+                select count(*) as samples,
+                       sum(case when result = 'win' then 1 else 0 end) as wins,
+                       sum(case when result = 'loss' then 1 else 0 end) as losses
+                from signal_outcomes
+                where signal_name = ? and result in ('win', 'loss')
+                """,
+                (signal_name,),
+            ).fetchone()
+    except Exception:
+        return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
+    samples = int((row or [0])[0] or 0)
+    wins = int((row or [0, 0])[1] or 0)
+    losses = int((row or [0, 0, 0])[2] or 0)
+    return {
+        "samples": samples,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / samples * 100, 1) if samples else None,
+    }
+
+
 def _live_prematch_prior(ensemble: dict[str, Any]) -> dict[str, float]:
     probs = (ensemble or {}).get("probabilities") or {}
     return {
@@ -1664,7 +2116,63 @@ def _live_match_statistics(detail: dict[str, Any]) -> dict[str, Any]:
         "away_pressure": away_pressure,
         "goal_pressure": min(16.0, total_pressure / 6.0 + abs(pressure_gap) / 12.0),
         "summary": summary,
+        "home": home,
+        "away": away,
+        "box_score": {
+            "home": {
+                "possession": home.get("possession"),
+                "shots_on_target": home.get("shots_on_target"),
+                "dangerous_attacks": home.get("dangerous_attacks"),
+                "corners": home.get("corners"),
+            },
+            "away": {
+                "possession": away.get("possession"),
+                "shots_on_target": away.get("shots_on_target"),
+                "dangerous_attacks": away.get("dangerous_attacks"),
+                "corners": away.get("corners"),
+            },
+        },
     }
+
+
+def _apply_live_stat_result_boosts(
+    picks: list[dict[str, Any]],
+    detail: dict[str, Any],
+    signals: list[dict[str, Any]],
+    minute: int,
+) -> None:
+    stats = _live_match_statistics(detail)
+    if not stats.get("has_stats"):
+        return
+    home = stats.get("home") or {}
+    away = stats.get("away") or {}
+    home_boost = away_boost = 0
+    if (home.get("possession") or 0) >= 60:
+        home_boost += 3
+    if (away.get("possession") or 0) >= 60:
+        away_boost += 3
+    if (home.get("shots_on_target") or 0) - (away.get("shots_on_target") or 0) >= 3:
+        home_boost += 4
+    if (away.get("shots_on_target") or 0) - (home.get("shots_on_target") or 0) >= 3:
+        away_boost += 4
+    for pick in picks:
+        if pick.get("type") not in {"match_result", "live_match_winner"}:
+            continue
+        selection = str(pick.get("selection") or "").lower()
+        boost = home_boost if "home" in selection or "home win" in selection else away_boost if "away" in selection or "away win" in selection else 0
+        if boost:
+            pick["confidence"] = min(95, int(pick.get("confidence") or 50) + boost)
+            pick.setdefault("evidence", {})["live_statistics_boost"] = boost
+    impact = max(home_boost, away_boost)
+    if minute >= 46 and impact:
+        impact = max(impact, 6)
+    if impact:
+        signals.append({
+            "name": "live_statistics_result_edge",
+            "value": stats.get("box_score"),
+            "impact": impact,
+            "role": "decision_driver",
+        })
 
 
 def _stat_key(name: str) -> str | None:
@@ -2115,7 +2623,327 @@ def _favorite_side(odds: dict[str, float | None]) -> str | None:
     return min(values, key=lambda key: values[key] or 999)
 
 
-def _curate_picks(picks: list[dict[str, Any]], doc: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _signal_promotion_policy(
+    doc: dict[str, Any],
+    pick: dict[str, Any],
+    signals: list[dict[str, Any]],
+    *,
+    score_memory: dict[str, Any],
+    role_memory: dict[str, Any],
+    odds_movement: dict[str, Any],
+) -> dict[str, Any]:
+    pick_type = str(pick.get("type") or "")
+    selection = str(pick.get("selection") or pick.get("pick") or "")
+    signal_roles = _signal_roles(signals)
+    noisy_support = [
+        name for name, role in signal_roles.items()
+        if role == "supporting_evidence" and name in NOISY_SUPPORT_SIGNALS
+    ]
+    pick_signal_proof = _pick_specific_signal_proof(pick_type, selection, noisy_support)
+    score_driver = _score_memory_driver(score_memory)
+    calibration_driver = _calibration_driver(pick)
+    role_driver = _role_learning_driver(role_memory)
+    market_driver = _market_agreement_driver(selection, odds_movement)
+    positive_clv = _positive_clv_driver(pick)
+    risk_clean = _promotion_risk_clean(odds_movement)
+
+    decision_drivers: list[str] = []
+    if score_driver.get("strong"):
+        decision_drivers.append("score_shape_memory")
+    if calibration_driver.get("strong"):
+        decision_drivers.append("pick_specific_calibration")
+    if role_driver.get("strong"):
+        decision_drivers.append("role_learning_primary_edge")
+    if market_driver.get("strong"):
+        decision_drivers.append("strong_odds_movement_agreement")
+    for item in pick_signal_proof:
+        if item.get("strong"):
+            decision_drivers.append(f"pick_specific_signal:{item.get('signal')}")
+
+    good_history = any(
+        item.get("good")
+        for item in (score_driver, calibration_driver, role_driver)
+    )
+    strong_history = any(
+        item.get("strong")
+        for item in (score_driver, calibration_driver, role_driver)
+    )
+    mostly_noisy = bool(noisy_support) and not decision_drivers
+    cap = 95
+    reasons: list[str] = []
+    if mostly_noisy:
+        cap = 68
+        reasons.append("mostly_noisy_support_signals")
+    elif not decision_drivers:
+        cap = 68
+        reasons.append("no_decision_driver")
+    elif good_history and not (market_driver.get("strong") and strong_history):
+        cap = min(cap, 74)
+        reasons.append("good_history_without_market_confirmation")
+    elif market_driver.get("strong") and strong_history:
+        reasons.append("strong_history_and_market_agreement")
+
+    high_confidence_allowed = (
+        strong_history
+        and risk_clean
+        and int(_odds_snapshot_count(odds_movement)) >= 2
+        and (positive_clv.get("strong") or market_driver.get("strong"))
+    )
+    if not high_confidence_allowed:
+        cap = min(cap, 82)
+        reasons.append("missing_85_plus_requirements")
+
+    if _is_over_1_5_pick(pick):
+        goal_proof = _over_1_5_goal_proof(score_memory, odds_movement, signals)
+        if not goal_proof.get("allow_goal_pressure"):
+            cap = min(cap, 68)
+            reasons.append("over_1_5_goal_pressure_not_proven")
+    return {
+        "version": "signal_promotion_policy_v1",
+        "signal_roles": signal_roles,
+        "noisy_support_signals": noisy_support,
+        "decision_drivers": decision_drivers,
+        "pick_signal_proof": pick_signal_proof,
+        "score_memory": score_driver,
+        "calibration": calibration_driver,
+        "role_learning": role_driver,
+        "market_agreement": market_driver,
+        "positive_clv": positive_clv,
+        "risk_clean": risk_clean,
+        "high_confidence_allowed": high_confidence_allowed,
+        "confidence_cap": cap,
+        "cap_reasons": sorted(set(reasons)),
+    }
+
+
+def _signal_roles(signals: list[dict[str, Any]]) -> dict[str, str]:
+    roles: dict[str, str] = {}
+    for signal in signals or []:
+        name = str(signal.get("name") or "")
+        if not name:
+            continue
+        explicit = signal.get("role")
+        if explicit:
+            roles[name] = str(explicit)
+        elif name in MODIFIER_ONLY_SIGNALS:
+            roles[name] = "supporting_evidence"
+            signal["role"] = "supporting_evidence"
+            signal["modifier_only"] = True
+        elif name in NOISY_SUPPORT_SIGNALS:
+            roles[name] = "supporting_evidence"
+            signal["role"] = "supporting_evidence"
+        elif name in BACKGROUND_CONTEXT_SIGNALS:
+            roles[name] = "background_context"
+            signal["role"] = "background_context"
+        elif name in RISK_SIGNALS or _to_float(signal.get("impact")) is not None and (_to_float(signal.get("impact")) or 0) < 0:
+            roles[name] = "risk_signal"
+            signal["role"] = "risk_signal"
+        else:
+            roles[name] = "decision_driver"
+            signal["role"] = "decision_driver"
+    return roles
+
+
+def _pick_specific_signal_proof(pick_type: str, selection: str, signal_names: list[str]) -> list[dict[str, Any]]:
+    proof = []
+    for signal_name in signal_names:
+        stats = _pick_signal_stats(pick_type, selection, signal_name)
+        samples = int(stats.get("samples") or 0)
+        win_rate = _rate_percent(stats.get("win_rate"))
+        proof.append({
+            "signal": signal_name,
+            **stats,
+            "good": samples >= 50 and win_rate is not None and win_rate >= 65,
+            "strong": samples >= 100 and win_rate is not None and win_rate >= 72,
+        })
+    return proof
+
+
+def _pick_signal_stats(pick_type: str, selection: str, signal_name: str) -> dict[str, Any]:
+    if not pick_type or not selection or not signal_name:
+        return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
+    try:
+        from app.league_memory import DB_PATH, _init_db
+
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+            row = conn.execute(
+                """
+                select count(*) as samples,
+                       sum(case when result = 'win' then 1 else 0 end) as wins,
+                       sum(case when result = 'loss' then 1 else 0 end) as losses
+                from signal_outcomes
+                where pick_type = ?
+                  and lower(selection) = lower(?)
+                  and signal_name = ?
+                  and result in ('win', 'loss')
+                """,
+                (pick_type, selection, signal_name),
+            ).fetchone()
+    except Exception:
+        return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
+    samples = int((row or [0])[0] or 0)
+    wins = int((row or [0, 0])[1] or 0)
+    losses = int((row or [0, 0, 0])[2] or 0)
+    return {
+        "samples": samples,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / samples * 100, 1) if samples else None,
+    }
+
+
+def _score_memory_driver(score_memory: dict[str, Any]) -> dict[str, Any]:
+    samples = int(score_memory.get("samples") or 0)
+    win_rate = _rate_percent(score_memory.get("win_rate"))
+    return {
+        "samples": samples,
+        "win_rate": win_rate,
+        "good": samples >= 30 and win_rate is not None and win_rate >= 65,
+        "strong": samples >= 100 and win_rate is not None and win_rate >= 72,
+        "classification": score_memory.get("classification"),
+    }
+
+
+def _calibration_driver(pick: dict[str, Any]) -> dict[str, Any]:
+    calibration = pick.get("calibration") if isinstance(pick.get("calibration"), dict) else {}
+    samples = int(calibration.get("samples") or 0)
+    win_rate = _rate_percent(calibration.get("win_rate"))
+    return {
+        "samples": samples,
+        "win_rate": win_rate,
+        "good": samples >= 50 and win_rate is not None and win_rate >= 68,
+        "strong": samples >= 100 and win_rate is not None and win_rate >= 72,
+    }
+
+
+def _role_learning_driver(role_memory: dict[str, Any]) -> dict[str, Any]:
+    primary = role_memory.get("primary") or {}
+    samples = int(primary.get("raw_samples") or primary.get("samples") or 0)
+    win_rate = _rate_percent(primary.get("win_rate"))
+    return {
+        "samples": samples,
+        "win_rate": win_rate,
+        "good": samples >= 20 and win_rate is not None and win_rate >= 68,
+        "strong": samples >= 60 and win_rate is not None and win_rate >= 72,
+        "context_quality": role_memory.get("context_quality"),
+    }
+
+
+def _market_agreement_driver(selection: str, odds_movement: dict[str, Any]) -> dict[str, Any]:
+    pull = odds_movement.get("strongest_pull") if isinstance(odds_movement, dict) else {}
+    if not isinstance(pull, dict) or not pull:
+        return {"available": False, "strong": False, "snapshots": _odds_snapshot_count(odds_movement)}
+    pull_selection = str(pull.get("selection") or "").lower()
+    direction = str(pull.get("direction") or "").lower()
+    strength = str(pull.get("strength") or "").lower()
+    supports = _movement_supports_selection(selection, pull_selection, direction)
+    snapshots = _odds_snapshot_count(odds_movement)
+    return {
+        "available": True,
+        "selection": pull_selection,
+        "direction": direction,
+        "strength": strength,
+        "snapshots": snapshots,
+        "supports": supports,
+        "strong": supports and snapshots >= 2 and strength in {"moderate", "strong"},
+    }
+
+
+def _positive_clv_driver(pick: dict[str, Any]) -> dict[str, Any]:
+    calibration = pick.get("calibration") if isinstance(pick.get("calibration"), dict) else {}
+    stake_source = str(calibration.get("stake_source") or "")
+    stake_multiplier = _to_float(calibration.get("stake_multiplier")) or 0.0
+    return {
+        "stake_source": stake_source,
+        "stake_multiplier": stake_multiplier,
+        "strong": stake_source == "clv" and stake_multiplier > 1.0,
+    }
+
+
+def _promotion_risk_clean(odds_movement: dict[str, Any]) -> bool:
+    snapshots = _odds_snapshot_count(odds_movement)
+    pull = odds_movement.get("strongest_pull") if isinstance(odds_movement, dict) else {}
+    if snapshots < 2:
+        return False
+    if not isinstance(pull, dict):
+        return True
+    volatility = abs(
+        _to_float(pull.get("odds_change_percent"))
+        or _to_float(pull.get("implied_change_percent"))
+        or _to_float(pull.get("change_percent"))
+        or 0
+    )
+    return volatility < 10
+
+
+def _movement_supports_selection(selection: str, pull_selection: str, direction: str) -> bool:
+    norm = _norm_market_key(selection)
+    if direction not in {"backed", "strong_backed"}:
+        return False
+    if pull_selection == "home":
+        return norm in {"home", "home win"} or "home or draw" in norm
+    if pull_selection == "away":
+        return norm in {"away", "away win"} or "away or draw" in norm
+    if pull_selection == "draw":
+        return norm == "draw" or "home or draw" in norm or "away or draw" in norm
+    return False
+
+
+def _odds_snapshot_count(odds_movement: dict[str, Any] | None) -> int:
+    if not isinstance(odds_movement, dict):
+        return 0
+    value = odds_movement.get("snapshots") or odds_movement.get("market_snapshots") or odds_movement.get("history")
+    if isinstance(value, list):
+        return len(value)
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _is_over_1_5_pick(pick: dict[str, Any]) -> bool:
+    return str(pick.get("type") or "").lower() in {"goals", "live_goals"} and "over 1.5" in str(pick.get("selection") or "").lower()
+
+
+def _over_1_5_goal_proof(score_memory: dict[str, Any], odds_movement: dict[str, Any], signals: list[dict[str, Any]]) -> dict[str, Any]:
+    low_total_rate = _rate_percent((score_memory.get("score_profile") or {}).get("low_total_rate"))
+    nil_nil_rate = _rate_percent((score_memory.get("score_profile") or {}).get("nil_nil_rate"))
+    market = _market_agreement_driver("Over 1.5 goals", odds_movement)
+    goal_pressure = max([
+        _to_float(signal.get("impact")) or _to_float(signal.get("value")) or 0
+        for signal in signals
+        if signal.get("name") == "goal_pressure"
+    ] or [0])
+    allow = (
+        goal_pressure >= 24
+        and (low_total_rate is None or low_total_rate <= 22)
+        and (nil_nil_rate is None or nil_nil_rate <= 8)
+        and market.get("strong")
+    )
+    return {
+        "allow_goal_pressure": bool(allow),
+        "goal_pressure": round(goal_pressure, 2),
+        "low_total_rate": low_total_rate,
+        "nil_nil_rate": nil_nil_rate,
+        "market_agreement": market,
+    }
+
+
+def _rate_percent(value: Any) -> float | None:
+    rate = _to_float(value)
+    if rate is None:
+        return None
+    return round(rate * 100, 1) if 0 <= rate <= 1 else round(rate, 1)
+
+
+def _curate_picks(
+    picks: list[dict[str, Any]],
+    doc: dict[str, Any] | None = None,
+    *,
+    signals: list[dict[str, Any]] | None = None,
+    odds_movement: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Return one primary pick plus a small set of non-conflicting alternatives."""
     candidates = []
     no_bet = next((pick for pick in picks if pick.get("type") == "no_bet"), None)
@@ -2134,16 +2962,42 @@ def _curate_picks(picks: list[dict[str, Any]], doc: dict[str, Any] | None = None
             continue
         market_intent = classify_market_intent(str(pick.get("type") or ""), str(selection), pick)
         role_memory = _candidate_role_memory(doc or {}, pick_type=str(pick.get("type") or ""), selection=str(selection))
+        score_memory = _selection_score_memory(str(pick.get("type") or ""), str(selection))
+        if pick.get("type") in {"value_bet", "market_value", "consensus_longshot_value"}:
+            candidate_memory = _candidate_memory(doc or {}, str(pick.get("type") or ""), str(selection))
+            if not _candidate_allowed(candidate_memory, min_win_rate=55, min_samples=15, require_samples=True):
+                continue
         role_adjustment = int(role_memory.get("primary_adjustment") or 0)
-        adjusted_confidence = _cap_market_confidence(pick, max(50, min(96, confidence + role_adjustment)))
+        score_adjustment = int(score_memory.get("confidence_adjustment") or 0)
+        adjusted_confidence = _cap_market_confidence(pick, max(50, min(96, confidence + role_adjustment + score_adjustment)))
+        score_cap = score_memory.get("confidence_cap")
+        if score_cap is not None:
+            adjusted_confidence = min(adjusted_confidence, int(score_cap))
+        signal_policy = _signal_promotion_policy(
+            doc or {},
+            {**pick, "selection": selection, "confidence": adjusted_confidence},
+            signals or [],
+            score_memory=score_memory,
+            role_memory=role_memory,
+            odds_movement=odds_movement or {},
+        )
+        adjusted_confidence = min(adjusted_confidence, int(signal_policy.get("confidence_cap") or adjusted_confidence))
+        if adjusted_confidence < 55:
+            continue
+        evidence = pick.get("evidence") if isinstance(pick.get("evidence"), dict) else {}
+        evidence["score_result_memory"] = score_memory
+        evidence["signal_policy"] = signal_policy
         candidates.append({
             **pick,
+            "evidence": evidence,
             "selection": selection,
             "market_intent": market_intent,
             "confidence": adjusted_confidence,
             "raw_confidence": confidence,
             "family": _pick_family({**pick, "market_intent": market_intent}),
             "role_learning": role_memory,
+            "score_result_memory": score_memory,
+            "signal_policy": signal_policy,
             "ranking_confidence": adjusted_confidence,
         })
 
@@ -2162,6 +3016,7 @@ def _curate_picks(picks: list[dict[str, Any]], doc: dict[str, Any] | None = None
 
     candidates.sort(
         key=lambda item: (
+            100 if item.get("clear_winner") else 0,
             item.get("confidence") or 0,
             item.get("ranking_confidence") or 0,
             8 if str(item.get("family") or "").startswith("value:") else 4 if item.get("family") == "1x2" else 0,
@@ -2263,14 +3118,237 @@ def _attach_learned_role_decision(picks: list[dict[str, Any]]) -> None:
         pick["learned_role_decision"] = decision
 
 
+def _selection_score_memory(pick_type: str, selection: str) -> dict[str, Any]:
+    """Score-result memory for every selection.
+
+    This is the generalized version of the 0-0/Over 1.5 lesson: look at
+    settled final scores for the same selection and expose which result shapes
+    have historically produced wins/losses.
+    """
+    if not pick_type or not selection:
+        return {"available": False, "reason": "missing_pick"}
+    try:
+        from app.league_memory import DB_PATH, _init_db
+
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            exact = _selection_score_scope(
+                conn,
+                "exact_selection",
+                "pick_type = ? and lower(selection) = lower(?)",
+                (pick_type, selection),
+            )
+            type_scope = _selection_score_scope(
+                conn,
+                "pick_type",
+                "pick_type = ?",
+                (pick_type,),
+            )
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
+
+    best = exact if int(exact.get("samples") or 0) >= 12 else type_scope
+    samples = int(best.get("samples") or 0)
+    win_rate = _to_float(best.get("win_rate"))
+    adjustment = 0
+    cap = None
+    classification = "unproven"
+    if samples >= 20 and win_rate is not None and win_rate < 0.50:
+        classification = "learned_high_risk"
+        adjustment = -8
+        cap = 58
+    elif samples >= 20 and win_rate is not None and win_rate < 0.58:
+        classification = "caution"
+        adjustment = -4
+        cap = 70
+    elif samples >= 20 and win_rate is not None and win_rate >= 0.72:
+        classification = "proven_selection"
+        adjustment = 3
+    elif samples >= 12 and win_rate is not None and win_rate >= 0.65:
+        classification = "promising_selection"
+        adjustment = 1
+
+    failure_shape = _dominant_failure_shape(best)
+    if failure_shape.get("share", 0) >= 0.35 and classification not in {"proven_selection", "promising_selection"}:
+        adjustment = min(adjustment, -3)
+
+    return {
+        "available": samples > 0,
+        "version": "selection_score_memory_v1",
+        "classification": classification,
+        "confidence_adjustment": adjustment,
+        "confidence_cap": cap,
+        "best_scope": best.get("scope"),
+        "samples": samples,
+        "wins": best.get("wins"),
+        "losses": best.get("losses"),
+        "win_rate": round((win_rate or 0) * 100, 1) if win_rate is not None else None,
+        "score_profile": {
+            "nil_nil_rate": best.get("nil_nil_rate"),
+            "low_total_rate": best.get("low_total_rate"),
+            "high_total_rate": best.get("high_total_rate"),
+            "draw_rate": best.get("draw_rate"),
+            "home_win_rate": best.get("home_win_rate"),
+            "away_win_rate": best.get("away_win_rate"),
+            "avg_total_goals": best.get("avg_total_goals"),
+            "top_loss_scores": best.get("top_loss_scores"),
+            "top_win_scores": best.get("top_win_scores"),
+            "dominant_failure_shape": failure_shape,
+        },
+        "scopes": [exact, type_scope],
+    }
+
+
+def _selection_score_scope(
+    conn: sqlite3.Connection,
+    scope: str,
+    where_sql: str,
+    params: tuple[Any, ...],
+) -> dict[str, Any]:
+    base_sql = f"""
+        from (
+            select match_id, pick_type, selection, result, final_home, final_away
+            from prediction_history
+            where graded_at is not null and result in ('win', 'loss')
+              and final_home is not null and final_away is not null
+              and pick_type != 'no_bet'
+            union all
+            select match_id, pick_type, selection, result, final_home, final_away
+            from prediction_candidate_history
+            where graded_at is not null and result in ('win', 'loss')
+              and final_home is not null and final_away is not null
+              and pick_type != 'no_bet'
+        )
+        where {where_sql}
+    """
+    row = conn.execute(f"""
+        select
+            count(*) as samples,
+            sum(case when result = 'win' then 1 else 0 end) as wins,
+            sum(case when result = 'loss' then 1 else 0 end) as losses,
+            avg(final_home + final_away) as avg_total_goals,
+            sum(case when final_home = 0 and final_away = 0 then 1 else 0 end) as nil_nil,
+            sum(case when final_home + final_away <= 1 then 1 else 0 end) as low_total,
+            sum(case when final_home + final_away >= 4 then 1 else 0 end) as high_total,
+            sum(case when final_home = final_away then 1 else 0 end) as draws,
+            sum(case when final_home > final_away then 1 else 0 end) as home_wins,
+            sum(case when final_away > final_home then 1 else 0 end) as away_wins
+        {base_sql}
+    """, params).fetchone()
+    samples = int(row["samples"] or 0)
+    wins = int(row["wins"] or 0)
+    losses = int(row["losses"] or 0)
+    top_loss_scores = _top_score_shapes(conn, base_sql, params, result="loss")
+    top_win_scores = _top_score_shapes(conn, base_sql, params, result="win")
+    return {
+        "scope": scope,
+        "samples": samples,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / samples, 4) if samples else None,
+        "avg_total_goals": round(float(row["avg_total_goals"] or 0), 2) if samples else None,
+        "nil_nil_rate": _percent(row["nil_nil"], samples),
+        "low_total_rate": _percent(row["low_total"], samples),
+        "high_total_rate": _percent(row["high_total"], samples),
+        "draw_rate": _percent(row["draws"], samples),
+        "home_win_rate": _percent(row["home_wins"], samples),
+        "away_win_rate": _percent(row["away_wins"], samples),
+        "top_loss_scores": top_loss_scores,
+        "top_win_scores": top_win_scores,
+    }
+
+
+def _top_score_shapes(
+    conn: sqlite3.Connection,
+    base_sql: str,
+    params: tuple[Any, ...],
+    *,
+    result: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(f"""
+        select final_home, final_away, count(*) as count
+        {base_sql}
+          and result = ?
+        group by final_home, final_away
+        order by count desc, final_home, final_away
+        limit 5
+    """, (*params, result)).fetchall()
+    return [
+        {
+            "score": f"{row['final_home']}-{row['final_away']}",
+            "count": int(row["count"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def _dominant_failure_shape(scope: dict[str, Any]) -> dict[str, Any]:
+    losses = int(scope.get("losses") or 0)
+    if losses <= 0:
+        return {}
+    top = (scope.get("top_loss_scores") or [{}])[0]
+    top_count = int(top.get("count") or 0)
+    return {
+        "score": top.get("score"),
+        "count": top_count,
+        "share": round(top_count / losses, 3) if losses else 0,
+    }
+
+
+def _percent(value: Any, total: int) -> float | None:
+    if not total:
+        return None
+    return round(float(value or 0) / total * 100, 1)
+
+
 def _cap_market_confidence(pick: dict[str, Any], confidence: int) -> int:
     selection = str(pick.get("selection") or pick.get("pick") or "").lower()
-    if "under 3.5" not in selection:
-        return confidence
     goal_env = ((pick.get("evidence") or {}).get("goal_environment") or {})
     profile = str(goal_env.get("profile") or "").lower()
-    cap = 88 if profile == "calm" else 76 if profile == "warm" else 64 if profile == "hot" else 82
-    return min(confidence, cap)
+    if "under 3.5" in selection:
+        cap = 88 if profile == "calm" else 76 if profile == "warm" else 64 if profile == "hot" else 82
+        return min(confidence, cap)
+    if "under 2.5" in selection:
+        cap = 84 if profile == "calm" else 72 if profile == "warm" else 60 if profile == "hot" else 78
+        return min(confidence, cap)
+    if "over 1.5" in selection:
+        nil_nil = goal_env.get("nil_nil_risk") or {}
+        level = str(nil_nil.get("level") or "").lower()
+        if level == "high":
+            return min(confidence, 54)
+        if level == "medium":
+            return min(confidence, 68)
+    return confidence
+
+
+def _attach_goal_environment_evidence(picks: list[dict[str, Any]], goal_env: dict[str, Any] | None) -> None:
+    """Ensure under-goals picks carry the computed goal environment context.
+
+    This is used to keep downstream confidence capping and audits stable even
+    when upstream pick sources omit the evidence block.
+    """
+    if not goal_env or not isinstance(goal_env, dict):
+        return
+    profile = goal_env.get("profile")
+    if not profile:
+        return
+    for pick in picks or []:
+        if not isinstance(pick, dict) or pick.get("type") == "no_bet":
+            continue
+        selection = str(pick.get("selection") or pick.get("pick") or "").lower()
+        if "under" not in selection and "over" not in selection:
+            continue
+        if "goals" not in selection and "goal" not in selection:
+            continue
+        evidence = pick.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        current = evidence.get("goal_environment")
+        if isinstance(current, dict) and current.get("profile"):
+            continue
+        evidence["goal_environment"] = goal_env
+        pick["evidence"] = evidence
 
 
 def _learned_role_score(pick: dict[str, Any], role: str) -> float:
@@ -2329,8 +3407,10 @@ def _market_selector_picks(
             home = round(home / total_1x2 * 100, 1)
             draw = round(draw / total_1x2 * 100, 1)
             away = round(away / total_1x2 * 100, 1)
-    over_2_5 = _blend_rate(float(model_probs.get("over_2_5") or 0), float(memory.get("over_2_5_rate") or 0) * 100, sample_factor)
-    btts = _blend_rate(float(model_probs.get("btts") or 0), float(memory.get("btts_rate") or 0) * 100, sample_factor)
+    model_over_2_5 = float(model_probs.get("over_2_5") or 0)
+    model_btts = float(model_probs.get("btts") or 0)
+    over_2_5 = _blend_rate(model_over_2_5 if model_over_2_5 > 0 else 50.0, float(memory.get("over_2_5_rate") or 0) * 100, sample_factor)
+    btts = _blend_rate(model_btts if model_btts > 0 else 50.0, float(memory.get("btts_rate") or 0) * 100, sample_factor)
     under_2_5 = 100 - over_2_5
     under_3_5 = _under_probability(poisson, dixon, 3.5)
     under_1_5 = _under_probability(poisson, dixon, 1.5)
@@ -2348,6 +3428,17 @@ def _market_selector_picks(
     best_side = max({"Home Win": home, "Draw": draw, "Away Win": away}, key={"Home Win": home, "Draw": draw, "Away Win": away}.get)
     side_conf = {"Home Win": home, "Draw": draw, "Away Win": away}[best_side]
     second_side = sorted([home, draw, away], reverse=True)[1]
+    clear_gap = float(get_settings().clear_winner_probability_gap)
+    if home - away >= clear_gap and home > draw:
+        pick = _selector_pick("match_result", "Home Win", max(home, 55 if home >= 45 else home), "ensemble home-win probability clears draw and away by threshold")
+        pick["clear_winner"] = True
+        pick["confidence_floor_applied"] = home >= 45 and home < 55
+        picks.append(pick)
+    elif away - home >= clear_gap and away > draw:
+        pick = _selector_pick("match_result", "Away Win", max(away, 55 if away >= 45 else away), "ensemble away-win probability clears draw and home by threshold")
+        pick["clear_winner"] = True
+        pick["confidence_floor_applied"] = away >= 45 and away < 55
+        picks.append(pick)
     # Straight 1X2 needs a real separation. A 45-50% side can be useful for
     # double chance, but it is too fragile as a primary match-winner pick.
     if side_conf >= 55 and side_conf - second_side >= 12 and samples >= 8:
@@ -2378,10 +3469,34 @@ def _market_selector_picks(
                     }
                 picks.append(pick)
 
+    nil_nil = goal_env.get("nil_nil_risk") or {}
     if under_1_5 >= 52 and avg_goals and avg_goals <= 1.8:
-        picks.append(_selector_pick("goals", "Under 1.5 goals", under_1_5, "previous final scores point to a very low total"))
+        picks.append({
+            **_selector_pick("goals", "Under 1.5 goals", under_1_5, "previous final scores point to a very low total"),
+            "evidence": {"goal_environment": goal_env},
+        })
+    elif nil_nil.get("level") in {"medium", "high"} and under_1_5 >= 45 and (not avg_goals or avg_goals <= 2.15):
+        confidence = min(78, under_1_5 + float(nil_nil.get("score") or 0) * 3)
+        picks.append({
+            **_selector_pick("goals", "Under 1.5 goals", confidence, "learned 0-0 profile warns against early over 1.5"),
+            "evidence": {"goal_environment": goal_env},
+        })
+    # Guardrail: Under 2.5 collapses in hot environments (our recent misses are
+    # dominated by 2-2 / 3+ totals even when "under" looked priced in).
+    under_2_5_allowed = False
     if under_2_5 >= 56 and (not avg_goals or avg_goals <= 2.55):
-        picks.append(_selector_pick("goals", "Under 2.5 goals", under_2_5, "goal model and finished database lean under"))
+        if goal_env.get("profile") == "calm":
+            under_2_5_allowed = True
+        elif goal_env.get("profile") == "warm":
+            # Warm environments require a stronger under edge to publish.
+            under_2_5_allowed = under_2_5 >= 60 and (not avg_goals or avg_goals <= 2.45) and float(goal_env.get("goal_pressure") or 0) <= 21
+        else:
+            under_2_5_allowed = False
+    if under_2_5_allowed:
+        picks.append({
+            **_selector_pick("goals", "Under 2.5 goals", under_2_5, "goal model and finished database lean under"),
+            "evidence": {"goal_environment": goal_env},
+        })
     if _allow_under_3_5(under_3_5, avg_goals, goal_env):
         picks.append({
             **_selector_pick(
@@ -2399,7 +3514,11 @@ def _market_selector_picks(
     elif btts <= 43 and samples >= 20:
         picks.append(_selector_pick("goals", "Both teams to score - No", 100 - btts, "finished-score memory shows weak both-team scoring"))
 
-    return sorted(_dedupe_picks(picks), key=lambda item: item.get("confidence") or 0, reverse=True)[:5]
+    return sorted(
+        _dedupe_picks(picks),
+        key=lambda item: (1 if item.get("clear_winner") else 0, item.get("confidence") or 0),
+        reverse=True,
+    )[:5]
 
 
 def _blended_model_probabilities(
@@ -2559,12 +3678,15 @@ def _goal_environment(
         confidence_cap = 90
         profile = "calm"
 
+    nil_nil = _nil_nil_risk_profile(rules, memory, goal_pressure, blended_over, blended_btts)
+
     return {
         "profile": profile,
         "goal_pressure": goal_pressure,
         "avg_goals": avg_goals,
         "over_2_5": blended_over,
         "btts": blended_btts,
+        "nil_nil_risk": nil_nil,
         "hot_reasons": hot_reasons,
         "warm_reasons": warm_reasons,
         "confidence_cap": confidence_cap,
@@ -2574,6 +3696,103 @@ def _goal_environment(
             else "under 3.5 only passes with reduced confidence because goal environment is mixed"
         ),
     }
+
+
+def _nil_nil_risk_profile(
+    rules: dict[str, Any],
+    memory: dict[str, Any],
+    goal_pressure: float,
+    over_2_5: float,
+    btts: float,
+) -> dict[str, Any]:
+    """Learned 0-0 warning profile from graded history.
+
+    Local graded 0-0s commonly share: lower-than-normal goal pressure, negative
+    recent-history/common-opponent edges, weak/negative market steam, and a low
+    finished-score goal environment. Use that as a brake on Over 1.5 and a
+    selective boost for Under 1.5.
+    """
+    recent_edge = _signal_metric(rules, "recent_history_edge", default=0.0)
+    common_edge = _signal_metric(rules, "common_opponent_edge", default=0.0)
+    market_steam = _signal_metric(rules, "market_steam", default=0.0)
+    odds_edge = _signal_metric(rules, "odds_edge", default=0.0)
+    avg_goals = float(memory.get("avg_goals") or 0)
+    draw_rate = float(memory.get("draw_rate") or 0) * 100
+
+    score = 0
+    reasons: list[str] = []
+    if 0 < goal_pressure <= 31:
+        score += 2
+        reasons.append("goal_pressure_matches_0_0_band")
+    elif 31 < goal_pressure <= 35.5:
+        score += 1
+        reasons.append("goal_pressure_near_0_0_band")
+    if avg_goals and avg_goals <= 2.05:
+        score += 2
+        reasons.append("finished_memory_low_average_goals")
+    elif avg_goals and avg_goals <= 2.30:
+        score += 1
+        reasons.append("finished_memory_not_goal_heavy")
+    if recent_edge <= -1:
+        score += 1
+        reasons.append("recent_history_edge_negative")
+    if common_edge <= -2:
+        score += 1
+        reasons.append("common_opponent_edge_negative")
+    if market_steam <= -4:
+        score += 1
+        reasons.append("market_steam_cold")
+    if over_2_5 <= 48:
+        score += 1
+        reasons.append("over_2_5_environment_soft")
+    if btts <= 52:
+        score += 1
+        reasons.append("btts_environment_soft")
+    if draw_rate >= 30:
+        score += 1
+        reasons.append("finished_memory_draw_rate_high")
+    if odds_edge >= 8 and goal_pressure >= 36:
+        score -= 2
+        reasons.append("odds_and_goal_pressure_push_against_0_0")
+
+    level = "high" if score >= 6 else "medium" if score >= 4 else "low"
+    return {
+        "version": "nil_nil_profile_v1",
+        "level": level,
+        "score": max(0, score),
+        "reasons": reasons[:8],
+        "learned_from": {
+            "zero_zero_matches": 263,
+            "over_1_5_zero_zero_losses": 44,
+            "zero_zero_goal_pressure_avg": 30.5,
+            "scoring_goal_pressure_avg": 34.2,
+        },
+        "inputs": {
+            "goal_pressure": round(goal_pressure, 2),
+            "avg_goals": round(avg_goals, 2),
+            "recent_history_edge": round(recent_edge, 2),
+            "common_opponent_edge": round(common_edge, 2),
+            "market_steam": round(market_steam, 2),
+            "over_2_5": round(over_2_5, 2),
+            "btts": round(btts, 2),
+            "draw_rate": round(draw_rate, 2),
+        },
+    }
+
+
+def _signal_metric(rules: dict[str, Any], name: str, *, default: float = 0.0) -> float:
+    values = []
+    for signal in rules.get("signals") or []:
+        if signal.get("name") != name:
+            continue
+        value = _to_float(signal.get("impact"))
+        if value is None:
+            value = _to_float(signal.get("value"))
+        if value is not None:
+            values.append(value)
+    if not values:
+        return default
+    return round(sum(values) / len(values), 2)
 
 
 def _allow_under_3_5(under_3_5: float, avg_goals: float, goal_env: dict[str, Any]) -> bool:
@@ -2629,6 +3848,68 @@ def _pick(kind: str, selection: str, confidence: float, reason: str) -> dict[str
     }
 
 
+def _finalize_prediction_output(prediction: dict[str, Any], ensemble: dict[str, Any]) -> None:
+    picks = prediction.get("picks") or []
+    if picks:
+        picks.sort(key=lambda pick: int(pick.get("confidence") or 0), reverse=True)
+        for index, pick in enumerate(picks):
+            pick["role"] = "primary" if index == 0 else "alternative"
+            selection = str(pick.get("selection") or "")
+            if "or draw protection" in selection.lower():
+                pick["selection"] = selection.replace(" or draw protection", " Win")
+    primary = picks[0] if picks else {"type": "no_bet", "selection": "No Bet", "confidence": 50}
+    probabilities = (ensemble or {}).get("probabilities") or (((prediction.get("models") or {}).get("ensemble") or {}).get("probabilities") or {})
+    home_prob = _to_float(probabilities.get("home_win")) or 0.0
+    away_prob = _to_float(probabilities.get("away_win")) or 0.0
+    draw_prob = _to_float(probabilities.get("draw")) or 0.0
+    clear_gap = float(get_settings().clear_winner_probability_gap)
+    clear_winner = (
+        (home_prob - away_prob >= clear_gap and home_prob > draw_prob)
+        or (away_prob - home_prob >= clear_gap and away_prob > draw_prob)
+        or bool(primary.get("clear_winner"))
+    )
+    prediction["clear_winner"] = bool(clear_winner)
+    prediction["prediction_label"] = _prediction_label(primary)
+    if prediction["prediction_label"] in {"Home Win", "Away Win"}:
+        prediction["winner_confidence"] = round(home_prob if prediction["prediction_label"] == "Home Win" else away_prob)
+    if primary.get("type") == "no_bet":
+        suppressed = primary.get("suppressed_picks") or []
+        prediction["secondary_picks"] = [pick for pick in suppressed if int(pick.get("confidence") or 0) >= 60]
+    live_summary = _live_match_statistics((prediction.get("data_quality") or {}).get("sofascore_detail") or {})
+    if not live_summary.get("has_stats"):
+        detail = ((prediction.get("data_sources") or {}).get("sofascore") or {}) if isinstance(prediction.get("data_sources"), dict) else {}
+        live_summary = _live_match_statistics(detail if isinstance(detail, dict) else {})
+    if (prediction.get("data_quality") or {}).get("live_stats_available"):
+        detail_stats = prediction.get("live_statistics_summary")
+        prediction["live_statistics_summary"] = detail_stats or live_summary.get("box_score") or {}
+
+
+def _prediction_label(pick: dict[str, Any]) -> str:
+    if pick.get("type") == "no_bet":
+        return "No Bet"
+    selection = str(pick.get("selection") or "")
+    normalized = selection.lower()
+    if normalized in {"home win", "away win", "draw"}:
+        return selection.title() if normalized == "draw" else selection
+    if "home win" in normalized or normalized == "home":
+        return "Home Win"
+    if "away win" in normalized or normalized == "away":
+        return "Away Win"
+    if "home or draw" in normalized:
+        return "Home or Draw"
+    if "away or draw" in normalized:
+        return "Away or Draw"
+    if "over 2.5" in normalized:
+        return "Over 2.5 Goals"
+    if "under 2.5" in normalized:
+        return "Under 2.5 Goals"
+    if "both teams" in normalized and "no" in normalized:
+        return "Both Teams Not to Score"
+    if "both teams" in normalized or "btts" in normalized:
+        return "Both Teams to Score"
+    return "No Bet" if not selection else selection
+
+
 def _model_signals(
     poisson: dict[str, Any] | None,
     dixon: dict[str, Any] | None,
@@ -2638,13 +3919,16 @@ def _model_signals(
 ) -> list[dict[str, Any]]:
     signals = []
     if poisson and not poisson.get("error"):
-        signals.append({"name": "poisson_model", "value": poisson.get("probabilities"), "impact": _prob_impact(poisson)})
+        signals.append({"name": "poisson_model", "value": poisson.get("probabilities"), "impact": _prob_impact(poisson), "role": "supporting_evidence"})
     if dixon and not dixon.get("error"):
-        signals.append({"name": "dixon_coles_model", "value": dixon.get("probabilities"), "impact": _prob_impact(dixon)})
+        signals.append({"name": "dixon_coles_model", "value": dixon.get("probabilities"), "impact": _prob_impact(dixon), "role": "supporting_evidence"})
     if elo and not elo.get("error"):
-        signals.append({"name": "elo_model", "value": elo, "impact": round((elo.get("home_win_probability", 50) - 50) / 3, 2)})
+        signals.append({"name": "elo_model", "value": elo, "impact": round((elo.get("home_win_probability", 50) - 50) / 3, 2), "role": "supporting_evidence"})
     if ensemble and not ensemble.get("error"):
         signals.append({"name": "ensemble_model", "value": ensemble, "impact": round((ensemble.get("confidence", 50) - 50) / 2, 2)})
+    consensus = _model_consensus_signal(poisson, dixon, elo, ensemble)
+    if consensus:
+        signals.append(consensus)
     web = doc.get("web_context") or {}
     snippets = web.get("snippets") or []
     scraped = web.get("scraped") or []
@@ -2674,6 +3958,47 @@ def _model_signals(
         }
     )
     return signals
+
+
+def _model_consensus_signal(
+    poisson: dict[str, Any] | None,
+    dixon: dict[str, Any] | None,
+    elo: dict[str, Any] | None,
+    ensemble: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    votes: list[str] = []
+    for model in (poisson, dixon):
+        if not model or model.get("error"):
+            continue
+        probs = model.get("probabilities") or {}
+        side = max(
+            ("home_win", "draw", "away_win"),
+            key=lambda key: _to_float(probs.get(key)) or 0,
+        )
+        votes.append(side)
+    if elo and not elo.get("error"):
+        home = _to_float(elo.get("home_win_probability")) or 0
+        away = _to_float(elo.get("away_win_probability")) or 0
+        draw = _to_float(elo.get("draw_probability")) or 0
+        votes.append(max({"home_win": home, "draw": draw, "away_win": away}, key={"home_win": home, "draw": draw, "away_win": away}.get))
+    if len(votes) < 2:
+        return None
+    top = Counter(votes).most_common(1)[0]
+    agreement = top[1] / len(votes)
+    if agreement < 0.67:
+        return {
+            "name": "model_consensus",
+            "value": {"votes": votes, "agreement": round(agreement, 2), "selection": None},
+            "impact": 0,
+            "role": "background_context",
+        }
+    confidence = _to_float((ensemble or {}).get("confidence")) or 50
+    return {
+        "name": "model_consensus",
+        "value": {"votes": votes, "agreement": round(agreement, 2), "selection": top[0]},
+        "impact": min(6, round((confidence - 50) / 6, 2)),
+        "role": "supporting_evidence",
+    }
 
 
 def _prob_impact(model: dict[str, Any]) -> float:
@@ -2753,6 +4078,14 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _probability_unit(value: Any) -> float | None:
+    number = _to_float(value)
+    if number is None:
+        return None
+    probability = number / 100 if number > 1 else number
+    return max(0.0, min(1.0, probability))
 
 
 def _to_int(value: Any, default: int = 0) -> int:

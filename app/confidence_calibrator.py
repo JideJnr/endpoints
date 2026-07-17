@@ -9,7 +9,7 @@ per-confidence-band accuracy rates. These are used to:
      is high enough to warrant a higher stake multiplier
 
 Calibration bands: 50-59, 60-69, 70-79, 80+
-Minimum samples before trusting a band: MIN_SAMPLES (default 10)
+Minimum samples before trusting a band: MIN_SAMPLES (default 30)
 
 Usage:
     from app.confidence_calibrator import calibrate_confidence, get_calibration_table
@@ -27,7 +27,8 @@ from typing import Any
 
 from app.league_memory import DB_PATH, _init_db
 
-MIN_SAMPLES = 10          # bands with fewer samples are not adjusted
+MIN_SAMPLES = 30          # bands with fewer samples are not adjusted
+DOUBLE_DOWN_MIN_SAMPLES = 50
 BLEND_WEIGHT = 0.4        # how much historical accuracy pulls the raw confidence
                           # 0 = no adjustment, 1 = fully replace with historical rate
 
@@ -41,11 +42,21 @@ UNIQUE_GRADED_HISTORY = """
                 partition by match_id, pick_type, selection
                 order by datetime(coalesce(graded_at, created_at)) desc, id desc
             ) as rn
-        from prediction_history ph
-        where graded_at is not null
-          and result in ('win', 'loss')
-          and pick_type not in ('no_bet')
-          and confidence is not null
+        from (
+            select id, match_id, pick_type, selection, confidence, result, created_at, graded_at
+            from prediction_history
+            where graded_at is not null
+              and result in ('win', 'loss')
+              and pick_type not in ('no_bet')
+              and confidence is not null
+            union all
+            select id, match_id, pick_type, selection, confidence, result, created_at, graded_at
+            from prediction_candidate_history
+            where graded_at is not null
+              and result in ('win', 'loss')
+              and pick_type not in ('no_bet')
+              and confidence is not null
+        ) ph
     )
     where rn = 1
 """
@@ -173,6 +184,9 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
     if not row or (row['samples'] or 0) < MIN_SAMPLES:
         return {
             "adjusted_confidence": raw_confidence,
+            "raw_confidence": raw_confidence,
+            "calibrated_probability": None,
+            "probability_source": None,
             "double_down": False,
             "win_rate": None,
             "samples": row['samples'] if row else 0,
@@ -187,10 +201,13 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
     adjusted = max(1, min(99, adjusted))
 
     # Double down: historical win rate >= 65% with solid sample
-    double_down = win_rate >= 0.65 and (row['samples'] or 0) >= MIN_SAMPLES
+    double_down = win_rate >= 0.65 and (row['samples'] or 0) >= DOUBLE_DOWN_MIN_SAMPLES
 
     return {
         "adjusted_confidence": adjusted,
+        "raw_confidence": raw_confidence,
+        "calibrated_probability": round(win_rate, 4),
+        "probability_source": "confidence_calibration",
         "double_down": double_down,
         "win_rate": round(win_rate * 100, 1),
         "samples": row['samples'],
@@ -221,7 +238,7 @@ def get_calibration_table() -> list[dict[str, Any]]:
             "wins":         row["wins"],
             "losses":       row["losses"],
             "win_rate":     round(float(row["win_rate"]) * 100, 1) if row["win_rate"] is not None else None,
-            "double_down":  (row["win_rate"] or 0) >= 0.65 and (row["samples"] or 0) >= MIN_SAMPLES,
+            "double_down":  (row["win_rate"] or 0) >= 0.65 and (row["samples"] or 0) >= DOUBLE_DOWN_MIN_SAMPLES,
             "last_updated": row["last_updated"],
         }
         for row in rows

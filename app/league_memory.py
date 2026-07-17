@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import re
+import os
 import sqlite3
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app.market_intent import classify_market_intent, grade_market_intent
-from app.prediction_audit import build_prediction_audit, grading_reason
+from app.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
 
 from app.config import get_settings
 
 
 DB_PATH = get_settings().database_path
+_DB_SCHEMA_READY = False
+_DB_SCHEMA_LOCK = threading.RLock()
 
 
 def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
@@ -28,12 +32,20 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
     away_goals = _to_int(score.get("away"), 0)
     total_goals = home_goals + away_goals
     minute = _match_minute(match)
-    raw_status = match.get("status") or {}
-    status_type = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
-    status_text = str(status_type or "").lower()
-    status_code = raw_status.get("code") if isinstance(raw_status, dict) else raw_status
-    is_finished = status_text in {"finished", "ended", "100"} or status_code == 100
-    is_live = status_text in {"inprogress", "live"} or minute > 0
+    # Use the shared match-state classifier so SportyBet period/status variants
+    # (e.g. "FT") resolve snapshots instead of leaving them permanently open.
+    try:
+        from app.match_state import classify_match_state
+
+        state = classify_match_state(match)
+        is_finished = bool(state.get("is_finished"))
+        is_live = bool(state.get("is_live"))
+    except Exception:
+        is_finished = False
+        is_live = False
+    # Minute is still a useful live hint for sources that omit explicit status.
+    if minute > 0:
+        is_live = True
 
     with sqlite3.connect(DB_PATH, timeout=15) as conn:
         conn.row_factory = sqlite3.Row
@@ -360,6 +372,13 @@ def get_league_detail_from_memory(league_id: str) -> dict[str, Any]:
 
 
 def run_memory_maintenance(raw_retention_days: int = 30, odds_retention_days: int = 60) -> dict[str, Any]:
+    if get_settings().disable_pruning:
+        return {
+            "status": "skipped",
+            "reason": "pruning disabled",
+            "raw_retention_days": raw_retention_days,
+            "odds_retention_days": odds_retention_days,
+        }
     _init_db()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
@@ -388,6 +407,24 @@ def run_memory_maintenance(raw_retention_days: int = 30, odds_retention_days: in
             """,
             (f"-{odds_retention_days} days",),
         )
+        # Odds market snapshots can grow extremely large; prune them with the same retention window.
+        for table in ("odds_market_snapshots", "odds_market_changes"):
+            try:
+                exists = conn.execute(
+                    "select 1 from sqlite_master where type='table' and name=?",
+                    (table,),
+                ).fetchone()
+                if not exists:
+                    continue
+                conn.execute(
+                    f"""
+                    delete from {table}
+                    where datetime(snapshot_time) < datetime('now', ?)
+                    """,
+                    (f"-{odds_retention_days} days",),
+                )
+            except Exception:
+                pass
         conn.commit()
         changed = conn.total_changes - before
         conn.execute("vacuum")
@@ -409,6 +446,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
     league_name = _league_from_match(prediction)
     country_name = _country_from_match(prediction, league_name)
     audit = prediction.get("audit") if isinstance(prediction.get("audit"), dict) else build_prediction_audit(prediction)
+    _record_prediction_decision(prediction, source, match_id, league_name, country_name, audit)
     _record_prediction_candidates(prediction, source, match_id, league_name, country_name)
 
     # ── Fix 3: skip junk predictions ───────────────────────────────────────────
@@ -423,6 +461,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             select id
             from prediction_history
             where match_id = ?
+              and coalesce(prediction_mode, 'prematch') = ?
               and pick_type = ?
               and selection = ?
               and result is null
@@ -430,7 +469,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             order by created_at desc
             limit 1
             """,
-            (match_id, best_pick.get("type"), best_pick.get("selection")),
+            (match_id, prediction.get("prediction_mode") or "prematch", best_pick.get("type"), best_pick.get("selection")),
         ).fetchone()
         if existing:
             return
@@ -439,9 +478,10 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             insert into prediction_history (
                 source, match_id, match_name, league_name, pick_type, selection,
                 confidence, reason, signals_json, picks_json, audit_json,
-                country_name, sofascore_id, sportybet_id, created_at
+                country_name, sofascore_id, sportybet_id, prediction_mode,
+                data_source, live_data_sources_json, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             """,
             (
                 source,
@@ -458,6 +498,9 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 country_name,
                 prediction.get("sofascore_id"),
                 prediction.get("sportybet_id") or match_id,
+                prediction.get("prediction_mode") or "prematch",
+                prediction.get("data_source") or ((prediction.get("data_quality") or {}).get("prediction_readiness") or {}).get("data_source"),
+                json.dumps(prediction.get("live_data_sources") or []),
             ),
         )
         conn.commit()
@@ -473,8 +516,115 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             match_name=prediction.get("name"),
             match_date=prediction.get("match_date"),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.health_counters import record_health_event
+
+        record_health_event("league_memory", "clv_entry_record_failed", exc, match_id=match_id)
+
+
+def record_deferred_prediction_decision(
+    *,
+    doc: dict[str, Any],
+    readiness: dict[str, Any],
+    audit: dict[str, Any],
+    source: str = "deferred",
+    reason: str | None = None,
+) -> None:
+    """Persist deferred/no-prediction decisions without polluting betting history."""
+    _init_db()
+    match_id = str(doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
+    if not match_id:
+        return
+    league_name = _league_from_match(doc)
+    country_name = _country_from_match(doc, league_name)
+    prediction = {
+        "match_id": match_id,
+        "sportybet_id": match_id,
+        "sofascore_id": doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
+        "name": doc.get("sportybet_name") or doc.get("name"),
+        "match_date": doc.get("match_date"),
+        "source": source,
+        "signals": [],
+        "picks": [{
+            "type": "no_bet",
+            "selection": "Prediction deferred",
+            "confidence": 0,
+            "reason": reason or "Prediction data contract is not ready",
+        }],
+        "data_quality": {"prediction_readiness": readiness},
+        "audit": audit,
+    }
+    _record_prediction_decision(prediction, source, match_id, league_name, country_name, audit, decision_type="deferred")
+
+
+def _record_prediction_decision(
+    prediction: dict[str, Any],
+    source: str,
+    match_id: str,
+    league_name: str,
+    country_name: str,
+    audit: dict[str, Any],
+    *,
+    decision_type: str | None = None,
+) -> None:
+    picks = prediction.get("picks") or []
+    best_pick = picks[0] if picks else {}
+    pick_type = best_pick.get("type") or "no_bet"
+    selection = best_pick.get("selection") or best_pick.get("pick") or "No decision"
+    confidence = int(best_pick.get("confidence") or 0)
+    resolved_decision_type = decision_type or ("no_bet" if pick_type == "no_bet" else "published")
+    readiness = (
+        (prediction.get("data_quality") or {}).get("prediction_readiness")
+        or prediction.get("prediction_readiness")
+        or {}
+    )
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        existing = conn.execute(
+            """
+            select id
+            from prediction_decision_log
+            where match_id = ?
+              and decision_type = ?
+              and pick_type = ?
+              and selection = ?
+              and datetime(created_at) >= datetime('now', '-4 hours')
+            order by created_at desc
+            limit 1
+            """,
+            (match_id, resolved_decision_type, pick_type, selection),
+        ).fetchone()
+        if existing:
+            return
+        conn.execute(
+            """
+            insert into prediction_decision_log (
+                source, match_id, sofascore_id, sportybet_id, match_name, league_name, country_name,
+                decision_type, pick_type, selection, confidence, reason,
+                readiness_json, signals_json, picks_json, audit_json, contextual_json, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            """,
+            (
+                source,
+                match_id,
+                prediction.get("sofascore_id"),
+                prediction.get("sportybet_id") or match_id,
+                prediction.get("name"),
+                league_name,
+                country_name,
+                resolved_decision_type,
+                pick_type,
+                selection,
+                confidence,
+                best_pick.get("reason") or best_pick.get("reasoning"),
+                json.dumps(readiness),
+                json.dumps(prediction.get("signals") or []),
+                json.dumps(picks),
+                json.dumps(audit),
+                json.dumps(prediction.get("contextual_intelligence") or best_pick.get("contextual_intelligence") or {}),
+            ),
+        )
+        conn.commit()
 
 
 def _record_prediction_candidates(
@@ -522,6 +672,7 @@ def _record_prediction_candidates(
             "primary" if index == 0 else "secondary",
             json.dumps(pick_context),
             json.dumps(prediction.get("signals") or []),
+            json.dumps(build_pick_audit(prediction, pick)),
         ))
         overlay = pick.get("value_overlay") or {}
         if overlay.get("selection"):
@@ -541,6 +692,12 @@ def _record_prediction_candidates(
                 "overlay",
                 json.dumps({**context, "market_intent": overlay_intent}),
                 json.dumps(prediction.get("signals") or []),
+                json.dumps(build_pick_audit(prediction, {
+                    **pick,
+                    "type": "value_bet",
+                    "selection": overlay.get("selection"),
+                    "reason": f"value overlay edge {overlay.get('edge_percent')} stake {overlay.get('stake_per_100')}",
+                })),
             ))
     ensemble = ((prediction.get("models") or {}).get("ensemble") or {})
     if ensemble and not ensemble.get("error") and ensemble.get("prediction"):
@@ -559,6 +716,13 @@ def _record_prediction_candidates(
             "evidence",
             json.dumps({**context, "market_intent": classify_market_intent("ensemble_1x2", str(ensemble.get("prediction") or ""))}),
             json.dumps(prediction.get("signals") or []),
+            json.dumps(build_pick_audit(prediction, {
+                "type": "ensemble_1x2",
+                "selection": ensemble.get("prediction"),
+                "confidence": int(float(ensemble.get("confidence") or 0)),
+                "role": "evidence",
+                "reason": f"ensemble evidence using {', '.join(ensemble.get('models_used') or [])}",
+            })),
         ))
     for signal in prediction.get("signals") or []:
         if signal.get("name") != "consensus_longshot_value":
@@ -585,6 +749,13 @@ def _record_prediction_candidates(
             "signal",
             json.dumps({**context, "signal": value, "market_intent": market_intent}),
             json.dumps(prediction.get("signals") or []),
+            json.dumps(build_pick_audit(prediction, {
+                "type": "consensus_longshot_value",
+                "selection": selection,
+                "confidence": confidence,
+                "role": "signal",
+                "reason": f"Consensus longshot value at {value.get('decimal_odds')} with {value.get('edge_percent')}% edge",
+            })),
         ))
     if not rows:
         return
@@ -618,7 +789,7 @@ def _record_prediction_candidates(
                 )
                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 """,
-                [(*row, audit_json) for row in fresh_rows],
+                [row if len(row) == 15 else (*row, audit_json) for row in fresh_rows],
             )
         conn.commit()
 
@@ -998,6 +1169,8 @@ def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> di
             (result, final_home, final_away, json.dumps(grade_info), prediction_id),
         )
         conn.commit()
+    _grade_decision_logs_by_ids([str(row["match_id"])], final_home, final_away)
+    _store_signal_outcome_for_row(row, result)
     return {"graded": True, "id": prediction_id, "result": result, "final_home": final_home, "final_away": final_away}
 
 
@@ -1068,6 +1241,263 @@ def _grading_reason_for_candidate_row(row: sqlite3.Row, final_home: int, final_a
     return info
 
 
+def _store_signal_outcome_for_row(row: sqlite3.Row, result: str) -> None:
+    """Store graded decision-signal outcomes in local memory, with Mongo as optional mirror."""
+    try:
+        payload = _signal_outcome_payload_for_row(row, result)
+        if not payload:
+            return
+        _store_signal_outcome_payload(payload)
+    except Exception:
+        pass
+
+
+def _signal_outcome_payload_for_row(row: sqlite3.Row, result: str) -> dict[str, Any] | None:
+    """Build signal-outcome payload without opening another SQLite writer."""
+    if result not in {"win", "loss"}:
+        return None
+    try:
+        try:
+            from app.self_learner import _decision_signals_for_row
+
+            signals = _decision_signals_for_row(row)
+        except Exception:
+            signals = _safe_json(row["signals_json"] if "signals_json" in row.keys() else "[]", [])
+        if not signals:
+            return None
+        return {
+            "match_id": str(row["match_id"]),
+            "match_name": row["match_name"] if "match_name" in row.keys() else None,
+            "tournament": row["league_name"] if "league_name" in row.keys() else None,
+            "country": row["country_name"] if "country_name" in row.keys() else None,
+            "match_date": str(row["created_at"] or "")[:10] if "created_at" in row.keys() else None,
+            "signals": signals,
+            "result": result,
+            "pick_type": row["pick_type"] if "pick_type" in row.keys() else None,
+            "selection": row["selection"] if "selection" in row.keys() else None,
+            "confidence": int(row["confidence"] or 0) if "confidence" in row.keys() else None,
+        }
+    except Exception:
+        return None
+
+
+def _store_signal_outcome_payload(payload: dict[str, Any]) -> None:
+    """Store signal outcome payload after the grading write transaction commits."""
+    store_local_signal_outcomes(**payload)
+    try:
+        from app.mongo_store import is_configured, store_signal_outcomes
+
+        if is_configured():
+            store_signal_outcomes(**payload)
+    except Exception:
+        pass
+
+
+def store_local_signal_outcomes(
+    match_id: str,
+    match_name: str | None,
+    tournament: str | None,
+    country: str | None,
+    match_date: str | None,
+    signals: list[dict[str, Any]],
+    result: str,
+    pick_type: str | None,
+    selection: str | None,
+    confidence: int | None,
+) -> int:
+    """Persist signal outcome analytics in the device SQLite memory."""
+    if result not in {"win", "loss"} or not signals:
+        return 0
+    _init_db()
+    rows = []
+    for signal in signals:
+        name = signal.get("name") if isinstance(signal, dict) else None
+        if not name:
+            continue
+        rows.append((
+            match_id,
+            match_name,
+            tournament,
+            country,
+            match_date,
+            str(name),
+            json.dumps(signal.get("value") if isinstance(signal, dict) else {}, default=str),
+            _to_float(signal.get("impact")) if isinstance(signal, dict) else None,
+            result,
+            pick_type,
+            selection,
+            confidence,
+        ))
+    if not rows:
+        return 0
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        _ensure_signal_outcomes_table(conn)
+        conn.executemany(
+            """
+            insert into signal_outcomes (
+                match_id, match_name, tournament, country, match_date,
+                signal_name, signal_value_json, signal_impact, result,
+                pick_type, selection, confidence
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(match_id, pick_type, selection, signal_name) do update set
+                match_name = excluded.match_name,
+                tournament = excluded.tournament,
+                country = excluded.country,
+                match_date = excluded.match_date,
+                signal_value_json = excluded.signal_value_json,
+                signal_impact = excluded.signal_impact,
+                result = excluded.result,
+                confidence = excluded.confidence,
+                recorded_at = current_timestamp
+            """,
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def get_local_signal_stats(
+    country: str | None = None,
+    tournament: str | None = None,
+    min_samples: int = 5,
+) -> dict[str, Any]:
+    """Aggregate signal win rates from local SQLite device memory."""
+    _init_db()
+    clauses = ["result in ('win', 'loss')"]
+    params: list[Any] = []
+    scope = "device"
+    if tournament:
+        clauses.append("lower(coalesce(tournament, '')) like ?")
+        params.append(f"%{tournament.lower()}%")
+        scope = f"device:tournament:{tournament}"
+    elif country:
+        clauses.append("lower(coalesce(country, '')) like ?")
+        params.append(f"%{country.lower()}%")
+        scope = f"device:country:{country}"
+    params.append(max(1, int(min_samples or 5)))
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        _ensure_signal_outcomes_table(conn)
+        existing = conn.execute("select count(*) from signal_outcomes").fetchone()[0]
+    if not existing:
+        _backfill_local_signal_outcomes_from_history()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        _ensure_signal_outcomes_table(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            select signal_name,
+                   count(*) as total,
+                   sum(case when result = 'win' then 1 else 0 end) as wins,
+                   sum(case when result = 'loss' then 1 else 0 end) as losses,
+                   avg(signal_impact) as avg_impact,
+                   avg(confidence) as avg_confidence
+            from signal_outcomes
+            where {' and '.join(clauses)}
+            group by signal_name
+            having count(*) >= ?
+            order by (1.0 * wins / nullif(total, 0)) desc, total desc
+            """,
+            params,
+        ).fetchall()
+    return {
+        "configured": True,
+        "storage": "device",
+        "scope": scope,
+        "min_samples": min_samples,
+        "signals": [
+            {
+                "signal": row["signal_name"],
+                "total": row["total"],
+                "wins": row["wins"],
+                "losses": row["losses"],
+                "win_rate": round((float(row["wins"] or 0) / max(1, int(row["total"] or 0))) * 100, 1),
+                "avg_impact": round(float(row["avg_impact"] or 0), 2),
+                "avg_confidence": round(float(row["avg_confidence"] or 0), 1),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists signal_outcomes (
+            id integer primary key autoincrement,
+            match_id text not null,
+            match_name text,
+            tournament text,
+            country text,
+            match_date text,
+            signal_name text not null,
+            signal_value_json text not null default '{}',
+            signal_impact real,
+            result text not null,
+            pick_type text,
+            selection text,
+            confidence integer,
+            recorded_at text not null default current_timestamp,
+            unique (match_id, pick_type, selection, signal_name)
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_signal_outcomes_signal on signal_outcomes(signal_name)")
+    conn.execute("create index if not exists idx_signal_outcomes_scope on signal_outcomes(country, tournament, result)")
+
+
+def _backfill_local_signal_outcomes_from_history(limit: int = 5000) -> int:
+    """Populate local signal analytics from already graded rows once."""
+    try:
+        from app.self_learner import _decision_signals_for_row
+    except Exception:
+        _decision_signals_for_row = None
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select *
+            from (
+                select id, match_id, match_name, league_name, country_name,
+                       pick_type, selection, confidence, result, signals_json,
+                       audit_json, '{}' as context_json, created_at, graded_at
+                from prediction_history ph
+                where result in ('win', 'loss')
+                  and pick_type != 'no_bet'
+                union all
+                select id, match_id, match_name, league_name, country_name,
+                       pick_type, selection, confidence, result, signals_json,
+                       audit_json, context_json, created_at, graded_at
+                from prediction_candidate_history pch
+                where result in ('win', 'loss')
+                  and pick_type != 'no_bet'
+            )
+            order by datetime(coalesce(graded_at, created_at)) desc
+            limit ?
+            """,
+            (max(1, int(limit or 5000)),),
+        ).fetchall()
+    stored = 0
+    for row in rows:
+        try:
+            signals = _decision_signals_for_row(row) if _decision_signals_for_row else _safe_json(row["signals_json"], [])
+            stored += store_local_signal_outcomes(
+                match_id=str(row["match_id"]),
+                match_name=row["match_name"] if "match_name" in row.keys() else None,
+                tournament=row["league_name"] if "league_name" in row.keys() else None,
+                country=row["country_name"] if "country_name" in row.keys() else None,
+                match_date=str(row["created_at"] or "")[:10] if "created_at" in row.keys() else None,
+                signals=signals,
+                result=row["result"],
+                pick_type=row["pick_type"] if "pick_type" in row.keys() else None,
+                selection=row["selection"] if "selection" in row.keys() else None,
+                confidence=int(row["confidence"] or 0) if "confidence" in row.keys() else None,
+            )
+        except Exception:
+            continue
+    return stored
+
+
 def _grade_candidate_predictions_for_match(
     match_id: str,
     sofa_ids: list[str],
@@ -1076,6 +1506,7 @@ def _grade_candidate_predictions_for_match(
 ) -> int:
     keys = [match_id, *sofa_ids]
     placeholders = ",".join("?" for _ in keys)
+    signal_payloads: list[dict[str, Any]] = []
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -1097,7 +1528,12 @@ def _grade_candidate_predictions_for_match(
                 """,
                 (result, final_home, final_away, json.dumps(grade_info), row["id"]),
             )
+            payload = _signal_outcome_payload_for_row(row, result)
+            if payload:
+                signal_payloads.append(payload)
         conn.commit()
+    for payload in signal_payloads:
+        _store_signal_outcome_payload(payload)
     return len(rows)
 
 
@@ -1111,7 +1547,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            select id, match_id, match_name, pick_type, selection
+            select *
             from prediction_history
             where graded_at is null
               and date(created_at) = ?
@@ -1144,6 +1580,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         final_home = _to_int(score.get("home"), 0)
         final_away = _to_int(score.get("away"), 0)
         candidate_graded += _grade_candidate_predictions_for_match(match_id, sofa_ids, final_home, final_away)
+        _grade_decision_logs_by_ids([match_id, *sofa_ids], final_home, final_away)
         grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         grade_info["result"] = result
@@ -1157,6 +1594,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
                 (result, final_home, final_away, json.dumps(grade_info), row["id"]),
             )
             conn.commit()
+        _store_signal_outcome_for_row(row, result)
         graded += 1
 
     primary_ids = {str(row["match_id"]) for row in rows}
@@ -1173,6 +1611,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         final_home = _to_int(score.get("home"), 0)
         final_away = _to_int(score.get("away"), 0)
         candidate_graded += _grade_candidate_predictions_for_match(match_id, sofa_ids, final_home, final_away)
+        _grade_decision_logs_by_ids([match_id, *sofa_ids], final_home, final_away)
 
     return {"graded": graded, "candidate_graded": candidate_graded, "skipped": skipped, "date": match_date}
 
@@ -1199,13 +1638,14 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
             "eligible": 0,
             "graded": 0,
             "candidate_graded": 0,
+            "decision_graded": 0,
             "still_live": 0,
             "not_found": 0,
             "skipped": 0,
             "errors": [],
         }
 
-    graded = candidate_graded = still_live = not_found = skipped = 0
+    graded = candidate_graded = decision_graded = still_live = not_found = skipped = 0
     sporty_graded = sofa_graded = 0
     errors: list[str] = []
     already_graded: set[str] = set()
@@ -1241,9 +1681,10 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
                 final_home=_to_int(score.get("home"), 0),
                 final_away=_to_int(score.get("away"), 0),
             )
-            if counts["primary"] or counts["candidate"]:
+            if counts["primary"] or counts["candidate"] or counts.get("decisions"):
                 graded += counts["primary"]
                 candidate_graded += counts["candidate"]
+                decision_graded += counts.get("decisions", 0)
                 sporty_graded += counts["primary"]
                 already_graded.add(match_id)
                 _safe_mark_buffer_finished(match_id, score.get("home"), score.get("away"))
@@ -1312,6 +1753,7 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
                 )
                 graded += counts["primary"]
                 candidate_graded += counts["candidate"]
+                decision_graded += counts.get("decisions", 0)
                 sofa_graded += counts["primary"]
                 _safe_mark_buffer_finished(match_id, score.get("home"), score.get("away"))
     except Exception as exc:
@@ -1323,6 +1765,7 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
         "eligible": len(rows),
         "graded": graded,
         "candidate_graded": candidate_graded,
+        "decision_graded": decision_graded,
         "sporty_graded": sporty_graded,
         "sofascore_graded": sofa_graded,
         "still_live": still_live,
@@ -1420,6 +1863,11 @@ def _pending_matches_for_grading(cutoff_seconds: float, limit: int) -> list[sqli
                 from prediction_candidate_history
                 where graded_at is null
                 group by match_id
+                union all
+                select match_id, min(created_at) as first_seen
+                from prediction_decision_log
+                where graded_at is null
+                group by match_id
             ),
             grouped as (
                 select match_id, min(first_seen) as first_seen
@@ -1460,6 +1908,7 @@ def _grade_match_predictions_by_ids(match_id: str, linked_ids: list[str], final_
             keys.append(str(value))
     placeholders = ",".join("?" for _ in keys)
     primary = candidate = 0
+    signal_payloads: list[dict[str, Any]] = []
     with sqlite3.connect(DB_PATH, timeout=15) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -1482,6 +1931,9 @@ def _grade_match_predictions_by_ids(match_id: str, linked_ids: list[str], final_
                 """,
                 (result, final_home, final_away, json.dumps(grade_info), row["id"]),
             )
+            payload = _signal_outcome_payload_for_row(row, result)
+            if payload:
+                signal_payloads.append(payload)
             primary += 1
 
         candidate_rows = conn.execute(
@@ -1503,9 +1955,98 @@ def _grade_match_predictions_by_ids(match_id: str, linked_ids: list[str], final_
                 """,
                 (result, final_home, final_away, json.dumps(grade_info), row["id"]),
             )
+            payload = _signal_outcome_payload_for_row(row, result)
+            if payload:
+                signal_payloads.append(payload)
             candidate += 1
         conn.commit()
-    return {"primary": primary, "candidate": candidate}
+    for payload in signal_payloads:
+        _store_signal_outcome_payload(payload)
+    decisions = _grade_decision_logs_by_ids(keys, final_home, final_away)
+    return {"primary": primary, "candidate": candidate, "decisions": decisions}
+
+
+def _grade_decision_logs_by_ids(keys: list[str], final_home: int, final_away: int) -> int:
+    clean_keys = []
+    for value in keys:
+        if value is not None and str(value) not in clean_keys:
+            clean_keys.append(str(value))
+    if not clean_keys:
+        return 0
+    placeholders = ",".join("?" for _ in clean_keys)
+    graded = 0
+    with sqlite3.connect(DB_PATH, timeout=15) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            select *
+            from prediction_decision_log
+            where graded_at is null and match_id in ({placeholders})
+            """,
+            tuple(clean_keys),
+        ).fetchall()
+        for row in rows:
+            grade_info = _grade_decision_row(row, final_home, final_away)
+            conn.execute(
+                """
+                update prediction_decision_log
+                set result = ?, final_home = ?, final_away = ?, grading_reason_json = ?, graded_at = current_timestamp
+                where id = ?
+                """,
+                (grade_info.get("result"), final_home, final_away, json.dumps(grade_info), row["id"]),
+            )
+            graded += 1
+        conn.commit()
+    return graded
+
+
+def _grade_decision_row(row: sqlite3.Row, final_home: int, final_away: int) -> dict[str, Any]:
+    pick_type = row["pick_type"]
+    selection = row["selection"]
+    if row["decision_type"] == "published" and pick_type != "no_bet":
+        info = grading_reason(pick_type, selection, final_home, final_away, row["match_name"])
+        if info.get("result") == "void":
+            info["result"] = _grade_pick_for_match(pick_type, selection, final_home, final_away, row["match_name"])
+        info["decision_type"] = row["decision_type"]
+        return info
+
+    audit = _safe_json(row["audit_json"], {})
+    rejected = (((audit.get("signals") or {}).get("rejected")) or []) if isinstance(audit, dict) else []
+    rejected_outcome = None
+    rejected_pick = None
+    for item in rejected:
+        rejected_type = item.get("type") or item.get("pick_type")
+        rejected_selection = item.get("selection")
+        if not rejected_type or not rejected_selection:
+            continue
+        result = grading_reason(rejected_type, rejected_selection, final_home, final_away, row["match_name"]).get("result")
+        if result in {"win", "loss"}:
+            rejected_outcome = result
+            rejected_pick = item
+            break
+
+    if row["decision_type"] in {"no_bet", "deferred"}:
+        if rejected_outcome == "loss":
+            result = "correct_avoid"
+            reason = "Avoid/deferred decision protected against a rejected pick that would have lost."
+        elif rejected_outcome == "win":
+            result = "missed_opportunity"
+            reason = "Avoid/deferred decision skipped a rejected pick that would have won."
+        else:
+            result = "avoided"
+            reason = "No graded rejected pick was available, so the no-prediction decision is recorded as avoided."
+    else:
+        result = "observed"
+        reason = "Decision was observed after match completion."
+
+    return {
+        "version": "decision_grading_v1",
+        "result": result,
+        "decision_type": row["decision_type"],
+        "final_score": {"home": final_home, "away": final_away, "total": final_home + final_away},
+        "rejected_pick_checked": rejected_pick,
+        "reason": reason,
+    }
 
 
 def _safe_mark_buffer_finished(match_id: str, final_home: Any, final_away: Any) -> None:
@@ -1868,17 +2409,40 @@ def list_prediction_history(limit: int = 200, match_id: str | None = None) -> di
         params.append(str(match_id))
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
+        order_clause = "datetime(created_at) asc, id asc" if match_id else "datetime(created_at) desc, id desc"
         rows = conn.execute(
             f"""
             select *
             from prediction_history
             where {" and ".join(clauses)}
-            order by created_at desc
+            order by {order_clause}
             limit ?
             """,
             (*params, limit),
         ).fetchall()
     return {"predictions": [_prediction_row(row) for row in rows]}
+
+
+def list_prediction_decisions(limit: int = 200, match_id: str | None = None) -> dict[str, Any]:
+    _init_db()
+    clauses = ["1 = 1"]
+    params: list[Any] = []
+    if match_id:
+        clauses.append("match_id = ?")
+        params.append(match_id)
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            select *
+            from prediction_decision_log
+            where {" and ".join(clauses)}
+            order by datetime(created_at) desc, id desc
+            limit ?
+            """,
+            (*params, max(1, min(int(limit or 200), 1000))),
+        ).fetchall()
+    return {"decisions": [_decision_row(row) for row in rows]}
 
 
 def save_betbuilder(
@@ -1961,6 +2525,8 @@ def grade_betbuilder_history(limit: int = 200) -> dict[str, Any]:
                 match_id = str(selection.get("match_id") or "")
                 pick_type = str(selection.get("type") or selection.get("pick_type") or "")
                 pick_selection = str(selection.get("selection") or "")
+                if not pick_type and pick_selection:
+                    pick_type = _infer_betbuilder_pick_type(pick_selection)
                 if not match_id or not pick_type or not pick_selection:
                     unresolved = True
                     continue
@@ -2031,7 +2597,83 @@ def _latest_leg_grade(conn: sqlite3.Connection, match_id: str, pick_type: str, s
                 "league": row["league_name"],
                 "country": row["country_name"] if "country_name" in row.keys() else None,
             }
+    # Fallback: if we never recorded a leg prediction but we have a final score,
+    # grade the leg directly from stored match results.
+    score = _latest_finished_score(conn, match_id)
+    if score is None:
+        return None
+    final_home, final_away = score
+    grade_info = grading_reason(pick_type, selection, final_home, final_away)
+    result = grade_info.get("result")
+    if result == "void":
+        result = _grade_pick_for_match(pick_type, selection, final_home, final_away, None)
+        grade_info["result"] = result
+    return {
+        "result": str(result or "void"),
+        "graded_at": None,
+        "grading_reason": grade_info,
+        "signals": [],
+        "context": {},
+        "league": None,
+        "country": None,
+    }
+
+
+def _latest_finished_score(conn: sqlite3.Connection, match_id: str) -> tuple[int, int] | None:
+    row = conn.execute(
+        """
+        select final_home_goals, final_away_goals
+        from matches
+        where match_id = ?
+          and is_finished = 1
+          and final_home_goals is not null
+          and final_away_goals is not null
+        order by datetime(last_seen_at) desc
+        limit 1
+        """,
+        (match_id,),
+    ).fetchone()
+    if row and row[0] is not None and row[1] is not None:
+        return (_to_int(row[0], 0), _to_int(row[1], 0))
+    row = conn.execute(
+        """
+        select score_home, score_away
+        from finished_matches
+        where match_id = ?
+        order by datetime(finished_at) desc
+        limit 1
+        """,
+        (match_id,),
+    ).fetchone()
+    if row and row[0] is not None and row[1] is not None:
+        return (_to_int(row[0], 0), _to_int(row[1], 0))
     return None
+
+
+def _infer_betbuilder_pick_type(selection: str) -> str:
+    """Infer a pick_type for betbuilder selections that omitted it."""
+    try:
+        from app.market_intent import classify_market_intent
+    except Exception:
+        classify_market_intent = None
+    text = str(selection or "")
+    if classify_market_intent:
+        intent = classify_market_intent("", text, {})
+        market = str(intent.get("market") or "")
+        if market in {"total_goals", "btts"}:
+            return "goals"
+        if market == "double_chance":
+            return "double_chance"
+        if market == "1x2":
+            return "match_result"
+    lower = text.lower()
+    if "over" in lower or "under" in lower or "both teams" in lower or "btts" in lower:
+        return "goals"
+    if " or draw" in lower or "home or away" in lower or lower.strip() in {"1x", "x2", "12"}:
+        return "double_chance"
+    if lower.strip() in {"home win", "away win", "draw", "home", "away"}:
+        return "match_result"
+    return ""
 
 
 def betbuilder_pick_memory(
@@ -2098,6 +2740,8 @@ def _record_betbuilder_legs(conn: sqlite3.Connection, bet_id: int, selections: l
         pick_type = str(selection.get("type") or selection.get("pick_type") or "")
         pick_selection = str(selection.get("selection") or "")
         match_id = str(selection.get("match_id") or "")
+        if not pick_type and pick_selection:
+            pick_type = _infer_betbuilder_pick_type(pick_selection)
         if not match_id or not pick_type or not pick_selection:
             continue
         odds = _to_float(selection.get("odds") or selection.get("decimal_odds"))
@@ -2514,10 +3158,62 @@ def normalize_league(value: str | None) -> str:
     return " ".join(text.split()).strip()
 
 
+def _run_legacy_backfills() -> bool:
+    """Large backfills are opt-in so routine health checks stay bounded."""
+    return os.getenv("PREDICTX_RUN_LEGACY_BACKFILLS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _run_schema_migrations() -> bool:
+    return os.getenv("PREDICTX_RUN_SCHEMA_MIGRATIONS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _existing_schema_can_be_trusted() -> bool:
+    """Fast path for the long-running production database."""
+    if _run_schema_migrations() or not DB_PATH.exists():
+        return False
+    try:
+        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2) as conn:
+            row = conn.execute(
+                """
+                select count(*)
+                from sqlite_master
+                where type = 'table'
+                  and name in ('prediction_history', 'match_buffer', 'job_runs')
+                """
+            ).fetchone()
+        return int(row[0] if row else 0) >= 2
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_lock(exc):
+            return True
+        return False
+
+
 def _init_db() -> None:
+    global _DB_SCHEMA_READY
+    if _DB_SCHEMA_READY:
+        return
+    with _DB_SCHEMA_LOCK:
+        if _DB_SCHEMA_READY:
+            return
+        if _existing_schema_can_be_trusted():
+            _DB_SCHEMA_READY = True
+            return
+        try:
+            _init_db_unlocked()
+            _DB_SCHEMA_READY = True
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_lock(exc) and DB_PATH.exists():
+                # Runtime callers should not fail just because another worker is
+                # writing. The schema is created at process startup; retry on the
+                # next call if this process has not completed initialization yet.
+                return
+            raise
+
+
+def _init_db_unlocked() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.execute("pragma busy_timeout = 30000")
+    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+        conn.execute("pragma busy_timeout = 60000")
         try:
             conn.execute("pragma journal_mode = wal")
             conn.execute("pragma synchronous = normal")
@@ -2659,6 +3355,9 @@ def _init_db() -> None:
                 reason text,
                 signals_json text not null,
                 picks_json text not null,
+                prediction_mode text not null default 'prematch',
+                data_source text,
+                live_data_sources_json text not null default '[]',
                 created_at text not null default current_timestamp
             )
             """
@@ -2684,6 +3383,57 @@ def _init_db() -> None:
                 final_away integer,
                 graded_at text,
                 created_at text not null default current_timestamp
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists prediction_decision_log (
+                id integer primary key autoincrement,
+                source text not null,
+                match_id text not null,
+                sofascore_id text,
+                sportybet_id text,
+                match_name text,
+                league_name text,
+                country_name text,
+                decision_type text not null,
+                pick_type text,
+                selection text,
+                confidence integer,
+                reason text,
+                readiness_json text not null default '{}',
+                signals_json text not null default '[]',
+                picks_json text not null default '[]',
+                audit_json text not null default '{}',
+                contextual_json text not null default '{}',
+                result text,
+                final_home integer,
+                final_away integer,
+                grading_reason_json text not null default '{}',
+                graded_at text,
+                created_at text not null default current_timestamp
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists signal_outcomes (
+                id integer primary key autoincrement,
+                match_id text not null,
+                match_name text,
+                tournament text,
+                country text,
+                match_date text,
+                signal_name text not null,
+                signal_value_json text not null default '{}',
+                signal_impact real,
+                result text not null,
+                pick_type text,
+                selection text,
+                confidence integer,
+                recorded_at text not null default current_timestamp,
+                unique (match_id, pick_type, selection, signal_name)
             )
             """
         )
@@ -2779,6 +3529,8 @@ def _init_db() -> None:
         conn.execute("create index if not exists idx_snapshots_resolved on match_snapshots(resolved_at)")
         conn.execute("create index if not exists idx_predictions_match on prediction_history(match_id)")
         conn.execute("create index if not exists idx_predictions_created on prediction_history(created_at)")
+        conn.execute("create index if not exists idx_signal_outcomes_signal on signal_outcomes(signal_name)")
+        conn.execute("create index if not exists idx_signal_outcomes_scope on signal_outcomes(country, tournament, result)")
         conn.execute("create index if not exists idx_odds_match on odds_snapshots(match_id)")
         conn.execute("create index if not exists idx_odds_date on odds_snapshots(match_date)")
         conn.execute("create index if not exists idx_odds_match_time on odds_snapshots(match_id, snapshot_time)")
@@ -2789,19 +3541,24 @@ def _init_db() -> None:
         _ensure_column(conn, "prediction_history", "country_name", "text")
         _ensure_column(conn, "prediction_history", "sofascore_id", "text")
         _ensure_column(conn, "prediction_history", "sportybet_id", "text")
+        _ensure_column(conn, "prediction_history", "prediction_mode", "text not null default 'prematch'")
+        _ensure_column(conn, "prediction_history", "data_source", "text")
+        _ensure_column(conn, "prediction_history", "live_data_sources_json", "text not null default '[]'")
         _ensure_column(conn, "prediction_history", "audit_json", "text not null default '{}'")
         _ensure_column(conn, "prediction_history", "grading_reason_json", "text not null default '{}'")
-        conn.execute(
-            """
-            update prediction_history
-            set country_name = case
-                when instr(league_name, ' ') > 0 then substr(league_name, 1, instr(league_name, ' ') - 1)
-                else 'Global'
-            end
-            where country_name is null or country_name = ''
-            """
-        )
+        if _run_legacy_backfills():
+            conn.execute(
+                """
+                update prediction_history
+                set country_name = case
+                    when instr(league_name, ' ') > 0 then substr(league_name, 1, instr(league_name, ' ') - 1)
+                    else 'Global'
+                end
+                where country_name is null or country_name = ''
+                """
+            )
         conn.execute("create index if not exists idx_predictions_graded on prediction_history(graded_at)")
+        conn.execute("create index if not exists idx_predictions_match_mode on prediction_history(match_id, prediction_mode, created_at)")
         conn.execute("create index if not exists idx_predictions_scope on prediction_history(league_name, country_name, pick_type, selection)")
         conn.execute("create index if not exists idx_candidate_match on prediction_candidate_history(match_id)")
         _ensure_column(conn, "prediction_candidate_history", "sofascore_id", "text")
@@ -2810,6 +3567,9 @@ def _init_db() -> None:
         _ensure_column(conn, "prediction_candidate_history", "grading_reason_json", "text not null default '{}'")
         conn.execute("create index if not exists idx_candidate_scope on prediction_candidate_history(league_name, country_name, pick_type, selection)")
         conn.execute("create index if not exists idx_candidate_graded on prediction_candidate_history(graded_at)")
+        conn.execute("create index if not exists idx_decision_match on prediction_decision_log(match_id)")
+        conn.execute("create index if not exists idx_decision_graded on prediction_decision_log(graded_at)")
+        conn.execute("create index if not exists idx_decision_scope on prediction_decision_log(league_name, country_name, decision_type, pick_type)")
         _ensure_column(conn, "betbuilder_history", "request_json", "text not null default '{}'")
         _ensure_column(conn, "betbuilder_history", "result", "text")
         _ensure_column(conn, "betbuilder_history", "leg_results_json", "text not null default '[]'")
@@ -2819,16 +3579,17 @@ def _init_db() -> None:
         conn.execute("create index if not exists idx_betbuilder_legs_scope on betbuilder_leg_history(league_name, country_name, pick_type, selection, odds_band)")
         conn.execute("create index if not exists idx_betbuilder_legs_graded on betbuilder_leg_history(graded_at)")
         _ensure_column(conn, "matches", "country_name", "text")
-        conn.execute(
-            """
-            update matches
-            set country_name = case
-                when instr(league_name, ' ') > 0 then substr(league_name, 1, instr(league_name, ' ') - 1)
-                else 'Global'
-            end
-            where country_name is null or country_name = ''
-            """
-        )
+        if _run_legacy_backfills():
+            conn.execute(
+                """
+                update matches
+                set country_name = case
+                    when instr(league_name, ' ') > 0 then substr(league_name, 1, instr(league_name, ' ') - 1)
+                    else 'Global'
+                end
+                where country_name is null or country_name = ''
+                """
+            )
         conn.execute("create index if not exists idx_matches_scope on matches(league_name, country_name, is_finished)")
         conn.execute("""
             create table if not exists team_history_cache (
@@ -3464,7 +4225,41 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
         "signals": _safe_json(row["signals_json"] if "signals_json" in row.keys() else "[]", []),
         "picks": picks,
         "audit": _safe_json(row["audit_json"] if "audit_json" in row.keys() else "{}", {}),
+        "prediction_mode": row["prediction_mode"] if "prediction_mode" in row.keys() else "prematch",
+        "data_source": row["data_source"] if "data_source" in row.keys() else None,
+        "live_data_sources": _safe_json(row["live_data_sources_json"] if "live_data_sources_json" in row.keys() else "[]", []),
         "grading_reason": _safe_json(row["grading_reason_json"] if "grading_reason_json" in row.keys() else "{}", {}),
+        "created_at": row["created_at"],
+    }
+
+
+def _decision_row(row: sqlite3.Row) -> dict[str, Any]:
+    pick = {
+        "type": row["pick_type"],
+        "selection": row["selection"],
+        "confidence": row["confidence"],
+        "reason": row["reason"],
+    }
+    return {
+        "id": row["id"],
+        "source": row["source"],
+        "match_id": row["match_id"],
+        "match_url": f"/match/{row['match_id']}",
+        "match_name": row["match_name"],
+        "league_name": row["league_name"],
+        "country_name": row["country_name"],
+        "decision_type": row["decision_type"],
+        "best_pick": pick,
+        "readiness": _safe_json(row["readiness_json"], {}),
+        "signals": _safe_json(row["signals_json"], []),
+        "picks": _safe_json(row["picks_json"], []),
+        "audit": _safe_json(row["audit_json"], {}),
+        "contextual_intelligence": _safe_json(row["contextual_json"], {}),
+        "result": row["result"],
+        "final_home": row["final_home"],
+        "final_away": row["final_away"],
+        "grading_reason": _safe_json(row["grading_reason_json"], {}),
+        "graded_at": row["graded_at"],
         "created_at": row["created_at"],
     }
 
@@ -3733,3 +4528,8 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     columns = {row[1] for row in conn.execute(f"pragma table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"alter table {table} add column {column} {definition}")
+
+
+def _is_sqlite_lock(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message

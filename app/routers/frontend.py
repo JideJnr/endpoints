@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date as dt
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -18,6 +19,13 @@ from app.market import get_movement
 from app.match_state import classify_match_state
 from app.scheduler import scheduler_status
 
+try:
+    from cachetools import TTLCache
+    _similar_cache: TTLCache = TTLCache(maxsize=200, ttl=300)
+except ImportError:
+    _similar_cache = {}  # type: ignore[assignment]
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["frontend"])
 
@@ -58,6 +66,7 @@ def get_matches_by_date(match_date: str, limit: int = Query(default=500, ge=1, l
 
 @router.get("/matches/today/{sportybet_id}")
 def get_today_match_detail(sportybet_id: str):
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
     if not doc:
         archived = _archived_match_detail(sportybet_id)
@@ -67,12 +76,77 @@ def get_today_match_detail(sportybet_id: str):
     return _match_detail(doc)
 
 
+@router.get("/matches/{sportybet_id}/similar")
+def get_similar_matches(
+    sportybet_id: str,
+    limit: int = Query(default=10, ge=1, le=25),
+):
+    """
+    Return up to `limit` historical matches most similar to the given match,
+    ranked by a composite similarity score (ELO proximity + odds proximity + league bonus).
+
+    Results are cached for 5 minutes per sportybet_id.
+    """
+    from app.similar_matches import find_similar_matches
+
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+    cache_key = (sportybet_id, limit)
+
+    # ── Cache hit ─────────────────────────────────────────────────────────────
+    if cache_key in _similar_cache:
+        return _similar_cache[cache_key]
+
+    # ── Fetch buffered match ──────────────────────────────────────────────────
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+
+    # ── Compute similarity ────────────────────────────────────────────────────
+    try:
+        from app.similar_matches import find_similar_matches, _extract_target_odds_implied
+        target_implied = _extract_target_odds_implied(doc)
+        target_odds_context = None
+        if target_implied:
+            try:
+                target_odds_context = {
+                    "home": round(1.0 / target_implied[0], 2),
+                    "draw": round(1.0 / target_implied[1], 2),
+                    "away": round(1.0 / target_implied[2], 2),
+                    "home_implied_pct": round(target_implied[0] * 100, 1),
+                    "draw_implied_pct": round(target_implied[1] * 100, 1),
+                    "away_implied_pct": round(target_implied[2] * 100, 1),
+                }
+            except Exception:
+                pass
+        matches = find_similar_matches(doc, limit=limit)
+    except Exception as exc:
+        _logger.exception("Similar matches computation failed for %s", sportybet_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Similar matches computation failed: {exc}",
+        )
+
+    result = {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "match_name": doc.get("sportybet_name") or doc.get("name") or sportybet_id,
+        "target_odds": target_odds_context,
+        "odds_filter_applied": target_odds_context is not None,
+        "count": len(matches),
+        "matches": matches,
+    }
+
+    _similar_cache[cache_key] = result
+    return result
+
+
 @router.get("/matches/{sportybet_id}/sporty-info")
 def get_match_sporty_info(sportybet_id: str):
     """Fetch fresh SportyBet endpoint data for one match and merge it into buffer."""
     from app.buffer import refresh_sporty_match_state
     from app.sportybet_client import fetch_match_info
 
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
     try:
         info = fetch_match_info(sportybet_id)
     except Exception as exc:
@@ -97,12 +171,78 @@ def get_match_sporty_info(sportybet_id: str):
     }
 
 
+@router.get("/matches/{sportybet_id}/sportradar-info")
+def get_match_sportradar_info(sportybet_id: str):
+    """Fetch fresh Sportradar/SIR widget stats for one buffered SportyBet match."""
+    from app.buffer import _data_sources, store_enriched
+    from app.sportradar_client import fetch_match_intelligence
+
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found in buffer")
+    raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+    sportradar = fetch_match_intelligence(raw_sporty.get("id") or sportybet_id)
+    merged = {**doc, "sportradar_detail": sportradar}
+    merged["data_sources"] = _data_sources(
+        merged.get("sofascore_event"),
+        merged.get("sofascore_detail"),
+        merged.get("raw_sporty") or raw_sporty,
+        sportradar,
+    )
+    store_enriched(sportybet_id, merged)
+    return {
+        "status": "success" if sportradar.get("available") else "unavailable",
+        "sportybet_id": sportybet_id,
+        "has_sportradar": bool(sportradar.get("available")),
+        "sportradar": sportradar,
+    }
+
+
+@router.post("/matches/sportradar-enrich")
+def post_sportradar_enrich_all(limit: int = Query(default=500, ge=1, le=2000)):
+    """Backfill Sportradar/SIR widget stats for buffered matches without running full prediction."""
+    from app.buffer import _data_sources, store_enriched
+    from app.sportradar_client import fetch_match_intelligence
+
+    docs = get_buffered_matches(limit=limit)
+    processed = available = stored = 0
+    errors: list[dict[str, Any]] = []
+    for doc in docs:
+        sportybet_id = str(doc.get("sportybet_id") or doc.get("id") or "")
+        if not sportybet_id:
+            continue
+        raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+        sportradar = fetch_match_intelligence(raw_sporty.get("id") or sportybet_id)
+        processed += 1
+        available += 1 if sportradar.get("available") else 0
+        if not sportradar.get("available"):
+            errors.append({"sportybet_id": sportybet_id, "error": sportradar.get("error")})
+        merged = {**doc, "sportradar_detail": sportradar}
+        merged["data_sources"] = _data_sources(
+            merged.get("sofascore_event"),
+            merged.get("sofascore_detail"),
+            merged.get("raw_sporty") or raw_sporty,
+            sportradar,
+        )
+        store_enriched(sportybet_id, merged)
+        stored += 1
+    return {
+        "status": "success",
+        "processed": processed,
+        "available": available,
+        "stored": stored,
+        "errors": errors[:25],
+    }
+
+
 @router.get("/matches/{sportybet_id}/sofascore-candidates")
 def get_sofascore_candidates(sportybet_id: str):
     """Return the full SofaScore pool for this SportyBet match state."""
     from app.buffer import _is_ghost_match, _sofascore_date_candidates
     from app.sofascore_client import fetch_all_scheduled_events, fetch_live_events, is_usable_event_for_mode
 
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found in buffer")
@@ -127,6 +267,27 @@ def get_sofascore_candidates(sportybet_id: str):
     if not live:
         sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
         scan_dates = _sofascore_date_candidates(sporty, target_date)
+        from app.buffer import _with_search_fallback_candidates
+
+        search_filtered = _with_search_fallback_candidates(sporty, [], live=False)
+        search_pool = sorted(
+            (_candidate_summary(event, doc, target_date) for event in search_filtered),
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+        confident_search = [item for item in search_pool if float(item.get("score") or 0) >= 0.70]
+        if confident_search:
+            return {
+                "status": "success",
+                "sportybet_id": sportybet_id,
+                "match_date": target_date,
+                "dates_scanned": scan_dates,
+                "mode": "prematch",
+                "count": len(confident_search),
+                "candidates": confident_search,
+                "best_score": float(search_pool[0].get("score") or 0),
+                "reason": "sofascore_search_fallback",
+            }
 
     try:
         if live:
@@ -157,6 +318,11 @@ def get_sofascore_candidates(sportybet_id: str):
         if not is_usable_event_for_mode(event, live=live):
             continue
         filtered.append(event)
+    if not live:
+        from app.buffer import _with_search_fallback_candidates
+
+        sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+        filtered = _with_search_fallback_candidates(sporty, filtered, live=False)
 
     candidate_pool = sorted(
         (_candidate_summary(event, doc, target_date) for event in filtered),
@@ -202,6 +368,7 @@ def match_sofascore_candidate(
     if sofa_id is None:
         raise HTTPException(status_code=400, detail="sofascore_id is required")
 
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
@@ -278,8 +445,8 @@ def refresh_predictions_today():
     """
     from datetime import date
     from app.league_memory import _init_db
-    from app.buffer import get_buffered_match, get_buffered_matches, refresh_sporty_buffer_scope, refresh_sporty_match_state, store_enriched
-    from app.prediction_flow import apply_prediction_state
+    from app.buffer import get_buffered_matches, refresh_sporty_buffer_scope
+    from app.agentic_prediction import AgentExecutionError, run_agentic_match_prediction
 
     today = date.today().isoformat()
     _init_db()
@@ -297,44 +464,44 @@ def refresh_predictions_today():
     predicted = 0
     errors = 0
     enriched = 0
+    skipped_already_predicted = 0
     skipped_inactive = 0
+    deferred = 0
+    agent_runs = []
     for doc in docs:
         match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
         try:
             if not match_id:
                 errors += 1
                 continue
-            try:
-                state = refresh_sporty_match_state(match_id)
-                if not state.get("active"):
-                    skipped_inactive += 1
-                    continue
-            except Exception:
-                state = {}
-            try:
-                from app.match_enrichment import enrich_buffered_match
-
-                enrich_buffered_match(match_id)
+            result = run_agentic_match_prediction(match_id)
+            state = result.get("prediction_state") or {}
+            completed_keys = {
+                item.get("key")
+                for item in (result.get("agent") or {}).get("completed", [])
+                if isinstance(item, dict)
+            }
+            if "enrich_context" in completed_keys:
                 enriched += 1
-                doc = get_buffered_match(match_id) or doc
-            except HTTPException as exc:
-                if exc.status_code == 409:
-                    skipped_inactive += 1
-                    continue
-            except Exception:
-                pass
-            state = apply_prediction_state(
-                doc,
-                match_id=match_id,
-                match_date=today,
-                source="enriched_ensemble",
-            )
-            store_enriched(match_id, doc)
             if state.get("status") == "predicted":
                 predicted += 1
+            elif state.get("status") == "skipped":
+                skipped_already_predicted += 1
+            elif state.get("status") == "deferred":
+                deferred += 1
             else:
                 errors += 1
-        except Exception as exc:
+            agent_runs.append({
+                "match_id": match_id,
+                "status": result.get("status"),
+                "prediction_status": state.get("status"),
+                "completed": list(completed_keys),
+            })
+        except AgentExecutionError as exc:
+            skipped_inactive += 1 if "inactive" in str(exc).lower() else 0
+            errors += 0 if "inactive" in str(exc).lower() else 1
+            agent_runs.append({"match_id": match_id, "status": "failed", "message": str(exc)})
+        except Exception:
             errors += 1
 
     return {
@@ -345,9 +512,16 @@ def refresh_predictions_today():
         "history_policy": "append_only",
         "enriched": enriched,
         "predicted": predicted,
+        "deferred": deferred,
+        "skipped_already_predicted": skipped_already_predicted,
         "errors": errors,
         "skipped_inactive": skipped_inactive,
         "total_matches": len(docs),
+        "agentic_execution": {
+            "mode": "plan_before_action",
+            "runs": agent_runs[:50],
+            "note": "Each match was validated, freshness-checked, readiness-checked, enriched only if needed, then predicted or skipped.",
+        },
     }
 
 
@@ -631,6 +805,123 @@ def get_system_audit(limit: int = Query(default=200, ge=20, le=1000)):
     return prediction_system_audit(limit=limit)
 
 
+@router.get("/system/authority")
+def get_system_authority():
+    """Current correction authority leases across self-healing loops."""
+    from app.loop_authority import authority_snapshot
+
+    return {
+        "status": "success",
+        "source_of_truth": "scheduler jobs plus scoped correction_authority_leases",
+        "scopes": {
+            "operational": "buffer/job cleanup only; held by system_supervisor",
+            "learning": "calibration/weight refresh only; held by prediction_monitor",
+            "flow": "ingest/enrich/grading catch-up only; held by scheduler/job guards",
+        },
+        "leases": authority_snapshot(),
+    }
+
+
+@router.post("/system/supervisor")
+def run_system_supervisor(auto_correct: bool = True, deep_audit: bool = False):
+    """Run the safe operational supervisor once."""
+    from app.system_supervisor import run_system_supervisor as _run_system_supervisor
+
+    return _run_system_supervisor(auto_correct=auto_correct, deep_audit=deep_audit)
+
+
+@router.get("/system/supervisor")
+def get_system_supervisor_snapshots(limit: int = Query(default=50, ge=1, le=300)):
+    """Recent supervisor observations, actions, and recurring operational issues."""
+    from app.system_supervisor import latest_supervisor_snapshots
+
+    return latest_supervisor_snapshots(limit=limit)
+
+
+@router.post("/system/prediction-monitor")
+def run_prediction_monitor(auto_correct: bool = True):
+    """Run the hourly prediction-quality monitor once."""
+    from app.prediction_monitor import run_prediction_monitor as _run_prediction_monitor
+
+    return _run_prediction_monitor(auto_correct=auto_correct)
+
+
+@router.get("/system/prediction-monitor")
+def get_prediction_monitor_snapshots(limit: int = Query(default=50, ge=1, le=300)):
+    """Recent prediction-quality snapshots, mismatch patterns, and accuracy trends."""
+    from app.prediction_monitor import latest_prediction_monitor_snapshots
+
+    return latest_prediction_monitor_snapshots(limit=limit)
+
+
+@router.get("/system/desk")
+def get_desk_observability(limit: int = Query(default=200, ge=20, le=1000)):
+    """Trading-desk style operational view: breaks, stale work, decision/risk log."""
+    from app.desk_analytics import desk_observability
+
+    return desk_observability(limit=limit)
+
+
+@router.get("/competition-special/world-cup/settings")
+def get_world_cup_special_settings():
+    """Settings-tab contract for the dedicated World Cup competition mode."""
+    from app.competition_special import get_competition_settings
+
+    return {"status": "success", "settings": get_competition_settings("world-cup-2026")}
+
+
+@router.post("/competition-special/world-cup/settings")
+def post_world_cup_special_settings(payload: dict[str, Any] = Body(...)):
+    """Enable/disable the World Cup special lane and adjust tournament ids/dates."""
+    from app.competition_special import update_competition_settings
+
+    return {"status": "success", "settings": update_competition_settings("world-cup-2026", payload)}
+
+
+@router.post("/competition-special/world-cup/sync")
+def post_world_cup_special_sync(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit_days: int = Query(default=60, ge=1, le=90),
+):
+    """Pull the World Cup fixture list into the dedicated competition buffer."""
+    from app.competition_special import sync_competition_fixtures
+
+    return sync_competition_fixtures(
+        "world-cup-2026",
+        start_date=start_date,
+        end_date=end_date,
+        limit_days=limit_days,
+    )
+
+
+@router.post("/competition-special/world-cup/enrich-predict")
+def post_world_cup_special_enrich_predict(
+    limit: int = Query(default=12, ge=1, le=80),
+    allow_repeat: bool = False,
+):
+    """Enrich World Cup rows from SofaScore and run the special prediction path."""
+    from app.competition_special import enrich_predict_competition
+
+    return enrich_predict_competition("world-cup-2026", limit=limit, allow_repeat=allow_repeat)
+
+
+@router.get("/competition-special/world-cup/buffer")
+def get_world_cup_special_buffer(limit: int = Query(default=200, ge=1, le=500)):
+    """Dedicated World Cup buffer: fixtures, groups, match state, enrichment, predictions."""
+    from app.competition_special import list_competition_buffer
+
+    return list_competition_buffer("world-cup-2026", limit=limit)
+
+
+@router.get("/competition-special/world-cup/status")
+def get_world_cup_special_status():
+    """Small health summary for the Settings tab and World Cup page."""
+    from app.competition_special import competition_status
+
+    return competition_status("world-cup-2026")
+
+
 @router.get("/analytics/clv")
 def get_clv_analytics(days: int = Query(default=30, ge=1, le=365)):
     """
@@ -656,6 +947,22 @@ def get_calibration():
     """Historical win rate per pick_type × confidence band. Used to size stakes."""
     from app.confidence_calibrator import get_calibration_table
     return {"status": "success", "calibration": get_calibration_table()}
+
+
+@router.get("/analytics/backtest-gate")
+def get_backtest_gate(limit: int = Query(default=1000, ge=50, le=10000), min_samples: int = Query(default=50, ge=10, le=1000)):
+    """Stored-decision replay gate used before trusting model/rule changes."""
+    from app.desk_analytics import backtest_gate
+
+    return backtest_gate(limit=limit, min_samples=min_samples)
+
+
+@router.get("/analytics/signal-attribution")
+def get_signal_attribution(min_samples: int = Query(default=5, ge=1, le=100), limit: int = Query(default=5000, ge=100, le=20000)):
+    """Signal attribution from graded primary and candidate prediction rows."""
+    from app.desk_analytics import signal_attribution_report
+
+    return signal_attribution_report(min_samples=min_samples, limit=limit)
 
 
 @router.post("/analytics/calibration/rebuild")
@@ -723,7 +1030,7 @@ def grade_results(hours_back: int = 24):
     import json
     from datetime import date as _date, timedelta as _timedelta
     from app.sportybet_client import fetch_results
-    from app.league_memory import DB_PATH, _init_db, _grade_pick_for_match, grade_overdue_predictions, grade_predictions_for_date
+    from app.league_memory import DB_PATH, _init_db, _grade_pick_for_match, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
     from app.prediction_audit import grading_reason
     from app.mongo_store import archive_finished_match_from_buffer
     from app.sofascore_client import fetch_all_scheduled_events
@@ -750,8 +1057,8 @@ def grade_results(hours_back: int = 24):
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         pending = conn.execute(
-            "select id, match_id, match_name, league_name, pick_type, selection, "
-            "confidence, signals_json, "
+            "select id, match_id, match_name, league_name, country_name, pick_type, selection, "
+            "confidence, signals_json, audit_json, "
             "(select match_date from match_buffer where match_id=ph.match_id limit 1) as match_date "
             "from prediction_history ph "
             "where graded_at is null and pick_type != 'no_bet'"
@@ -773,25 +1080,45 @@ def grade_results(hours_back: int = 24):
                 (outcome, score["home"], score["away"], json.dumps(grade_info), row["id"]),
             )
             conn.commit()
-        # store signal outcomes in MongoDB
+        # Store decision-signal outcomes in local device memory; Mongo is only an optional mirror.
         try:
-            from app.mongo_store import store_signal_outcomes, is_configured
-            if is_configured():
-                signals = json.loads(row["signals_json"]) if row["signals_json"] else []
-                tournament = row["league_name"] or ""
-                country = tournament.split(" - ")[0].strip() if " - " in tournament else ""
-                store_signal_outcomes(
-                    match_id=str(row["match_id"]),
-                    match_name=row["match_name"],
-                    tournament=tournament,
-                    country=country,
-                    match_date=row["match_date"],
-                    signals=signals,
-                    result=outcome,
-                    pick_type=row["pick_type"],
-                    selection=row["selection"],
-                    confidence=row["confidence"],
-                )
+            from app.self_learner import _decision_signals_for_row
+
+            signals = _decision_signals_for_row(row)
+        except Exception:
+            signals = json.loads(row["signals_json"]) if row["signals_json"] else []
+        try:
+            tournament = row["league_name"] or ""
+            country = row["country_name"] or (tournament.split(" - ")[0].strip() if " - " in tournament else "")
+            store_local_signal_outcomes(
+                match_id=str(row["match_id"]),
+                match_name=row["match_name"],
+                tournament=tournament,
+                country=country,
+                match_date=row["match_date"],
+                signals=signals,
+                result=outcome,
+                pick_type=row["pick_type"],
+                selection=row["selection"],
+                confidence=row["confidence"],
+            )
+            try:
+                from app.mongo_store import store_signal_outcomes, is_configured
+                if is_configured():
+                    store_signal_outcomes(
+                        match_id=str(row["match_id"]),
+                        match_name=row["match_name"],
+                        tournament=tournament,
+                        country=country,
+                        match_date=row["match_date"],
+                        signals=signals,
+                        result=outcome,
+                        pick_type=row["pick_type"],
+                        selection=row["selection"],
+                        confidence=row["confidence"],
+                    )
+            except Exception:
+                pass
         except Exception:
             pass
         graded += 1
@@ -905,12 +1232,10 @@ def get_signal_analytics(
     Signal win rate analytics.
     Scope: whole DB (default), filtered by country, or filtered by tournament.
     """
-    from app.mongo_store import get_signal_stats, is_configured
-    if not is_configured():
-        raise HTTPException(status_code=503, detail="MongoDB not configured")
+    from app.league_memory import get_local_signal_stats
     return {
         "status": "success",
-        **get_signal_stats(
+        **get_local_signal_stats(
             country=country or None,
             tournament=tournament or None,
             min_samples=min_samples,
@@ -1392,77 +1717,63 @@ def enrich_match_endpoint(sportybet_id: str):
     try:
         from app.match_enrichment import MatchEnrichmentError, enrich_buffered_match
 
+        sportybet_id = _resolve_buffer_match_id(sportybet_id)
         return enrich_buffered_match(sportybet_id)
     except MatchEnrichmentError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 @router.post("/matches/{sportybet_id}/predict")
-def predict_single_match(sportybet_id: str):
-    """Run every available model on the richest available match data."""
-    from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
-    from app.enriched_prediction import prediction_readiness
-    from app.prediction_flow import apply_prediction_state
-    from datetime import date
-
-    refresh_state = refresh_sporty_match_state(sportybet_id)
-    if not refresh_state.get("active"):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Prediction blocked because the match is not active after fresh SportyBet odds/time check",
-                "refresh": refresh_state,
-            },
-        )
-
-    doc = get_buffered_match(sportybet_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+def predict_single_match(
+    sportybet_id: str,
+    force_enrich: bool = False,
+    allow_repeat: bool = False,
+    dry_run: bool = False,
+):
+    """Plan, enrich only when needed, then predict with bounded agentic execution."""
+    from app.agentic_prediction import AgentExecutionError, run_agentic_match_prediction
 
     try:
-        from app.match_enrichment import enrich_buffered_match
-
-        enrich_buffered_match(sportybet_id)
-        doc = get_buffered_match(sportybet_id) or doc
-    except HTTPException as exc:
-        if exc.status_code == 409:
-            raise
-    except Exception:
-        pass
-
-    readiness = prediction_readiness(doc)
-    if not readiness["ready"]:
-        doc["prediction"] = None
-        doc["prediction_error"] = "Prediction deferred until full signal is ready" + (
-            f": {', '.join(readiness.get('missing') or [])}" if readiness.get("missing") else ""
+        sportybet_id = _resolve_buffer_match_id(sportybet_id)
+        result = run_agentic_match_prediction(
+            sportybet_id,
+            force_enrich=force_enrich,
+            allow_repeat=allow_repeat,
+            dry_run=dry_run,
         )
-        doc["prediction_readiness"] = readiness
-        store_enriched(sportybet_id, doc)
+    except AgentExecutionError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc), "agent": exc.trace})
+
+    state = result.get("prediction_state") or {}
+    if result.get("status") == "deferred":
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "Prediction deferred until full signal is ready",
-                "readiness": readiness,
+                "message": state.get("message") or "Prediction deferred until full signal is ready",
+                "readiness": result.get("readiness"),
+                "agent": result.get("agent"),
             },
         )
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"message": state.get("message") or "Prediction failed", "agent": result.get("agent")})
+    if result.get("status") == "skipped":
+        return {
+            "status": "success",
+            "sportybet_id": sportybet_id,
+            "sporty_refresh": result.get("sporty_refresh"),
+            "prediction": result.get("prediction") or _latest_prediction(sportybet_id),
+            "skipped": True,
+            "skip_reason": state.get("skip_reason"),
+            "agent": result.get("agent"),
+        }
 
-    state = apply_prediction_state(
-        doc,
-            match_id=sportybet_id,
-            match_date=doc.get("match_date") or date.today().isoformat(),
-            source="enriched_ensemble",
-            attach_brain=True,
-    )
-    store_enriched(sportybet_id, doc)
-    if state.get("status") == "deferred":
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "Prediction deferred until full signal is ready", "readiness": state.get("readiness")},
-        )
-    if state.get("status") == "error":
-        raise HTTPException(status_code=500, detail=state.get("message") or "Prediction failed")
-
-    return {"status": "success", "sportybet_id": sportybet_id, "sporty_refresh": refresh_state, "prediction": state.get("prediction")}
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "sporty_refresh": result.get("sporty_refresh"),
+        "prediction": result.get("prediction"),
+        "agent": result.get("agent"),
+    }
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
@@ -1475,6 +1786,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
     home_form = form.get("homeTeam") or form.get("home_team") or {}
     away_form = form.get("awayTeam") or form.get("away_team") or {}
     web = doc.get("web_context") or {}
+    sportradar = doc.get("sportradar_detail") or {}
     sportybet_id = str(doc.get("sportybet_id") or doc.get("id") or "")
     readiness = prediction_readiness(doc)
     match_state = classify_match_state(doc)
@@ -1512,6 +1824,12 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
                 "detail": bool(detail),
                 "status": doc.get("sofascore_match_status"),
             },
+            "sportradar": {
+                "available": bool(sportradar.get("available")),
+                "detail": bool(sportradar.get("match")),
+                "standings": bool(sportradar.get("standings")),
+                "error": sportradar.get("error") or sportradar.get("standings_error"),
+            },
             "ready_for_prediction": bool(readiness.get("ready")),
             "missing": readiness.get("missing") or [],
         },
@@ -1519,6 +1837,8 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "sportybet_data_status": doc.get("sportybet_data_status"),
         "has_sportybet_detail": bool(doc.get("sportybet_detail") or doc.get("raw_sporty")),
         "has_sofascore": bool(detail),
+        "has_sportradar": bool(sportradar.get("available")),
+        "sportradar_detail": sportradar,
         "odds_1x2": _extract_1x2(doc.get("sportybet_markets") or doc.get("markets") or []),
         "all_markets": doc.get("sportybet_markets") or doc.get("markets") or [],
         "home_manager": _manager_name(managers, "home"),
@@ -1625,7 +1945,7 @@ def _local_finished_match(match_id: str) -> dict[str, Any] | None:
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "select raw_doc from finished_matches where match_id = ?",
+                "select coalesce(raw_doc, raw_json) as raw_doc from finished_matches where match_id = ?",
                 (str(match_id),),
             ).fetchone()
         if not row or not row["raw_doc"]:
@@ -1926,16 +2246,14 @@ def _latest_prediction(match_id: str) -> dict[str, Any] | None:
 
 
 def _grade_signal_stats(graded: int) -> dict[str, Any]:
-    """Quick signal win rate summary from MongoDB after grading."""
+    """Quick signal win rate summary from local device memory after grading."""
     if graded == 0:
         return {}
     try:
-        from app.mongo_store import get_signal_stats, is_configured
-        if not is_configured():
-            return {}
-        stats = get_signal_stats(min_samples=3)
+        from app.league_memory import get_local_signal_stats
+        stats = get_local_signal_stats(min_samples=3)
         top = stats.get("signals", [])[:5]
-        return {"top_signals": top, "scope": "all"}
+        return {"top_signals": top, "scope": "device"}
     except Exception:
         return {}
 
@@ -1964,6 +2282,15 @@ def trigger_learning_cycle():
     from app.self_learner import run_learning_cycle
     result = run_learning_cycle()
     return {"status": "success", **result}
+
+
+def _resolve_buffer_match_id(match_id: str) -> str:
+    if not match_id or ":" in match_id:
+        return match_id
+    prefixed = f"competition:world-cup-2026:{match_id}"
+    if get_buffered_match(prefixed):
+        return prefixed
+    return match_id
 
 
 @router.get("/analytics/brain/signals")

@@ -12,6 +12,7 @@ from app.scheduler import (
     job_archive_finished,
     job_flush_to_mongo,
     job_live_priority,
+    job_competition_special,
     get_live_priority_mode,
     set_live_priority_mode,
     scheduler_status,
@@ -127,6 +128,15 @@ def post_scan_live_priority(
 ):
     try:
         return run_job_with_guard(job_live_priority, count=count, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/scan/world-cup-special")
+def post_scan_world_cup_special():
+    """Manual run for the dedicated World Cup competition lane."""
+    try:
+        return run_job_with_guard(job_competition_special)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 

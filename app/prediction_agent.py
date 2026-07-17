@@ -129,7 +129,7 @@ def predict_sofascore_event(
     home_power = form_edge + league_edge + h2h_edge + table_edge + odds_edge + common_opp_edge
     if abs(home_power) >= 8:
         side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
-        picks.append(_pick("match_result", f"{side} or draw protection", 55 + min(abs(home_power), 25), "stronger side with safety"))
+        picks.append(_pick("match_result", f"{side} Win", 55 + min(abs(home_power), 25), "stronger side has a decisive edge"))
     elif abs(home_power) >= 4:
         side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
         picks.append(_pick("double_chance", f"{side} double chance", 52 + min(abs(home_power), 20), "small edge, safer market"))

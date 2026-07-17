@@ -8,7 +8,8 @@ from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enr
 from app.enrichment import FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD, _fuzzy_match, _is_junk, _llm_match
 from app.market import snapshot_odds
 from app.match_state import classify_match_state
-from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events, is_usable_event_for_mode
+from app.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_event_detail, fetch_live_events, is_terminal_event, is_usable_event_for_mode
+from app.sportradar_client import fetch_match_intelligence
 from app.time_context import match_time_context
 from app.web_context import search_match_context
 
@@ -82,6 +83,8 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
     except Exception:
         pass
 
+    sportradar_detail = fetch_match_intelligence(sporty.get("id") or sportybet_id)
+
     now = datetime.now(timezone.utc).isoformat()
     markets = sporty.get("markets") or []
     match_status = "matched" if sofa else "no_match"
@@ -96,11 +99,16 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "markets": markets,
         "sportybet_detail": _sporty_detail(sporty, sportybet_id, markets, now),
         "sportybet_data_status": "stale_buffer_fallback" if sporty_fallback_used else "available",
-        "data_sources": _data_sources(sofa, detail, sporty, markets, fresh=not sporty_fallback_used),
+        "data_sources": _data_sources(sofa, detail, sporty, markets, fresh=not sporty_fallback_used, sportradar=sportradar_detail),
+        "sportradar_detail": sportradar_detail,
         "sofascore_id": sofa.get("id") if sofa else None,
         "sofascore_name": sofa.get("name") if sofa else None,
         "sofascore_event": sofa,
         "sofascore_detail": detail,
+        "home_last_matches": (detail or {}).get("home_last_matches") or [],
+        "away_last_matches": (detail or {}).get("away_last_matches") or [],
+        "standings": (detail or {}).get("standings") or [],
+        "league_table": (detail or {}).get("standings") or [],
         "sofascore_match_status": match_status,
         "sofascore_best_score": round(score, 3),
         "sofascore_no_match_at": None if sofa else now,
@@ -137,6 +145,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "match_source": source,
         "has_detail": bool(detail),
         "has_web_context": bool(web_context.get("snippets")),
+        "has_sportradar": bool(sportradar_detail.get("available")),
         "web_context_query": web_context.get("query"),
         "sporty_refresh": refresh_state,
         "enriched_at": now,
@@ -152,12 +161,27 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
         score = _candidate_score(sofa, doc) if sofa else float(doc.get("match_score") or 1.0)
         return sofa, score, "manual"
 
+    if not _is_live_doc(doc):
+        try:
+            from app.buffer import _with_search_fallback_candidates
+
+            search_events = _with_search_fallback_candidates(sporty, [], live=False)
+            sofa, score = _fuzzy_match(sporty, search_events)
+            if sofa and score >= FUZZY_THRESHOLD:
+                return sofa, score, "search"
+        except Exception:
+            pass
+
     try:
         sofa_events = fetch_live_events() if _is_live_doc(doc) else fetch_all_scheduled_events(match_date)
         sofa_events = [
             event for event in sofa_events
             if is_usable_event_for_mode(event, live=_is_live_doc(doc))
         ]
+        if not _is_live_doc(doc):
+            from app.buffer import _with_search_fallback_candidates
+
+            sofa_events = _with_search_fallback_candidates(sporty, sofa_events, live=False)
     except Exception:
         sofa_events = []
 
@@ -178,14 +202,22 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
 
 
 def _find_sofascore_event(sofa_id: str, match_date: str, live: bool) -> dict[str, Any] | None:
+    # When we already have the ID (saved from a previous match or manual link),
+    # skip the usability gate — just find the event and trust it. The gate was
+    # causing matched=0 for live matches whose SofaScore status was "notstarted"
+    # (prematch window) or for prematch matches whose status was "inprogress"
+    # (kicked off between enrichment cycles).
+
+    # 1. Check live feed first (fastest for in-play matches)
     if live:
         try:
-            match = next((event for event in fetch_live_events() if str(event.get("id")) == sofa_id), None)
-            if match and is_usable_event_for_mode(match, live=True):
+            match = next((e for e in fetch_live_events() if str(e.get("id")) == sofa_id), None)
+            if match and not is_terminal_event(match):
                 return match
         except Exception:
             pass
 
+    # 2. Check scheduled feed for the match date + today
     dates: list[str] = []
     for value in (match_date, date.today().isoformat()):
         if value and value not in dates:
@@ -195,9 +227,18 @@ def _find_sofascore_event(sofa_id: str, match_date: str, live: bool) -> dict[str
             events = fetch_all_scheduled_events(target_date)
         except Exception:
             continue
-        match = next((event for event in events if str(event.get("id")) == sofa_id), None)
-        if match and is_usable_event_for_mode(match, live=False):
+        match = next((e for e in events if str(e.get("id")) == sofa_id), None)
+        if match and not is_terminal_event(match):
             return match
+
+    # 3. Direct event fetch as final fallback — works regardless of date/status
+    try:
+        match = fetch_event(sofa_id)
+        if match and not is_terminal_event(match):
+            return match
+    except Exception:
+        pass
+
     return None
 
 
@@ -234,6 +275,7 @@ def _data_sources(
     markets: list[dict[str, Any]],
     *,
     fresh: bool = True,
+    sportradar: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "sportybet": {
@@ -250,6 +292,12 @@ def _data_sources(
             "detail": bool(detail),
             "statistics": bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics")),
             "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
+        },
+        "sportradar": {
+            "available": bool((sportradar or {}).get("available")),
+            "detail": bool((sportradar or {}).get("match")),
+            "standings": bool((sportradar or {}).get("standings")),
+            "error": (sportradar or {}).get("error") or (sportradar or {}).get("standings_error"),
         },
     }
 

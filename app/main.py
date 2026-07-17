@@ -6,7 +6,12 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings, public_settings
 from app.league_memory import DB_PATH, _init_db
-from app.routers import agent, frontend, mongo, platform, sporty, sofascore
+from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore
+from app.routers import sofa_pipeline as sofa_pipeline_router
+from app.routers import pipelines as pipelines_router
+from app.routers import scheduler as scheduler_router
+from app.routers import diagnostics as diagnostics_router
+from app.routers import composite as composite_router
 from app.scheduler import start_scheduler
 
 settings = get_settings()
@@ -15,6 +20,14 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_db()
+    # ── Initialize default pipeline states on first boot ──────────────────────
+    try:
+        from app.pipeline_registry import ensure_default_states
+        initialised = ensure_default_states()
+        if initialised:
+            print(f"[startup] pipeline defaults set: {initialised}")
+    except Exception as exc:
+        print(f"[startup] pipeline default init failed: {exc}")
     # Clean up any finished matches left in buffer from previous run
     try:
         from app.mongo_store import cleanup_buffer
@@ -33,6 +46,14 @@ async def lifespan(app: FastAPI):
     try:
         if settings.environment != "test":
             start_scheduler()
+        print(
+            "[startup] prediction thresholds: "
+            f"calibration_samples={settings.validation_gate_min_calibration_samples}, "
+            f"clv_samples={settings.validation_gate_min_clv_samples}, "
+            f"volatility_hard_block={settings.risk_manager_volatility_hard_block_threshold}, "
+            f"bootstrap_confidence_ceiling={settings.risk_manager_bootstrap_confidence_ceiling}, "
+            f"clear_winner_gap={settings.clear_winner_probability_gap}"
+        )
         yield
     finally:
         await _close_live_websockets()
@@ -55,6 +76,12 @@ app.include_router(agent.router)
 app.include_router(frontend.router)
 app.include_router(platform.router)
 app.include_router(mongo.router)
+app.include_router(mobile_bridge.router)
+app.include_router(sofa_pipeline_router.router)
+app.include_router(pipelines_router.router)
+app.include_router(scheduler_router.router)
+app.include_router(diagnostics_router.router)
+app.include_router(composite_router.router)
 
 
 connected_clients: list[WebSocket] = []

@@ -88,13 +88,28 @@ def extract_pattern(match_id: str) -> list[dict[str, Any]]:
             order by snapshot_time asc
         """, (str(match_id),)).fetchall()
 
-        # Per-market series
-        market_rows = conn.execute("""
+        # Per-market series (prefer lean change points when present)
+        market_table = "odds_market_snapshots"
+        try:
+            conn.execute("select 1 from odds_market_changes limit 1")
+            has_changes = conn.execute(
+                "select 1 from odds_market_changes where match_id = ? limit 1",
+                (str(match_id),),
+            ).fetchone()
+            if has_changes:
+                market_table = "odds_market_changes"
+        except sqlite3.OperationalError:
+            market_table = "odds_market_snapshots"
+
+        market_rows = conn.execute(
+            f"""
             select market_name, specifier, selection_name, odds, snapshot_time, match_date
-            from odds_market_snapshots
+            from {market_table}
             where match_id = ? and odds is not null
             order by market_name, specifier, selection_name, snapshot_time asc
-        """, (str(match_id),)).fetchall()
+            """,
+            (str(match_id),),
+        ).fetchall()
 
     features = []
     match_date = rows_1x2[0]["match_date"] if rows_1x2 else None

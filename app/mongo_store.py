@@ -5,7 +5,10 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from pymongo import MongoClient
+try:
+    from pymongo import MongoClient
+except Exception:  # pragma: no cover - optional dependency on local-only installs
+    MongoClient = None
 
 from app.config import get_settings
 
@@ -14,7 +17,8 @@ _db = None
 
 
 def is_configured() -> bool:
-    return bool(get_settings().mongodb_uri)
+    settings = get_settings()
+    return bool(settings.mongodb_uri) and not settings.local_storage_only and MongoClient is not None
 
 
 def _get_db():
@@ -23,6 +27,8 @@ def _get_db():
         settings = get_settings()
         if not settings.mongodb_uri:
             raise RuntimeError("MONGODB_URI is not configured")
+        if MongoClient is None:
+            raise RuntimeError("pymongo is not installed")
         _client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=8000)
         _db = _client[settings.mongodb_db]
     return _db
@@ -36,6 +42,10 @@ def init_mongo() -> dict[str, Any]:
     _get_db()["signal_outcomes"].create_index("tournament")
     _get_db()["signal_outcomes"].create_index("country")
     _get_db()["signal_outcomes"].create_index("result")
+    _get_db()["signal_outcomes"].create_index(
+        [("match_id", 1), ("pick_type", 1), ("selection", 1), ("signal_name", 1)],
+        name="uniq_signal_outcome_pick",
+    )
     return {"configured": True, "database": get_settings().mongodb_db}
 
 
@@ -216,7 +226,17 @@ def store_signal_outcomes(
             "recorded_at": now,
         })
     if docs:
-        _get_db()["signal_outcomes"].insert_many(docs)
+        for doc in docs:
+            _get_db()["signal_outcomes"].update_one(
+                {
+                    "match_id": doc["match_id"],
+                    "pick_type": doc["pick_type"],
+                    "selection": doc["selection"],
+                    "signal_name": doc["signal_name"],
+                },
+                {"$set": doc},
+                upsert=True,
+            )
     return len(docs)
 
 
@@ -304,6 +324,7 @@ def flush_buffer_to_mongo(match_date: str | None = None) -> dict[str, Any]:
 def cleanup_buffer() -> dict[str, Any]:
     from app.league_memory import DB_PATH, _init_db
     from datetime import datetime, timezone
+    settings = get_settings()
     _init_db()
 
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -323,7 +344,11 @@ def cleanup_buffer() -> dict[str, Any]:
     for row in rows_to_archive:
         try:
             if is_configured():
-                archive_finished_match_from_buffer(str(row["match_id"]))
+                try:
+                    archive_finished_match_from_buffer(str(row["match_id"]))
+                except Exception:
+                    from app.buffer import _archive_finished_locally
+                    _archive_finished_locally(str(row["match_id"]))
             else:
                 from app.buffer import _archive_finished_locally
                 _archive_finished_locally(str(row["match_id"]))
@@ -352,24 +377,28 @@ def cleanup_buffer() -> dict[str, Any]:
             )
             """
         )
-        # Delete ghost matches — kick-off passed 2+ hours ago, still not started
-        # start_time from SportyBet is Unix milliseconds (13-digit)
-        ghost_cutoff_ms = (now_ts - 120 * 60) * 1000
-        r4 = conn.execute(
-            """
-            delete from match_buffer
-            where is_live = 0
-              and is_finished = 0
-              and start_time is not null
-              and cast(start_time as real) < ?
-              and (period is null or lower(period) in ('not start', 'not started', ''))
-            """,
-            (ghost_cutoff_ms,),
-        )
-        # Delete stale unenriched rows older than 1 day
-        r5 = conn.execute(
-            "delete from match_buffer where enriched_at is null and datetime(ingested_at) < datetime('now', '-1 day')"
-        )
+        if settings.disable_pruning:
+            r4 = _RowCountStub()
+            r5 = _RowCountStub()
+        else:
+            # Delete ghost matches — kick-off passed 2+ hours ago, still not started
+            # start_time from SportyBet is Unix milliseconds (13-digit)
+            ghost_cutoff_ms = (now_ts - 120 * 60) * 1000
+            r4 = conn.execute(
+                """
+                delete from match_buffer
+                where is_live = 0
+                  and is_finished = 0
+                  and start_time is not null
+                  and cast(start_time as real) < ?
+                  and (period is null or lower(period) in ('not start', 'not started', ''))
+                """,
+                (ghost_cutoff_ms,),
+            )
+            # Delete stale unenriched rows older than 1 day
+            r5 = conn.execute(
+                "delete from match_buffer where enriched_at is null and datetime(ingested_at) < datetime('now', '-1 day')"
+            )
         conn.commit()
     return {
         "deleted_finished":         r1.rowcount + r2.rowcount,
@@ -379,7 +408,26 @@ def cleanup_buffer() -> dict[str, Any]:
     }
 
 def store_scheduled_matches(*args, **kwargs) -> int:
-    return 0
+    if not is_configured():
+        return 0
+    events = list(args[0] if args else kwargs.get("events") or [])
+    match_date = kwargs.get("match_date")
+    stored = 0
+    for event in events:
+        status = event.get("status") or {}
+        status_type = (status.get("type") if isinstance(status, dict) else status) or ""
+        if str(status_type).lower() != "finished":
+            continue
+        archive_doc = _scheduled_event_archive_doc(event, match_date=match_date)
+        if not archive_doc:
+            continue
+        _get_db()["finished_matches"].update_one(
+            {"_id": archive_doc["_id"]},
+            {"$set": archive_doc},
+            upsert=True,
+        )
+        stored += 1
+    return stored
 
 def store_enriched_matches(*args, **kwargs) -> int:
     return 0
@@ -393,8 +441,22 @@ def get_enriched_matches(match_date: str | None = None, limit: int = 500) -> lis
 def save_odds_snapshot(*args, **kwargs) -> bool:
     return False
 
-def save_finished_match(*args, **kwargs) -> bool:
-    return False
+def save_finished_match(source: str, match: dict[str, Any]) -> bool:
+    if not is_configured():
+        return False
+    archive_doc = _manual_finished_archive_doc(source, match)
+    if not archive_doc:
+        return False
+    _get_db()["finished_matches"].update_one(
+        {"_id": archive_doc["_id"]},
+        {"$set": archive_doc},
+        upsert=True,
+    )
+    return True
+
+
+class _RowCountStub:
+    rowcount = 0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -432,3 +494,96 @@ def _latest_prediction(match_id: str) -> dict[str, Any] | None:
         return {"type": row["pick_type"], "selection": row["selection"], "confidence": row["confidence"], "reason": row["reason"]}
     except Exception:
         return None
+
+
+def _scheduled_event_archive_doc(event: dict[str, Any], *, match_date: str | None = None) -> dict[str, Any] | None:
+    match_id = str(event.get("match_id") or event.get("id") or event.get("_id") or "")
+    if not match_id:
+        return None
+    home_team = event.get("homeTeam") or event.get("home_team") or {}
+    away_team = event.get("awayTeam") or event.get("away_team") or {}
+    tournament = event.get("tournament") or {}
+    score = event.get("score") or {}
+    status = event.get("status") or {}
+    return {
+        "_id": match_id,
+        "match_id": match_id,
+        "match_date": match_date or event.get("match_date"),
+        "name": event.get("name") or _event_name(home_team, away_team),
+        "home_team": _team_name(home_team),
+        "away_team": _team_name(away_team),
+        "home_team_id": _team_id(home_team),
+        "away_team_id": _team_id(away_team),
+        "tournament": tournament.get("name") if isinstance(tournament, dict) else tournament,
+        "score": {
+            "home": _score_value(score, "home"),
+            "away": _score_value(score, "away"),
+        },
+        "period": status.get("description") if isinstance(status, dict) else status,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "sofascore_detail": event,
+        "data_sources": {"sofascore": True},
+        "archive_source": "sofascore_scheduled",
+    }
+
+
+def _manual_finished_archive_doc(source: str, match: dict[str, Any]) -> dict[str, Any] | None:
+    match_id = str(match.get("match_id") or match.get("id") or match.get("_id") or "")
+    if not match_id:
+        return None
+    tournament = match.get("tournament") or {}
+    score = match.get("score") or {}
+    home_team = match.get("home_team") or match.get("homeTeam") or {}
+    away_team = match.get("away_team") or match.get("awayTeam") or {}
+    return {
+        "_id": match_id,
+        "match_id": match_id,
+        "match_date": match.get("match_date"),
+        "name": match.get("name") or _event_name(home_team, away_team),
+        "home_team": _team_name(home_team),
+        "away_team": _team_name(away_team),
+        "home_team_id": _team_id(home_team),
+        "away_team_id": _team_id(away_team),
+        "tournament": tournament.get("name") if isinstance(tournament, dict) else tournament,
+        "score": {
+            "home": _score_value(score, "home", fallback=match.get("final_home_goals")),
+            "away": _score_value(score, "away", fallback=match.get("final_away_goals")),
+        },
+        "period": match.get("period") or "FT",
+        "finished_at": match.get("finished_at") or datetime.now(timezone.utc).isoformat(),
+        "archive_source": source,
+        "raw_doc": match,
+    }
+
+
+def _team_name(team: Any) -> str | None:
+    if isinstance(team, dict):
+        return team.get("name")
+    return team or None
+
+
+def _team_id(team: Any) -> str | int | None:
+    if isinstance(team, dict):
+        return team.get("id")
+    return None
+
+
+def _event_name(home_team: Any, away_team: Any) -> str | None:
+    home = _team_name(home_team)
+    away = _team_name(away_team)
+    if home and away:
+        return f"{home} vs {away}"
+    return home or away
+
+
+def _score_value(score: Any, side: str, *, fallback: Any = None) -> int | None:
+    if isinstance(score, dict):
+        value = score.get(side)
+        if value is None:
+            side_block = score.get(side) or {}
+            if isinstance(side_block, dict):
+                value = side_block.get("current") or side_block.get("display")
+        parsed = _to_int(value)
+        if parsed is not None:
+            return parsed
+    return _to_int(fallback)

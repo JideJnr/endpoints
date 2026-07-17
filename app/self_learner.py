@@ -46,10 +46,23 @@ UNIQUE_GRADED_HISTORY = """
                 partition by match_id, pick_type, selection
                 order by datetime(coalesce(graded_at, created_at)) desc, id desc
             ) as rn
-        from prediction_history ph
-        where graded_at is not null
-          and result in ('win', 'loss')
-          and pick_type != 'no_bet'
+        from (
+            select id, match_id, league_name, country_name, pick_type,
+                   selection, confidence, result, signals_json, audit_json, '{}' as context_json,
+                   created_at, graded_at
+            from prediction_history
+            where graded_at is not null
+              and result in ('win', 'loss')
+              and pick_type != 'no_bet'
+            union all
+            select id, match_id, league_name, country_name, pick_type,
+                   selection, confidence, result, signals_json, audit_json, context_json,
+                   created_at, graded_at
+            from prediction_candidate_history
+            where graded_at is not null
+              and result in ('win', 'loss')
+              and pick_type != 'no_bet'
+        ) ph
     )
     where rn = 1
 """
@@ -137,7 +150,7 @@ def run_learning_cycle() -> dict[str, Any]:
         rows = conn.execute(f"""
             select
                 match_id, league_name, country_name, pick_type,
-                selection, confidence, result, signals_json, created_at
+                selection, confidence, result, signals_json, audit_json, context_json, created_at
             from ({UNIQUE_GRADED_HISTORY})
             order by created_at desc
         """).fetchall()
@@ -153,7 +166,7 @@ def run_learning_cycle() -> dict[str, Any]:
         league_key = _norm_league(row["league_name"] or "")
         result = row["result"]
         pick_type = row["pick_type"] or "unknown"
-        signals = _safe_json(row["signals_json"])
+        signals = _decision_signals_for_row(row)
 
         for sig in signals:
             name = str(sig.get("name") or "")
@@ -199,7 +212,7 @@ def run_learning_cycle() -> dict[str, Any]:
     model_stats: dict[str, dict] = {m: {"samples": 0, "wins": 0} for m in model_signal_map}
 
     for row in rows:
-        signals = _safe_json(row["signals_json"])
+        signals = _decision_signals_for_row(row)
         signal_names = {str(s.get("name") or "") for s in signals}
         result = row["result"]
         for model, model_signals in model_signal_map.items():
@@ -216,6 +229,10 @@ def run_learning_cycle() -> dict[str, Any]:
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_learner_tables(conn)
         now = datetime.now(timezone.utc).isoformat()
+        conn.execute("delete from signal_weights")
+        conn.execute("delete from signal_pick_weights")
+        conn.execute("delete from league_accuracy")
+        conn.execute("delete from learned_model_weights")
 
         # Signal weights
         for (signal_name, league_key), stats in signal_stats.items():
@@ -545,6 +562,155 @@ def _tally(stats: dict, key: tuple, result: str) -> None:
         stats[key]["losses"] += 1
 
 
+def _decision_signals_for_row(row: sqlite3.Row) -> list[dict[str, Any]]:
+    """Return only signals that plausibly drove this row's market decision.
+
+    Prediction rows keep many background signals for auditability. Learning from
+    all of them blurs attribution, so this filter trains weights on market-
+    relevant evidence first and falls back to strong support signals only when
+    the pick type is unknown.
+    """
+    signals = _safe_json(row["signals_json"])
+    if not signals:
+        return []
+
+    audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
+    context = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)
+    pick_type = str(row["pick_type"] or "").lower()
+    selection = str(row["selection"] or "").lower()
+    allowed = _market_signal_names(pick_type, selection, context)
+    support_names = _audit_support_signal_names(audit)
+
+    decision: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for signal in signals:
+        name = str(signal.get("name") or "")
+        if not name or name in seen:
+            continue
+        if name in allowed or name in support_names or _signal_mentions_selection(signal, selection):
+            decision.append(signal)
+            seen.add(name)
+
+    if decision:
+        return decision
+
+    # Conservative fallback: use high-impact support/risk signals, but keep
+    # generic source-presence signals out of the learner.
+    for signal in signals:
+        name = str(signal.get("name") or "")
+        if name in _BACKGROUND_SIGNAL_NAMES:
+            continue
+        try:
+            impact = abs(float(signal.get("impact") or 0))
+        except Exception:
+            impact = 0
+        if impact >= 5:
+            decision.append(signal)
+    return decision[:8]
+
+
+_BACKGROUND_SIGNAL_NAMES = {
+    "web_context",
+    "sportybet_detail_available",
+    "sportybet_markets_available",
+    "sofascore_detail_available",
+    "sofascore_statistics_available",
+    "source_blend_full_signal_plus_sporty",
+    "source_blend_full_signal",
+    "source_blend_sportybet_live_signal",
+    "source_blend_sportybet_prematch_minimum",
+    "source_blend_sportybet_market_signal",
+    "data_depth",
+}
+
+
+def _market_signal_names(pick_type: str, selection: str, context: dict[str, Any]) -> set[str]:
+    base = {
+        "prediction_memory",
+        "finished_database_memory",
+        "close_match_strength_memory",
+        "contextual_intelligence",
+        "risk_management",
+        "ai_brain_review",
+    }
+    goal = {
+        "goal_pressure",
+        "goal_environment",
+        "poisson_model",
+        "dixon_coles_model",
+        "odds_progression",
+        "odds_pattern",
+        "market_steam",
+        "live_inplay_state",
+        "late_goal_window",
+        "red_card_state",
+        "sofascore_grade",
+        "avg_rating_edge",
+        "recent_history_edge",
+    }
+    side = {
+        "ensemble_model",
+        "elo_model",
+        "poisson_model",
+        "dixon_coles_model",
+        "league_strength_edge",
+        "h2h_edge",
+        "recent_history_edge",
+        "common_opponent_edge",
+        "league_position_edge",
+        "odds_edge",
+        "market_steam",
+        "odds_progression",
+        "odds_pattern",
+        "market_favorite",
+        "venue_form_edge",
+        "sofascore_grade",
+        "avg_rating_edge",
+    }
+    value = {
+        "consensus_longshot_value",
+        "consensus_longshot_market_value",
+        "market_favorite",
+        "odds_edge",
+        "odds_progression",
+        "odds_pattern",
+        "market_steam",
+        "ensemble_model",
+    }
+    live = {"live_inplay_state", "red_card_state", "late_goal_window"}
+
+    market_intent = context.get("market_intent") if isinstance(context.get("market_intent"), dict) else {}
+    family = str(market_intent.get("family") or market_intent.get("market") or "").lower()
+    if pick_type in {"goals", "live_goals", "live_total_goals", "live_next_goal", "live_team_to_score"} or "goal" in selection or "btts" in selection or "goals" in family:
+        return base | goal | live
+    if pick_type in {"value_bet", "market_value", "consensus_longshot_value", "value_overlay"}:
+        return base | value | (goal if ("goal" in selection or "over" in selection or "under" in selection) else side)
+    if pick_type.startswith("live_"):
+        return base | live | side | goal
+    return base | side
+
+
+def _audit_support_signal_names(audit: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    signals = audit.get("signals") if isinstance(audit, dict) else {}
+    if not isinstance(signals, dict):
+        return names
+    for bucket in ("support", "risk"):
+        for item in signals.get(bucket) or []:
+            name = str((item or {}).get("name") or "")
+            if name and name not in _BACKGROUND_SIGNAL_NAMES:
+                names.add(name)
+    return names
+
+
+def _signal_mentions_selection(signal: dict[str, Any], selection: str) -> bool:
+    if not selection:
+        return False
+    value = signal.get("value") if isinstance(signal.get("value"), dict) else {}
+    signal_selection = str(value.get("selection") or value.get("pick") or "").lower()
+    return bool(signal_selection and (signal_selection in selection or selection in signal_selection))
+
+
 def _norm_league(name: str) -> str:
     return name.lower().strip().replace(" ", "_")[:60] if name else ""
 
@@ -557,6 +723,16 @@ def _safe_json(raw: str | None) -> list:
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def _safe_json_object(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _calibration_verdict(gap: float | None) -> str:
