@@ -284,19 +284,36 @@ def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
 
 
 def parse_events_response(data: dict[str, Any]) -> list[dict]:
-    """Normalize a raw SportyBet events response into buffer-ready match rows."""
-    tournaments = data.get("data", {}).get("tournaments", [])
+    """Normalize legacy and current SportyBet event envelopes."""
+    payload = data.get("data", data) if isinstance(data, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {"events": payload} if isinstance(payload, list) else {}
+    tournaments = payload.get("tournaments") or payload.get("tournamentList") or payload.get("eventGroups") or []
+    if isinstance(tournaments, dict):
+        tournaments = list(tournaments.values())
     matches = []
     for tournament in tournaments:
+        if not isinstance(tournament, dict):
+            continue
         group = {
-            "name": tournament.get("name"),
+            "name": tournament.get("name") or tournament.get("tournamentName"),
             "categoryName": (
                 tournament.get("sport", {}).get("category", {}).get("name")
                 or tournament.get("category", {}).get("name")
+                or tournament.get("categoryName")
             ),
         }
-        for event in tournament.get("events", []):
+        for event in tournament.get("events") or tournament.get("eventList") or []:
             matches.append(_parse_event(event, group))
+    for event in payload.get("events") or payload.get("eventList") or []:
+        if not isinstance(event, dict):
+            continue
+        sport = event.get("sport") or {}
+        category = sport.get("category") or event.get("category") or {}
+        matches.append(_parse_event(event, {
+            "name": (category.get("tournament") or {}).get("name") or event.get("tournamentName"),
+            "categoryName": category.get("name") or event.get("categoryName"),
+        }))
     return matches
 
 
@@ -421,29 +438,38 @@ def _parse_result(event: dict, group: dict) -> dict:
 
 
 def _parse_event(event: dict, group: dict) -> dict:
-    score_parts = (event.get("setScore") or "").split(":")
-    home_score = score_parts[0] if len(score_parts) == 2 else None
-    away_score = score_parts[1] if len(score_parts) == 2 else None
+    home_team = event.get("homeTeam") or {}
+    away_team = event.get("awayTeam") or {}
+    home_name = event.get("homeTeamName") or home_team.get("name")
+    away_name = event.get("awayTeamName") or away_team.get("name")
+    score_value = event.get("setScore") or event.get("score") or ""
+    if isinstance(score_value, dict):
+        home_score = score_value.get("home") or score_value.get("homeScore")
+        away_score = score_value.get("away") or score_value.get("awayScore")
+    else:
+        score_parts = str(score_value).split(":")
+        home_score = score_parts[0] if len(score_parts) == 2 else None
+        away_score = score_parts[1] if len(score_parts) == 2 else None
     event_category = (event.get("sport") or {}).get("category") or {}
     event_tournament = event_category.get("tournament") or {}
 
     return {
-        "id":           event.get("eventId"),
-        "name":         f"{event.get('homeTeamName')} vs {event.get('awayTeamName')}",
-        "home_team":    event.get("homeTeamName"),
-        "away_team":    event.get("awayTeamName"),
+        "id":           event.get("eventId") or event.get("id"),
+        "name":         f"{home_name} vs {away_name}",
+        "home_team":    home_name,
+        "away_team":    away_name,
         "score":        {"home": home_score, "away": away_score},
-        "period_scores": event.get("gameScore"),
-        "period":       event.get("matchStatus"),
+        "period_scores": event.get("gameScore") or event.get("periodScores"),
+        "period":       event.get("matchStatus") or event.get("period"),
         "played_seconds": event.get("playedSeconds"),
         "status":       event.get("status"),
         "home_red_cards": _first_present(event, "homeRedCards", "homeRedCard", "homeTeamRedCards"),
         "away_red_cards": _first_present(event, "awayRedCards", "awayRedCard", "awayTeamRedCards"),
-        "start_time":   event.get("estimateStartTime"),
+        "start_time":   event.get("estimateStartTime") or event.get("startTime"),
         "tournament":   group.get("name") or event_tournament.get("name"),
         "category":     group.get("categoryName") or event_category.get("name"),
         "venue":        event.get("fixtureVenue", {}).get("name"),
-        "markets":      [_parse_market(m) for m in event.get("markets", [])],
+        "markets":      [_parse_market(m) for m in event.get("markets") or event.get("marketList") or []],
         "raw_event":    event,
         "raw_group":    group,
     }
@@ -464,7 +490,7 @@ def _parse_market(market: dict) -> dict:
                 "is_active":   o.get("isActive"),
                 "probability": o.get("probability"),
             }
-            for o in market.get("outcomes", [])
+            for o in market.get("outcomes") or market.get("selections") or []
         ],
     }
 

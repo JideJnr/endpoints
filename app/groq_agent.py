@@ -22,91 +22,34 @@ from app.league_memory import record_prediction
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an elite football prediction agent. Your job is to analyse every match
-and find the true winner — especially in lower leagues where bookmakers misprice odds.
+SYSTEM_PROMPT = """You are a football prediction expert. Analyse the match data and output a prediction as valid JSON only — no text outside the JSON block.
 
-Your edge is finding matches where:
-- One team is clearly dominant across ALL data points
-- The odds are still high due to obscure league or low public attention
-- This is a VALUE BET — high confidence + high odds = profit
+Consider: form (W/L/D), H2H record, league standings, 1x2 odds, and any web context provided.
+Only predict if confidence >= 0.60, otherwise set status to "low_confidence".
 
-## Your reasoning process for EVERY match:
-
-1. CHECK TIME — compare match start_time to current time
-   - If match already started or finished → skip, output status: "skipped"
-   - Calculate hours until kickoff — note if team played recently (fatigue risk)
-
-2. ANALYSE STANDINGS — league position gap tells you dominance
-   - Top 3 vs bottom 3 = strong signal
-   - Mid-table vs mid-table = low confidence, skip unless other signals are strong
-
-3. ANALYSE HEAD TO HEAD — historical dominance matters
-   - 4+ wins out of last 5 = strong signal
-   - Balanced h2h = reduce confidence
-
-4. POISSON MODEL — call poisson_model(home_team_id, away_team_id)
-   - Pure maths based on last 10 matches goals scored/conceded
-   - If Poisson says Home Win > 55% AND reasoning agrees = strong signal
-   - Use over_2_5 % and btts % to fill those prediction fields
-
-5. MARKET MOVEMENT — call get_odds_movement(sportybet_id)
-   - Odds shortened = smart money backing that team = STRONG signal
-   - Sharp signal on same side as your prediction = increase confidence by 0.05
-   - Sharp signal against your prediction = reduce confidence by 0.08
-
-6. ANALYSE FORM WITH SCHEDULE CONTEXT — call strength_of_schedule(home_team_id, away_team_id)
-   - CRITICAL — raw form (W/L/D) is misleading without opponent context
-   - soft_losses (losses vs weak teams) = genuine red flag
-   - quality_wins (wins vs strong teams) = genuine signal
-   - Division gap: higher league tier = structural advantage
-
-7. ANALYSE ODDS — market signal
-   - High odds (>3.0) on a dominant team = VALUE BET opportunity
-
-8. READ WEB CONTEXT — what are experts saying?
-   - Injury news, suspensions, team news
-   - If key player missing → reduce confidence
-
-9. FATIGUE CHECK — if team played 2-3 days ago, reduce confidence by 0.1
-
-10. MAKE DECISION — only predict if confidence >= 0.60
-    - Below 0.60 → output status: "low_confidence", skip
-
-## Output ONLY valid JSON — no text outside the JSON block:
-
+Output format:
 {
   "match": "<home> vs <away>",
-  "tournament": "<tournament name>",
-  "category": "<country>",
-  "kickoff_utc": "<ISO timestamp>",
-  "status": "<predicted | skipped | low_confidence>",
-  "prediction": "<Home Win | Away Win | Draw>",
-  "odds": "<best available odds for this prediction as string>",
-  "confidence": <float 0.0-1.0>,
-  "value_bet": <true if confidence >= 0.70 and odds >= 2.5>,
-  "btts": "<Yes | No | Unknown>",
-  "over_2_5": "<Yes | No | Unknown>",
-  "poisson": {
-    "home_win_pct": <float>,
-    "draw_pct": <float>,
-    "away_win_pct": <float>,
-    "over_2_5_pct": <float>,
-    "btts_pct": <float>,
-    "top_score": "<most likely scoreline e.g. 2-1>"
-  },
-  "market_signal": "<sharp money on HOME | sharp money on AWAY | stable | unavailable>",
+  "status": "predicted | low_confidence | skipped",
+  "prediction": "Home Win | Away Win | Draw",
+  "odds": "<decimal odds string>",
+  "confidence": <0.0-1.0>,
+  "value_bet": <true if confidence>=0.70 and odds>=2.5>,
+  "btts": "Yes | No | Unknown",
+  "over_2_5": "Yes | No | Unknown",
+  "market_signal": "sharp HOME | sharp AWAY | stable | unavailable",
   "key_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],
   "reasoning": {
-    "form": "<one sentence on quality-adjusted form>",
-    "h2h": "<one sentence on head to head record>",
-    "standings": "<one sentence on league position gap>",
-    "poisson": "<one sentence on what the maths says>",
-    "odds_signal": "<one sentence on odds movement>",
-    "web_consensus": "<one sentence on expert previews>",
-    "fatigue": "<one sentence on fixture congestion>",
+    "form": "<one sentence>",
+    "h2h": "<one sentence>",
+    "standings": "<one sentence>",
+    "odds_signal": "<one sentence>",
     "verdict": "<one sentence final summary>"
   }
 }"""
+
+# LangChain-escaped version for use inside ChatPromptTemplate (agent mode)
+_SYSTEM_PROMPT_LANGCHAIN = SYSTEM_PROMPT.replace("{", "{{").replace("}", "}}")
 
 
 # ── Agent builder ─────────────────────────────────────────────────────────────
@@ -127,7 +70,7 @@ def _build_agent():
     tools = ALL_TOOLS + [get_current_time]
     llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
+        ("system", _SYSTEM_PROMPT_LANGCHAIN),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),
     ])
@@ -137,30 +80,98 @@ def _build_agent():
 
 # ── Single match prediction ───────────────────────────────────────────────────
 
-def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
-    match_input = (
-        f"Analyse and predict this match:\n\n"
-        f"match: {doc.get('sportybet_name') or doc.get('name')}\n"
-        f"sofascore_event_id: {doc.get('sofascore_id')}\n"
-        f"sportybet_id: {doc.get('sportybet_id')}\n"
-        f"tournament: {doc.get('tournament')}\n"
-        f"category: {doc.get('category')}\n"
-        f"start_time_unix_ms: {doc.get('start_time')}\n"
-        f"match_date: {doc.get('match_date')}\n"
-        f"current_period: {doc.get('period')}\n"
-        f"current_score: {json.dumps(doc.get('score'))}\n\n"
-        f"data_sources:\n"
-        f"{json.dumps(doc.get('data_sources') or {}, indent=2)}\n\n"
-        f"sportybet_detail (score, clock, cards, active markets):\n"
-        f"{json.dumps(doc.get('sportybet_detail') or {}, indent=2)}\n\n"
-        f"sportybet_markets (live odds):\n"
-        f"{json.dumps((doc.get('sportybet_markets') or doc.get('markets') or [])[:3], indent=2)}\n\n"
-        f"sofascore_detail (h2h, form, standings, odds):\n"
-        f"{json.dumps(doc.get('sofascore_detail'), indent=2)}\n\n"
-        f"web_context (expert previews):\n"
-        f"{json.dumps(doc.get('web_context'), indent=2)}\n\n"
-        f"Analyse all available data and output your prediction as JSON."
+def _summarise_doc(doc: dict[str, Any]) -> str:
+    """
+    Distil an enriched match doc into a tight summary for Groq.
+    Hard target: < 800 tokens total. No JSON blobs, no full history arrays.
+    """
+    detail = doc.get("sofascore_detail") or {}
+    home = detail.get("home_team") or doc.get("home_team") or {}
+    away = detail.get("away_team") or doc.get("away_team") or {}
+    home_name = (home.get("name") or "") if isinstance(home, dict) else str(home or "")
+    away_name = (away.get("name") or "") if isinstance(away, dict) else str(away or "")
+
+    # Form: W/L/D string only, last 5 matches
+    def _wld(history: list, team_id: Any) -> str:
+        finished = [m for m in (history or []) if (m.get("status") or {}).get("type") == "finished"][:5]
+        out = []
+        for m in finished:
+            s = m.get("score") or {}
+            h_id = (m.get("home_team") or {}).get("id")
+            is_home = str(h_id) == str(team_id) if h_id else True
+            gf = s.get("home", 0) if is_home else s.get("away", 0)
+            ga = s.get("away", 0) if is_home else s.get("home", 0)
+            try:
+                gf, ga = int(gf), int(ga)
+                out.append("W" if gf > ga else "D" if gf == ga else "L")
+            except Exception:
+                out.append("?")
+        return "".join(out) or "N/A"
+
+    home_hist = detail.get("home_last_matches") or []
+    away_hist = detail.get("away_last_matches") or []
+    home_id = home.get("id") if isinstance(home, dict) else None
+    away_id = away.get("id") if isinstance(away, dict) else None
+
+    # H2H
+    h2h = detail.get("h2h") or {}
+    td = h2h.get("team_duel") or {}
+    h2h_str = f"HW={td.get('homeWins',0)} AW={td.get('awayWins',0)} D={td.get('draws',0)}"
+
+    # Pregame ratings + positions
+    pregame = detail.get("pregame_form") or {}
+    hpf = pregame.get("home_team") or {}
+    apf = pregame.get("away_team") or {}
+
+    # Standings: just find the two teams' rows
+    standings = detail.get("standings") or []
+    home_pos = away_pos = "?"
+    for row in standings:
+        tn = (row.get("team") or {}).get("name") or ""
+        if home_name and home_name.lower() in tn.lower():
+            home_pos = f"#{row.get('position','?')} {row.get('points','?')}pts"
+        if away_name and away_name.lower() in tn.lower():
+            away_pos = f"#{row.get('position','?')} {row.get('points','?')}pts"
+
+    # 1x2 odds
+    markets = doc.get("sportybet_markets") or doc.get("markets") or []
+    odds_str = "unavailable"
+    for mkt in markets:
+        n = (mkt.get("name") or "").lower()
+        if mkt.get("id") == "1" or "1x2" in n or "match result" in n:
+            sels = mkt.get("selections") or []
+            odds_str = " | ".join(f"{s.get('name')}={s.get('odds')}" for s in sels[:3])
+            break
+    if odds_str == "unavailable":
+        choices = ((detail.get("odds_featured") or {}).get("default") or {}).get("choices") or []
+        if choices:
+            odds_str = " | ".join(f"{c.get('name')}={c.get('fractional_value')}" for c in choices[:3])
+
+    # Web context: 1 snippet, max 150 chars
+    web = doc.get("web_context") or {}
+    snippets = web.get("snippets") or []
+    web_str = str((snippets[0].get("snippet") if snippets else None) or "none")[:150]
+
+    return (
+        f"{doc.get('sportybet_name') or doc.get('name')} | "
+        f"{doc.get('tournament')} ({doc.get('category')}) | "
+        f"date={doc.get('match_date')} period={doc.get('period')} "
+        f"score={json.dumps(doc.get('score'))}\n"
+        f"IDs: sofa={doc.get('sofascore_id')} sporty={doc.get('sportybet_id')}\n"
+        f"\n"
+        f"HOME {home_name}: form(last5)={_wld(home_hist, home_id)} "
+        f"rating={hpf.get('avg_rating')} standing={home_pos}\n"
+        f"AWAY {away_name}: form(last5)={_wld(away_hist, away_id)} "
+        f"rating={apf.get('avg_rating')} standing={away_pos}\n"
+        f"H2H: {h2h_str}\n"
+        f"ODDS: {odds_str}\n"
+        f"WEB: {web_str}\n"
+        f"\nOutput prediction as JSON."
     )
+
+
+def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
+    match_input = _summarise_doc(doc)
 
     try:
         result = executor.invoke({"input": match_input})
@@ -185,6 +196,63 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
+
+def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
+    """
+    Run a direct (no-tool) Groq analysis for one enriched match document.
+
+    Uses a direct LLM call instead of the LangChain agent so tool schemas
+    are never injected into the context. This keeps the request well within
+    the 12,000 TPM on-demand limit for llama-3.3-70b-versatile.
+    """
+    from app.llm import is_groq_available
+
+    if not is_groq_available():
+        return {"status": "groq_unavailable", "message": "Set GROQ_API_KEY to enable AI analysis."}
+
+    try:
+        from app.llm import get_llm
+        llm = get_llm()
+        summary = _summarise_doc(doc)
+        # Direct invoke — no tools, no agent scaffolding, minimal token overhead
+        response = llm.invoke([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": summary},
+        ])
+        raw = response.content if hasattr(response, "content") else str(response)
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw.strip())
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "message": f"LLM returned non-JSON: {exc}"}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+    if result.get("status") == "error":
+        return {"status": "error", "message": result.get("error") or "Analysis failed."}
+
+    try:
+        raw_confidence = float(result.get("confidence"))
+        confidence = round(raw_confidence * 100) if raw_confidence <= 1 else round(raw_confidence)
+    except (TypeError, ValueError):
+        confidence = None
+
+    return {
+        "status": result.get("status") or "predicted",
+        "recommendation": result.get("prediction"),
+        "confidence": confidence,
+        "value_bet": bool(result.get("value_bet")),
+        "key_factors": result.get("key_factors") or [],
+        "reasoning": result.get("reasoning") or {},
+        "market_signal": result.get("market_signal"),
+        "btts": result.get("btts"),
+        "over_2_5": result.get("over_2_5"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "groq_agent",
+    }
+
 
 def run_groq_predictions(
     match_date: str | None = None,

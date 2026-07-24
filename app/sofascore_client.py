@@ -6,6 +6,8 @@ from curl_cffi import requests
 
 SOFASCORE_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/unique-tournament/{tournament_id}/scheduled-events/{date}"
 SOFASCORE_ALL_URL = "https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
+SOFASCORE_CATEGORY_URL = "https://www.sofascore.com/api/v1/category/{category_id}/scheduled-events/{date}"
+SOFASCORE_CATEGORIES_URL = "https://www.sofascore.com/api/v1/sport/football/categories"
 SOFASCORE_SEARCH_TOURNAMENT_URL = "https://www.sofascore.com/api/v1/search/all?q={query}"
 SOFASCORE_EVENT_URL = "https://www.sofascore.com/api/v1/event/{event_id}"
 SOFASCORE_SEARCH_URL = "https://www.sofascore.com/api/v1/search/all?q={query}"
@@ -59,6 +61,7 @@ _HOME_HEADERS = {
 _LIST_CACHE_TTL_SCHEDULED = 60   # seconds
 _LIST_CACHE_TTL_LIVE = 20        # seconds
 _list_cache: Dict[str, Tuple[float, list]] = {}  # key → (fetched_at, data)
+_category_cache: Optional[Tuple[float, list[int]]] = None
 
 
 def _list_cache_get(key: str, ttl: float) -> Optional[list]:
@@ -109,7 +112,7 @@ LIVE_STATUS_TYPES = {"inprogress", "live"}
 
 
 def _status_text(event: dict) -> tuple[str, str]:
-    status = event.get("status") or {}
+    status = event.get("status") or (event.get("eventState") or {}).get("status") or {}
     status_type = str(status.get("type") or "").lower().replace(" ", "").replace("_", "")
     description = str(status.get("description") or "").lower()
     return status_type, description
@@ -158,10 +161,32 @@ def _get(url: str) -> requests.Response:
         return resp
 
 
+def _events_from_response(payload: object) -> list[dict]:
+    """Read event lists from both legacy and current SofaScore envelopes."""
+    if not isinstance(payload, dict):
+        return payload if isinstance(payload, list) else []
+    data = payload.get("data", payload)
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    return data.get("events") or data.get("items") or data.get("results") or []
+
+
+def _get_events(url: str, *, allow_not_found: bool = False) -> list[dict]:
+    """Fetch an event endpoint, treating an empty/removed route as no events."""
+    try:
+        response = _get(url)
+    except Exception as exc:
+        if allow_not_found and "404" in str(exc):
+            return []
+        raise
+    return [_parse_event(event) for event in _events_from_response(response.json()) if isinstance(event, dict)]
+
+
 def fetch_scheduled_events(date: str, tournament_id: int = 17) -> list[dict]:
     url = SOFASCORE_TOURNAMENT_URL.format(tournament_id=tournament_id, date=date)
-    events = _get(url).json().get("events", [])
-    return [_parse_event(e) for e in events]
+    return _get_events(url, allow_not_found=True)
 
 
 # ── Curated top-league unique-tournament IDs ─────────────────────────────────
@@ -255,9 +280,36 @@ def _fetch_tournament_events(tournament_id: int, date: str) -> list[dict]:
         if resp.status_code == 404:
             return []
         resp.raise_for_status()
-        return [_parse_event(e) for e in resp.json().get("events", [])]
+        return [_parse_event(e) for e in _events_from_response(resp.json()) if isinstance(e, dict)]
     except Exception:
         return []
+
+
+def _fetch_category_events(category_id: int, date: str) -> list[dict]:
+    """Current SofaScore schedule route; global schedules now return 404."""
+    try:
+        return _get_events(
+            SOFASCORE_CATEGORY_URL.format(category_id=category_id, date=date),
+            allow_not_found=True,
+        )
+    except Exception:
+        return []
+
+
+def _scheduled_category_ids() -> list[int]:
+    """Return active Football category IDs, cached for one day."""
+    global _category_cache
+    if _category_cache and time.monotonic() - _category_cache[0] < 24 * 60 * 60:
+        return _category_cache[1]
+    try:
+        categories = _get(SOFASCORE_CATEGORIES_URL).json().get("categories", [])
+        # International/high-priority categories keep this fallback bounded;
+        # the curated tournament routes above cover domestic competitions.
+        ids = [int(item["id"]) for item in categories if item.get("id") and item.get("priority", 0) > 0]
+    except Exception:
+        ids = []
+    _category_cache = (time.monotonic(), ids)
+    return ids
 
 
 def fetch_all_scheduled_events(date: str) -> list[dict]:
@@ -275,7 +327,7 @@ def fetch_all_scheduled_events(date: str) -> list[dict]:
         url = SOFASCORE_ALL_URL.format(date=date)
         resp = _session.get(url, headers=HEADERS, timeout=12)
         if resp.status_code == 200:
-            events = [_parse_event(e) for e in resp.json().get("events", [])]
+            events = [_parse_event(e) for e in _events_from_response(resp.json()) if isinstance(e, dict)]
             if events:
                 _list_cache_set(cache_key, events)
                 return events
@@ -303,6 +355,19 @@ def fetch_all_scheduled_events(date: str) -> list[dict]:
                     tname = t.get("name")
                     if tid and tid not in all_ids:
                         learn_tournament_id(tid, tname)
+
+    # Current SofaScore schedules are exposed per category. This supplies
+    # international fixtures which are not part of the curated tournament list.
+    category_ids = _scheduled_category_ids()
+    if category_ids:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(_fetch_category_events, category_id, date) for category_id in category_ids]
+            for future in as_completed(futures):
+                for ev in future.result():
+                    eid = ev.get("id")
+                    if eid and eid not in seen:
+                        seen.add(eid)
+                        events.append(ev)
 
     _list_cache_set(cache_key, events)
     return events
@@ -335,7 +400,9 @@ def search_events(query: str, limit: int = 12) -> list[dict]:
 def fetch_event(event_id) -> dict:
     """Fetch one SofaScore event directly by id."""
     url = SOFASCORE_EVENT_URL.format(event_id=event_id)
-    event = _get(url).json().get("event", {})
+    payload = _get(url).json()
+    data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    event = data.get("event", data) if isinstance(data, dict) else {}
     return _parse_event(event) if event else {}
 
 
@@ -344,7 +411,7 @@ def fetch_live_events() -> list[dict]:
     cached = _list_cache_get(cache_key, _LIST_CACHE_TTL_LIVE)
     if cached is not None:
         return cached
-    events = [_parse_event(e) for e in _get(SOFASCORE_LIVE_URL).json().get("events", [])]
+    events = _get_events(SOFASCORE_LIVE_URL)
     _list_cache_set(cache_key, events)
     return events
 
@@ -629,9 +696,9 @@ def _parse_event(e: dict) -> dict:
     away = e.get("awayTeam", {})
     home_score = e.get("homeScore", {})
     away_score = e.get("awayScore", {})
-    status = e.get("status", {})
+    status = e.get("status") or (e.get("eventState") or {}).get("status") or {}
     tournament = e.get("tournament", {})
-    season = e.get("season", {})
+    season = e.get("season") or e.get("seasonInfo") or {}
     venue = e.get("venue", {})
 
     return {
@@ -651,8 +718,8 @@ def _parse_event(e: dict) -> dict:
             "code": away.get("nameCode"),
         },
         "score": {
-            "home": home_score.get("current"),
-            "away": away_score.get("current"),
+            "home": home_score.get("current", home_score.get("display")),
+            "away": away_score.get("current", away_score.get("display")),
             "home_ht": home_score.get("period1"),
             "away_ht": away_score.get("period1"),
         },
@@ -664,9 +731,9 @@ def _parse_event(e: dict) -> dict:
         "home_red_cards": e.get("homeRedCards") or e.get("homeRedCard") or e.get("homeTeamRedCards"),
         "away_red_cards": e.get("awayRedCards") or e.get("awayRedCard") or e.get("awayTeamRedCards"),
         "tournament": {
-            "id": tournament.get("uniqueTournament", {}).get("id"),
-            "tournament_id": tournament.get("id"),
-            "name": tournament.get("name"),
+            "id": tournament.get("uniqueTournament", {}).get("id") or tournament.get("uniqueTournamentId"),
+            "tournament_id": tournament.get("id") or tournament.get("tournamentId"),
+            "name": tournament.get("name") or tournament.get("uniqueTournament", {}).get("name"),
         },
         "season": season.get("name"),
         "season_id": season.get("id"),

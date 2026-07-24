@@ -13,6 +13,7 @@ from app.buffer import (
     get_buffered_match,
     get_live_buffered_matches,
     get_buffer_stats,
+    store_enriched,
 )
 from app.league_memory import list_prediction_history
 from app.market import get_movement
@@ -1776,6 +1777,25 @@ def predict_single_match(
     }
 
 
+@router.post("/matches/{sportybet_id}/ai-analysis")
+def analyze_match_with_groq(sportybet_id: str):
+    """Create and persist a Grok explanation for the currently stored match data."""
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Match not found in the buffer")
+
+    from app.groq_agent import run_groq_match_analysis
+
+    analysis = run_groq_match_analysis(doc)
+    if analysis.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+        raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
+
+    doc["ai_analysis"] = analysis
+    store_enriched(sportybet_id, doc)
+    return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis}
+
+
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
     from app.enriched_prediction import prediction_readiness
     from app.match_intelligence import build_match_intelligence
@@ -1803,6 +1823,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "category": doc.get("category"),
         "match_date": doc.get("match_date") or (doc.get("time_context") or {}).get("local_date"),
         "start_time": doc.get("start_time"),
+        "ai_analysis": doc.get("ai_analysis"),
         "period": doc.get("period"),
         "played_seconds": doc.get("played_seconds"),
         "is_live": bool(match_state.get("is_live")),

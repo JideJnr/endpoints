@@ -40,6 +40,10 @@ _db_job_lock = threading.RLock()
 _watchdog_thread: threading.Thread | None = None
 _watchdog_stop = threading.Event()
 LIVE_PRIORITY_ENGINE_ID = "live_priority_mode"
+# A full SofaScore detail fetch fans out into several provider calls. Keep each
+# scheduled pass comfortably below its five-minute cadence, then advance the
+# priority queue on the next pass.
+UNIFIED_UPCOMING_BATCH_SIZE = 4
 SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "ingest_live": {"label": "Live ingest", "default": 180, "min": 15, "max": 600, "pipeline_id": "sportybet_ingest_live"},
     "ingest_upcoming": {"label": "Upcoming ingest", "default": 120, "min": 60, "max": 600, "pipeline_id": "sportybet_ingest_upcoming"},
@@ -557,7 +561,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         pass
 
     from app.sportybet_client import fetch_upcoming_matches_post
-    from app.sofascore_client import fetch_all_scheduled_events
+    from app.sofascore_client import fetch_all_scheduled_events, is_usable_event_for_mode, search_events
     from app.buffer import ingest_matches, get_unenriched_batch, store_enriched, get_buffered_match
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.sofascore_client import fetch_event_detail
@@ -602,17 +606,54 @@ def job_unified_upcoming() -> dict[str, Any]:
     all_sofa_events = [e for events in sofa_cache.values() for e in events]
 
     # ── Step 3: Match ALL unmatched buffer matches against SofaScore ──────────
-    # Pull all pending (no limit) so we clear the entire backlog in one pass
-    pending = get_unenriched_batch(limit=500, exclude_live=True)
+    # Work through a small, time-bounded queue.  One enriched fixture fans out
+    # into multiple SofaScore detail calls; processing the whole backlog here
+    # leaves the scheduler job running indefinitely and blocks later cycles.
+    eligible_dates = {today, tomorrow}
+    pending = [
+        item for item in get_unenriched_batch(
+            limit=UNIFIED_UPCOMING_BATCH_SIZE,
+            exclude_live=True,
+        )
+        if item.get("match_date") in eligible_dates
+    ]
+    record_activity(
+        f"Unified upcoming matching {len(pending)} next fixtures",
+        job="unified_upcoming",
+        status="running",
+        details={"batch_size": UNIFIED_UPCOMING_BATCH_SIZE, "sofa_candidates": len(all_sofa_events)},
+    )
 
     now = datetime.now(timezone.utc).isoformat()
-    matched_count = unmatched_count = predicted_count = stored_count = 0
+    matched_count = unmatched_count = predicted_count = deferred_count = stored_count = search_matched_count = 0
 
     def _fetch_detail_safe(sofa_event):
         try:
             return fetch_event_detail(sofa_event)
         except Exception:
             return None
+
+    def _search_match_safe(sporty_event: dict) -> tuple[dict | None, float]:
+        """Use SofaScore's team search only when the daily feed misses a real fixture."""
+        if _is_junk(sporty_event.get("name") or ""):
+            return None, 0.0
+        query = " ".join(filter(None, [
+            str(sporty_event.get("home_team") or ""),
+            str(sporty_event.get("away_team") or ""),
+        ])).strip()
+        if not query:
+            return None, 0.0
+        try:
+            candidates = [
+                event for event in search_events(query, limit=12)
+                if is_usable_event_for_mode(event, live=False)
+            ]
+            sofa_event, candidate_score = _fuzzy_match(sporty_event, candidates)
+            # Search results are already team-specific. Allow minor provider-name
+            # differences (e.g. FC/Hana Citizen) when kickoff also agrees.
+            return (sofa_event, candidate_score) if candidate_score >= 0.70 else (None, candidate_score)
+        except Exception:
+            return None, 0.0
 
     # Match all in parallel detail fetches
     pairs: list[tuple[dict, Any, float]] = []
@@ -633,6 +674,14 @@ def job_unified_upcoming() -> dict[str, Any]:
         sofa, score = _fuzzy_match(sporty, all_sofa_events)
         threshold = FUZZY_THRESHOLD
         if score < threshold:
+            searched_sofa, searched_score = _search_match_safe(sporty)
+            if searched_sofa:
+                sofa = searched_sofa
+                score = searched_score
+                matched_count += 1
+                search_matched_count += 1
+                pairs.append((item, sofa, score))
+                continue
             if score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
                 llm_sofa = _llm_match(sporty, all_sofa_events)
                 if llm_sofa:
@@ -651,7 +700,7 @@ def job_unified_upcoming() -> dict[str, Any]:
     # Fetch SofaScore detail in parallel for all matched
     needs_detail = [(i, sofa, item) for i, (item, sofa, _) in enumerate(pairs) if sofa]
     details: dict[int, dict | None] = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_fetch_detail_safe, sofa): i for i, sofa, item in needs_detail}
         for future in as_completed(futures):
             details[futures[future]] = future.result()
@@ -708,27 +757,34 @@ def job_unified_upcoming() -> dict[str, Any]:
                 result = apply_prediction_state(fresh, match_id=str(item["match_id"]))
                 if result.get("status") == "predicted":
                     predicted_count += 1
+                elif result.get("status") == "deferred":
+                    deferred_count += 1
             except Exception as exc:
                 _logger.debug("unified_upcoming: prediction failed for %s: %s", item["match_id"], exc)
 
     record_activity(
         f"Unified upcoming done: {len(matches)} fetched, {ingested_new} new, "
-        f"{matched_count}/{len(pending)} matched, {predicted_count} predicted",
+        f"{matched_count}/{len(pending)} matched ({search_matched_count} via search), "
+        f"{predicted_count} predicted, {deferred_count} deferred",
         job="unified_upcoming", status="ok",
         details={"fetched": len(matches), "ingested_new": ingested_new,
                  "pending_processed": len(pending), "matched": matched_count,
-                 "unmatched": unmatched_count, "stored": stored_count, "predicted": predicted_count},
+                 "unmatched": unmatched_count, "stored": stored_count,
+                 "predicted": predicted_count, "deferred": deferred_count,
+                 "search_matched": search_matched_count},
     )
     return {
         "status": "ok", "job": "unified_upcoming",
         "fetched": len(matches), "ingested_new": ingested_new,
         "pending_processed": len(pending), "matched": matched_count,
-        "unmatched": unmatched_count, "stored": stored_count, "predicted": predicted_count,
+        "unmatched": unmatched_count, "stored": stored_count,
+        "predicted": predicted_count, "deferred": deferred_count,
+        "search_matched": search_matched_count,
     }
 
 
 def job_unified_live() -> dict[str, Any]:
-    Unified Live Pipeline:
+    """Unified Live Pipeline:
     1. Fetch live matches from SportyBet
     2. Patch scores in buffer
     3. Run enrichment worker (live-only: matches Sporty → Sofa live, updates predictions)
