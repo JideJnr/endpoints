@@ -43,7 +43,7 @@ LIVE_PRIORITY_ENGINE_ID = "live_priority_mode"
 # A full SofaScore detail fetch fans out into several provider calls. Keep each
 # scheduled pass comfortably below its five-minute cadence, then advance the
 # priority queue on the next pass.
-UNIFIED_UPCOMING_BATCH_SIZE = 4
+UNIFIED_UPCOMING_BATCH_SIZE = 12
 SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "ingest_live": {"label": "Live ingest", "default": 180, "min": 15, "max": 600, "pipeline_id": "sportybet_ingest_live"},
     "ingest_upcoming": {"label": "Upcoming ingest", "default": 120, "min": 60, "max": 600, "pipeline_id": "sportybet_ingest_upcoming"},
@@ -1343,7 +1343,7 @@ def start_scheduler():
         replace_existing=True,
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=120,
+        misfire_grace_time=240,
     )
 
     scheduler.add_job(
@@ -1354,7 +1354,7 @@ def start_scheduler():
         replace_existing=True,
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=60,
+        misfire_grace_time=90,
     )
 
     scheduler.add_job(
