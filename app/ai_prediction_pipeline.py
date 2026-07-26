@@ -301,8 +301,47 @@ def shortlist_markets(home: TeamBehaviourProfile, away: TeamBehaviourProfile) ->
     return sorted(selected, key=lambda x: x.score, reverse=True)[:5]
 
 
-def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45) -> dict:
-    prompt = f"Decide football prediction for {match_name}. Evidence: {' | '.join(response_chain)}. Markets: {[asdict(x) for x in shortlisted_markets]}. Return JSON only with market,outcome,confidence,value_bet,btts,over_2_5,key_factors,reasoning."
+def _truncate_competition_context(text: str) -> str:
+    """Truncate at nearest sentence boundary at or before 100-token limit."""
+    if len(text) // 4 <= 100:
+        return text
+    target = 400  # 100 tokens * 4 chars
+    truncated = text[:target]
+    boundary = truncated.rfind(". ")
+    return (truncated[:boundary + 1] if boundary >= 0 else truncated).strip()
+
+
+def _get_competition_context(doc: dict, conn) -> str | None:
+    """Return truncated competition analysis text, or None on any failure."""
+    try:
+        key = (
+            (doc.get("competition_special") or {}).get("key")
+            or (doc.get("known_competition") or {}).get("key")
+        )
+        if not key:
+            return None
+        from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
+        init_competition_analysis_table(conn)
+        row = get_latest_analysis(key, conn)
+        if not row:
+            return None
+        text = row.get("analysis_text") or ""
+        if not text:
+            return None
+        truncated = _truncate_competition_context(text)
+        logger.debug(
+            "_get_competition_context: key=%s generated_at=%s",
+            key, row.get("generated_at"),
+        )
+        return truncated
+    except Exception as exc:
+        logger.debug("_get_competition_context failed (non-critical): %s", exc)
+        return None
+
+
+def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None) -> dict:
+    context_block = f"Competition context: {competition_context} | " if competition_context else ""
+    prompt = f"Decide football prediction for {match_name}. {context_block}Evidence: {' | '.join(response_chain)}. Markets: {[asdict(x) for x in shortlisted_markets]}. Return JSON only with market,outcome,confidence,value_bet,btts,over_2_5,key_factors,reasoning."
     started = time.monotonic(); raw = _ollama(model, prompt, timeout)
     logger.debug("Ollama decider model=%s elapsed_ms=%d", model, (time.monotonic()-started)*1000)
     parsed = json.loads(raw[raw.find('{'):raw.rfind('}')+1])
@@ -329,20 +368,32 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
     try:
         from app.llm import is_groq_available
         model = "groq" if is_groq_available() else _ollama_model()
-        if not model: return _rules_fallback(doc, "unavailable", **kwargs)
+        if not model:
+            result = _rules_fallback(doc, "unavailable", **kwargs)
+            result["competition_analysis_used"] = False
+            result["competition_analysis_key"] = None
+            return result
         doc["low_value_odds"] = _best_odds(doc) < 1.3
         logger.info("AI pipeline match=%s sportybet_id=%s tier=%s odds=%s low_value=%s", _name(doc), doc.get("sportybet_id"), classify_tournament_tier(_tournament(doc)), _best_odds(doc), doc["low_value_odds"])
         _init_db()
+        competition_context: str | None = None
+        competition_analysis_key: str | None = None
         with sqlite3.connect(DB_PATH, timeout=20) as conn:
             home, away = _teams(doc); hp, ap = derive_team_profile(home, conn), derive_team_profile(away, conn)
             persist_team_profile(hp, conn); persist_team_profile(ap, conn); conn.commit()
+            competition_context = _get_competition_context(doc, conn)
+            if competition_context:
+                competition_analysis_key = (
+                    (doc.get("competition_special") or {}).get("key")
+                    or (doc.get("known_competition") or {}).get("key")
+                )
         chain = []
         for fn, fallback in ((_step_h2h,H2H_FALLBACK), (_step_common_opponent,COMMON_FALLBACK), (_step_form,FORM_FALLBACK), (_step_odds,ODDS_FALLBACK), (_step_similar_matches,SIMILAR_FALLBACK)):
             try: sentence = fn(doc, model)
             except Exception as exc: logger.warning("AI step %s failed: %s", fn.__name__, exc); sentence = fallback
             chain.append(sentence or fallback); logger.debug("AI step %s: %s", fn.__name__, chain[-1])
         markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
-        decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model)
+        decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context)
         from app.prediction_flow import apply_prediction_state
         result = apply_prediction_state(doc, **kwargs)
         if result.get("status") != "predicted": return result
@@ -354,11 +405,16 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         }
         prediction.update({"prediction_source":"ollama_pipeline", "ai_provider":model, "reasoning_context":reasoning_context, "market":decision["market"], "outcome":decision["outcome"], "key_factors":decision["key_factors"], "reasoning":decision["reasoning"], "confidence":_convert_confidence(decision["confidence"]), "value_bet":decision["value_bet"], "btts":decision["btts"], "over_2_5":decision["over_2_5"]})
         result["prediction_source"] = "ollama_pipeline"; result["reasoning_context"] = prediction["reasoning_context"]
+        result["competition_analysis_used"] = competition_context is not None
+        result["competition_analysis_key"] = competition_analysis_key
         logger.info("AI pipeline completed match=%s outcome=%s", _name(doc), decision["outcome"])
         return result
     except Exception as exc:
         logger.exception("AI pipeline failed: %s", exc)
-        return _rules_fallback(doc, "exception", **kwargs)
+        result = _rules_fallback(doc, "exception", **kwargs)
+        result["competition_analysis_used"] = False
+        result["competition_analysis_key"] = None
+        return result
 
 
 def job_ai_prediction_queue(batch_size: int = 10) -> dict:
