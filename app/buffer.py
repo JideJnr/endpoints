@@ -687,7 +687,11 @@ def refresh_sporty_match_state(match_id: str) -> dict[str, Any]:
     is_live = bool(state.get("is_live"))
     is_finished = bool(state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
     return {
-        "active": not is_finished and (scope != "live" or is_live),
+        # SportyBet can include a fixture with period "Not start" in its
+        # `isLive=true` response shortly before kick-off.  The provider bucket
+        # is not authoritative; the parsed match state is.  Rejecting it here
+        # made valid prematch requests fail with "not active".
+        "active": _is_sporty_match_active(state),
         "match_id": match_id,
         "scope": scope,
         "is_live": scope == "live" and is_live and not is_finished,
@@ -700,6 +704,13 @@ def refresh_sporty_match_state(match_id: str) -> dict[str, Any]:
         "sporty_endpoint": info.get("api_endpoint"),
         "source": info.get("source"),
     }
+
+
+def _is_sporty_match_active(state: dict[str, Any]) -> bool:
+    """Whether a fresh SportyBet event can safely be enriched or predicted."""
+    if bool(state.get("is_finished")) or state.get("state") in {"finished", "postponed", "cancelled"}:
+        return False
+    return bool(state.get("is_prematch") or state.get("is_live"))
 
 
 def purge_ghost_matches() -> int:
@@ -1360,6 +1371,13 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
     date_keys: list[str] = []
     live_needed = False
     for item in queue:
+        existing = item.get("existing") or {}
+        # Candidate feeds are needed only to discover an unknown SofaScore ID.
+        # Saved matches can use their stored event (or one direct ID lookup)
+        # below, so including their dates here causes needless full schedule
+        # fetches on every live-refresh cycle.
+        if existing.get("sofascore_id"):
+            continue
         live_needed = live_needed or item.get("is_live", False)
         for date_key in _sofascore_date_candidates(item["sporty"], item.get("match_date")):
             if date_key not in date_keys:
@@ -1396,17 +1414,15 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             match_id=str(item.get("match_id") or ""),
             match_name=match_name,
         )
-        sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
-        sofa_events = _with_search_fallback_candidates(sporty, sofa_events, bool(item.get("is_live")))
-        item["sofascore_candidate_count"] = len(sofa_events)
         saved_sofa_id = existing.get("sofascore_id")
         sofa = None
         score = 0.0
         source = "none"
 
         if saved_sofa_id:
-            sofa = next((event for event in sofa_events if str(event.get("id")) == str(saved_sofa_id)), None)
-            if not sofa:
+            if isinstance(existing.get("sofascore_event"), dict):
+                sofa = existing["sofascore_event"]
+            else:
                 try:
                     from app.sofascore_client import fetch_event, is_terminal_event
                     direct = fetch_event(str(saved_sofa_id))
@@ -1414,11 +1430,12 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                         sofa = direct
                 except Exception:
                     pass
-            if not sofa and isinstance(existing.get("sofascore_event"), dict):
-                sofa = existing["sofascore_event"]
             score = float(existing.get("match_score") or 1.0)
             source = "saved"
         else:
+            sofa_events = _candidate_sofascore_events(item, sofa_cache, live_events)
+            sofa_events = _with_search_fallback_candidates(sporty, sofa_events, bool(item.get("is_live")))
+            item["sofascore_candidate_count"] = len(sofa_events)
             sofa, score = _fuzzy_match(sporty, sofa_events)
             source = "fuzzy"
         threshold = 0.62 if item.get("is_live") else FUZZY_THRESHOLD
@@ -1456,12 +1473,14 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                 details={"best_score": round(score, 3), "source": source},
             )
 
-        detail = None
-        if sofa:
+        detail = _reusable_sofascore_detail(existing, sofa, bool(item.get("is_live")))
+        detail_source = "saved" if detail else "fetched"
+        if sofa and not detail:
             try:
                 detail = fetch_event_detail(sofa)
             except Exception as exc:
                 detail = None
+                detail_source = "unavailable"
                 source = f"{source}:detail_failed:{exc}"
 
         try:
@@ -1505,6 +1524,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "sofascore_name":    sofa.get("name") if sofa else None,
             "sofascore_event":   sofa,
             "sofascore_detail":  detail,
+            "sofascore_detail_source": detail_source,
             "live_data_sofascore": _sofa_live_data(detail) or existing.get("live_data_sofascore") or {},
             "home_last_matches": (detail or {}).get("home_last_matches") or [],
             "away_last_matches": (detail or {}).get("away_last_matches") or [],
@@ -2094,6 +2114,23 @@ def _candidate_sofascore_events(
                 events.append(event)
                 seen.add(eid)
     return events
+
+
+def _reusable_sofascore_detail(
+    existing: dict[str, Any],
+    sofa: dict[str, Any] | None,
+    is_live: bool,
+) -> dict[str, Any] | None:
+    """Avoid refetching static pre-match detail for an already matched event."""
+    if is_live or not sofa:
+        return None
+    detail = existing.get("sofascore_detail")
+    if not isinstance(detail, dict) or not detail:
+        return None
+    detail_id = detail.get("id") or detail.get("event_id")
+    if detail_id is not None and str(detail_id) != str(sofa.get("id")):
+        return None
+    return detail
 
 
 def _with_search_fallback_candidates(

@@ -1883,6 +1883,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
             "query": web.get("query"),
             "snippets": web.get("snippets", []),
             "articles": web.get("scraped", []) or web.get("articles", []),
+            "grok_analysis": web.get("grok_analysis") or {},
             "error": web.get("error"),
             "disabled": web.get("disabled"),
             "diagnostics": web.get("diagnostics"),

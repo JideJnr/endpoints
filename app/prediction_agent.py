@@ -117,6 +117,7 @@ def predict_sofascore_event(
         home_history,
         away_history,
         signals,
+        event.get("standings") or event.get("league_table") or [],
     )
 
     total_goals = _to_int(score.get("home"), 0) + _to_int(score.get("away"), 0)
@@ -315,6 +316,7 @@ def _common_opponent_edge(
     home_history: list[dict[str, Any]],
     away_history: list[dict[str, Any]],
     signals: list[dict[str, Any]],
+    standings: list[dict[str, Any]] | None = None,
 ) -> float:
     """
     Find opponents both teams have faced recently and compare results.
@@ -322,7 +324,10 @@ def _common_opponent_edge(
 
     Scoring per shared opponent:
       Win   = +3 pts,  Draw = +1,  Loss = 0
-      Edge  = (home_pts - away_pts) across all shared opponents
+      Results against better current league-table opponents count more than
+      results against teams near the bottom.  This avoids treating a win over
+      first place as identical to a win over last place.
+      Edge  = table-weighted (home_pts - away_pts) across shared opponents
       Scaled to max ±12 and added to home_power.
     """
     def _opp_name(event: dict[str, Any], team: str) -> str:
@@ -352,7 +357,44 @@ def _common_opponent_edge(
         return (hs - as_) if h.lower() == team.lower() else (as_ - hs)
 
     def _norm(name: str) -> str:
-        return name.lower().strip()[:8]
+        return " ".join("".join(ch if ch.isalnum() else " " for ch in name.lower()).split())
+
+    table_by_id: dict[str, dict[str, Any]] = {}
+    table_by_name: dict[str, dict[str, Any]] = {}
+    table_size = len(standings or [])
+    for row in standings or []:
+        team = row.get("team") or {}
+        name = str(team.get("name") or "")
+        if not name:
+            continue
+        entry = {
+            "position": _to_int(row.get("position"), 0),
+            "points": _to_int(row.get("points"), 0),
+            "team": name,
+        }
+        team_id = team.get("id")
+        if team_id is not None:
+            table_by_id[str(team_id)] = entry
+        table_by_name[_norm(name)] = entry
+
+    def _opponent_table(event: dict[str, Any], opponent: str) -> dict[str, Any] | None:
+        home_team = event.get("home_team") or event.get("homeTeam") or {}
+        away_team = event.get("away_team") or event.get("awayTeam") or {}
+        for team in (home_team, away_team):
+            if _norm(str(team.get("name") or "")) == _norm(opponent):
+                team_id = team.get("id")
+                if team_id is not None and str(team_id) in table_by_id:
+                    return table_by_id[str(team_id)]
+        return table_by_name.get(_norm(opponent))
+
+    def _table_weight(entry: dict[str, Any] | None) -> float:
+        # 1.0 when table data is unavailable; 1.45 for the leaders down to
+        # 0.75 at the foot of a normal table.  The cap keeps a single result
+        # from overpowering form, odds and H2H.
+        if not entry or not entry.get("position") or table_size < 2:
+            return 1.0
+        strength = (table_size - int(entry["position"])) / (table_size - 1)
+        return round(0.75 + max(0.0, min(1.0, strength)) * 0.70, 2)
 
     # Build lookup: normalised opponent name → best result for each team
     home_opp: dict[str, dict] = {}
@@ -405,14 +447,18 @@ def _common_opponent_edge(
         away_total += a_entry["pts"]
         home_gd += h_entry["gd"]
         away_gd += a_entry["gd"]
-        home_rating += h_entry["rating"]
-        away_rating += a_entry["rating"]
+        table = _opponent_table(h_entry["event"], h_entry["opp"]) or _opponent_table(a_entry["event"], a_entry["opp"])
+        weight = _table_weight(table)
+        home_rating += h_entry["rating"] * weight
+        away_rating += a_entry["rating"] * weight
         comparisons.append({
             "opponent": h_entry["opp"],
             "home_pts": h_entry["pts"],
             "away_pts": a_entry["pts"],
             "home_goal_diff": h_entry["gd"],
             "away_goal_diff": a_entry["gd"],
+            "opponent_table": table,
+            "table_weight": weight,
             "winner": "home" if h_entry["rating"] > a_entry["rating"] else "away" if a_entry["rating"] > h_entry["rating"] else "even",
             "home_event": h_entry["event"],
             "away_event": a_entry["event"],
@@ -439,6 +485,8 @@ def _common_opponent_edge(
                         "away_result": _pts_label(c["away_pts"]),
                         "home_goal_diff": c["home_goal_diff"],
                         "away_goal_diff": c["away_goal_diff"],
+                        "opponent_table": c["opponent_table"],
+                        "table_weight": c["table_weight"],
                         "winner": c["winner"],
                         "home_score": _score_str(c["home_event"]),
                         "away_score": _score_str(c["away_event"]),
