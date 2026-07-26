@@ -1284,10 +1284,18 @@ def run_enrichment_worker(
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
-        if sofa or item.get("is_live"):
-            from app.prediction_flow import apply_prediction_state
+        # The AI queue owns prematch predictions when enabled.  Enrichment still
+        # writes the complete document to the buffer, then the queue prioritises
+        # all ready prematch rows in one deterministic batch.
+        try:
+            from app.pipeline_registry import is_pipeline_enabled
+            ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
+        except Exception:
+            ai_queue_enabled = False
+        if (sofa or item.get("is_live")) and (item.get("is_live") or not ai_queue_enabled):
+            from app.ai_prediction_pipeline import run_ai_prediction_with_fallback
 
-            state = apply_prediction_state(doc, match_id=str(item.get("match_id") or ""))
+            state = run_ai_prediction_with_fallback(doc, match_id=str(item.get("match_id") or ""))
             readiness = state.get("readiness") or {}
             if state.get("status") == "predicted":
                 predicted += 1
@@ -1326,6 +1334,13 @@ def run_enrichment_worker(
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
+        elif not item.get("is_live") and ai_queue_enabled:
+            from app.enriched_prediction import prediction_readiness
+
+            doc["prediction"] = None
+            doc["prediction_error"] = None
+            doc["prediction_readiness"] = prediction_readiness(doc)
+            doc["ai_prediction_queue_pending"] = True
         else:
             doc["prediction"] = None
             from app.enriched_prediction import prediction_readiness
@@ -1556,10 +1571,15 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
-        if sofa or item.get("is_live"):
-            from app.prediction_flow import apply_prediction_state
+        try:
+            from app.pipeline_registry import is_pipeline_enabled
+            ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
+        except Exception:
+            ai_queue_enabled = False
+        if (sofa or item.get("is_live")) and (item.get("is_live") or not ai_queue_enabled):
+            from app.ai_prediction_pipeline import run_ai_prediction_with_fallback
 
-            state = apply_prediction_state(doc, match_id=str(item.get("match_id") or ""))
+            state = run_ai_prediction_with_fallback(doc, match_id=str(item.get("match_id") or ""))
             readiness = state.get("readiness") or {}
             if state.get("status") == "predicted":
                 predicted += 1
@@ -1598,6 +1618,13 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
+        elif not item.get("is_live") and ai_queue_enabled:
+            from app.enriched_prediction import prediction_readiness
+
+            doc["prediction"] = None
+            doc["prediction_error"] = None
+            doc["prediction_readiness"] = prediction_readiness(doc)
+            doc["ai_prediction_queue_pending"] = True
         else:
             doc["prediction"] = None
             from app.enriched_prediction import prediction_readiness

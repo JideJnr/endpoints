@@ -3178,10 +3178,10 @@ def _existing_schema_can_be_trusted() -> bool:
                 select count(*)
                 from sqlite_master
                 where type = 'table'
-                  and name in ('prediction_history', 'match_buffer', 'job_runs')
+                  and name in ('prediction_history', 'match_buffer', 'job_runs', 'team_behaviour_profiles')
                 """
             ).fetchone()
-        return int(row[0] if row else 0) >= 2
+        return int(row[0] if row else 0) >= 3
     except sqlite3.OperationalError as exc:
         if _is_sqlite_lock(exc):
             return True
@@ -3484,6 +3484,21 @@ def _init_db_unlocked() -> None:
                 id text primary key,
                 status text not null,
                 updated_at text not null default current_timestamp
+            )
+            """
+        )
+        conn.execute(
+            """
+            create table if not exists team_behaviour_profiles (
+                team_name text primary key,
+                btts_rate real,
+                over_2_5_rate real,
+                clean_sheet_rate real,
+                comeback_rate real,
+                high_scorer_flag integer,
+                loss_to_nil_rate real,
+                sample_size integer,
+                computed_at text
             )
             """
         )

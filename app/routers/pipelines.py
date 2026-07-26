@@ -43,7 +43,7 @@ def list_pipelines():
 @router.post("/{engine_id}/enable")
 def enable_pipeline(engine_id: str):
     """Enable a toggleable pipeline by engine_id and trigger an immediate run if applicable."""
-    from app.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP
+    from app.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP, PRESETS
     from app.league_memory import set_engine_status
     from app.activity_log import record_activity
     import threading
@@ -54,12 +54,23 @@ def enable_pipeline(engine_id: str):
             detail=f"Pipeline '{engine_id}' not found. Valid IDs: {sorted(TOGGLEABLE_IDS)}",
         )
 
-    set_engine_status(engine_id, "active")
+    # AI prediction is a complete prematch lane, not a competing worker.
+    # Its main toggle keeps only the buffer feeds it requires and pauses the
+    # remaining toggleable lanes.
+    if engine_id == "ai_prediction_queue":
+        for pipeline_id, status in PRESETS["ai_prematch"].items():
+            set_engine_status(pipeline_id, status)
+    else:
+        set_engine_status(engine_id, "active")
     record_activity(
         f"Pipeline '{PIPELINE_MAP[engine_id].label}' enabled",
         job="pipeline_control",
         status="ok",
-        details={"engine_id": engine_id, "action": "enable"},
+        details={
+            "engine_id": engine_id,
+            "action": "enable",
+            "preset": "ai_prematch" if engine_id == "ai_prediction_queue" else None,
+        },
     )
 
     # Immediate run for pipelines that have a dedicated job function
@@ -87,6 +98,7 @@ def enable_pipeline(engine_id: str):
         "enabled": True,
         "label": PIPELINE_MAP[engine_id].label,
         "immediate_run": engine_id in _IMMEDIATE_RUN_MAP,
+        "preset_applied": "ai_prematch" if engine_id == "ai_prediction_queue" else None,
     }
 
 

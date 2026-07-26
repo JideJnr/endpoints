@@ -51,6 +51,15 @@ class PipelineDef:
 
 PIPELINES: list[PipelineDef] = [
     PipelineDef(
+        engine_id="ai_prediction_queue",
+        label="AI Prediction Queue",
+        description="Prioritises enriched prematch buffer rows, then runs the evidence-first Ollama pipeline with rules-engine fallback.",
+        interval="Every 5 min",
+        source="Internal",
+        job_ids=("ai_prediction_queue",),
+        default="active",
+    ),
+    PipelineDef(
         engine_id="sportybet_ingest_live",
         label="Live Ingest (SportyBet)",
         description="Fetches live matches from SportyBet every 30 s and patches scores/periods. "
@@ -73,8 +82,8 @@ PIPELINES: list[PipelineDef] = [
     PipelineDef(
         engine_id="sportybet_enrich_prematch",
         label="Prematch Enrichment",
-        description="Enriches upcoming (non-live) matches with SofaScore detail, "
-                    "web context, and runs predictions. Independent of live enrichment.",
+        description="Enriches upcoming (non-live) matches with SofaScore detail and web context. "
+                    "When AI Prediction Queue is enabled, it owns prematch prediction order.",
         interval="Every 30 s",
         source="SofaScore",
         job_ids=("enrich_worker",),
@@ -162,6 +171,14 @@ TOGGLEABLE_IDS: frozenset[str] = frozenset(PIPELINE_MAP.keys())
 # ── Preset definitions ─────────────────────────────────────────────────────────
 
 PRESETS: dict[str, dict[str, StatusType]] = {
+    # Keep only the data lanes required to fill the prematch buffer plus the
+    # priority AI decision lane. All live/special/duplicate pipelines are off.
+    "ai_prematch": {
+        p.engine_id: ("active" if p.engine_id in {
+            "ai_prediction_queue", "sportybet_ingest_upcoming", "sportybet_enrich_prematch"
+        } else "paused")
+        for p in PIPELINES
+    },
     # Cloud: disable SportyBet ingest, enable SofaScore pipeline
     "cloud": {
         "sportybet_ingest_live":     "paused",

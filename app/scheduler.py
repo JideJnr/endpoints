@@ -31,6 +31,7 @@ from app.buffer import (
     purge_ghost_matches,
 )
 from app.activity_log import record_activity
+from app.ai_prediction_pipeline import job_ai_prediction_queue
 
 
 _scheduler = None
@@ -45,6 +46,7 @@ LIVE_PRIORITY_ENGINE_ID = "live_priority_mode"
 # priority queue on the next pass.
 UNIFIED_UPCOMING_BATCH_SIZE = 12
 SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
+    "ai_prediction_queue": {"label": "AI prediction queue", "default": 300, "min": 60, "max": 600, "pipeline_id": "ai_prediction_queue"},
     "ingest_live": {"label": "Live ingest", "default": 180, "min": 15, "max": 600, "pipeline_id": "sportybet_ingest_live"},
     "ingest_upcoming": {"label": "Upcoming ingest", "default": 120, "min": 60, "max": 600, "pipeline_id": "sportybet_ingest_upcoming"},
     "enrich_worker": {"label": "Live enrichment", "default": 30, "min": 30, "max": 300, "pipeline_id": "sportybet_enrich_live"},
@@ -55,6 +57,7 @@ SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "unified_live": {"label": "Unified live pipeline", "default": 60, "min": 30, "max": 300, "pipeline_id": "unified_live"},
 }
 _DB_WRITE_JOB_IDS = {
+    "ai_prediction_queue",
     "ingest_live",
     "ingest_upcoming",
     "enrich_worker",
@@ -74,6 +77,7 @@ _DB_WRITE_JOB_IDS = {
     "unified_live",
 }
 _JOB_STALE_SECONDS = {
+    "ai_prediction_queue": 600,
     "ingest_live": 150,
     "ingest_upcoming": 180,
     "enrich_worker": 180,
@@ -1215,6 +1219,17 @@ def start_scheduler():
         coalesce=True,
         misfire_grace_time=120,
         next_run_time=now + timedelta(seconds=45),
+    )
+
+    scheduler.add_job(
+        _safe(job_ai_prediction_queue),
+        IntervalTrigger(seconds=_scheduler_interval("ai_prediction_queue")),
+        id="ai_prediction_queue",
+        name="Evidence-first AI prediction queue",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
 
     # future enrichment — every 1 hour, enriches fixtures beyond tomorrow
