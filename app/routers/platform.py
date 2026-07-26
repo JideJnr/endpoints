@@ -410,8 +410,52 @@ def post_grade_betbuilder(limit: int = Query(default=300, ge=1, le=1000)):
     return {"status": "success", **result}
 
 
+@router.post("/matches/{sportybet_id}/enriched-analysis")
+def post_enriched_match_analysis(sportybet_id: str, payload: dict[str, Any] = Body(default_factory=dict)):
+    try:
+        from app.ai_betbuilder import enriched_match_analysis
+
+        result = enriched_match_analysis(sportybet_id, force_refresh=bool(payload.get("force_refresh")))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if result.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+        raise HTTPException(status_code=503, detail=result.get("message") or "AI analysis is unavailable")
+    return result
+
+
+@router.post("/betbuilder/sure-picks")
+def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
+    analyses = payload.get("analyses") or []
+    if len(analyses) < 2:
+        raise HTTPException(status_code=400, detail="At least two completed Enriched Analysis results are required")
+    try:
+        from app.ai_betbuilder import synthesize_sure_picks
+        target_odds = max(1.01, _to_float(payload.get("target_odds")) or 5.0)
+        max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 1.35)
+
+        return synthesize_sure_picks(
+            analyses[:20],
+            target_odds=target_odds,
+            max_total_odds=max_total_odds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
 @router.post("/betbuilder/auto")
 def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
+    """Build a Groq-powered slip from upcoming prediction-engine candidates."""
+    from app.ai_betbuilder import build_ai_betbuilder
+
+    result = build_ai_betbuilder(payload)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+def _post_auto_betbuilder_legacy(payload: dict[str, Any]):
     """Build a slip from learned predictions under user odds/date constraints."""
     from app.buffer import refresh_sporty_buffer_scope
     from app.current_predictions import list_recent_dashboard_predictions
