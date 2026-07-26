@@ -43,16 +43,54 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     target_date = match_date or dt.today().isoformat()
 
     sporty_matches = fetch_live_and_upcoming_matches_post()[:limit]
-    sofa_events = [
-        event for event in fetch_all_scheduled_events(target_date)
-        if is_usable_event_for_mode(event, live=False)
-    ]
+    # Existing links are stable for a fixture.  Do not download the complete
+    # candidate schedule again just to rediscover an already stored ID.
+    from app.league_memory import get_enriched_match
+
+    existing_by_index: dict[int, dict[str, Any]] = {}
+    for index, sporty in enumerate(sporty_matches):
+        if force:
+            continue
+        existing = get_enriched_match(str(sporty.get("id") or ""))
+        if existing and existing.get("sofascore_id"):
+            existing_by_index[index] = existing
+
+    needs_candidate_search = len(existing_by_index) < len(sporty_matches)
+    sofa_events = []
+    if needs_candidate_search:
+        sofa_events = [
+            event for event in fetch_all_scheduled_events(target_date)
+            if is_usable_event_for_mode(event, live=False)
+        ]
 
     # ── Step 1: fuzzy + HF match all sporty → sofa (fast, CPU-bound) ──────────
     matched_pairs: list[tuple[dict, dict | None, float]] = []
-    matched = unmatched = llm_used = 0
+    cached_details: dict[int, dict] = {}
+    matched = unmatched = llm_used = reused = 0
 
-    for sporty in sporty_matches:
+    for index, sporty in enumerate(sporty_matches):
+        existing = existing_by_index.get(index)
+        if existing:
+            saved_event = existing.get("sofascore_event")
+            sofa = saved_event if isinstance(saved_event, dict) else None
+            if not sofa:
+                try:
+                    from app.sofascore_client import fetch_event
+
+                    sofa = fetch_event(int(existing["sofascore_id"]))
+                except Exception:
+                    sofa = None
+            saved_detail = existing.get("sofascore_detail")
+            if sofa and isinstance(saved_detail, dict) and saved_detail:
+                detail_id = saved_detail.get("id") or saved_detail.get("event_id")
+                if detail_id is None or str(detail_id) == str(sofa.get("id")):
+                    cached_details[index] = saved_detail
+            matched_pairs.append((sporty, sofa, float(existing.get("match_score") or 1.0)))
+            matched += int(bool(sofa))
+            unmatched += int(not sofa)
+            reused += int(bool(sofa))
+            continue
+
         sofa, score = _fuzzy_match(sporty, sofa_events)
 
         if score < FUZZY_THRESHOLD:
@@ -77,8 +115,11 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
 
     # ── Step 2: fetch SofaScore detail in parallel ────────────────────────────
     # Only for matches that have a sofa event — skip the rest
-    needs_detail = [(i, sofa) for i, (_, sofa, _) in enumerate(matched_pairs) if sofa]
-    details: dict[int, dict | None] = {i: None for i in range(len(matched_pairs))}
+    needs_detail = [
+        (i, sofa) for i, (_, sofa, _) in enumerate(matched_pairs)
+        if sofa and i not in cached_details
+    ]
+    details: dict[int, dict | None] = {i: cached_details.get(i) for i in range(len(matched_pairs))}
 
     def _fetch_detail(idx: int, sofa: dict) -> tuple[int, dict | None]:
         try:
@@ -92,7 +133,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             idx, detail = future.result()
             details[idx] = detail
 
-    print(f"[enrichment] sofa detail fetched: {sum(1 for d in details.values() if d)}/{len(needs_detail)}")
+    print(f"[enrichment] sofa detail fetched: {len(needs_detail)} requested, {reused} saved matches reused")
 
     # ── Step 3: web context in parallel — only for sofa-matched matches ───────
     # Web search is optional and slow — skip it for unmatched matches entirely
@@ -162,6 +203,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "sofascore_name": sofa.get("name") if sofa else None,
             "sofascore_event": sofa,
             "sofascore_detail": detail,
+            "sofascore_detail_source": "saved" if i in cached_details else "fetched" if detail else "unavailable",
             "home_last_matches": (detail or {}).get("home_last_matches") or [],
             "away_last_matches": (detail or {}).get("away_last_matches") or [],
             "standings": (detail or {}).get("standings") or [],
@@ -188,6 +230,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
         "date": target_date,
         "sporty_count": len(sporty_matches),
         "sofa_count": len(sofa_events),
+        "sofascore_reused": reused,
         "matched": matched,
         "llm_fallback": llm_used,
         "unmatched": unmatched,

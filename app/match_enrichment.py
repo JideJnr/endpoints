@@ -66,12 +66,14 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
     match_date = doc.get("match_date") or date.today().isoformat()
     sofa, score, source = _resolve_sofascore_match(doc, sporty, match_date)
 
-    detail = None
-    if sofa:
+    detail = _saved_sofascore_detail(doc, sofa)
+    detail_source = "saved" if detail else "fetched"
+    if sofa and not detail:
         try:
             detail = fetch_event_detail(sofa)
         except Exception:
             detail = None
+            detail_source = "unavailable"
 
     web_context = {}
     try:
@@ -105,6 +107,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "sofascore_name": sofa.get("name") if sofa else None,
         "sofascore_event": sofa,
         "sofascore_detail": detail,
+        "sofascore_detail_source": detail_source,
         "home_last_matches": (detail or {}).get("home_last_matches") or [],
         "away_last_matches": (detail or {}).get("away_last_matches") or [],
         "standings": (detail or {}).get("standings") or [],
@@ -144,6 +147,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "fuzzy_score": round(score, 3),
         "match_source": source,
         "has_detail": bool(detail),
+        "sofascore_detail_source": detail_source,
         "has_web_context": bool(web_context.get("snippets")),
         "has_sportradar": bool(sportradar_detail.get("available")),
         "web_context_query": web_context.get("query"),
@@ -155,11 +159,15 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
 def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_date: str) -> tuple[dict[str, Any] | None, float, str]:
     saved_sofa_id = doc.get("sofascore_id")
     if saved_sofa_id:
-        sofa = _find_sofascore_event(str(saved_sofa_id), match_date, _is_live_doc(doc))
-        if not sofa and isinstance(doc.get("sofascore_event"), dict):
-            sofa = doc["sofascore_event"]
+        # A previously matched event is stable for the lifetime of a fixture.
+        # Reusing it prevents every manual enrich/predict request from scanning
+        # the complete SofaScore candidate feeds again.  We still resolve the
+        # ID directly when an older document does not contain the saved event.
+        sofa = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else None
+        if not sofa or str(sofa.get("id") or "") != str(saved_sofa_id):
+            sofa = _find_sofascore_event(str(saved_sofa_id), match_date, _is_live_doc(doc))
         score = _candidate_score(sofa, doc) if sofa else float(doc.get("match_score") or 1.0)
-        return sofa, score, "manual"
+        return sofa, score, "saved"
 
     if not _is_live_doc(doc):
         try:
@@ -199,6 +207,19 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
         sofa = None
         source = "no_match"
     return sofa, score, source
+
+
+def _saved_sofascore_detail(doc: dict[str, Any], sofa: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return reusable pre-match detail only when it belongs to the saved event."""
+    if _is_live_doc(doc) or not sofa:
+        return None
+    detail = doc.get("sofascore_detail")
+    if not isinstance(detail, dict) or not detail:
+        return None
+    detail_id = detail.get("id") or detail.get("event_id")
+    if detail_id is not None and str(detail_id) != str(sofa.get("id")):
+        return None
+    return detail
 
 
 def _find_sofascore_event(sofa_id: str, match_date: str, live: bool) -> dict[str, Any] | None:
