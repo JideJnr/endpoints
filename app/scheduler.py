@@ -32,6 +32,7 @@ from app.buffer import (
 )
 from app.activity_log import record_activity
 from app.ai_prediction_pipeline import job_ai_prediction_queue
+from app.competition_analyser import job_competition_analysis
 
 
 _scheduler = None
