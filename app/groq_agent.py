@@ -151,6 +151,8 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
     web = doc.get("web_context") or {}
     snippets = web.get("snippets") or []
     web_str = str((snippets[0].get("snippet") if snippets else None) or "none")[:150]
+    grok_web = web.get("grok_analysis") or {}
+    grok_web_str = str(grok_web.get("summary") or "none")[:600]
 
     return (
         f"{doc.get('sportybet_name') or doc.get('name')} | "
@@ -166,6 +168,7 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         f"H2H: {h2h_str}\n"
         f"ODDS: {odds_str}\n"
         f"WEB: {web_str}\n"
+        f"GROK_WEB_RESEARCH: {grok_web_str}\n"
         f"\nOutput prediction as JSON."
     )
 

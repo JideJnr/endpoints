@@ -3932,6 +3932,7 @@ def _model_signals(
     web = doc.get("web_context") or {}
     snippets = web.get("snippets") or []
     scraped = web.get("scraped") or []
+    grok = web.get("grok_analysis") or {}
     attempts = web.get("attempts") or []
     web_impact = 0
     if web.get("error") or web.get("disabled"):
@@ -3945,6 +3946,8 @@ def _model_signals(
                 "query": web.get("query"),
                 "snippets": len(snippets),
                 "scraped": len(scraped),
+                "grok_status": grok.get("status"),
+                "grok_evidence": len(grok.get("evidence") or []),
                 "attempts": attempts,
                 "source_titles": [
                     item.get("title")

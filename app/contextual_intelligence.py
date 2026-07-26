@@ -599,6 +599,14 @@ def _web_text(doc: dict[str, Any]) -> str:
         if isinstance(item, dict):
             values.append(str(item.get("title") or ""))
             values.append(str(item.get("text") or item.get("snippet") or ""))
+        else:
+            values.append(str(item))
+    grok = web.get("grok_analysis") or {}
+    if grok.get("status") == "ok":
+        values.append(str(grok.get("summary") or ""))
+        for item in grok.get("evidence") or []:
+            if isinstance(item, dict):
+                values.append(str(item.get("claim") or ""))
     return " ".join(values)
 
 
