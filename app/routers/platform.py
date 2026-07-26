@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from datetime import date as dt, datetime
+from datetime import date as dt
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.contextual_intelligence import builder_relationship_intelligence
 from app.league_memory import (
-    betbuilder_pick_memory,
     get_enriched_match,
     get_enriched_matches,
     get_country_from_memory,
@@ -399,6 +397,32 @@ def post_betbuilder(payload: dict[str, Any] = Body(...)):
     return {"status": "success", "bet": bet}
 
 
+@router.post("/betbuilder/book")
+def post_betbuilder_book(payload: dict[str, Any] = Body(...)):
+    """Build the SportyBet booking request and optionally obtain a share code.
+
+    SPORTYBET_SHARE_CODE_URL is intentionally opt-in because SportyBet's
+    booking endpoint can vary by market/app version. Without it, clients get
+    a fully resolved payload they can inspect or submit through their approved
+    integration.
+    """
+    from app.sportybet_booking import build_booking_payload, request_share_code
+
+    selections = payload.get("selections") or []
+    try:
+        stake = int(payload.get("stake") or 0)
+        booking_payload = build_booking_payload(
+            selections,
+            stake=stake,
+            loading_share_code=payload.get("loadingShareCode"),
+        )
+        return request_share_code(booking_payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
 @router.get("/betbuilder/history")
 def get_betbuilder_history(limit: int = Query(default=100, ge=1, le=1000), auto_grade: bool = True):
     return {"status": "success", **list_betbuilder_history(limit=limit, auto_grade=auto_grade)}
@@ -453,148 +477,6 @@ def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
     if result.get("status") == "error":
         raise HTTPException(status_code=503, detail=result)
     return result
-
-
-def _post_auto_betbuilder_legacy(payload: dict[str, Any]):
-    """Build a slip from learned predictions under user odds/date constraints."""
-    from app.buffer import refresh_sporty_buffer_scope
-    from app.current_predictions import list_recent_dashboard_predictions
-    from app.pick_roles import backfill_role_learning, learned_best_pick, load_role_memory_rows
-
-    scope = str(payload.get("scope") or payload.get("mode") or "upcoming").strip().lower()
-    if scope not in {"upcoming", "live"}:
-        scope = "upcoming"
-    try:
-        refresh_state = refresh_sporty_buffer_scope(scope)
-    except Exception as exc:
-        refresh_state = {"status": "error", "scope": scope, "error": str(exc)}
-    target_odds = max(1.01, _to_float(payload.get("target_odds")) or 5.0)
-    max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 1.35)
-    min_leg_odds = max(1.01, _to_float(payload.get("min_leg_odds")) or 1.10)
-    max_leg_odds = max(min_leg_odds, _to_float(payload.get("max_leg_odds")) or 4.00)
-    min_confidence = max(1, min(99, _to_int(payload.get("min_confidence"), 60)))
-    max_legs = max(1, min(30, _to_int(payload.get("max_legs"), 10)))
-    date_filter = str(payload.get("date") or "").strip()
-    start_time = str(payload.get("start_time") or "").strip()
-    end_time = str(payload.get("end_time") or "").strip()
-    allowed_types = {
-        str(item).strip()
-        for item in (payload.get("pick_types") or payload.get("picks") or [])
-        if str(item).strip()
-    }
-
-    predictions = list_recent_dashboard_predictions(hours=72, limit=1200)
-    role_rows = load_role_memory_rows()
-    time_map = _betbuilder_match_time_map()
-    candidates: list[dict[str, Any]] = []
-    skipped: dict[str, int] = {}
-
-    for prediction in predictions:
-        match_id = str(prediction.get("match_id") or "")
-        timing = time_map.get(match_id, {})
-        eligible, skip_reason = _betbuilder_scope_eligible(timing, scope)
-        if not eligible:
-            skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
-            continue
-        match_date = str(timing.get("match_date") or prediction.get("match_date") or "")[:10]
-        local_time = _betbuilder_time_label(timing)
-        if date_filter and match_date and match_date != date_filter:
-            skipped["date_filter"] = skipped.get("date_filter", 0) + 1
-            continue
-        time_key = _betbuilder_time_key(timing)
-        if start_time and time_key and time_key < start_time[:5]:
-            skipped["start_time_filter"] = skipped.get("start_time_filter", 0) + 1
-            continue
-        if end_time and time_key and time_key > end_time[:5]:
-            skipped["end_time_filter"] = skipped.get("end_time_filter", 0) + 1
-            continue
-        picks = [pick for pick in (prediction.get("picks") or []) if pick.get("type") != "no_bet"]
-        backfill_role_learning(prediction, picks, match_id, role_rows)
-        if not picks:
-            continue
-        # Keep all eligible picks, but mark the learned-best one.
-        best = learned_best_pick(picks)
-        for pick in picks:
-            pick_type = str(pick.get("type") or "")
-            if allowed_types and pick_type not in allowed_types and str(pick.get("selection") or "") not in allowed_types:
-                continue
-            confidence = int(pick.get("confidence") or 0)
-            if confidence < min_confidence:
-                continue
-            odds = _pick_decimal_odds(pick)
-            if odds < min_leg_odds or odds > max_leg_odds:
-                continue
-            builder_memory = betbuilder_pick_memory(
-                pick_type,
-                str(pick.get("selection") or ""),
-                prediction.get("league_name"),
-                prediction.get("country_name"),
-                odds,
-            )
-            score = _builder_pick_score(pick, best) + float(builder_memory.get("adjustment") or 0)
-            candidates.append({
-                "match_id": match_id,
-                "match": prediction.get("match_name"),
-                "league": prediction.get("league_name"),
-                "country": prediction.get("country_name"),
-                "match_date": match_date,
-                "local_time": local_time,
-                "status": "Live" if timing.get("is_live") else "Upcoming",
-                "period": timing.get("period") or ("Live" if timing.get("is_live") else "Not start"),
-                "scope": scope,
-                "type": pick_type,
-                "selection": pick.get("selection"),
-                "odds": round(odds, 3),
-                "confidence": confidence,
-                "reason": pick.get("reason"),
-                "score": round(score, 2),
-                "learned_best": bool(pick is best or pick.get("learned_best")),
-                "learning": {
-                    "role": pick.get("role"),
-                    "role_learning": pick.get("role_learning"),
-                    "calibration": pick.get("calibration"),
-                    "betbuilder_memory": builder_memory,
-                },
-            })
-
-    candidates.sort(key=lambda item: (item["learned_best"], item["score"], item["confidence"]), reverse=True)
-    selections = _choose_builder_combo(candidates, target_odds, max_total_odds, max_legs)
-    combined = _combined_builder_odds(selections)
-    avg_conf = round(sum(item["confidence"] for item in selections) / len(selections)) if selections else 0
-    request = {
-        "target_odds": target_odds,
-        "max_total_odds": max_total_odds,
-        "min_leg_odds": min_leg_odds,
-        "max_leg_odds": max_leg_odds,
-        "min_confidence": min_confidence,
-        "max_legs": max_legs,
-        "date": date_filter,
-        "start_time": start_time,
-        "end_time": end_time,
-        "pick_types": sorted(allowed_types),
-        "scope": scope,
-    }
-    max_possible = _estimate_builder_max_possible(candidates, max_legs)
-    return {
-        "status": "success",
-        "request": request,
-        "sporty_refresh": refresh_state,
-        "candidate_count": len(candidates),
-        "skipped": skipped,
-        "max_possible_odds": round(max_possible, 3),
-        "combined_odds": round(combined, 3),
-        "target_met": bool(selections and combined >= target_odds and combined <= max_total_odds),
-        "target_gap": round(max(0.0, target_odds - combined), 3),
-        "constraint_warning": (
-            "Target odds cannot be reached with the current max legs and leg odds filters."
-            if candidates and max_possible < target_odds
-            else None
-        ),
-        "confidence": avg_conf,
-        "selections": selections,
-        "alternates": [item for item in candidates if item not in selections][:20],
-        "learning_note": f"Generated from {scope} prediction history, role memory, calibration, and available pick odds. Save the slip to add it to betbuilder training history.",
-    }
 
 
 @router.get("/engines/metrics")
@@ -974,270 +856,6 @@ def _pick_decimal_odds(pick: dict[str, Any]) -> float:
     if odds and odds > 1:
         return odds
     return _estimate_odds(pick.get("confidence"))
-
-
-def _builder_pick_score(pick: dict[str, Any], best_pick: dict[str, Any]) -> float:
-    confidence = float(pick.get("confidence") or 0)
-    score = confidence
-    if pick is best_pick or pick.get("learned_best"):
-        score += 7
-    role_memory = pick.get("role_learning") if isinstance(pick.get("role_learning"), dict) else {}
-    role = "primary" if pick.get("role") == "primary" else "secondary"
-    stats = role_memory.get("primary") if role == "primary" else (role_memory.get("secondary") or {})
-    samples = float((stats or {}).get("samples") or 0)
-    local_samples = float((stats or {}).get("local_samples") or 0)
-    win_rate = float((stats or {}).get("win_rate") or 0)
-    if samples >= 5:
-        score += (win_rate - 0.52) * 18
-    if local_samples:
-        score += min(4.0, local_samples)
-    calibration = pick.get("calibration") if isinstance(pick.get("calibration"), dict) else {}
-    memory = calibration.get("memory_weighting") if isinstance(calibration.get("memory_weighting"), dict) else {}
-    blended = _to_float(memory.get("blended_win_rate"))
-    if blended is not None:
-        score += (blended - 52) / 4
-    if pick.get("type") == "value_bet":
-        score -= 6
-    return score
-
-
-def _choose_builder_combo(
-    candidates: list[dict[str, Any]],
-    target_odds: float,
-    max_total_odds: float,
-    max_legs: int,
-) -> list[dict[str, Any]]:
-    pool = candidates[:120]
-    states: list[tuple[float, float, tuple[str, ...], list[dict[str, Any]]]] = [(1.0, 0.0, tuple(), [])]
-    for candidate in pool:
-        next_states = list(states)
-        for combined, quality, match_ids, selections in states:
-            if len(selections) >= max_legs or candidate["match_id"] in match_ids:
-                continue
-            next_combined = combined * float(candidate["odds"])
-            if next_combined > max_total_odds * 1.12:
-                continue
-            relationship = builder_relationship_intelligence(selections, candidate)
-            candidate_with_relationship = {
-                **candidate,
-                "builder_relationship": relationship,
-                "score": round(float(candidate.get("score") or 0) + float(relationship.get("score_adjustment") or 0), 2),
-            }
-            next_states.append((
-                next_combined,
-                quality + float(candidate_with_relationship.get("score") or 0),
-                (*match_ids, candidate["match_id"]),
-                [*selections, candidate_with_relationship],
-            ))
-        next_states.sort(
-            key=lambda state: (
-                state[0] >= target_odds and state[0] <= max_total_odds,
-                -abs(target_odds - state[0]) / max(target_odds, 1.0),
-                state[1] / max(1, len(state[3])),
-                -len(state[3]),
-            ),
-            reverse=True,
-        )
-        states = next_states[:140]
-
-    valid = [state for state in states if state[3] and target_odds <= state[0] <= max_total_odds]
-    if valid:
-        return max(
-            valid,
-            key=lambda state: (
-                state[1] / max(1, len(state[3])),
-                -abs(target_odds - state[0]),
-                -len(state[3]),
-            ),
-        )[3]
-    odds_first = _greedy_reach_builder_target(candidates, target_odds, max_total_odds, max_legs)
-    if odds_first:
-        return odds_first
-    below = [state for state in states if state[3] and state[0] < target_odds]
-    if below:
-        return max(below, key=lambda state: (state[0], state[1] / max(1, len(state[3]))))[3]
-    fallback = [state for state in states if state[3]]
-    return min(fallback, key=lambda state: state[0]) [3] if fallback else []
-
-
-def _greedy_reach_builder_target(
-    candidates: list[dict[str, Any]],
-    target_odds: float,
-    max_total_odds: float,
-    max_legs: int,
-) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    used: set[str] = set()
-    combined = 1.0
-    pool = sorted(
-        candidates,
-        key=lambda item: (float(item.get("odds") or 1), float(item.get("score") or 0)),
-        reverse=True,
-    )
-    while combined < target_odds and len(selected) < max_legs:
-        usable = [
-            item for item in pool
-            if item["match_id"] not in used and combined * float(item.get("odds") or 1) <= max_total_odds
-        ]
-        if not usable:
-            break
-        scored = [
-            {
-                **item,
-                "builder_relationship": builder_relationship_intelligence(selected, item),
-            }
-            for item in usable
-        ]
-        for item in scored:
-            item["score"] = round(float(item.get("score") or 0) + float((item.get("builder_relationship") or {}).get("score_adjustment") or 0), 2)
-        # Prefer the leg that gets us closest to target without crossing the ceiling.
-        best = min(
-            scored,
-            key=lambda item: (
-                abs(target_odds - combined * float(item.get("odds") or 1)),
-                -float(item.get("score") or 0),
-            ),
-        )
-        selected.append(best)
-        used.add(best["match_id"])
-        combined *= float(best.get("odds") or 1)
-    return selected if target_odds <= combined <= max_total_odds else []
-
-
-def _combined_builder_odds(selections: list[dict[str, Any]]) -> float:
-    combined = 1.0
-    for selection in selections:
-        combined *= float(selection.get("odds") or 1)
-    return combined if selections else 0.0
-
-
-def _estimate_builder_max_possible(candidates: list[dict[str, Any]], max_legs: int) -> float:
-    combined = 1.0
-    used: set[str] = set()
-    legs = 0
-    for candidate in sorted(candidates, key=lambda item: float(item.get("odds") or 1), reverse=True):
-        if candidate["match_id"] in used:
-            continue
-        combined *= float(candidate.get("odds") or 1)
-        used.add(candidate["match_id"])
-        legs += 1
-        if legs >= max_legs:
-            break
-    return combined if legs else 0.0
-
-
-def _betbuilder_match_time_map() -> dict[str, dict[str, Any]]:
-    import json
-    import sqlite3
-    from app.league_memory import DB_PATH, _init_db
-    from app.buffer import _init_buffer_table
-
-    _init_db()
-    result: dict[str, dict[str, Any]] = {}
-    try:
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
-            conn.row_factory = sqlite3.Row
-            _init_buffer_table(conn)
-            rows = conn.execute(
-                """
-                select match_id, match_date, start_time, period, is_live, is_finished,
-                       raw_sporty, raw_enriched, 'match_buffer' as source_table
-                from match_buffer
-                union all
-                select match_id, match_date, start_time, period, is_live, is_finished,
-                       raw_sporty, raw_enriched, 'future_match_buffer' as source_table
-                from future_match_buffer
-                """
-            ).fetchall()
-        for row in rows:
-            doc = {}
-            for raw_key in ("raw_enriched", "raw_sporty"):
-                try:
-                    doc = json.loads(row[raw_key] or "{}")
-                    if doc:
-                        break
-                except Exception:
-                    pass
-            time_context = doc.get("time_context") if isinstance(doc.get("time_context"), dict) else {}
-            start_value = row["start_time"] or doc.get("start_time")
-            start_ms = _betbuilder_start_ms(start_value)
-            local_date = str(
-                time_context.get("local_date")
-                or row["match_date"]
-                or doc.get("match_date")
-                or (_date_from_ms(start_ms) if start_ms else "")
-            )
-            result[str(row["match_id"])] = {
-                "match_date": local_date,
-                "start_time": str(start_value or ""),
-                "start_ms": start_ms,
-                "local_time": str(time_context.get("match_local_time") or time_context.get("user_local_time") or row["start_time"] or ""),
-                "period": str(row["period"] or doc.get("period") or ""),
-                "is_live": bool(row["is_live"]),
-                "is_finished": bool(row["is_finished"]),
-                "source_table": row["source_table"],
-            }
-    except Exception:
-        pass
-    return result
-
-
-def _betbuilder_scope_eligible(timing: dict[str, Any], scope: str) -> tuple[bool, str]:
-    if not timing:
-        return False, "not_in_buffer"
-    if timing.get("is_finished"):
-        return False, "finished"
-    now_ms = int(datetime.now().timestamp() * 1000)
-    start_ms = _to_int(timing.get("start_ms"), 0)
-    period = str(timing.get("period") or "").strip().lower()
-    if scope == "live":
-        if timing.get("is_live") and period not in {"ft", "ended", "finished", "aet"}:
-            return True, ""
-        return False, "not_live"
-    if timing.get("is_live"):
-        return False, "live"
-    if start_ms and start_ms < now_ms - 15 * 60 * 1000:
-        return False, "stale_or_started"
-    return True, ""
-
-
-def _betbuilder_time_label(timing: dict[str, Any]) -> str:
-    value = str(timing.get("local_time") or "").strip()
-    hhmm = _betbuilder_time_key(timing)
-    if hhmm and (value.isdigit() or not value):
-        return hhmm
-    return value or hhmm
-
-
-def _betbuilder_time_key(timing: dict[str, Any]) -> str:
-    value = str(timing.get("local_time") or timing.get("start_time") or "").strip()
-    if len(value) >= 5 and value[2] == ":":
-        return value[:5]
-    if len(value) >= 16 and value[13:16].startswith(":"):
-        return value[11:16]
-    start_ms = _to_int(timing.get("start_ms"), 0)
-    if start_ms:
-        try:
-            return datetime.fromtimestamp(start_ms / 1000).strftime("%H:%M")
-        except Exception:
-            return ""
-    return ""
-
-
-def _betbuilder_start_ms(value: Any) -> int:
-    raw = _to_float(value)
-    if raw is None:
-        return 0
-    if raw < 10_000_000_000:
-        raw *= 1000
-    return int(raw)
-
-
-def _date_from_ms(start_ms: int) -> str:
-    try:
-        return datetime.fromtimestamp(start_ms / 1000).date().isoformat()
-    except Exception:
-        return ""
 
 
 def _to_int(value: Any, default: int = 0) -> int:
