@@ -469,6 +469,26 @@ def _parse_event(event: dict, group: dict) -> dict:
         "tournament":   group.get("name") or event_tournament.get("name"),
         "category":     group.get("categoryName") or event_category.get("name"),
         "venue":        event.get("fixtureVenue", {}).get("name"),
+        "team_ids": {
+            "home": event.get("homeTeamId") or home_team.get("id"),
+            "away": event.get("awayTeamId") or away_team.get("id"),
+        },
+        "team_icons": {
+            "home": event.get("homeTeamIcon"),
+            "away": event.get("awayTeamIcon"),
+        },
+        "sporty_metadata": {
+            "game_id": event.get("gameId"),
+            "event_source": event.get("eventSource") or {},
+            "booking_status": event.get("bookingStatus"),
+            "product_status": event.get("productStatus"),
+            "banned": bool(event.get("banned")),
+            "market_count": len(event.get("markets") or event.get("marketList") or []),
+            "comments_count": event.get("commentsNum"),
+            "match_tracker_available": not bool(event.get("matchTrackerNotAllowed")),
+            "top_team": bool(event.get("topTeam")),
+            "topic_id": event.get("topicId"),
+        },
         "markets":      [_parse_market(m) for m in event.get("markets") or event.get("marketList") or []],
         "raw_event":    event,
         "raw_group":    group,
@@ -482,6 +502,13 @@ def _parse_market(market: dict) -> dict:
         "specifier": market.get("specifier"),
         "status":   market.get("status"),
         "group":    market.get("group"),
+        "group_id": market.get("groupId"),
+        "title": market.get("title"),
+        "guide": market.get("marketGuide"),
+        "is_banned": bool(market.get("banned")),
+        "available_score": market.get("availableScore"),
+        "last_odds_change_time": market.get("lastOddsChangeTime"),
+        "early_payout_markets": market.get("earlyPayoutMarkets") or [],
         "selections": [
             {
                 "id":          o.get("id"),
@@ -489,6 +516,7 @@ def _parse_market(market: dict) -> dict:
                 "odds":        o.get("odds"),
                 "is_active":   o.get("isActive"),
                 "probability": o.get("probability"),
+                "void_probability": o.get("voidProbability"),
             }
             for o in market.get("outcomes") or market.get("selections") or []
         ],

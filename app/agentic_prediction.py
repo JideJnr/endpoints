@@ -342,6 +342,8 @@ def _action_initialize_match_state(state: dict[str, Any]) -> dict[str, Any]:
     doc = get_buffered_match(state["match_id"])
     if not doc:
         raise AgentExecutionError(f"Match {state['match_id']} not found in buffer", {"status": "not_found"})
+    from app.competition_special import apply_known_competition_context
+    apply_known_competition_context(doc)
     state["doc"] = doc
     intelligence = build_match_intelligence(doc)
     state["match_intelligence"] = intelligence
@@ -491,6 +493,8 @@ def _action_local_llm_reasoning(state: dict[str, Any]) -> dict[str, Any]:
 
 def _action_run_prediction(state: dict[str, Any]) -> dict[str, Any]:
     doc = state.get("doc") if isinstance(state.get("doc"), dict) else {}
+    from app.competition_special import apply_known_competition_context
+    apply_known_competition_context(doc)
     result = apply_prediction_state(
         doc,
         match_id=state["match_id"],

@@ -923,6 +923,66 @@ def get_world_cup_special_status():
     return competition_status("world-cup-2026")
 
 
+@router.get("/competition-special/competitions")
+def get_top_competition_catalogue():
+    """All 30 SofaScore competitions and their individual lane settings."""
+    from app.competition_special import list_top_competitions
+
+    competitions = list_top_competitions()
+    return {"status": "success", "provider": "sofascore", "count": len(competitions), "competitions": competitions}
+
+
+@router.get("/competition-special/{competition_key}/settings")
+def get_competition_special_settings(competition_key: str):
+    from app.competition_special import get_competition_settings
+
+    return {"status": "success", "settings": get_competition_settings(competition_key)}
+
+
+@router.post("/competition-special/{competition_key}/settings")
+def post_competition_special_settings(competition_key: str, payload: dict[str, Any] = Body(...)):
+    from app.competition_special import update_competition_settings
+
+    return {"status": "success", "settings": update_competition_settings(competition_key, payload)}
+
+
+@router.post("/competition-special/{competition_key}/sync")
+def post_competition_special_sync(
+    competition_key: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit_days: int = Query(default=7, ge=1, le=90),
+):
+    from app.competition_special import sync_competition_fixtures
+
+    return sync_competition_fixtures(competition_key, start_date=start_date, end_date=end_date, limit_days=limit_days)
+
+
+@router.post("/competition-special/{competition_key}/enrich-predict")
+def post_competition_special_enrich_predict(
+    competition_key: str,
+    limit: int = Query(default=12, ge=1, le=80),
+    allow_repeat: bool = False,
+):
+    from app.competition_special import enrich_predict_competition
+
+    return enrich_predict_competition(competition_key, limit=limit, allow_repeat=allow_repeat)
+
+
+@router.get("/competition-special/{competition_key}/buffer")
+def get_competition_special_buffer(competition_key: str, limit: int = Query(default=200, ge=1, le=500)):
+    from app.competition_special import list_competition_buffer
+
+    return list_competition_buffer(competition_key, limit=limit)
+
+
+@router.get("/competition-special/{competition_key}/status")
+def get_competition_special_status(competition_key: str):
+    from app.competition_special import competition_status
+
+    return competition_status(competition_key)
+
+
 @router.get("/analytics/clv")
 def get_clv_analytics(days: int = Query(default=30, ge=1, le=365)):
     """

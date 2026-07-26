@@ -128,6 +128,11 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "enriched_at": now,
     }
 
+    # A manual SofaScore match and a dedicated competition fixture should get
+    # identical league/table/team-strength context before any prediction path.
+    from app.competition_special import apply_known_competition_context
+    apply_known_competition_context(enriched_doc)
+
     snapshot_odds(enriched_doc)
 
     if auto_predict:
@@ -281,6 +286,9 @@ def _sporty_detail(sporty: dict[str, Any], sportybet_id: str, markets: list[dict
         "home_red_cards": sporty.get("home_red_cards"),
         "away_red_cards": sporty.get("away_red_cards"),
         "venue": sporty.get("venue"),
+        "team_ids": sporty.get("team_ids") or {},
+        "team_icons": sporty.get("team_icons") or {},
+        "metadata": sporty.get("sporty_metadata") or {},
         "markets": markets,
         "market_count": len(markets),
         "odds_1x2": _extract_1x2(markets),

@@ -839,7 +839,7 @@ def job_unified_live() -> dict[str, Any]:
 
 
 def job_competition_special() -> dict[str, Any]:
-    """Optional dedicated competition lane, currently configured for World Cup 2026."""
+    """Run the dedicated SofaScore lane for all enabled top-30 competitions."""
     if is_shutting_down():
         return {"status": "shutdown", "job": "competition_special"}
     # ── Pipeline toggle check ──────────────────────────────────────────────────
@@ -849,10 +849,10 @@ def job_competition_special() -> dict[str, Any]:
             return {"status": "skipped", "job": "competition_special", "reason": "pipeline_disabled"}
     except Exception:
         pass
-    from app.competition_special import run_competition_special_cycle
+    from app.competition_special import run_enabled_competition_cycles
 
-    record_activity("Competition special cycle checking World Cup buffer", job="competition_special", status="running")
-    result = run_competition_special_cycle("world-cup-2026")
+    record_activity("Competition special cycle checking enabled top-30 buffers", job="competition_special", status="running")
+    result = run_enabled_competition_cycles()
     record_activity(
         f"Competition special cycle {result.get('status')}",
         job="competition_special",
@@ -1399,7 +1399,7 @@ def start_scheduler():
     print("[scheduler]   ingest_upcoming  every  2 min  (new matches)")
     print("[scheduler]   enrich_worker    every 30 sec  (live + today - SofaScore + predict)")
     print("[scheduler]   enrich_future    every  1 hr   (future fixtures - pre-match data)")
-    print("[scheduler]   competition_special every  5 min  (continuous World Cup special lane when enabled)")
+    print("[scheduler]   competition_special every  5 min  (enabled top-30 SofaScore special lanes)")
     print("[scheduler]   flush_to_mongo   every  2 min  (buffer -> MongoDB)")
     print("[scheduler]   supervisor       every  3 min  (audit + safe self-correction)")
     print("[scheduler]   pred_monitor     every  1 hr   (grade + mismatch/trend learning)")

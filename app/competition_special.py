@@ -18,6 +18,99 @@ DEFAULT_WORLD_CUP = {
     "end_date": "2026-07-19",
 }
 
+# Curated, stable SofaScore unique-tournament identifiers.  The catalogue is
+# intentionally configuration data rather than prediction logic: each entry
+# uses the same SofaScore-only enrichment and prediction lane below.
+TOP_30_COMPETITIONS: tuple[dict[str, Any], ...] = (
+    {"key": "premier-league", "name": "Premier League", "unique_tournament_id": 17},
+    {"key": "la-liga", "name": "LaLiga", "unique_tournament_id": 8},
+    {"key": "serie-a", "name": "Serie A", "unique_tournament_id": 23},
+    {"key": "bundesliga", "name": "Bundesliga", "unique_tournament_id": 35},
+    {"key": "ligue-1", "name": "Ligue 1", "unique_tournament_id": 34},
+    {"key": "champions-league", "name": "UEFA Champions League", "unique_tournament_id": 7},
+    {"key": "europa-league", "name": "UEFA Europa League", "unique_tournament_id": 679},
+    {"key": "conference-league", "name": "UEFA Conference League", "unique_tournament_id": 329},
+    {"key": "championship", "name": "EFL Championship", "unique_tournament_id": 37},
+    {"key": "eredivisie", "name": "Eredivisie", "unique_tournament_id": 44},
+    {"key": "primeira-liga", "name": "Primeira Liga", "unique_tournament_id": 238},
+    {"key": "super-lig", "name": "Süper Lig", "unique_tournament_id": 325},
+    {"key": "mls", "name": "Major League Soccer", "unique_tournament_id": 955},
+    {"key": "brasileirao", "name": "Brasileirão Série A", "unique_tournament_id": 242},
+    {"key": "argentine-primera", "name": "Argentine Primera División", "unique_tournament_id": 390},
+    {"key": "liga-mx", "name": "Liga MX", "unique_tournament_id": 406},
+    {"key": "saudi-pro-league", "name": "Saudi Pro League", "unique_tournament_id": 203},
+    {"key": "j1-league", "name": "J1 League", "unique_tournament_id": 98},
+    {"key": "k-league-1", "name": "K League 1", "unique_tournament_id": 116},
+    {"key": "liga-profesional", "name": "Liga Profesional Argentina", "unique_tournament_id": 155},
+    {"key": "copa-libertadores", "name": "Copa Libertadores", "unique_tournament_id": 384},
+    {"key": "copa-sudamericana", "name": "Copa Sudamericana", "unique_tournament_id": 480},
+    {"key": "belgian-pro-league", "name": "Belgian Pro League", "unique_tournament_id": 38},
+    {"key": "scottish-premiership", "name": "Scottish Premiership", "unique_tournament_id": 36},
+    {"key": "swiss-super-league", "name": "Swiss Super League", "unique_tournament_id": 215},
+    {"key": "austrian-bundesliga", "name": "Austrian Bundesliga", "unique_tournament_id": 45},
+    {"key": "danish-superliga", "name": "Danish Superliga", "unique_tournament_id": 39},
+    {"key": "eliteserien", "name": "Eliteserien", "unique_tournament_id": 20},
+    {"key": "allsvenskan", "name": "Allsvenskan", "unique_tournament_id": 67},
+    {"key": "colombia-primera-a", "name": "Categoría Primera A", "unique_tournament_id": 11539},
+)
+_CATALOGUE_BY_KEY = {entry["key"]: entry for entry in TOP_30_COMPETITIONS}
+
+
+def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
+    """Attach competition-special intelligence to any ordinary match document.
+
+    This keeps manual match matching and Grok analysis on the same known-league
+    footing as fixtures that entered through the dedicated competition lane.
+    """
+    event = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else {}
+    detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else {}
+    tournament = event.get("tournament") if isinstance(event.get("tournament"), dict) else {}
+    tournament_id = tournament.get("tournament_id") or doc.get("unique_tournament_id")
+    name = str(tournament.get("name") or doc.get("tournament") or "")
+    entry = next((item for item in TOP_30_COMPETITIONS if str(item["unique_tournament_id"]) == str(tournament_id)), None)
+    if not entry:
+        normalized = _normalise_competition_name(name)
+        entry = next((item for item in TOP_30_COMPETITIONS if _normalise_competition_name(item["name"]) == normalized), None)
+    if not entry:
+        doc["known_competition"] = {"known": False, "provider": "sofascore", "tournament": name or None}
+        return doc
+
+    intelligence = _competition_intelligence_context(entry["key"], event, detail, doc)
+    context = {
+        "known": True,
+        "provider": "sofascore",
+        "key": entry["key"],
+        "name": entry["name"],
+        "unique_tournament_id": entry["unique_tournament_id"],
+        "importance": _match_importance_context(entry["key"], event),
+        "intelligence": intelligence,
+    }
+    doc["known_competition"] = context
+    doc["competition_special"] = {"key": entry["key"], "name": entry["name"], "source": "known_competition_match"}
+    doc["competition_intelligence"] = intelligence
+    doc["team_strength_context"] = intelligence.get("team_strength")
+    doc["table_context"] = intelligence.get("table")
+    return doc
+
+
+def _normalise_competition_name(value: str) -> str:
+    return "".join(char for char in value.lower() if char.isalnum())
+
+
+def list_top_competitions() -> list[dict[str, Any]]:
+    """Return the complete curated catalogue with persisted enablement."""
+    return [get_competition_settings(entry["key"]) for entry in TOP_30_COMPETITIONS]
+
+
+def _catalogue_default(key: str) -> dict[str, Any]:
+    if key == DEFAULT_WORLD_CUP["key"]:
+        return DEFAULT_WORLD_CUP
+    entry = _CATALOGUE_BY_KEY.get(key)
+    if entry:
+        # League fixtures are rolling, so do not inherit the World Cup dates.
+        return {**entry, "season_id": None, "start_date": "", "end_date": ""}
+    return {"key": key, "name": key, "unique_tournament_id": 0, "season_id": None, "start_date": "", "end_date": ""}
+
 
 def init_competition_tables(conn: sqlite3.Connection) -> None:
     conn.execute("pragma busy_timeout = 30000")
@@ -74,24 +167,25 @@ def get_competition_settings(key: str = "world-cup-2026") -> dict[str, Any]:
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
-        _ensure_default_world_cup(conn)
+        _ensure_catalogue_settings(conn)
         row = conn.execute(
             "select * from competition_special_settings where key = ?",
             (key,),
         ).fetchone()
-    return _settings_row(row) if row else {**DEFAULT_WORLD_CUP, "enabled": False, "metadata": {}}
+    return _settings_row(row) if row else {**_catalogue_default(key), "enabled": False, "metadata": {}}
 
 
 def update_competition_settings(key: str, payload: dict[str, Any]) -> dict[str, Any]:
     current = get_competition_settings(key)
+    default = _catalogue_default(key)
     updated = {
         **current,
         "enabled": bool(payload.get("enabled", current.get("enabled"))),
-        "name": str(payload.get("name") or current.get("name") or DEFAULT_WORLD_CUP["name"]),
-        "unique_tournament_id": int(payload.get("unique_tournament_id") or current.get("unique_tournament_id") or 16),
+        "name": str(payload.get("name") or current.get("name") or default["name"]),
+        "unique_tournament_id": int(payload.get("unique_tournament_id") or current.get("unique_tournament_id") or default["unique_tournament_id"]),
         "season_id": _optional_int(payload.get("season_id", current.get("season_id"))),
-        "start_date": str(payload.get("start_date") or current.get("start_date") or ""),
-        "end_date": str(payload.get("end_date") or current.get("end_date") or ""),
+        "start_date": str(payload.get("start_date") if payload.get("start_date") is not None else current.get("start_date") or ""),
+        "end_date": str(payload.get("end_date") if payload.get("end_date") is not None else current.get("end_date") or ""),
         "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else current.get("metadata") or {},
     }
     _init_db()
@@ -138,9 +232,9 @@ def sync_competition_fixtures(
     from app.sofascore_client import fetch_scheduled_events
 
     settings = get_competition_settings(key)
-    tournament_id = int(settings.get("unique_tournament_id") or DEFAULT_WORLD_CUP["unique_tournament_id"])
-    start = _parse_date(start_date or settings.get("start_date") or DEFAULT_WORLD_CUP["start_date"])
-    end = _parse_date(end_date or settings.get("end_date") or DEFAULT_WORLD_CUP["end_date"])
+    tournament_id = int(settings.get("unique_tournament_id") or _catalogue_default(key)["unique_tournament_id"])
+    start = _parse_date(start_date or settings.get("start_date") or date.today().isoformat())
+    end = _parse_date(end_date or settings.get("end_date") or start.isoformat())
     if end < start:
         end = start
     days = min(max((end - start).days + 1, 1), max(1, limit_days))
@@ -153,7 +247,7 @@ def sync_competition_fixtures(
     _init_db()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         init_competition_tables(conn)
-        _ensure_default_world_cup(conn)
+        _ensure_catalogue_settings(conn)
         for offset in range(days):
             match_date = (start + timedelta(days=offset)).isoformat()
             try:
@@ -192,7 +286,7 @@ def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> di
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
-        _ensure_default_world_cup(conn)
+        _ensure_catalogue_settings(conn)
         rows = conn.execute(
             """
             select * from competition_special_buffer
@@ -216,7 +310,7 @@ def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
     _init_db()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         init_competition_tables(conn)
-        _ensure_default_world_cup(conn)
+        _ensure_catalogue_settings(conn)
         row = conn.execute(
             """
             select
@@ -364,8 +458,8 @@ def run_competition_special_cycle(key: str = "world-cup-2026") -> dict[str, Any]
     settings = get_competition_settings(key)
     if not settings.get("enabled"):
         return {"status": "idle", "competition": key, "enabled": False}
-    configured_start = _parse_date(settings.get("start_date") or DEFAULT_WORLD_CUP["start_date"])
-    configured_end = _parse_date(settings.get("end_date") or DEFAULT_WORLD_CUP["end_date"])
+    configured_start = _parse_date(settings.get("start_date") or date.today().isoformat())
+    configured_end = _parse_date(settings.get("end_date") or (date.today() + timedelta(days=3)).isoformat())
     loaded_until = _sync_cursor(key) or _loaded_until(key)
     if loaded_until and loaded_until < configured_end:
         window_start = loaded_until + timedelta(days=1)
@@ -384,6 +478,14 @@ def run_competition_special_cycle(key: str = "world-cup-2026") -> dict[str, Any]
     enrich = enrich_predict_competition(key, limit=8)
     refresh = refresh_competition_context(key, limit=12)
     return {"status": "success", "competition": key, "sync": sync, "mirrored": mirrored, "enrich": enrich, "refresh": refresh}
+
+
+def run_enabled_competition_cycles(limit: int = 31) -> dict[str, Any]:
+    """Run the rolling lane for enabled top-30 entries and the existing World Cup special."""
+    settings = [get_competition_settings(DEFAULT_WORLD_CUP["key"]), *list_top_competitions()]
+    enabled = [item for item in settings if item.get("enabled")][:max(1, limit)]
+    results = [run_competition_special_cycle(item["key"]) for item in enabled]
+    return {"status": "success", "processed": len(results), "enabled": len(enabled), "competitions": results}
 
 
 def refresh_competition_context(key: str = "world-cup-2026", limit: int = 12) -> dict[str, Any]:
@@ -430,29 +532,22 @@ def refresh_competition_context(key: str = "world-cup-2026", limit: int = 12) ->
     return {"status": "success", "competition": key, "refreshed": refreshed, "errors": errors, "matches": items}
 
 
-def _ensure_default_world_cup(conn: sqlite3.Connection) -> None:
-    exists = conn.execute(
-        "select 1 from competition_special_settings where key = ?",
-        (DEFAULT_WORLD_CUP["key"],),
-    ).fetchone()
-    if exists:
-        return
-    conn.execute(
-        """
-        insert into competition_special_settings
-            (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
-        values (?, ?, 0, ?, ?, ?, ?, ?)
-        """,
-        (
-            DEFAULT_WORLD_CUP["key"],
-            DEFAULT_WORLD_CUP["name"],
-            DEFAULT_WORLD_CUP["unique_tournament_id"],
-            DEFAULT_WORLD_CUP["season_id"],
-            DEFAULT_WORLD_CUP["start_date"],
-            DEFAULT_WORLD_CUP["end_date"],
-            json.dumps({"source": "sofascore", "mode": "competition_special"}),
-        ),
-    )
+def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
+    """Seed catalogue rows once, preserving all operator configuration."""
+    for default in (DEFAULT_WORLD_CUP, *TOP_30_COMPETITIONS):
+        conn.execute(
+            """
+            insert into competition_special_settings
+                (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
+            values (?, ?, 0, ?, ?, ?, ?, ?)
+            on conflict(key) do nothing
+            """,
+            (
+                default["key"], default["name"], default["unique_tournament_id"],
+                default.get("season_id"), default.get("start_date", ""), default.get("end_date", ""),
+                json.dumps({"source": "sofascore", "mode": "competition_special"}),
+            ),
+        )
 
 
 def _loaded_until(key: str) -> date | None:
@@ -604,7 +699,7 @@ def _save_competition_detail(
 def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
     start = event.get("start_timestamp") or detail.get("start_timestamp")
     match_date = datetime.fromtimestamp(float(start), tz=timezone.utc).date().isoformat() if start else date.today().isoformat()
-    markets = _special_markets()
+    markets = _special_markets(detail)
     importance = _match_importance_context(key, event)
     intelligence = _competition_intelligence_context(key, event, detail, {})
     return {
@@ -671,7 +766,24 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
     }
 
 
-def _special_markets() -> list[dict[str, Any]]:
+def _special_markets(detail: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Expose SofaScore's featured 1X2 prices in the normal market shape."""
+    featured = (detail or {}).get("odds_featured") or {}
+    candidates = [featured.get("full_time"), featured.get("default")]
+    for market in candidates:
+        choices = (market or {}).get("choices") or []
+        selections = [
+            {"name": choice.get("name"), "odds": _decimal_odds(choice.get("fractional_value"))}
+            for choice in choices
+            if choice.get("name")
+        ]
+        if len(selections) >= 2:
+            return [{
+                "id": "sofascore_featured_1x2",
+                "name": market.get("market_name") or "SofaScore Featured Odds",
+                "selections": selections,
+                "source": "sofascore",
+            }]
     return [
         {
             "id": "competition_special_1x2",
@@ -683,6 +795,19 @@ def _special_markets() -> list[dict[str, Any]]:
             ],
         }
     ]
+
+
+def _decimal_odds(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value).strip()
+        if "/" in text:
+            numerator, denominator = text.split("/", 1)
+            return round(1 + float(numerator) / float(denominator), 3)
+        return round(float(text), 3)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
 
 
 def _settings_row(row: sqlite3.Row) -> dict[str, Any]:

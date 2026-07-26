@@ -86,6 +86,16 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
     Hard target: < 800 tokens total. No JSON blobs, no full history arrays.
     """
     detail = doc.get("sofascore_detail") or {}
+    known_competition = doc.get("known_competition") or {}
+    competition_line = "unknown"
+    if known_competition.get("known"):
+        intelligence = known_competition.get("intelligence") or {}
+        competition_line = (
+            f"known={known_competition.get('name')} key={known_competition.get('key')} "
+            f"importance={((known_competition.get('importance') or {}).get('tier'))} "
+            f"table={json.dumps(intelligence.get('table') or {})[:450]} "
+            f"team_strength={json.dumps(intelligence.get('team_strength') or {})[:450]}"
+        )
     home = detail.get("home_team") or doc.get("home_team") or {}
     away = detail.get("away_team") or doc.get("away_team") or {}
     home_name = (home.get("name") or "") if isinstance(home, dict) else str(home or "")
@@ -166,6 +176,7 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         f"AWAY {away_name}: form(last5)={_wld(away_hist, away_id)} "
         f"rating={apf.get('avg_rating')} standing={away_pos}\n"
         f"H2H: {h2h_str}\n"
+        f"KNOWN_COMPETITION: {competition_line}\n"
         f"ODDS: {odds_str}\n"
         f"WEB: {web_str}\n"
         f"GROK_WEB_RESEARCH: {grok_web_str}\n"
@@ -174,6 +185,8 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
 
 
 def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
+    from app.competition_special import apply_known_competition_context
+    apply_known_competition_context(doc)
     match_input = _summarise_doc(doc)
 
     try:
@@ -214,6 +227,8 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         return {"status": "groq_unavailable", "message": "Set GROQ_API_KEY to enable AI analysis."}
 
     try:
+        from app.competition_special import apply_known_competition_context
+        apply_known_competition_context(doc)
         from app.llm import get_llm
         llm = get_llm()
         summary = _summarise_doc(doc)
