@@ -1839,7 +1839,7 @@ def predict_single_match(
 
 @router.post("/matches/{sportybet_id}/ai-analysis")
 def analyze_match_with_groq(sportybet_id: str):
-    """Create and persist a Grok explanation for the currently stored match data."""
+    """Create and persist a Groq explanation for the currently stored match data."""
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
     if not doc:
@@ -1854,6 +1854,87 @@ def analyze_match_with_groq(sportybet_id: str):
     doc["ai_analysis"] = analysis
     store_enriched(sportybet_id, doc)
     return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis}
+
+
+@router.post("/matches/{sportybet_id}/ai-analysis-ollama")
+def analyze_match_with_ollama(
+    sportybet_id: str,
+    model: str = Query(default="all", description="qwen3:8b | deepseek-r1:8b | all"),
+):
+    """
+    Run Ollama local LLM analysis for one match.
+    model=all runs both qwen3:8b and deepseek-r1:8b and returns a consensus.
+    Results are persisted alongside the Groq analysis so the frontend can show all three.
+    """
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Match not found in the buffer")
+
+    from app.ollama_agent import run_ollama_all_models, run_ollama_match_analysis
+
+    if model == "all":
+        result = run_ollama_all_models(doc)
+    else:
+        result = run_ollama_match_analysis(doc, model=model)
+        result = {"status": "success", "models": {model: result}, "consensus": result.get("recommendation"), "consensus_reached": True}
+
+    if result.get("status") not in {"success"}:
+        raise HTTPException(status_code=503, detail=result.get("message") or "Ollama analysis unavailable")
+
+    doc["ai_analysis_ollama"] = result
+    store_enriched(sportybet_id, doc)
+    return {"status": "success", "sportybet_id": sportybet_id, "ollama": result}
+
+
+@router.get("/matches/{sportybet_id}/ai-analysis-all")
+def get_all_ai_analyses(sportybet_id: str):
+    """
+    Return all stored AI analyses for a match: Groq + Ollama (qwen3:8b + deepseek-r1:8b).
+    Runs nothing — only returns what has already been computed and persisted.
+    """
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Match not found in the buffer")
+
+    groq_analysis = doc.get("ai_analysis")
+    ollama_analysis = doc.get("ai_analysis_ollama")
+
+    providers: dict[str, Any] = {}
+    if groq_analysis:
+        providers["groq"] = {
+            "label": "Groq (llama-3.3-70b)",
+            "emoji": "⚡",
+            "role": "Cloud LLM — fast, high-quality reasoning",
+            **groq_analysis,
+        }
+    if ollama_analysis:
+        for model_key, model_result in (ollama_analysis.get("models") or {}).items():
+            providers[f"ollama_{model_key.replace(':', '_').replace('.', '_')}"] = model_result
+
+    # Build overall consensus across all providers
+    all_predictions = [
+        p.get("recommendation") or p.get("prediction")
+        for p in providers.values()
+        if (p.get("status") == "predicted" or p.get("recommendation") or p.get("prediction"))
+    ]
+    all_predictions = [p for p in all_predictions if p]
+    overall_consensus = None
+    if all_predictions and len(set(all_predictions)) == 1:
+        overall_consensus = all_predictions[0]
+
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "match_name": doc.get("sportybet_name") or doc.get("name"),
+        "providers": providers,
+        "overall_consensus": overall_consensus,
+        "consensus_reached": overall_consensus is not None,
+        "provider_count": len(providers),
+        "ollama_consensus": ollama_analysis.get("consensus") if ollama_analysis else None,
+        "ollama_consensus_reached": (ollama_analysis or {}).get("consensus_reached", False),
+    }
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
@@ -1884,6 +1965,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "match_date": doc.get("match_date") or (doc.get("time_context") or {}).get("local_date"),
         "start_time": doc.get("start_time"),
         "ai_analysis": doc.get("ai_analysis"),
+        "ai_analysis_ollama": doc.get("ai_analysis_ollama"),
         "period": doc.get("period"),
         "played_seconds": doc.get("played_seconds"),
         "is_live": bool(match_state.get("is_live")),

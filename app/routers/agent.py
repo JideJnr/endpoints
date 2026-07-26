@@ -423,3 +423,51 @@ def get_groq_status():
         }
     except Exception as e:
         return {"status": "error", "groq_available": False, "detail": str(e)}
+
+
+# ── Ollama local LLM endpoints ────────────────────────────────────────────────
+# Requires Ollama running locally. Pull models:
+#   ollama pull qwen3:8b
+#   ollama pull deepseek-r1:8b
+
+@router.post("/ollama/predict")
+def post_ollama_predictions(
+    match_date: Optional[str] = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    model: str = Query(default="qwen3:8b"),
+):
+    """
+    Run Ollama local LLM predictions over today's enriched matches.
+    Supported models: qwen3:8b (Best Overall), deepseek-r1:8b (Best Reasoning).
+    Requires Ollama running locally.
+    """
+    try:
+        from app.ollama_agent import run_ollama_predictions
+        return run_ollama_predictions(match_date=match_date, limit=limit, model=model)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/ollama/status")
+def get_ollama_status():
+    """Check if Ollama is running and which models are available."""
+    try:
+        from app.ollama_agent import is_ollama_available, OLLAMA_MODELS
+        reachable = is_ollama_available()
+        model_status = {}
+        if reachable:
+            for model in OLLAMA_MODELS:
+                info = OLLAMA_MODELS[model]
+                model_status[model] = {
+                    **info,
+                    "available": is_ollama_available(model),
+                    "pull_command": f"ollama pull {model}",
+                }
+        return {
+            "status": "success",
+            "ollama_running": reachable,
+            "message": "Ollama ready" if reachable else "Ollama not running. Start with: ollama serve",
+            "models": model_status,
+        }
+    except Exception as e:
+        return {"status": "error", "ollama_running": False, "detail": str(e)}
