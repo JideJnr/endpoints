@@ -557,6 +557,96 @@ def run_competition_analysis(
     }
 
 
+# ── Catch-up: refresh stale/in-progress match scores ─────────────────────────
+
+def catchup_competition_scores(competition_key: str) -> dict[str, Any]:
+    """Re-fetch SofaScore status for rows that are still in-progress or have no
+    terminal status — handles the case where the engine was offline during a match.
+    Returns counts of rows refreshed and newly finished.
+    """
+    from app.sofascore_client import fetch_event
+
+    _init_db()
+    refreshed = newly_finished = 0
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        init_competition_analysis_table(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select match_id, raw_event, status from competition_special_buffer
+            where competition_key = ?
+              and status not in ('finished', 'cancelled', 'postponed')
+            """,
+            (competition_key,),
+        ).fetchall()
+
+        for row in rows:
+            try:
+                fresh = fetch_event(row["match_id"])
+                if not fresh:
+                    continue
+                status_obj = fresh.get("status") or {}
+                new_status = (status_obj.get("type") or status_obj.get("description") or "").lower()
+                score = fresh.get("score") or {}
+                conn.execute(
+                    """
+                    update competition_special_buffer
+                    set status = ?, score_home = ?, score_away = ?, raw_event = ?
+                    where competition_key = ? and match_id = ?
+                    """,
+                    (
+                        new_status,
+                        str(score.get("home") or ""),
+                        str(score.get("away") or ""),
+                        json.dumps(fresh),
+                        competition_key,
+                        row["match_id"],
+                    ),
+                )
+                refreshed += 1
+                if new_status in _TERMINAL_STATUSES:
+                    newly_finished += 1
+            except Exception as exc:
+                logger.debug("catchup_competition_scores: %s/%s failed: %s", competition_key, row["match_id"], exc)
+        conn.commit()
+
+    return {"refreshed": refreshed, "newly_finished": newly_finished}
+
+
+def _has_new_finished_since_last_analysis(conn: sqlite3.Connection, competition_key: str) -> bool:
+    """Return True if any match finished after the most recent analysis was generated."""
+    row = conn.execute(
+        """
+        select max(generated_at) from competition_analysis
+        where competition_key = ?
+        """,
+        (competition_key,),
+    ).fetchone()
+    last_generated_at = row[0] if row else None
+    if not last_generated_at:
+        # No analysis yet — check if there are any finished matches at all
+        count = conn.execute(
+            """
+            select count(*) from competition_special_buffer
+            where competition_key = ? and status in ('finished', 'cancelled', 'postponed')
+            """,
+            (competition_key,),
+        ).fetchone()[0]
+        return int(count or 0) > 0
+
+    # Check if any match was updated (enriched_at) after the last analysis
+    count = conn.execute(
+        """
+        select count(*) from competition_special_buffer
+        where competition_key = ?
+          and status in ('finished', 'cancelled', 'postponed')
+          and enriched_at > ?
+        """,
+        (competition_key, last_generated_at),
+    ).fetchone()[0]
+    return int(count or 0) > 0
+
+
 # ── Scheduler Job ─────────────────────────────────────────────────────────────
 
 def job_competition_analysis() -> dict[str, Any]:
@@ -570,23 +660,54 @@ def job_competition_analysis() -> dict[str, Any]:
 
     rounds_analysed = 0
     rounds_skipped = 0
+    rounds_deferred = 0
+    catchup_total = 0
     errors: list[str] = []
     competitions_checked = 0
 
     try:
         _init_db()
+
+        # Step 1: catch up any stale/in-progress rows for all enabled competitions
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            init_competition_analysis_table(conn)
+            enabled_keys = [
+                row[0] for row in conn.execute(
+                    "select key from competition_special_settings where enabled = 1"
+                ).fetchall()
+            ]
+
+        for key in enabled_keys:
+            try:
+                catchup = catchup_competition_scores(key)
+                catchup_total += catchup.get("newly_finished", 0)
+            except Exception as exc:
+                logger.debug("job_competition_analysis: catchup failed for %s: %s", key, exc)
+
+        # Step 2: detect completed rounds and generate analysis
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             init_competition_analysis_table(conn)
             completed_rounds = detect_newly_completed_rounds(conn)
 
-        enabled_keys = {r.competition_key for r in completed_rounds}
-        competitions_checked = len(enabled_keys)
+            # Defer competitions where nothing new has finished since last analysis
+            actionable: list[CompletedRound] = []
+            for completed in completed_rounds:
+                if _has_new_finished_since_last_analysis(conn, completed.competition_key):
+                    actionable.append(completed)
+                else:
+                    rounds_deferred += 1
+                    logger.info(
+                        "job_competition_analysis: deferring %s/%s — no new finished matches",
+                        completed.competition_key, completed.round_name,
+                    )
+
+        competitions_checked = len({r.competition_key for r in actionable})
         logger.info(
-            "job_competition_analysis: competitions_checked=%d newly_completed_rounds=%d",
-            competitions_checked, len(completed_rounds),
+            "job_competition_analysis: competitions_checked=%d actionable=%d deferred=%d catchup_new=%d",
+            competitions_checked, len(actionable), rounds_deferred, catchup_total,
         )
 
-        for completed in completed_rounds:
+        for completed in actionable:
             try:
                 result = run_competition_analysis(
                     completed.competition_key, completed.round_name
@@ -616,15 +737,23 @@ def job_competition_analysis() -> dict[str, Any]:
             "competitions_checked": competitions_checked,
             "rounds_analysed": rounds_analysed,
             "rounds_skipped": rounds_skipped,
+            "rounds_deferred": rounds_deferred,
+            "catchup_newly_finished": catchup_total,
             "errors": errors,
         }
 
     final_status = "ok" if not errors else "degraded"
     record_activity(
-        f"Competition analysis job done: {rounds_analysed} analysed, {rounds_skipped} skipped",
+        f"Competition analysis job done: {rounds_analysed} analysed, {rounds_skipped} skipped, {rounds_deferred} deferred",
         job="competition_analysis",
         status=final_status,
-        details={"rounds_analysed": rounds_analysed, "rounds_skipped": rounds_skipped, "errors": errors},
+        details={
+            "rounds_analysed": rounds_analysed,
+            "rounds_skipped": rounds_skipped,
+            "rounds_deferred": rounds_deferred,
+            "catchup_newly_finished": catchup_total,
+            "errors": errors,
+        },
     )
     return {
         "status": final_status,
@@ -632,5 +761,7 @@ def job_competition_analysis() -> dict[str, Any]:
         "competitions_checked": competitions_checked,
         "rounds_analysed": rounds_analysed,
         "rounds_skipped": rounds_skipped,
+        "rounds_deferred": rounds_deferred,
+        "catchup_newly_finished": catchup_total,
         "errors": errors,
     }

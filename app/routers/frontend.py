@@ -983,6 +983,91 @@ def get_competition_special_status(competition_key: str):
     return competition_status(competition_key)
 
 
+@router.get("/competition-special/{competition_key}/analysis/latest")
+def get_competition_analysis_latest(competition_key: str):
+    """Most recent post-matchday Ollama analysis for a competition."""
+    import sqlite3
+    from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
+    from app.league_memory import DB_PATH, _init_db
+
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        init_competition_analysis_table(conn)
+        row = get_latest_analysis(competition_key, conn)
+
+    if row is None:
+        return {"status": "not_found", "competition_key": competition_key}
+    return {
+        "status": "ok",
+        "competition_key": row.get("competition_key"),
+        "round_name": row.get("round_name"),
+        "analysis_text": row.get("analysis_text"),
+        "model_used": row.get("model_used"),
+        "generated_at": row.get("generated_at"),
+        "match_count": row.get("match_count"),
+        "matchday_date": row.get("matchday_date"),
+    }
+
+
+@router.get("/competition-special/{competition_key}/analysis/history")
+def get_competition_analysis_history(
+    competition_key: str,
+    limit: int = Query(default=10, ge=1, le=100),
+):
+    """Paginated post-matchday analysis history for a competition."""
+    import sqlite3
+    from app.competition_analyser import get_analysis_history, init_competition_analysis_table
+    from app.league_memory import DB_PATH, _init_db
+
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        init_competition_analysis_table(conn)
+        rows = get_analysis_history(competition_key, limit, conn)
+
+    return {"status": "ok", "competition_key": competition_key, "count": len(rows), "history": rows}
+
+
+@router.post("/competition-special/{competition_key}/analysis/trigger")
+def trigger_competition_analysis(competition_key: str):
+    """Manually trigger post-matchday Ollama analysis for a competition."""
+    from app.competition_analyser import run_competition_analysis
+
+    return run_competition_analysis(competition_key)
+
+
+@router.get("/competition-special/{competition_key}/page")
+def get_competition_page(
+    competition_key: str,
+    buffer_limit: int = Query(default=200, ge=1, le=500),
+    analysis_limit: int = Query(default=5, ge=1, le=50),
+):
+    """Single-call competition page: settings + buffer + status + latest analysis + history."""
+    import sqlite3
+    from app.competition_special import competition_status, get_competition_settings, list_competition_buffer
+    from app.competition_analyser import get_analysis_history, get_latest_analysis, init_competition_analysis_table
+    from app.league_memory import DB_PATH, _init_db
+
+    buffer = list_competition_buffer(competition_key, limit=buffer_limit)
+    status = competition_status(competition_key)
+
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        init_competition_analysis_table(conn)
+        latest_analysis = get_latest_analysis(competition_key, conn)
+        analysis_history = get_analysis_history(competition_key, analysis_limit, conn)
+
+    return {
+        "status": "success",
+        "competition_key": competition_key,
+        "settings": buffer.get("competition"),
+        "buffer_summary": buffer.get("summary"),
+        "buffer_status": status.get("buffer"),
+        "matches": buffer.get("matches", []),
+        "latest_analysis": latest_analysis,
+        "analysis_history": analysis_history,
+    }
+
+
 @router.get("/analytics/clv")
 def get_clv_analytics(days: int = Query(default=30, ge=1, le=365)):
     """
