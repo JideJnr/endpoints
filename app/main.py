@@ -12,6 +12,7 @@ from app.routers import pipelines as pipelines_router
 from app.routers import scheduler as scheduler_router
 from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
+from app.routers import competition_analysis as competition_analysis_router
 from app.scheduler import start_scheduler
 
 settings = get_settings()
@@ -82,6 +83,7 @@ app.include_router(pipelines_router.router)
 app.include_router(scheduler_router.router)
 app.include_router(diagnostics_router.router)
 app.include_router(composite_router.router)
+app.include_router(competition_analysis_router.router)
 
 
 connected_clients: list[WebSocket] = []

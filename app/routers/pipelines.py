@@ -75,6 +75,7 @@ def enable_pipeline(engine_id: str):
 
     # Immediate run for pipelines that have a dedicated job function
     _IMMEDIATE_RUN_MAP = {
+        "ai_prediction_queue": "app.ai_prediction_pipeline.job_ai_prediction_queue",
         "unified_upcoming": "app.scheduler.job_unified_upcoming",
         "unified_live":     "app.scheduler.job_unified_live",
         "sofa_pipeline":    "app.scheduler.job_sofa_pipeline",

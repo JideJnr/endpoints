@@ -150,6 +150,16 @@ PIPELINES: list[PipelineDef] = [
         default="paused",
     ),
     PipelineDef(
+        engine_id="competition_analysis",
+        label="Competition Analysis",
+        description="Detects newly completed matchdays for enabled competitions and generates "
+                    "Ollama-powered post-matchday analysis. Runs once per day.",
+        interval="Every 24 hrs",
+        source="Internal",
+        job_ids=("competition_analysis",),
+        default="paused",
+    ),
+    PipelineDef(
         engine_id="sporty_only_upcoming",
         label="SportyBet-Only Upcoming Pipeline",
         description="Fetches all 300 upcoming matches from SportyBet and predicts directly from "

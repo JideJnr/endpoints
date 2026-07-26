@@ -1,0 +1,636 @@
+"""Competition Special Analysis — matchday completion detector, context assembler,
+Ollama prompt builder, and persistence layer.
+
+This module never modifies any existing module except via the scheduler job
+registration in scheduler.py and the context injection in ai_prediction_pipeline.py.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from app.league_memory import DB_PATH, _init_db
+
+logger = logging.getLogger(__name__)
+
+_TERMINAL_STATUSES = {"finished", "cancelled", "postponed"}
+
+
+# ── Dataclasses ───────────────────────────────────────────────────────────────
+
+@dataclass
+class CompletedRound:
+    competition_key: str
+    round_name: str
+    match_count: int
+
+
+@dataclass
+class StandingRow:
+    position: int
+    team: str
+    played: int
+    points: int
+    goal_difference: int
+
+
+@dataclass
+class RoundResult:
+    match_name: str
+    score_home: str
+    score_away: str
+    was_upset: bool
+
+
+@dataclass
+class TeamOddsMovement:
+    team: str
+    opening: float
+    current: float
+    direction: str  # "shortened" | "drifted" | "stable"
+
+
+@dataclass
+class AnalysisContext:
+    competition_key: str
+    round_name: str
+    match_count: int
+    standings: list[StandingRow] = field(default_factory=list)
+    form: dict[str, str] = field(default_factory=dict)
+    round_results: list[RoundResult] = field(default_factory=list)
+    odds_movements: list[TeamOddsMovement] = field(default_factory=list)
+    matchday_date: str = ""
+
+
+# ── Table DDL ─────────────────────────────────────────────────────────────────
+
+def init_competition_analysis_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists competition_analysis (
+            id integer primary key autoincrement,
+            competition_key text not null,
+            round_name text not null,
+            analysis_text text not null,
+            model_used text not null,
+            match_count integer not null default 0,
+            matchday_date text not null default '',
+            generated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_comp_analysis_key_date "
+        "on competition_analysis(competition_key, generated_at desc)"
+    )
+
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+
+def persist_competition_analysis(
+    conn: sqlite3.Connection,
+    competition_key: str,
+    round_name: str,
+    analysis_text: str,
+    model_used: str,
+    match_count: int,
+    matchday_date: str,
+    generated_at: str,
+) -> None:
+    """Always INSERT a new row — never updates an existing one."""
+    conn.execute(
+        """
+        insert into competition_analysis
+            (competition_key, round_name, analysis_text, model_used,
+             match_count, matchday_date, generated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (competition_key, round_name, analysis_text, model_used,
+         match_count, matchday_date, generated_at),
+    )
+
+
+def get_latest_analysis(competition_key: str, conn: sqlite3.Connection) -> dict[str, Any] | None:
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        select * from competition_analysis
+        where competition_key = ?
+        order by generated_at desc
+        limit 1
+        """,
+        (competition_key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_analysis_history(
+    competition_key: str, limit: int, conn: sqlite3.Connection
+) -> list[dict[str, Any]]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        select * from competition_analysis
+        where competition_key = ?
+        order by generated_at desc
+        limit ?
+        """,
+        (competition_key, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+# ── Matchday Completion Detector ──────────────────────────────────────────────
+
+def is_round_complete(statuses: list[str]) -> bool:
+    return bool(statuses) and all(s in _TERMINAL_STATUSES for s in statuses)
+
+
+def should_skip_small_round(match_count: int) -> bool:
+    return match_count < 2
+
+
+def should_generate_analysis(round_complete: bool, prior_analysis_exists: bool) -> bool:
+    return round_complete and not prior_analysis_exists
+
+
+def detect_newly_completed_rounds(conn: sqlite3.Connection) -> list[CompletedRound]:
+    conn.row_factory = sqlite3.Row
+    # Fetch all enabled competitions
+    enabled = conn.execute(
+        "select key from competition_special_settings where enabled = 1"
+    ).fetchall()
+
+    results: list[CompletedRound] = []
+    for setting in enabled:
+        key = setting["key"]
+        # Group buffer rows by round_name
+        rounds = conn.execute(
+            """
+            select round_name, count(*) as cnt,
+                   group_concat(status, '|') as statuses
+            from competition_special_buffer
+            where competition_key = ?
+              and round_name is not null and round_name != ''
+            group by round_name
+            order by round_name asc
+            """,
+            (key,),
+        ).fetchall()
+
+        for row in rounds:
+            round_name = row["round_name"]
+            cnt = int(row["cnt"])
+            statuses = (row["statuses"] or "").split("|")
+
+            if should_skip_small_round(cnt):
+                continue
+            if not is_round_complete(statuses):
+                continue
+
+            # Check if analysis already exists
+            existing = conn.execute(
+                """
+                select 1 from competition_analysis
+                where competition_key = ? and round_name = ?
+                limit 1
+                """,
+                (key, round_name),
+            ).fetchone()
+            if existing:
+                continue
+
+            results.append(CompletedRound(competition_key=key, round_name=round_name, match_count=cnt))
+
+    return results
+
+
+# ── Odds Movement ─────────────────────────────────────────────────────────────
+
+def classify_odds_movement_direction(opening: float, current: float) -> str:
+    diff = current - opening
+    if diff <= -0.20:
+        return "shortened"
+    if diff >= 0.20:
+        return "drifted"
+    return "stable"
+
+
+def _get_odds_for_match(sportybet_id: str, raw_event: dict[str, Any], conn: sqlite3.Connection) -> tuple[float | None, float | None]:
+    """Return (opening, current) odds from snapshots or raw_event fallback."""
+    try:
+        rows = conn.execute(
+            """
+            select odds_json from odds_snapshots
+            where sportybet_id = ?
+            order by created_at asc
+            """,
+            (sportybet_id,),
+        ).fetchall()
+        if rows:
+            def _extract_win_odds(odds_json: str) -> float | None:
+                try:
+                    data = json.loads(odds_json)
+                    markets = data.get("markets") or []
+                    for market in markets:
+                        for sel in (market.get("selections") or []):
+                            name = str(sel.get("name") or "").lower()
+                            if name in ("home", "1", "win"):
+                                odds = sel.get("odds")
+                                if odds:
+                                    return float(odds)
+                except Exception:
+                    pass
+                return None
+
+            opening = _extract_win_odds(rows[0][0])
+            current = _extract_win_odds(rows[-1][0])
+            if opening and current:
+                return opening, current
+    except Exception:
+        pass
+
+    # Fallback: raw_event featured odds
+    try:
+        featured = raw_event.get("odds_featured") or {}
+        ft = featured.get("full_time") or featured.get("default") or {}
+        choices = ft.get("choices") or []
+        for choice in choices:
+            name = str(choice.get("name") or "").lower()
+            if name in ("home", "1", "win"):
+                from app.competition_special import _decimal_odds
+                val = _decimal_odds(choice.get("fractional_value"))
+                if val:
+                    return val, val
+    except Exception:
+        pass
+    return None, None
+
+
+# ── Analysis Context Assembler ────────────────────────────────────────────────
+
+def assemble_analysis_context(
+    conn: sqlite3.Connection, competition_key: str, round_name: str
+) -> AnalysisContext | None:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        select match_id, name, score_home, score_away, status,
+               raw_event, raw_detail, prediction_json, match_date
+        from competition_special_buffer
+        where competition_key = ? and round_name = ?
+        """,
+        (competition_key, round_name),
+    ).fetchall()
+
+    finished = [r for r in rows if r["status"] in _TERMINAL_STATUSES and r["status"] != "cancelled"]
+    if len(finished) < 2:
+        logger.warning(
+            "assemble_analysis_context: fewer than 2 finished matches for %s/%s",
+            competition_key, round_name,
+        )
+        return None
+
+    # Build round results
+    round_results: list[RoundResult] = []
+    for row in finished[:6]:
+        prediction = None
+        try:
+            prediction = json.loads(row["prediction_json"] or "null")
+        except Exception:
+            pass
+        confidence = 0
+        if isinstance(prediction, dict):
+            confidence = int(prediction.get("confidence") or 0)
+        was_upset = confidence >= 60  # high-confidence prediction that may have been wrong
+        round_results.append(RoundResult(
+            match_name=row["name"] or "",
+            score_home=row["score_home"] or "",
+            score_away=row["score_away"] or "",
+            was_upset=was_upset,
+        ))
+
+    # Build standings from raw_detail of first enriched match
+    standings: list[StandingRow] = []
+    form: dict[str, str] = {}
+    for row in rows:
+        if not row["raw_detail"]:
+            continue
+        try:
+            detail = json.loads(row["raw_detail"])
+            raw_standings = detail.get("standings") or []
+            if raw_standings and not standings:
+                for i, s in enumerate(raw_standings[:8]):
+                    team_obj = s.get("team") or {}
+                    team_name = team_obj.get("name") or str(team_obj) if isinstance(team_obj, dict) else str(team_obj)
+                    standings.append(StandingRow(
+                        position=int(s.get("position") or i + 1),
+                        team=team_name,
+                        played=int(s.get("played") or 0),
+                        points=int(s.get("points") or 0),
+                        goal_difference=int(str(s.get("goal_diff") or "0").replace("+", "") or 0),
+                    ))
+            # Form strings from last_matches
+            for side in ("home_last_matches", "away_last_matches"):
+                matches = detail.get(side) or []
+                if not matches:
+                    continue
+                event = json.loads(row["raw_event"] or "{}")
+                team_key = "home_team" if side == "home_last_matches" else "away_team"
+                team_obj = event.get(team_key) or {}
+                team_name = team_obj.get("name") if isinstance(team_obj, dict) else str(team_obj)
+                if team_name and team_name not in form:
+                    results = []
+                    for m in matches[:5]:
+                        score = m.get("score") or {}
+                        hg = score.get("home")
+                        ag = score.get("away")
+                        if hg is None or ag is None:
+                            continue
+                        try:
+                            results.append("W" if int(hg) > int(ag) else "D" if int(hg) == int(ag) else "L")
+                        except Exception:
+                            pass
+                    if results:
+                        form[team_name] = "".join(results)
+        except Exception:
+            continue
+
+    # Odds movement
+    odds_movements: list[TeamOddsMovement] = []
+    for row in finished:
+        try:
+            event = json.loads(row["raw_event"] or "{}")
+            sportybet_id = f"competition:{competition_key}:{row['match_id']}"
+            opening, current = _get_odds_for_match(sportybet_id, event, conn)
+            if opening and current:
+                direction = classify_odds_movement_direction(opening, current)
+                if direction != "stable":
+                    home_team = event.get("home_team") or {}
+                    team_name = home_team.get("name") if isinstance(home_team, dict) else str(home_team)
+                    odds_movements.append(TeamOddsMovement(
+                        team=team_name or row["name"] or "",
+                        opening=opening,
+                        current=current,
+                        direction=direction,
+                    ))
+        except Exception:
+            continue
+
+    matchday_date = ""
+    for row in finished:
+        if row["match_date"]:
+            matchday_date = row["match_date"]
+            break
+
+    return AnalysisContext(
+        competition_key=competition_key,
+        round_name=round_name,
+        match_count=len(finished),
+        standings=standings,
+        form=form,
+        round_results=round_results,
+        odds_movements=odds_movements,
+        matchday_date=matchday_date,
+    )
+
+
+# ── Prompt Builder ────────────────────────────────────────────────────────────
+
+def _standings_compact(standings: list[StandingRow], max_teams: int = 8) -> str:
+    parts = [f"{s.position}.{s.team[:12]}({s.points}pts,GD{s.goal_difference:+d})" for s in standings[:max_teams]]
+    return "|".join(parts)[:160]
+
+
+def _form_compact(form: dict[str, str]) -> str:
+    parts = [f"{team[:10]}:{results}" for team, results in list(form.items())[:6] if results]
+    return "|".join(parts)[:90]
+
+
+def _results_compact(results: list[RoundResult]) -> str:
+    parts = []
+    for r in results[:6]:
+        upset = "!" if r.was_upset else ""
+        parts.append(f"{r.match_name[:16]}:{r.score_home}-{r.score_away}{upset}")
+    return "|".join(parts)[:120]
+
+
+def _odds_compact(movements: list[TeamOddsMovement]) -> str:
+    parts = [f"{m.team[:10]}:{m.direction[0].upper()}({m.opening:.2f}→{m.current:.2f})" for m in movements]
+    return "|".join(parts)[:80]
+
+
+def build_analysis_prompt(ctx: AnalysisContext) -> str:
+    standings_str = _standings_compact(ctx.standings, max_teams=8)
+    form_str = _form_compact(ctx.form)
+    results_str = _results_compact(ctx.round_results)
+    odds_str = _odds_compact(ctx.odds_movements)
+
+    prompt = (
+        f"Competition:{ctx.competition_key} Round:{ctx.round_name} Matches:{ctx.match_count}\n"
+        f"Standings:{standings_str}\n"
+        f"Form:{form_str}\n"
+        f"Results:{results_str}\n"
+        f"OddsMovement:{odds_str}\n"
+        "Provide a concise 2-sentence analysis of this matchday: key results, standings impact, "
+        "and any notable odds movements. JSON: {\"analysis\":\"<text>\"}"
+    )
+
+    # Token budget check (len // 4 as proxy)
+    if len(prompt) // 4 >= 250:
+        standings_str = _standings_compact(ctx.standings, max_teams=6)
+        prompt = (
+            f"Competition:{ctx.competition_key} Round:{ctx.round_name} Matches:{ctx.match_count}\n"
+            f"Standings:{standings_str}\n"
+            f"Form:{form_str}\n"
+            f"Results:{results_str}\n"
+            f"OddsMovement:{odds_str}\n"
+            "Provide a concise 2-sentence analysis of this matchday: key results, standings impact, "
+            "and any notable odds movements. JSON: {\"analysis\":\"<text>\"}"
+        )
+
+    return prompt
+
+
+# ── Ollama Integration ────────────────────────────────────────────────────────
+
+def run_competition_analysis(
+    competition_key: str, round_name: str | None = None
+) -> dict[str, Any]:
+    from app.ollama_agent import is_ollama_available
+    from app.ollama_agent import _call_ollama
+
+    # Determine round_name if not provided
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        init_competition_analysis_table(conn)
+        if round_name is None:
+            rounds = detect_newly_completed_rounds(conn)
+            target = next((r for r in rounds if r.competition_key == competition_key), None)
+            if not target:
+                return {"status": "no_completed_rounds", "competition_key": competition_key}
+            round_name = target.round_name
+
+        ctx = assemble_analysis_context(conn, competition_key, round_name)
+
+    if ctx is None:
+        logger.warning("run_competition_analysis: no context for %s/%s", competition_key, round_name)
+        return {"status": "insufficient_data", "competition_key": competition_key, "round_name": round_name}
+
+    logger.info(
+        "run_competition_analysis: key=%s round=%s matches=%d",
+        competition_key, round_name, ctx.match_count,
+    )
+
+    # Model priority
+    model = next(
+        (name for name in ("qwen3:1.7b", "deepseek-r1:1.5b") if is_ollama_available(name)),
+        None,
+    )
+    if not model:
+        logger.warning(
+            "run_competition_analysis: Ollama unavailable for %s/%s", competition_key, round_name
+        )
+        return {"status": "ollama_unavailable", "competition_key": competition_key, "round_name": round_name}
+
+    prompt = build_analysis_prompt(ctx)
+    logger.debug(
+        "run_competition_analysis: model=%s estimated_tokens=%d start=%s",
+        model, len(prompt) // 4, datetime.now(timezone.utc).isoformat(),
+    )
+
+    try:
+        started = time.monotonic()
+        raw = _call_ollama(model, prompt, timeout=45)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "run_competition_analysis: elapsed_ms=%d preview=%s",
+            elapsed_ms, raw[:80],
+        )
+    except Exception as exc:
+        logger.warning(
+            "run_competition_analysis: Ollama call failed for %s/%s: %s",
+            competition_key, round_name, exc,
+        )
+        return {"status": "ollama_error", "competition_key": competition_key, "round_name": round_name, "error": str(exc)}
+
+    # Extract analysis text
+    analysis_text = raw.strip()
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(raw[start:end])
+            analysis_text = parsed.get("analysis") or analysis_text
+    except Exception:
+        pass
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        init_competition_analysis_table(conn)
+        persist_competition_analysis(
+            conn,
+            competition_key=competition_key,
+            round_name=round_name,
+            analysis_text=analysis_text,
+            model_used=model,
+            match_count=ctx.match_count,
+            matchday_date=ctx.matchday_date,
+            generated_at=generated_at,
+        )
+        conn.commit()
+
+    return {
+        "status": "ok",
+        "competition_key": competition_key,
+        "round_name": round_name,
+        "analysis_text": analysis_text,
+        "generated_at": generated_at,
+        "match_count": ctx.match_count,
+        "model_used": model,
+    }
+
+
+# ── Scheduler Job ─────────────────────────────────────────────────────────────
+
+def job_competition_analysis() -> dict[str, Any]:
+    from app.pipeline_registry import is_pipeline_enabled
+    from app.activity_log import record_activity
+
+    if not is_pipeline_enabled("competition_analysis"):
+        return {"status": "skipped", "reason": "pipeline_disabled"}
+
+    record_activity("Competition analysis job started", job="competition_analysis", status="running")
+
+    rounds_analysed = 0
+    rounds_skipped = 0
+    errors: list[str] = []
+    competitions_checked = 0
+
+    try:
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            init_competition_analysis_table(conn)
+            completed_rounds = detect_newly_completed_rounds(conn)
+
+        enabled_keys = {r.competition_key for r in completed_rounds}
+        competitions_checked = len(enabled_keys)
+        logger.info(
+            "job_competition_analysis: competitions_checked=%d newly_completed_rounds=%d",
+            competitions_checked, len(completed_rounds),
+        )
+
+        for completed in completed_rounds:
+            try:
+                result = run_competition_analysis(
+                    completed.competition_key, completed.round_name
+                )
+                if result.get("status") == "ok":
+                    rounds_analysed += 1
+                else:
+                    rounds_skipped += 1
+                    logger.warning(
+                        "job_competition_analysis: skipped %s/%s reason=%s",
+                        completed.competition_key, completed.round_name, result.get("status"),
+                    )
+            except Exception as exc:
+                errors.append(f"{completed.competition_key}/{completed.round_name}: {exc}")
+                logger.exception("job_competition_analysis: error for %s/%s", completed.competition_key, completed.round_name)
+
+    except Exception as exc:
+        errors.append(str(exc))
+        record_activity(
+            f"Competition analysis job failed: {exc}",
+            job="competition_analysis",
+            status="error",
+        )
+        return {
+            "status": "error",
+            "job": "competition_analysis",
+            "competitions_checked": competitions_checked,
+            "rounds_analysed": rounds_analysed,
+            "rounds_skipped": rounds_skipped,
+            "errors": errors,
+        }
+
+    final_status = "ok" if not errors else "degraded"
+    record_activity(
+        f"Competition analysis job done: {rounds_analysed} analysed, {rounds_skipped} skipped",
+        job="competition_analysis",
+        status=final_status,
+        details={"rounds_analysed": rounds_analysed, "rounds_skipped": rounds_skipped, "errors": errors},
+    )
+    return {
+        "status": final_status,
+        "job": "competition_analysis",
+        "competitions_checked": competitions_checked,
+        "rounds_analysed": rounds_analysed,
+        "rounds_skipped": rounds_skipped,
+        "errors": errors,
+    }

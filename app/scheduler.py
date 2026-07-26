@@ -72,6 +72,7 @@ _DB_WRITE_JOB_IDS = {
     "grade_predictions",
     "enrich_future",
     "competition_special",
+    "competition_analysis",
     "sofa_pipeline",
     "unified_upcoming",
     "unified_live",
@@ -91,6 +92,7 @@ _JOB_STALE_SECONDS = {
     "grade_predictions": 3600,
     "autopilot_guardian": 1200,
     "competition_special": 1800,
+    "competition_analysis": 90000,
     "sofa_pipeline": 600,
     "unified_upcoming": 600,
     "unified_live": 180,
@@ -1348,6 +1350,17 @@ def start_scheduler():
         coalesce=True,
         misfire_grace_time=180,
         next_run_time=now + timedelta(minutes=3),
+    )
+
+    scheduler.add_job(
+        _safe(job_competition_analysis),
+        IntervalTrigger(seconds=86400),
+        id="competition_analysis",
+        name="Post-matchday competition analysis (Ollama)",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
 
     scheduler.add_job(
