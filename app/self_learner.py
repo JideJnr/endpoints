@@ -928,8 +928,9 @@ def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> i
             accept_count = summary["by_action"].get("accept", {}).get("count", 0)
             reject_count = summary["by_action"].get("reject", {}).get("count", 0)
             pick_count = summary["by_action"].get("pick", {}).get("count", 0)
+            user_pick_count = summary["by_action"].get("user_pick", {}).get("count", 0)
 
-            net_user_signal = accept_count - reject_count
+            net_user_signal = accept_count + user_pick_count * 2 - reject_count
             if net_user_signal == 0:
                 continue
 

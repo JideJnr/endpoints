@@ -1745,6 +1745,9 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
             for row in date_rows:
                 match_id = str(row["match_id"])
                 sofa_ids = _sofa_ids_from_raw(row["raw_enriched"])
+                _row_sofa = str(row["sofascore_id"]) if row["sofascore_id"] else None
+                if _row_sofa and _row_sofa not in sofa_ids:
+                    sofa_ids.append(_row_sofa)
                 event = event_by_id.get(match_id)
                 if not event:
                     event = next((event_by_id.get(sofa_id) for sofa_id in sofa_ids if event_by_id.get(sofa_id)), None)
@@ -1901,8 +1904,16 @@ def _pending_matches_for_grading(cutoff_seconds: float, limit: int) -> list[sqli
                    coalesce(mb.start_time, fb.start_time) as start_time,
                    coalesce(mb.is_live, fb.is_live, 0) as is_live,
                    coalesce(mb.raw_enriched, fb.raw_enriched) as raw_enriched,
-                   coalesce(mb.raw_sporty, fb.raw_sporty) as raw_sporty
+                   coalesce(mb.raw_sporty, fb.raw_sporty) as raw_sporty,
+                   coalesce(mb.sofascore_id, fb.sofascore_id, ph_ids.sofascore_id) as sofascore_id,
+                   coalesce(mb.sportybet_id, fb.sportybet_id) as sportybet_id
             from grouped g
+            left join (
+                select match_id, max(sofascore_id) as sofascore_id
+                from prediction_history
+                where sofascore_id is not null
+                group by match_id
+            ) ph_ids on ph_ids.match_id = g.match_id
             left join match_buffer mb on mb.match_id = g.match_id
             left join future_match_buffer fb on fb.match_id = g.match_id
             order by coalesce(mb.start_time, fb.start_time, strftime('%s', g.first_seen) * 1000) asc

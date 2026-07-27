@@ -479,6 +479,45 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         from app.health_counters import record_health_event
         record_health_event("enriched_prediction", "finished_memory_failed", exc)
 
+    # ── User pick signal ──────────────────────────────────────────────────────
+    # If the user has submitted a pick for this match, inject it as a signal
+    # that nudges confidence toward their selection.
+    try:
+        from app.league_memory import get_behavior_weighted_picks
+        match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
+        if match_id_str:
+            user_picks = [p for p in get_behavior_weighted_picks(match_id_str) if p.get("user_action") == "user_pick"]
+            if user_picks:
+                latest = user_picks[0]
+                user_selection = str(latest.get("selection") or "")
+                user_pick_type = str(latest.get("pick_type") or "match_result")
+                # Determine alignment with ensemble prediction
+                ensemble_pred = str((ensemble or {}).get("prediction") or "").lower()
+                user_sel_lower = user_selection.lower()
+                agrees = (
+                    ("home" in user_sel_lower and "home" in ensemble_pred) or
+                    ("away" in user_sel_lower and "away" in ensemble_pred) or
+                    ("draw" in user_sel_lower and "draw" in ensemble_pred) or
+                    ("over" in user_sel_lower and "over" in ensemble_pred) or
+                    ("under" in user_sel_lower and "under" in ensemble_pred) or
+                    ("btts" in user_sel_lower and "btts" in ensemble_pred)
+                )
+                impact = 4 if agrees else -2
+                signals.append({
+                    "name": "user_pick_signal",
+                    "value": {
+                        "selection": user_selection,
+                        "pick_type": user_pick_type,
+                        "agrees_with_model": agrees,
+                        "recorded_at": latest.get("created_at"),
+                    },
+                    "impact": impact,
+                    "role": "decision_driver" if agrees else "risk_signal",
+                })
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "user_pick_signal_failed", exc)
+
     # ── Odds pattern signal ───────────────────────────────────────────────────
     odds_pattern_signal: dict[str, Any] = {}
     pattern_adj = 0
