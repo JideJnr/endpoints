@@ -1923,53 +1923,32 @@ def predict_single_match(
 
 
 @router.post("/matches/{sportybet_id}/ai-analysis")
-def analyze_match_with_groq(sportybet_id: str):
-    """Create and persist a Groq explanation for the currently stored match data."""
+def analyze_match_with_ai(sportybet_id: str):
+    """
+    Run AI analysis with fallback: try Groq first, then Ollama.
+    Returns the result from the first successful provider.
+    """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in the buffer")
 
     from app.groq_agent import run_groq_match_analysis
+    from app.ollama_agent import run_ollama_all_models
 
     analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
-        raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
+    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+        doc["ai_analysis"] = analysis
+        store_enriched(sportybet_id, doc)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
 
-    doc["ai_analysis"] = analysis
-    store_enriched(sportybet_id, doc)
-    return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis}
+    ollama_result = run_ollama_all_models(doc)
+    if ollama_result.get("status") == "success":
+        doc["ai_analysis_ollama"] = ollama_result
+        store_enriched(sportybet_id, doc)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
 
-
-@router.post("/matches/{sportybet_id}/ai-analysis-ollama")
-def analyze_match_with_ollama(
-    sportybet_id: str,
-    model: str = Query(default="all", description="qwen3:8b | deepseek-r1:8b | all"),
-):
-    """
-    Run Ollama local LLM analysis for one match.
-    model=all runs both qwen3:8b and deepseek-r1:8b and returns a consensus.
-    Results are persisted alongside the Groq analysis so the frontend can show all three.
-    """
-    sportybet_id = _resolve_buffer_match_id(sportybet_id)
-    doc = get_buffered_match(sportybet_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Match not found in the buffer")
-
-    from app.ollama_agent import run_ollama_all_models, run_ollama_match_analysis
-
-    if model == "all":
-        result = run_ollama_all_models(doc)
-    else:
-        result = run_ollama_match_analysis(doc, model=model)
-        result = {"status": "success", "models": {model: result}, "consensus": result.get("recommendation"), "consensus_reached": True}
-
-    if result.get("status") not in {"success"}:
-        raise HTTPException(status_code=503, detail=result.get("message") or "Ollama analysis unavailable")
-
-    doc["ai_analysis_ollama"] = result
-    store_enriched(sportybet_id, doc)
-    return {"status": "success", "sportybet_id": sportybet_id, "ollama": result}
+    raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
 
 
 @router.get("/matches/{sportybet_id}/ai-analysis-all")
