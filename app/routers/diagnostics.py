@@ -64,3 +64,83 @@ def live_prediction_gaps() -> dict[str, Any]:
         return {"status": "success", "count": len(gaps), "gaps": gaps, "live_retry_queue": retry_entries}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/prediction-coverage")
+def prediction_coverage() -> dict[str, Any]:
+    """Show prediction coverage: which matches have predictions and which don't."""
+    try:
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            # Total matches in buffer
+            total = conn.execute(
+                "select count(*) as count from match_buffer where status in ('upcoming', 'live', 'inplay')"
+            ).fetchone()["count"]
+
+            # Matches with predictions
+            with_preds = conn.execute(
+                """
+                select count(distinct match_id) as count
+                from prediction_history
+                where result is null
+                  and datetime(created_at) >= datetime('now', '-24 hours')
+                """
+            ).fetchone()["count"]
+
+            # Matches without predictions
+            without_preds = total - with_preds
+
+            # Coverage by league
+            by_league = conn.execute(
+                """
+                select ph.league_name,
+                       count(distinct ph.match_id) as total_matches,
+                       count(distinct case when ph.result is null then ph.match_id end) as predicted_matches,
+                       round(100.0 * count(distinct case when ph.result is null then ph.match_id end) /
+                             nullif(count(distinct ph.match_id), 0), 1) as coverage_pct
+                from prediction_history ph
+                where datetime(ph.created_at) >= datetime('now', '-24 hours')
+                group by ph.league_name
+                order by coverage_pct desc
+                """
+            ).fetchall()
+
+            # Matches needing enrichment
+            needs_enrichment = conn.execute(
+                """
+                select count(*) as count
+                from match_buffer mb
+                where mb.status in ('upcoming', 'live', 'inplay')
+                  and (mb.raw_enriched is null or mb.enriched_at is null
+                       or datetime(mb.enriched_at) < datetime('now', '-6 hours'))
+                """
+            ).fetchone()["count"]
+
+            # Matches needing prediction
+            needs_prediction = conn.execute(
+                """
+                select count(*) as count
+                from match_buffer mb
+                where mb.status in ('upcoming', 'live', 'inplay')
+                  and not exists (
+                      select 1 from prediction_history ph
+                      where ph.match_id = mb.match_id
+                        and ph.result is null
+                        and datetime(ph.created_at) >= datetime('now', '-24 hours')
+                  )
+                """
+            ).fetchone()["count"]
+
+            return {
+                "status": "success",
+                "total_matches_in_buffer": total,
+                "matches_with_predictions_24h": with_preds,
+                "matches_without_predictions": without_preds,
+                "coverage_pct": round(100.0 * with_preds / total, 1) if total > 0 else 0,
+                "needs_enrichment": needs_enrichment,
+                "needs_prediction": needs_prediction,
+                "by_league": [dict(row) for row in by_league],
+            }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

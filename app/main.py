@@ -6,7 +6,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings, public_settings
 from app.league_memory import DB_PATH, _init_db, close_db
-from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore
+from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore, user_behavior, betbuilder
 from app.routers import sofa_pipeline as sofa_pipeline_router
 from app.routers import pipelines as pipelines_router
 from app.routers import scheduler as scheduler_router
@@ -93,6 +93,8 @@ app.include_router(scheduler_router.router)
 app.include_router(diagnostics_router.router)
 app.include_router(composite_router.router)
 app.include_router(competition_analysis_router.router)
+app.include_router(user_behavior.router)
+app.include_router(betbuilder.router)
 
 
 connected_clients: list[WebSocket] = []

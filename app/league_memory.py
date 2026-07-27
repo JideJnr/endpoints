@@ -3546,6 +3546,32 @@ def _init_db_unlocked() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            create table if not exists user_behavior (
+                id integer primary key autoincrement,
+                match_id text not null,
+                user_action text not null,
+                pick_type text,
+                selection text,
+                confidence real,
+                metadata_json text not null default '{}',
+                created_at text not null default current_timestamp
+            )
+            """
+        )
+        conn.execute(
+            """
+            create index if not exists idx_user_behavior_match
+            on user_behavior(match_id, user_action)
+            """
+        )
+        conn.execute(
+            """
+            create index if not exists idx_user_behavior_action
+            on user_behavior(user_action, created_at)
+            """
+        )
         _ensure_column(conn, "matches", "match_fingerprint", "text")
         _ensure_column(conn, "matches", "start_time", "text")
         conn.execute("create index if not exists idx_matches_league on matches(league_key)")
@@ -4559,3 +4585,105 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 def _is_sqlite_lock(exc: sqlite3.OperationalError) -> bool:
     message = str(exc).lower()
     return "database is locked" in message or "database table is locked" in message
+
+
+def track_user_behavior(
+    match_id: str,
+    user_action: str,
+    pick_type: str | None = None,
+    selection: str | None = None,
+    confidence: float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Track user interaction with a prediction for self-learning."""
+    _init_db()
+    if not match_id or not user_action:
+        return
+    with _conn() as conn:
+        conn.execute(
+            """
+            insert into user_behavior (match_id, user_action, pick_type, selection, confidence, metadata_json)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                match_id,
+                user_action,
+                pick_type,
+                selection,
+                confidence,
+                json.dumps(metadata or {}),
+            ),
+        )
+
+
+def get_user_behavior_summary(match_id: str | None = None, days: int = 30) -> dict[str, Any]:
+    """Get aggregated user behavior for self-learning."""
+    _init_db()
+    with _conn() as conn:
+        if match_id:
+            rows = conn.execute(
+                """
+                select user_action, pick_type, selection, confidence, metadata_json, created_at
+                from user_behavior
+                where match_id = ?
+                order by created_at desc
+                """,
+                (match_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select user_action, pick_type, selection, confidence, metadata_json, created_at
+                from user_behavior
+                where created_at >= datetime('now', ? || ' days')
+                order by created_at desc
+                """,
+                (f"-{days}",),
+            ).fetchall()
+
+    actions = {}
+    for row in rows:
+        action = row["user_action"]
+        if action not in actions:
+            actions[action] = {"count": 0, "pick_types": {}, "selections": {}, "confidences": []}
+        actions[action]["count"] += 1
+        if row["pick_type"]:
+            actions[action]["pick_types"][row["pick_type"]] = actions[action]["pick_types"].get(row["pick_type"], 0) + 1
+        if row["selection"]:
+            actions[action]["selections"][row["selection"]] = actions[action]["selections"].get(row["selection"], 0) + 1
+        if row["confidence"] is not None:
+            actions[action]["confidences"].append(row["confidence"])
+
+    return {
+        "total_interactions": len(rows),
+        "by_action": actions,
+        "match_id": match_id,
+        "period_days": days,
+    }
+
+
+def get_behavior_weighted_picks(match_id: str) -> list[dict[str, Any]]:
+    """Get user's past picks for this match to influence auto-bet suggestions."""
+    _init_db()
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            select user_action, pick_type, selection, confidence, metadata_json, created_at
+            from user_behavior
+            where match_id = ?
+            order by created_at desc
+            """,
+            (match_id,),
+        ).fetchall()
+
+    picks = []
+    for row in rows:
+        picks.append({
+            "user_action": row["user_action"],
+            "pick_type": row["pick_type"],
+            "selection": row["selection"],
+            "confidence": row["confidence"],
+            "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+            "created_at": row["created_at"],
+        })
+    return picks

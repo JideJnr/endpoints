@@ -77,7 +77,14 @@ def evaluate_promotion_gate(doc: dict[str, Any], pick: dict[str, Any]) -> dict[s
     _HARD_BLOCK_IN_BOOTSTRAP = {"recent_drawdown_breach", "recent_loss_streak_breach", "negative_or_flat_clv"}
 
     if bootstrap_mode:
-        blocking_reasons = [r for r in reasons if r in _HARD_BLOCK_IN_BOOTSTRAP]
+        # In bootstrap, only block on genuine quality failures.
+        # negative_or_flat_clv requires actual CLV data to be meaningful —
+        # with zero samples it is noise, not a real signal.
+        blocking_reasons = [
+            r for r in reasons
+            if r in _HARD_BLOCK_IN_BOOTSTRAP
+            and not (r == "negative_or_flat_clv" and clv["samples"] == 0)
+        ]
     else:
         blocking_reasons = reasons
 

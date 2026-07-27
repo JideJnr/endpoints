@@ -33,9 +33,9 @@ TOP_30_COMPETITIONS: tuple[dict[str, Any], ...] = (
     {"key": "championship", "name": "EFL Championship", "unique_tournament_id": 37},
     {"key": "eredivisie", "name": "Eredivisie", "unique_tournament_id": 44},
     {"key": "primeira-liga", "name": "Primeira Liga", "unique_tournament_id": 238},
-    {"key": "super-lig", "name": "Süper Lig", "unique_tournament_id": 325},
-    {"key": "mls", "name": "Major League Soccer", "unique_tournament_id": 955},
-    {"key": "brasileirao", "name": "Brasileirão Série A", "unique_tournament_id": 242},
+    {"key": "super-lig", "name": "Süper Lig", "unique_tournament_id": 52},
+    {"key": "mls", "name": "Major League Soccer", "unique_tournament_id": 242},
+    {"key": "brasileirao", "name": "Brasileirão Série A", "unique_tournament_id": 325},
     {"key": "argentine-primera", "name": "Argentine Primera División", "unique_tournament_id": 390},
     {"key": "liga-mx", "name": "Liga MX", "unique_tournament_id": 406},
     {"key": "saudi-pro-league", "name": "Saudi Pro League", "unique_tournament_id": 203},
@@ -234,13 +234,19 @@ def sync_competition_fixtures(
     settings = get_competition_settings(key)
     tournament_id = int(settings.get("unique_tournament_id") or _catalogue_default(key)["unique_tournament_id"])
     start = _parse_date(start_date or settings.get("start_date") or date.today().isoformat())
-    end = _parse_date(end_date or settings.get("end_date") or start.isoformat())
+    # For leagues (no end_date configured), default to 7 days ahead so future
+    # fixtures are always pulled in automatically.
+    configured_end = settings.get("end_date") or ""
+    end = _parse_date(end_date or configured_end or (date.today() + timedelta(days=7)).isoformat())
     if end < start:
         end = start
     days = min(max((end - start).days + 1, 1), max(1, limit_days))
+    # Only filter by season_id when one is explicitly configured.
+    required_season_id = str(settings.get("season_id") or "").strip()
 
     stored = 0
     fetched = 0
+    rejected = 0
     errors: list[dict[str, str]] = []
     cursor_candidate: str | None = None
     cursor_blocked = False
@@ -260,7 +266,14 @@ def sync_competition_fixtures(
                 cursor_candidate = match_date
             fetched += len(events)
             for event in events:
-                if str((event.get("season_id") or settings.get("season_id") or "")) != str(settings.get("season_id") or event.get("season_id") or ""):
+                # SofaScore occasionally returns an event list for a stale or
+                # remapped tournament route. Never store it under the requested
+                # competition unless its unique tournament identity agrees.
+                if _event_unique_tournament_id(event) != tournament_id:
+                    rejected += 1
+                    continue
+                # Skip season filter when no season_id is configured (rolling leagues)
+                if required_season_id and str(event.get("season_id") or "").strip() != required_season_id:
                     continue
                 _upsert_competition_event(conn, key, event, match_date)
                 stored += 1
@@ -274,6 +287,7 @@ def sync_competition_fixtures(
         "date_range": {"start": start.isoformat(), "end": scanned_end},
         "fetched": fetched,
         "stored": stored,
+        "rejected_wrong_tournament": rejected,
         "mirrored_to_main_buffer": stored,
         "cursor_advanced_to": cursor_candidate,
         "cursor_blocked": cursor_blocked,
@@ -360,8 +374,7 @@ def enrich_predict_competition(key: str = "world-cup-2026", limit: int = 12, all
               and (
                 raw_detail is null
                 or prediction_json is null
-                or status not in ('finished', 'cancelled', 'postponed')
-                or enriched_at < datetime('now', '-10 minutes')
+              or enriched_at < datetime('now', '-10 minutes')
               )
             order by
               case when status in ('inprogress', '1st half', '2nd half', 'halftime') then 0 else 1 end asc,
@@ -459,20 +472,22 @@ def run_competition_special_cycle(key: str = "world-cup-2026") -> dict[str, Any]
     if not settings.get("enabled"):
         return {"status": "idle", "competition": key, "enabled": False}
     configured_start = _parse_date(settings.get("start_date") or date.today().isoformat())
-    configured_end = _parse_date(settings.get("end_date") or (date.today() + timedelta(days=3)).isoformat())
+    # For rolling leagues end_date is empty — use a 14-day rolling horizon.
+    configured_end_raw = settings.get("end_date") or ""
+    configured_end = _parse_date(configured_end_raw) if configured_end_raw else date.today() + timedelta(days=14)
     loaded_until = _sync_cursor(key) or _loaded_until(key)
     if loaded_until and loaded_until < configured_end:
         window_start = loaded_until + timedelta(days=1)
     else:
         window_start = max(date.today(), configured_start)
-    # Continuous lane: keep a small rolling fixture window fresh, then enrich
+    # Continuous lane: keep a rolling 7-day fixture window fresh, then enrich
     # and predict the highest-priority competition matches.
-    window_end = min(configured_end, window_start + timedelta(days=3))
+    window_end = min(configured_end, window_start + timedelta(days=7))
     sync = sync_competition_fixtures(
         key,
         start_date=window_start.isoformat(),
         end_date=window_end.isoformat(),
-        limit_days=4,
+        limit_days=8,
     )
     mirrored = ensure_competition_main_buffer(key)
     enrich = enrich_predict_competition(key, limit=8)
@@ -539,7 +554,7 @@ def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
             """
             insert into competition_special_settings
                 (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
-            values (?, ?, 0, ?, ?, ?, ?, ?)
+            values (?, ?, 1, ?, ?, ?, ?, ?)
             on conflict(key) do nothing
             """,
             (
@@ -548,6 +563,67 @@ def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
                 json.dumps({"source": "sofascore", "mode": "competition_special"}),
             ),
         )
+    # Correct two historic catalogue IDs without overwriting any other operator
+    # configuration. MLS was previously pointed at 955, while 242 is its
+    # SofaScore unique-tournament ID; Brasileirão Série A is 325.
+    conn.execute("""update competition_special_settings
+                    set unique_tournament_id = 242, updated_at = current_timestamp
+                    where key = 'mls' and unique_tournament_id = 955""")
+    conn.execute("""update competition_special_settings
+                    set unique_tournament_id = 325, updated_at = current_timestamp
+                    where key = 'brasileirao' and unique_tournament_id = 242""")
+    conn.execute("""update competition_special_settings
+                    set unique_tournament_id = 52, updated_at = current_timestamp
+                    where key = 'super-lig' and unique_tournament_id = 325""")
+
+
+def _event_unique_tournament_id(event: dict[str, Any]) -> int | None:
+    """Extract SofaScore's stable unique-tournament ID from parsed/raw events."""
+    tournament = event.get("tournament") if isinstance(event.get("tournament"), dict) else {}
+    try:
+        if tournament.get("id") is not None:
+            return int(tournament["id"])
+    except (TypeError, ValueError):
+        pass
+    raw = event.get("raw_event") if isinstance(event.get("raw_event"), dict) else {}
+    unique = ((raw.get("tournament") or {}).get("uniqueTournament") or {}) if raw else {}
+    try:
+        return int(unique.get("id")) if unique.get("id") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def purge_misclassified_competition_rows() -> dict[str, int]:
+    """Remove regenerable rows created by the historic Brasileirão→MLS mix-up."""
+    _init_db()
+    removed_special = removed_main = 0
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        init_competition_tables(conn)
+        rows = conn.execute("""select match_id, raw_event from competition_special_buffer
+                               where competition_key = 'brasileirao'""").fetchall()
+        wrong_ids = []
+        for row in rows:
+            try:
+                event = json.loads(row["raw_event"] or "{}")
+            except Exception:
+                continue
+            if _event_unique_tournament_id(event) == 242:
+                wrong_ids.append(str(row["match_id"]))
+        if wrong_ids:
+            placeholders = ",".join("?" for _ in wrong_ids)
+            removed_special = conn.execute(
+                f"delete from competition_special_buffer where competition_key = 'brasileirao' and match_id in ({placeholders})",
+                wrong_ids,
+            ).rowcount
+            prefixed = [f"competition:brasileirao:{item}" for item in wrong_ids]
+            main_placeholders = ",".join("?" for _ in prefixed)
+            for table in ("match_buffer", "future_match_buffer"):
+                removed_main += conn.execute(
+                    f"delete from {table} where match_id in ({main_placeholders})", prefixed
+                ).rowcount
+        conn.commit()
+    return {"competition_rows": removed_special, "main_buffer_rows": removed_main}
 
 
 def _loaded_until(key: str) -> date | None:

@@ -142,41 +142,24 @@ def _build_h2h_statement(h2h_matches: list[dict]) -> str:
 
 
 def _ollama_model() -> str | None:
-    """Return the first installed local fallback model, if Ollama is ready."""
-    from app.ollama_agent import is_ollama_available
-    return next((name for name in ("qwen3:1.7b", "deepseek-r1:1.5b") if is_ollama_available(name)), None)
+    """Return the first available local model via the router."""
+    from app.ai_router import get_router
+    return get_router().best_available()
 
 
 def _call_provider(model: str, prompt: str, timeout: int) -> str:
-    """Call the preferred remote provider, falling back to local Ollama.
-
-    ``groq`` is deliberately attempted first while the local runtime installs.
-    Quota, token, or network failures are not fatal: the exact prompt is retried
-    on Ollama when it is available.
-    """
-    if model == "groq":
-        try:
-            from app.llm import get_llm
-            logger.debug("Groq call tokens~%d", len(prompt.split()))
-            response = get_llm().invoke([{"role": "user", "content": prompt}])
-            return str(response.content if hasattr(response, "content") else response).strip()
-        except Exception as exc:
-            # Groq commonly surfaces exhausted TPM/RPM credit as an HTTP 429.
-            # Treat every remote failure as recoverable so local inference can
-            # take over without stopping the prediction chain.
-            logger.warning("Groq unavailable or quota exhausted; trying Ollama: %s", exc)
-            fallback_model = _ollama_model()
-            if not fallback_model:
-                raise
-            model = fallback_model
-    from app.ollama_agent import _call_ollama
-    logger.debug("Ollama call model=%s tokens~%d", model, len(prompt.split()))
-    return _call_ollama(model, prompt, timeout=timeout).strip()
+    """Route through AIRouter — Ollama primary, Groq final fallback."""
+    from app.ai_router import get_router
+    task = "reasoning" if model not in ("groq",) else "analysis"
+    return get_router().call_auto(prompt, task=task)
 
 
 # Kept as an internal compatibility alias for existing step tests/call sites.
 def _ollama(model: str, prompt: str, timeout: int) -> str:
-    return _call_provider(model, prompt, timeout)
+    from app.ai_router import get_router
+    # Step functions pass the model name as a hint for task routing
+    task = "reasoning"
+    return get_router().call_auto(prompt, task=task)
 
 
 def _step_h2h(doc: dict, model: str, timeout: int = 20) -> str:
@@ -340,11 +323,13 @@ def _get_competition_context(doc: dict, conn) -> str | None:
 
 
 def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None) -> dict:
+    from app.ai_router import get_router, parse_json_response
     context_block = f"Competition context: {competition_context} | " if competition_context else ""
     prompt = f"Decide football prediction for {match_name}. {context_block}Evidence: {' | '.join(response_chain)}. Markets: {[asdict(x) for x in shortlisted_markets]}. Return JSON only with market,outcome,confidence,value_bet,btts,over_2_5,key_factors,reasoning."
-    started = time.monotonic(); raw = _ollama(model, prompt, timeout)
-    logger.debug("Ollama decider model=%s elapsed_ms=%d", model, (time.monotonic()-started)*1000)
-    parsed = json.loads(raw[raw.find('{'):raw.rfind('}')+1])
+    started = time.monotonic()
+    raw = get_router().call_analysis(prompt)
+    logger.debug("AI decider elapsed_ms=%d", (time.monotonic()-started)*1000)
+    parsed = parse_json_response(raw)
     required = {"market", "outcome", "confidence", "value_bet", "btts", "over_2_5", "key_factors", "reasoning"}
     if not required <= parsed.keys(): raise ValueError("Decider response missing required keys")
     return parsed
@@ -366,8 +351,9 @@ def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
 def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None = None, match_date: str | None = None, source: str = "enriched_ensemble", attach_brain: bool = False, allow_repeat: bool = False) -> dict[str, Any]:
     kwargs = dict(match_id=match_id, match_date=match_date, source=source, attach_brain=attach_brain, allow_repeat=allow_repeat)
     try:
-        from app.llm import is_groq_available
-        model = "groq" if is_groq_available() else _ollama_model()
+        from app.ai_router import get_router
+        router = get_router()
+        model = router.best_available() or ("groq" if router.is_groq_available() else None)
         if not model:
             result = _rules_fallback(doc, "unavailable", **kwargs)
             result["competition_analysis_used"] = False

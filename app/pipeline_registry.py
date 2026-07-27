@@ -121,13 +121,13 @@ PIPELINES: list[PipelineDef] = [
     ),
     PipelineDef(
         engine_id="competition_special",
-        label="Competition Special (World Cup)",
-        description="Dedicated enrichment and prediction lane for the World Cup 2026 buffer. "
-                    "Leave paused when no active major tournament is running.",
-        interval="Every 3 min",
+        label="Competition Special",
+        description="Dedicated enrichment and prediction lane for all enabled top-30 competitions. "
+                    "Auto-pulls future fixtures and predicts them. Enable individual competitions in the Competition settings.",
+        interval="Every 5 min",
         source="SofaScore",
         job_ids=("competition_special",),
-        default="paused",
+        default="active",
     ),
     PipelineDef(
         engine_id="unified_upcoming",

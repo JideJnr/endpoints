@@ -215,36 +215,24 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
 
 def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     """
-    Run a direct (no-tool) Groq analysis for one enriched match document.
-
-    Uses a direct LLM call instead of the LangChain agent so tool schemas
-    are never injected into the context. This keeps the request well within
-    the 12,000 TPM on-demand limit for llama-3.3-70b-versatile.
+    Run a match analysis for one enriched document.
+    Routes through AIRouter: qwen3:8b → deepseek-r1:8b → Groq.
     """
-    from app.llm import is_groq_available
+    from app.ai_router import get_router, parse_json_response
 
-    if not is_groq_available():
-        return {"status": "groq_unavailable", "message": "Set GROQ_API_KEY to enable AI analysis."}
+    router = get_router()
+    if not router.any_available():
+        return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
 
     try:
         from app.competition_special import apply_known_competition_context
         apply_known_competition_context(doc)
-        from app.llm import get_llm
-        llm = get_llm()
         summary = _summarise_doc(doc)
-        # Direct invoke — no tools, no agent scaffolding, minimal token overhead
-        response = llm.invoke([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": summary},
-        ])
-        raw = response.content if hasattr(response, "content") else str(response)
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        result = json.loads(raw.strip())
+        prompt = f"{SYSTEM_PROMPT}\n\n{summary}"
+        raw = router.call_analysis(prompt)
+        result = parse_json_response(raw)
     except json.JSONDecodeError as exc:
-        return {"status": "error", "message": f"LLM returned non-JSON: {exc}"}
+        return {"status": "error", "message": f"Model returned non-JSON: {exc}"}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -257,6 +245,9 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         confidence = None
 
+    status_info = router.status()
+    active_model = status_info.get("primary_model") or "groq"
+
     return {
         "status": result.get("status") or "predicted",
         "recommendation": result.get("prediction"),
@@ -268,7 +259,8 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         "btts": result.get("btts"),
         "over_2_5": result.get("over_2_5"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "groq_agent",
+        "source": "ai_router",
+        "model": active_model,
     }
 
 
@@ -288,9 +280,9 @@ def run_groq_predictions(
     Returns:
         summary dict with predictions list
     """
-    from app.llm import is_groq_available
-    if not is_groq_available():
-        return {"status": "groq_unavailable", "message": "Set GROQ_API_KEY to enable Groq agent"}
+    from app.ai_router import get_router
+    if not get_router().any_available():
+        return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
 
     target_date = match_date or dt.today().isoformat()
 

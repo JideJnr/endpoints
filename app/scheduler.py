@@ -38,7 +38,7 @@ from app.competition_analyser import job_competition_analysis
 _scheduler = None
 _shutting_down = False
 _live_priority_lock = threading.Lock()
-_db_job_lock = threading.RLock()
+_db_job_lock = threading.Lock()
 _watchdog_thread: threading.Thread | None = None
 _watchdog_stop = threading.Event()
 LIVE_PRIORITY_ENGINE_ID = "live_priority_mode"
@@ -1736,8 +1736,15 @@ def run_job_with_guard(fn, *args, guard_job_id: str | None = None, **kwargs):
     """Run a scheduler job through the persistent cross-process job ledger."""
     job_id = guard_job_id or (fn.__name__[4:] if fn.__name__.startswith("job_") else fn.__name__)
     if job_id in _DB_WRITE_JOB_IDS:
-        with _db_job_lock:
+        stale_after = _JOB_STALE_SECONDS.get(job_id, 900)
+        acquired = _db_job_lock.acquire(timeout=min(30, stale_after // 2))
+        if not acquired:
+            _logger.warning("[scheduler] %s skipped: db_job_lock held too long (possible hung job)", job_id)
+            return {"status": "busy", "job": job_id, "reason": "db_job_lock timeout"}
+        try:
             return _run_job_with_guard_locked(fn, *args, guard_job_id=job_id, **kwargs)
+        finally:
+            _db_job_lock.release()
     return _run_job_with_guard_locked(fn, *args, guard_job_id=job_id, **kwargs)
 
 

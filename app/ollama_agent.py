@@ -88,7 +88,11 @@ def _call_ollama(model: str, prompt: str, timeout: int = 60) -> str:
         "model": model,
         "prompt": f"{SYSTEM_PROMPT}\n\n{prompt}",
         "stream": False,
-        "options": {"temperature": 0},
+        # Qwen's thinking mode can consume the entire generation on a small
+        # local CPU before it emits a final answer. Pipeline calls need concise
+        # factual output, so keep local fallback generations bounded.
+        "think": False,
+        "options": {"temperature": 0, "num_predict": 192},
     }).encode("utf-8")
     req = urllib_request.Request(
         url,

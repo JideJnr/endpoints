@@ -83,13 +83,13 @@ def apply_prediction_state(
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
         prediction_mode = _prediction_mode_from_readiness(readiness)
         if resolved_match_id and not allow_repeat:
-            cooldown_minutes = 8 if prediction_mode == "live" else 180
+            cooldown_minutes = 3 if prediction_mode == "live" else 180
             if (
                 prediction_mode == "live"
                 and (doc.get("sofascore_id") or (doc.get("sofascore_detail") or {}).get("id"))
                 and "sofascore" in (readiness.get("live_data_sources") or [])
             ):
-                cooldown_minutes = 3
+                cooldown_minutes = 2
             recent = _recent_ungraded_prediction(resolved_match_id, minutes=cooldown_minutes, prediction_mode=prediction_mode)
             if recent:
                 return {

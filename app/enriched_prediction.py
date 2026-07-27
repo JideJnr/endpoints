@@ -232,22 +232,19 @@ def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
         missing.append("live_clock_mature")
     elif is_live and not live_sources and prematch_missing:
         missing.append("live_statistics")
-    if markets and not detail and (doc.get("time_context") or match_time_context(doc)):
-        # SportyBet-only live fallback is allowed after the clock matures.
-        # SportyBet-only prematch fallback is also a valid degraded mode: it
-        # may publish "avoid" or very low-assurance market reads, but it must
-        # still be auditable instead of leaving the match dead.
-        # Once SofaScore is matched, keep the stricter enrichment contract so
-        # a half-enriched match cannot publish a market-only pick as full signal.
+    if markets and (doc.get("time_context") or match_time_context(doc)):
+        # SportyBet markets are sufficient for a degraded prediction in all cases:
+        # - prematch: market-only signal is valid
+        # - live: allow as soon as markets exist, regardless of clock or SofaScore state
+        # - SofaScore match/detail failures should not block when we have odds data
         removable = {
             "confident_sofascore_match",
             "sofascore_detail",
             "home_recent_history",
             "away_recent_history",
             "live_statistics",
+            "live_clock_mature",
         }
-        if not is_live or _played_seconds(doc.get("played_seconds")) >= 5 * 60:
-            removable.add("live_clock_mature")
         missing = [
             item for item in missing
             if item not in removable
@@ -646,6 +643,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         if importance_map:
             _apply_feature_importance(signals, importance_map)
     except Exception as exc:
+        from app.health_counters import record_health_event
         record_health_event("feature_importance_error", str(exc))
 
     # ── Calibration: adjust confidence based on historical win rates ──────────
@@ -708,6 +706,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                         "reason": f"Confidence {raw_conf}% exceeds historical win rate by {gap_info['gap']} points",
                     })
             except Exception as exc:
+                from app.health_counters import record_health_event
                 record_health_event("calibration_gap_error", str(exc))
             if memory.get("blended_win_rate") is not None:
                 signals.append({

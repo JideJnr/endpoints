@@ -341,11 +341,17 @@ def run_learning_cycle() -> dict[str, Any]:
 
         conn.commit()
 
+    # ── 5. Incorporate user behavior for self-learning ────────────────────
+    behavior_updates = _incorporate_user_behavior(conn, rows)
+
+    conn.commit()
+
     print(
         f"[self_learner] cycle complete: "
         f"{signal_updates} signal weights | "
         f"{league_updates} league accuracy rows | "
-        f"{model_updates} model weights updated"
+        f"{model_updates} model weights updated | "
+        f"{behavior_updates} behavior adjustments"
     )
     return {
         "status": "ok",
@@ -353,6 +359,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "signal_updates": signal_updates,
         "league_updates": league_updates,
         "model_weight_updates": model_updates,
+        "behavior_adjustments": behavior_updates,
     }
 
 
@@ -744,3 +751,129 @@ def _calibration_verdict(gap: float | None) -> str:
     if g < -0.10:
         return "overconfident"    # model claims more than it delivers
     return "well_calibrated"
+
+
+def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> int:
+    """
+    Adjust signal weights based on user behavior (accepts, rejects, picks).
+    This creates a feedback loop where the system learns from user preferences.
+    """
+    try:
+        from app.league_memory import get_user_behavior_summary, get_behavior_weighted_picks
+    except Exception:
+        return 0
+
+    if not graded_rows:
+        return 0
+
+    # Collect unique match_ids from graded predictions
+    match_ids = list({row["match_id"] for row in graded_rows if row.get("match_id")})
+    if not match_ids:
+        return 0
+
+    behavior_adjustments = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for match_id in match_ids[:50]:  # limit to avoid overload
+        try:
+            summary = get_user_behavior_summary(match_id=match_id, days=7)
+            if summary["total_interactions"] == 0:
+                continue
+
+            # Get the prediction for this match
+            pred = conn.execute(
+                """
+                select ph.pick_type, ph.selection, ph.confidence, ph.signals_json, ph.league_name
+                from prediction_history ph
+                where ph.match_id = ? and ph.result is null
+                order by ph.confidence desc limit 1
+                """,
+                (match_id,),
+            ).fetchone()
+
+            if not pred:
+                continue
+
+            pick_type = pred["pick_type"] or "unknown"
+            selection = pred["selection"] or ""
+            signals = _safe_json(pred["signals_json"])
+            league_key = _norm_league(pred["league_name"] or "")
+
+            # User accepted this pick → boost signal weights
+            # User rejected this pick → suppress signal weights
+            accept_count = summary["by_action"].get("accept", {}).get("count", 0)
+            reject_count = summary["by_action"].get("reject", {}).get("count", 0)
+            pick_count = summary["by_action"].get("pick", {}).get("count", 0)
+
+            net_user_signal = accept_count - reject_count
+            if net_user_signal == 0:
+                continue
+
+            # Adjust signal weights for signals in this prediction
+            for sig in signals:
+                name = str(sig.get("name") or "")
+                if not name:
+                    continue
+
+                # Get current weight
+                current = conn.execute(
+                    """
+                    select weight_adj from signal_weights
+                    where signal_name = ? and league_key in (?, '__global__')
+                    order by case when league_key = ? then 0 else 1 end
+                    limit 1
+                    """,
+                    (name, league_key, league_key),
+                ).fetchone()
+
+                current_adj = float(current["weight_adj"]) if current else 0.0
+
+                # Apply user behavior adjustment
+                # Positive net accepts → boost, negative → suppress
+                adjustment = round(net_user_signal * 0.05, 3)  # max ±5% per interaction cycle
+                new_adj = round(current_adj + adjustment, 3)
+                new_adj = max(-1.0, min(1.0, new_adj))  # clamp
+
+                conn.execute("""
+                    insert into signal_weights
+                        (signal_name, league_key, samples, wins, losses, win_rate, weight_adj, last_updated)
+                    values (?, ?, 0, 0, 0, NULL, ?, ?)
+                    on conflict(signal_name, league_key) do update set
+                        weight_adj = excluded.weight_adj,
+                        last_updated = excluded.last_updated
+                """, (name, league_key, new_adj, now))
+                behavior_adjustments += 1
+
+            # Also adjust pick-type specific weights
+            for sig in signals:
+                name = str(sig.get("name") or "")
+                if not name:
+                    continue
+
+                current = conn.execute(
+                    """
+                    select weight_adj from signal_pick_weights
+                    where signal_name = ? and league_key = ? and pick_type = ?
+                    limit 1
+                    """,
+                    (name, league_key, pick_type),
+                ).fetchone()
+
+                current_adj = float(current["weight_adj"]) if current else 0.0
+                adjustment = round(net_user_signal * 0.03, 3)
+                new_adj = round(current_adj + adjustment, 3)
+                new_adj = max(-1.0, min(1.0, new_adj))
+
+                conn.execute("""
+                    insert into signal_pick_weights
+                        (signal_name, league_key, pick_type, samples, wins, losses, win_rate, weight_adj, last_updated)
+                    values (?, ?, ?, 0, 0, 0, NULL, ?, ?)
+                    on conflict(signal_name, league_key, pick_type) do update set
+                        weight_adj = excluded.weight_adj,
+                        last_updated = excluded.last_updated
+                """, (name, league_key, pick_type, new_adj, now))
+
+        except Exception:
+            continue
+
+    return behavior_adjustments

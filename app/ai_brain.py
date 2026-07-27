@@ -14,17 +14,23 @@ DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     AI supervisor with memory-aware reasoning.
-    Injects historical accuracy context so the LLM reasons with knowledge
-    of what has worked before — not just the current match in isolation.
-    Falls back to deterministic review when no model is running.
+    Routes through AIRouter (qwen3 → deepseek → groq) then falls back to
+    deterministic rules when no model is available.
     """
     safe_detail = detail if isinstance(detail, dict) else {}
     memory_context = _build_memory_context(prediction)
     prompt_payload = _compact_prediction(prediction, safe_detail, memory_context)
-    provider = get_settings().ai_provider
-    providers = ["huggingface", "ollama"] if provider == "auto" else [provider]
-    for name in providers:
-        ai = _provider_review(name, prompt_payload)
+    # Try AIRouter first (covers ollama + groq in one call)
+    from app.ai_router import get_router
+    if get_router().any_available():
+        ai = _router_review(prompt_payload)
+        if ai:
+            ai["memory_context_used"] = bool(memory_context)
+            return ai
+    # HuggingFace as secondary cloud option
+    settings = get_settings()
+    if settings.hf_token_present:
+        ai = _huggingface_review(prompt_payload)
         if ai:
             ai["memory_context_used"] = bool(memory_context)
             return ai
@@ -113,7 +119,24 @@ def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] |
         return _huggingface_review(payload)
     if provider == "ollama":
         return _ollama_review(payload)
+    if provider in {"groq", "auto"}:
+        return _router_review(payload)
     return None
+
+
+def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Use AIRouter for supervisor review: qwen3 → deepseek → groq."""
+    from app.ai_router import get_router, parse_json_safe
+    try:
+        messages = _review_messages(payload)
+        raw = get_router().call_review(messages)
+        parsed = parse_json_safe(raw)
+        if not parsed:
+            return None
+        model = get_router().best_available() or "groq"
+        return _review_result("ai_router", model, parsed)
+    except Exception:
+        return None
 
 
 def _huggingface_review(payload: dict[str, Any]) -> dict[str, Any] | None:
