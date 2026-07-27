@@ -1218,6 +1218,74 @@ def _importance_prediction_focus(stage: str) -> list[str]:
     return ["freshness", "team_strength", "market_context"]
 
 
+def list_all_competition_summaries(
+    buffer_limit: int = 50,
+    analysis_limit: int = 1,
+) -> dict[str, Any]:
+    """Return a lightweight summary for every tracked competition.
+
+    This is the production-ready data source for the unified competition
+    dashboard page.  It aggregates settings, buffer health, and latest
+    analysis for all 30 curated competitions plus the World Cup special.
+    """
+    _init_db()
+    all_keys = [DEFAULT_WORLD_CUP["key"], *[entry["key"] for entry in TOP_30_COMPETITIONS]]
+    summaries: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    for key in all_keys:
+        try:
+            settings = get_competition_settings(key)
+            buffer = list_competition_buffer(key, limit=buffer_limit)
+            status = competition_status(key)
+
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                init_competition_tables(conn)
+                from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
+                init_competition_analysis_table(conn)
+                latest_analysis = get_latest_analysis(key, conn)
+
+            summary = {
+                "key": key,
+                "name": settings.get("name") or key,
+                "enabled": bool(settings.get("enabled")),
+                "unique_tournament_id": settings.get("unique_tournament_id"),
+                "settings": settings,
+                "buffer_summary": buffer.get("summary", {}),
+                "buffer_status": status.get("buffer", {}),
+                "latest_analysis": latest_analysis,
+                "match_count": buffer.get("count", 0),
+                "error": None,
+            }
+            summaries.append(summary)
+        except Exception as exc:
+            errors.append({"key": key, "error": str(exc)})
+            summaries.append({
+                "key": key,
+                "name": key,
+                "enabled": False,
+                "unique_tournament_id": 0,
+                "settings": {"key": key, "name": key, "enabled": False},
+                "buffer_summary": {},
+                "buffer_status": {},
+                "latest_analysis": None,
+                "match_count": 0,
+                "error": str(exc),
+            })
+
+    # Sort: enabled first, then by match count descending
+    summaries.sort(key=lambda s: (not s["enabled"], -s.get("match_count", 0)))
+
+    return {
+        "status": "success",
+        "total_tracked": len(all_keys),
+        "enabled_count": sum(1 for s in summaries if s["enabled"]),
+        "competitions": summaries,
+        "errors": errors,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
     columns = {row[1] for row in conn.execute(f"pragma table_info({table})").fetchall()}
     if column not in columns:
