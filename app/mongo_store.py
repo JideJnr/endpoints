@@ -155,6 +155,28 @@ def get_finished_match(match_id: str) -> dict[str, Any] | None:
     return doc
 
 
+def get_finished_match_by_sofascore_id(sofascore_id: str) -> dict[str, Any] | None:
+    """
+    Look up a finished match by SofaScore ID.
+    Used as fallback when the SportyBet ID is not available.
+    """
+    if not is_configured():
+        return None
+    doc = _get_db()["finished_matches"].find_one(
+        {"$or": [
+            {"sofascore_id": sofascore_id},
+            {"sofascore_detail.sofascoreId": sofascore_id},
+            {"sofascore_detail.sofascore_id": sofascore_id},
+        ]},
+        {"_id": 0},
+    )
+    if not doc:
+        return None
+    doc["_id"] = str(doc.get("_id") or doc.get("sportybet_id") or "")
+    doc["archive_source"] = "mongodb"
+    return doc
+
+
 def get_team_finished_matches(team_id: str | int, limit: int = 15) -> list[dict[str, Any]]:
     """
     Fetch finished matches for a team from MongoDB.

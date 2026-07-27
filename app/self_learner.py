@@ -341,7 +341,10 @@ def run_learning_cycle() -> dict[str, Any]:
 
         conn.commit()
 
-    # ── 5. Incorporate user behavior for self-learning ────────────────────
+    # ── 5. AI analysis feedback loop ────────────────────────────────
+    ai_updates = _incorporate_ai_analysis(conn, rows)
+
+    # ── 6. Incorporate user behavior for self-learning ────────────
     behavior_updates = _incorporate_user_behavior(conn, rows)
 
     conn.commit()
@@ -351,6 +354,7 @@ def run_learning_cycle() -> dict[str, Any]:
         f"{signal_updates} signal weights | "
         f"{league_updates} league accuracy rows | "
         f"{model_updates} model weights updated | "
+        f"{ai_updates} AI analysis adjustments | "
         f"{behavior_updates} behavior adjustments"
     )
     return {
@@ -359,6 +363,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "signal_updates": signal_updates,
         "league_updates": league_updates,
         "model_weight_updates": model_updates,
+        "ai_analysis_adjustments": ai_updates,
         "behavior_adjustments": behavior_updates,
     }
 
@@ -751,6 +756,125 @@ def _calibration_verdict(gap: float | None) -> str:
     if g < -0.10:
         return "overconfident"    # model claims more than it delivers
     return "well_calibrated"
+
+
+def _incorporate_ai_analysis(conn: sqlite3.Connection, graded_rows: list) -> int:
+    """
+    Incorporate AI analysis feedback from finished matches into the learning system.
+    Reads AI analysis results from MongoDB finished_matches and adjusts signal weights
+    and model weights based on AI verdicts on predictions.
+    """
+    from app.mongo_store import list_finished_matches, is_configured
+
+    if not is_configured():
+        return 0
+
+    try:
+        finished = list_finished_matches(limit=500)
+    except Exception:
+        return 0
+
+    if not finished:
+        return 0
+
+    updates = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for doc in finished:
+        ai_analysis = doc.get("ai_analysis") or doc.get("ai_analysis_ollama")
+        if not ai_analysis:
+            continue
+
+        prediction = doc.get("prediction")
+        if not prediction:
+            continue
+
+        pick = prediction.get("picks", [{}])[0] if prediction.get("picks") else {}
+        if not pick:
+            continue
+
+        pick_type = pick.get("type") or prediction.get("pick_type") or "unknown"
+        selection = pick.get("selection") or pick.get("pick") or ""
+        confidence = pick.get("confidence") or prediction.get("confidence") or 50
+        result = doc.get("result")
+
+        # AI verdict on the prediction
+        ai_recommendation = ai_analysis.get("recommendation") or ai_analysis.get("prediction") or ""
+        ai_confidence = ai_analysis.get("confidence") or 50
+        ai_verdict = ai_analysis.get("verdict") or ai_recommendation
+
+        # Determine if AI agrees with the prediction
+        ai_agrees = False
+        if ai_verdict and selection:
+            sel_lower = str(selection).lower()
+            verdict_lower = str(ai_verdict).lower()
+            if sel_lower in ("home", "1", "home win") and verdict_lower in ("home", "1", "home win", "home"):
+                ai_agrees = True
+            elif sel_lower in ("away", "2", "away win") and verdict_lower in ("away", "2", "away win", "away"):
+                ai_agrees = True
+            elif sel_lower in ("draw", "x", "draw") and verdict_lower in ("draw", "x", "draw"):
+                ai_agrees = True
+            elif sel_lower in ("home or draw", "1x") and verdict_lower in ("home", "1", "home win", "draw", "x"):
+                ai_agrees = True
+            elif sel_lower in ("away or draw", "x2") and verdict_lower in ("away", "2", "away win", "draw", "x"):
+                ai_agrees = True
+
+        # Adjust signal weights based on AI analysis
+        signals = _decision_signals_for_row({
+            "pick_type": pick_type,
+            "selection": selection,
+            "confidence": confidence,
+            "result": result,
+            "signals_json": pick.get("signals_json") or "[]",
+            "audit_json": pick.get("audit_json") or "{}",
+            "context_json": pick.get("context_json") or "{}",
+            "league_name": doc.get("tournament") or "",
+            "country_name": doc.get("country") or "",
+        })
+
+        for sig in signals:
+            name = str(sig.get("name") or "")
+            if not name:
+                continue
+
+            # Boost signals that AI agrees with, suppress those it disagrees with
+            adjustment = 0.05 if ai_agrees else -0.03
+
+            try:
+                conn.execute("""
+                    update signal_weights
+                    set weight_adj = weight_adj + ?, last_updated = ?
+                    where signal_name = ? and league_key = ?
+                """, (adjustment, now, name, _norm_league(doc.get("tournament") or "")))
+                updates += 1
+            except Exception:
+                pass
+
+        # Adjust model weights based on AI confidence vs prediction confidence
+        if ai_confidence and confidence:
+            ai_conf = float(ai_confidence) / 100 if float(ai_confidence) <= 1 else float(ai_confidence)
+            pred_conf = float(confidence) / 100 if float(confidence) <= 1 else float(confidence)
+            confidence_gap = ai_conf - pred_conf
+
+            # If AI is more confident than our prediction, boost the model
+            # If AI is less confident, suppress the model
+            if abs(confidence_gap) > 0.1:
+                model_name = "groq" if doc.get("ai_analysis") else "ollama"
+                try:
+                    conn.execute("""
+                        update learned_model_weights
+                        set learned_weight = CASE
+                            WHEN confidence_gap > 0 THEN LEAST(learned_weight + 0.02, 0.50)
+                            ELSE GREATEST(learned_weight - 0.02, 0.05)
+                        END,
+                        last_updated = ?
+                        WHERE model_name = ?
+                    """, (now, model_name))
+                    updates += 1
+                except Exception:
+                    pass
+
+    return updates
 
 
 def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> int:

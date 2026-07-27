@@ -141,6 +141,20 @@ def get_similar_matches(
     return result
 
 
+@router.get("/matches/sofascore/{sofascore_id}")
+def get_match_by_sofascore_id(sofascore_id: str):
+    """
+    Look up a finished match by SofaScore ID.
+    Used as fallback when the SportyBet ID is not available.
+    """
+    from app.mongo_store import get_finished_match_by_sofascore_id
+
+    doc = get_finished_match_by_sofascore_id(sofascore_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Match with SofaScore ID {sofascore_id} not found")
+    return {"status": "success", "match": doc}
+
+
 @router.get("/matches/{sportybet_id}/sporty-info")
 def get_match_sporty_info(sportybet_id: str):
     """Fetch fresh SportyBet endpoint data for one match and merge it into buffer."""
@@ -1308,6 +1322,21 @@ def grade_results(hours_back: int = 24):
 
     overdue = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
 
+    # AI analysis for graded matches
+    ai_analysis_count = 0
+    for row in pending:
+        if row["result"] not in ("win", "loss"):
+            continue
+        try:
+            from app.mongo_store import get_finished_match
+            finished = get_finished_match(str(row["match_id"]))
+            if not finished:
+                continue
+            _run_ai_analysis_on_graded_match(finished)
+            ai_analysis_count += 1
+        except Exception:
+            pass
+
     return {
         "status": "ok",
         "results_fetched": len(results),
@@ -1318,6 +1347,7 @@ def grade_results(hours_back: int = 24):
         "sofascore": sofascore,
         "overdue": overdue,
         "matches_archived": archived,
+        "ai_analysis_triggered": ai_analysis_count,
         "signal_stats": _grade_signal_stats(graded + sofascore["graded"] + int(overdue.get("graded") or 0)),
     }
 
@@ -1999,6 +2029,133 @@ def get_all_ai_analyses(sportybet_id: str):
         "ollama_consensus": ollama_analysis.get("consensus") if ollama_analysis else None,
         "ollama_consensus_reached": (ollama_analysis or {}).get("consensus_reached", False),
     }
+
+
+@router.post("/matches/{sportybet_id}/ai-analysis-match")
+def analyze_match_snapshot(sportybet_id: str):
+    """
+    Full AI analysis of a finished match snapshot.
+    Used after grading to see if the prediction was correct and how the match fared.
+    Tries Groq first, falls back to Ollama if Groq is unavailable.
+    """
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+
+    # Try buffer first, then finished matches
+    doc = get_buffered_match(sportybet_id)
+    if not doc:
+        from app.mongo_store import get_finished_match
+        doc = get_finished_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Match not found in buffer or archive")
+
+    from app.groq_agent import run_groq_match_analysis
+    from app.ollama_agent import run_ollama_all_models
+
+    # Run Groq analysis first
+    analysis = run_groq_match_analysis(doc)
+    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+        analysis["provider"] = "groq"
+        analysis["fallback"] = None
+        doc["ai_analysis"] = analysis
+        store_enriched(sportybet_id, doc)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+
+    # Fall back to Ollama
+    ollama_result = run_ollama_all_models(doc)
+    if ollama_result.get("status") == "success":
+        ollama_result["provider"] = "ollama"
+        ollama_result["fallback"] = "groq_unavailable"
+        doc["ai_analysis_ollama"] = ollama_result
+        store_enriched(sportybet_id, doc)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
+
+    raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
+
+
+@router.post("/matches/{sportybet_id}/ai-analyze-graded")
+def analyze_graded_match(sportybet_id: str):
+    """
+    Analyze a graded match result with AI.
+    Called after grading to see what happened and if the prediction was correct.
+    Sends the full match snapshot including final score, prediction, and signals to the AI.
+    """
+    sportybet_id = _resolve_buffer_match_id(sportybet_id)
+
+    from app.mongo_store import get_finished_match
+    doc = get_finished_match(sportybet_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Finished match not found")
+
+    from app.groq_agent import run_groq_match_analysis
+    from app.ollama_agent import run_ollama_all_models
+
+    # Add grading result context to the document
+    prediction = doc.get("prediction")
+    if prediction:
+        doc["_grading_result"] = {
+            "prediction_pick": prediction.get("pick") or prediction.get("selection"),
+            "prediction_confidence": prediction.get("confidence"),
+            "prediction_type": prediction.get("type") or prediction.get("pick_type"),
+        }
+
+    # Run Groq analysis first
+    analysis = run_groq_match_analysis(doc)
+    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+        analysis["provider"] = "groq"
+        analysis["fallback"] = None
+        analysis["graded_result"] = doc.get("_grading_result")
+        doc["ai_analysis"] = analysis
+        store_enriched(sportybet_id, doc)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+
+    # Fall back to Ollama
+    ollama_result = run_ollama_all_models(doc)
+    if ollama_result.get("status") == "success":
+        ollama_result["provider"] = "ollama"
+        ollama_result["fallback"] = "groq_unavailable"
+        ollama_result["graded_result"] = doc.get("_grading_result")
+        doc["ai_analysis_ollama"] = ollama_result
+        store_enriched(sportybet_id, doc)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
+
+    raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
+
+
+def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Run AI analysis on a graded match to see what happened and if the prediction was correct.
+    Tries Groq first, falls back to Ollama.
+    """
+    from app.groq_agent import run_groq_match_analysis
+    from app.ollama_agent import run_ollama_all_models
+
+    prediction = doc.get("prediction")
+    if prediction:
+        doc["_grading_result"] = {
+            "prediction_pick": prediction.get("pick") or prediction.get("selection"),
+            "prediction_confidence": prediction.get("confidence"),
+            "prediction_type": prediction.get("type") or prediction.get("pick_type"),
+        }
+
+    analysis = run_groq_match_analysis(doc)
+    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+        analysis["provider"] = "groq"
+        analysis["fallback"] = None
+        analysis["graded_result"] = doc.get("_grading_result")
+        doc["ai_analysis"] = analysis
+        store_enriched(str(doc.get("_id") or doc.get("sportybet_id") or ""), doc)
+        return analysis
+
+    ollama_result = run_ollama_all_models(doc)
+    if ollama_result.get("status") == "success":
+        ollama_result["provider"] = "ollama"
+        ollama_result["fallback"] = "groq_unavailable"
+        ollama_result["graded_result"] = doc.get("_grading_result")
+        doc["ai_analysis_ollama"] = ollama_result
+        store_enriched(str(doc.get("_id") or doc.get("sportybet_id") or ""), doc)
+        return ollama_result
+
+    return None
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
