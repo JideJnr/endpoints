@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
-from app.league_memory import DB_PATH
+from app.league_memory import DB_PATH, _conn
 
 
 MIN_CALIBRATION_SAMPLES = 30
@@ -36,8 +35,7 @@ def evaluate_promotion_gate(doc: dict[str, Any], pick: dict[str, Any]) -> dict[s
     metrics: dict[str, Any] = {"market": market, "league": league}
 
     try:
-        with sqlite3.connect(Path(DB_PATH), timeout=15) as conn:
-            conn.row_factory = sqlite3.Row
+        with _conn(timeout=15) as conn:
             calibration = _calibration_metrics(conn, market, pick_type, confidence)
             clv = _clv_metrics(conn, market, pick_type, league)
             drawdown = _drawdown_metrics(conn, market, pick_type, league)

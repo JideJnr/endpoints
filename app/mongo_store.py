@@ -71,68 +71,64 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
             "select match_id, match_date, raw_enriched, raw_sporty from match_buffer where match_id = ?",
             (match_id,),
         ).fetchone()
+        if not row:
+            return False
+        raw = row["raw_enriched"] or row["raw_sporty"]
+        if not raw:
+            return False
 
-    if not row:
-        return False
+        doc = json.loads(raw)
+        score = doc.get("score") or {}
+        now = datetime.now(timezone.utc).isoformat()
 
-    raw = row["raw_enriched"] or row["raw_sporty"]
-    if not raw:
-        return False
+        # odds movement — opening/closing 1x2
+        movement = get_movement(match_id) or {}
+        snapshots = movement.get("snapshots", [])
+        odds_open  = snapshots[0].get("odds_1x2")  if snapshots else None
+        odds_close = snapshots[-1].get("odds_1x2") if snapshots else None
 
-    doc = json.loads(raw)
-    score = doc.get("score") or {}
-    now = datetime.now(timezone.utc).isoformat()
+        # top prediction pick
+        prediction = _latest_prediction(match_id)
 
-    # odds movement — opening/closing 1x2
-    movement = get_movement(match_id) or {}
-    snapshots = movement.get("snapshots", [])
-    odds_open  = snapshots[0].get("odds_1x2")  if snapshots else None
-    odds_close = snapshots[-1].get("odds_1x2") if snapshots else None
+        # Extract team IDs from sofascore_detail for model training
+        detail = doc.get("sofascore_detail") or {}
+        home_team_obj = detail.get("home_team") or detail.get("homeTeam") or {}
+        away_team_obj = detail.get("away_team") or detail.get("awayTeam") or {}
 
-    # top prediction pick
-    prediction = _latest_prediction(match_id)
+        archive_doc = {
+            "_id":             match_id,
+            "match_date":      row["match_date"],
+            "name":            doc.get("sportybet_name") or doc.get("name"),
+            "home_team":       _team(doc, "home"),
+            "away_team":       _team(doc, "away"),
+            "home_team_id":    home_team_obj.get("id"),
+            "away_team_id":    away_team_obj.get("id"),
+            "tournament":      _tournament_name(doc),
+            "score":           {"home": _to_int(score.get("home")), "away": _to_int(score.get("away"))},
+            "odds_open":       odds_open,
+            "odds_close":      odds_close,
+            "prediction":      prediction,
+            "finished_at":     now,
+            # Full enriched data for model training
+            "sofascore_detail":    detail,
+            "home_last_matches":   detail.get("home_last_matches") or [],
+            "away_last_matches":   detail.get("away_last_matches") or [],
+            "h2h":                 detail.get("h2h"),
+            "standings":           detail.get("standings"),
+            "sportybet_detail":    doc.get("sportybet_detail") or {},
+            "sportybet_data_status": doc.get("sportybet_data_status"),
+            "data_sources":        doc.get("data_sources") or {},
+            "raw_sporty":          doc.get("raw_sporty") or {},
+            "sportybet_markets":   doc.get("sportybet_markets") or doc.get("markets") or [],
+        }
 
-    # Extract team IDs from sofascore_detail for model training
-    detail = doc.get("sofascore_detail") or {}
-    home_team_obj = detail.get("home_team") or detail.get("homeTeam") or {}
-    away_team_obj = detail.get("away_team") or detail.get("awayTeam") or {}
+        _get_db()["finished_matches"].update_one(
+            {"_id": match_id},
+            {"$set": archive_doc},
+            upsert=True,
+        )
 
-    archive_doc = {
-        "_id":             match_id,
-        "match_date":      row["match_date"],
-        "name":            doc.get("sportybet_name") or doc.get("name"),
-        "home_team":       _team(doc, "home"),
-        "away_team":       _team(doc, "away"),
-        "home_team_id":    home_team_obj.get("id"),
-        "away_team_id":    away_team_obj.get("id"),
-        "tournament":      _tournament_name(doc),
-        "score":           {"home": _to_int(score.get("home")), "away": _to_int(score.get("away"))},
-        "odds_open":       odds_open,
-        "odds_close":      odds_close,
-        "prediction":      prediction,
-        "finished_at":     now,
-        # Full enriched data for model training
-        "sofascore_detail":    detail,
-        "home_last_matches":   detail.get("home_last_matches") or [],
-        "away_last_matches":   detail.get("away_last_matches") or [],
-        "h2h":                 detail.get("h2h"),
-        "standings":           detail.get("standings"),
-        "sportybet_detail":    doc.get("sportybet_detail") or {},
-        "sportybet_data_status": doc.get("sportybet_data_status"),
-        "data_sources":        doc.get("data_sources") or {},
-        "raw_sporty":          doc.get("raw_sporty") or {},
-        "sportybet_markets":   doc.get("sportybet_markets") or doc.get("markets") or [],
-    }
-
-    _get_db()["finished_matches"].update_one(
-        {"_id": match_id},
-        {"$set": archive_doc},
-        upsert=True,
-    )
-
-    # remove from buffer immediately
-    from app.league_memory import DB_PATH as _DB
-    with sqlite3.connect(_DB) as conn:
+        # remove from buffer immediately
         conn.execute("delete from match_buffer where match_id = ?", (match_id,))
         conn.commit()
 

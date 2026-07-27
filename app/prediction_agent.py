@@ -127,6 +127,24 @@ def predict_sofascore_event(
     memory_signal = late_goal_memory_signal(event)
     memory_boost = _late_goal_memory_boost(memory_signal, signals)
 
+    # Form trajectory — opponent-quality-weighted trend (last 3 vs previous 3)
+    standings = event.get("standings") or event.get("league_table") or []
+    home_trajectory = form_trajectory_signal(home.get("id"), home_history, standings, side="home")
+    away_trajectory = form_trajectory_signal(away.get("id"), away_history, standings, side="away")
+    if home_trajectory["available"] and home_trajectory["trajectory"] != "flat":
+        signals.append({
+            "name": "home_form_trajectory",
+            "value": home_trajectory,
+            "impact": home_trajectory["impact"],
+        })
+    if away_trajectory["available"] and away_trajectory["trajectory"] != "flat":
+        # Away improving hurts home; away declining helps home
+        signals.append({
+            "name": "away_form_trajectory",
+            "value": away_trajectory,
+            "impact": -away_trajectory["impact"],
+        })
+
     home_power = form_edge + league_edge + h2h_edge + table_edge + odds_edge + common_opp_edge
     if abs(home_power) >= 8:
         side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
@@ -549,6 +567,111 @@ def _form_edge(event: dict[str, Any], home_form: dict[str, Any], away_form: dict
         signals.append({"name": "avg_rating_edge", "value": round(rating_edge, 2), "impact": round(rating_edge, 2)})
 
     return edge
+
+
+def form_trajectory_signal(
+    team_id: int | None,
+    history: list[dict[str, Any]],
+    standings: list[dict[str, Any]] | None = None,
+    side: str = "home",
+) -> dict[str, Any]:
+    """
+    Compute form trajectory (improving / declining / flat) weighted by opponent quality.
+    Compares last 3 matches vs previous 3 matches.
+    Returns a signal dict with impact and trajectory label.
+    """
+    finished = [m for m in (history or []) if (m.get("status") or {}).get("type") == "finished"][:8]
+    if not team_id or len(finished) < 4:
+        return {"available": False, "trajectory": "unknown", "impact": 0}
+
+    # Build opponent position lookup from standings
+    pos_by_id: dict[str, int] = {}
+    pos_by_name: dict[str, int] = {}
+    table_size = len(standings or [])
+    for row in standings or []:
+        team = row.get("team") or {}
+        tid = str(team.get("id") or "")
+        tname = str(team.get("name") or "").lower()
+        pos = _to_int(row.get("position"), 0)
+        if tid:
+            pos_by_id[tid] = pos
+        if tname:
+            pos_by_name[tname] = pos
+
+    def _opp_weight(match: dict[str, Any]) -> float:
+        """1.5 for top-quarter opponents, 0.6 for bottom-quarter, 1.0 otherwise."""
+        if not table_size:
+            return 1.0
+        is_home = str((match.get("homeTeam") or match.get("home_team") or {}).get("id") or "") == str(team_id)
+        opp = match.get("awayTeam") or match.get("away_team") if is_home else match.get("homeTeam") or match.get("home_team")
+        if not isinstance(opp, dict):
+            return 1.0
+        opp_id = str(opp.get("id") or "")
+        opp_name = str(opp.get("name") or "").lower()
+        pos = pos_by_id.get(opp_id) or pos_by_name.get(opp_name) or 0
+        if not pos:
+            return 1.0
+        percentile = pos / table_size
+        if percentile <= 0.25:
+            return 1.5   # top quarter — harder opponent
+        if percentile >= 0.75:
+            return 0.6   # bottom quarter — weaker opponent
+        return 1.0
+
+    def _match_pts(match: dict[str, Any]) -> int:
+        score = match.get("score") or {}
+        home_score = _to_int(score.get("home"), -1)
+        away_score = _to_int(score.get("away"), -1)
+        if home_score < 0 or away_score < 0:
+            return -1
+        is_home = str((match.get("homeTeam") or match.get("home_team") or {}).get("id") or "") == str(team_id)
+        gf = home_score if is_home else away_score
+        ga = away_score if is_home else home_score
+        return 3 if gf > ga else 1 if gf == ga else 0
+
+    recent = finished[:3]
+    older = finished[3:6]
+
+    def _weighted_pts(matches: list[dict[str, Any]]) -> float:
+        total = 0.0
+        for m in matches:
+            pts = _match_pts(m)
+            if pts < 0:
+                continue
+            total += pts * _opp_weight(m)
+        return total
+
+    recent_pts = _weighted_pts(recent)
+    older_pts = _weighted_pts(older)
+    delta = recent_pts - older_pts
+
+    # Classify trajectory
+    if delta >= 3.0:
+        trajectory = "improving"
+        impact = min(6.0, delta * 0.8)
+    elif delta <= -3.0:
+        trajectory = "declining"
+        impact = max(-6.0, delta * 0.8)
+    else:
+        trajectory = "flat"
+        impact = 0.0
+
+    # Detect "losing to everyone" — all recent results are losses
+    all_losses = all(_match_pts(m) == 0 for m in recent if _match_pts(m) >= 0)
+    if all_losses and len(recent) >= 3:
+        trajectory = "poor"
+        impact = min(impact, -5.0)
+
+    return {
+        "available": True,
+        "side": side,
+        "trajectory": trajectory,
+        "recent_weighted_pts": round(recent_pts, 2),
+        "older_weighted_pts": round(older_pts, 2),
+        "delta": round(delta, 2),
+        "all_recent_losses": all_losses,
+        "impact": round(impact, 2),
+    }
 
 
 def _league_strength_edge(

@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
 import asyncio
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings, public_settings
-from app.league_memory import DB_PATH, _init_db
+from app.league_memory import DB_PATH, _init_db, close_db
 from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore
 from app.routers import sofa_pipeline as sofa_pipeline_router
 from app.routers import pipelines as pipelines_router
@@ -70,6 +70,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _release_db_connection(request: Request, call_next):
+    """Return the thread-local SQLite connection to the pool after each request."""
+    try:
+        return await call_next(request)
+    finally:
+        close_db()
 
 app.include_router(sporty.router)
 app.include_router(sofascore.router)

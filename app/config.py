@@ -90,8 +90,8 @@ def get_settings() -> Settings:
         over25_upgrade_requires_market_steam=_bool_env("PREDICTX_OVER25_UPGRADE_REQUIRES_MARKET_STEAM", False),
         validation_gate_min_calibration_samples=_int_env("VALIDATION_GATE_MIN_CALIBRATION_SAMPLES", 30),
         validation_gate_min_clv_samples=_int_env("VALIDATION_GATE_MIN_CLV_SAMPLES", 25),
-        risk_manager_volatility_hard_block_threshold=float(os.getenv("RISK_MANAGER_VOLATILITY_HARD_BLOCK_THRESHOLD", "30")),
-        risk_manager_bootstrap_confidence_ceiling=_int_env("RISK_MANAGER_BOOTSTRAP_CONFIDENCE_CEILING", 72),
+        risk_manager_volatility_hard_block_threshold=float(os.getenv("RISK_MANAGER_VOLATILITY_HARD_BLOCK_THRESHOLD", "35")),
+        risk_manager_bootstrap_confidence_ceiling=_int_env("RISK_MANAGER_BOOTSTRAP_CONFIDENCE_CEILING", 78),
         clear_winner_probability_gap=float(os.getenv("CLEAR_WINNER_PROBABILITY_GAP", "12")),
     )
 

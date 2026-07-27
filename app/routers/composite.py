@@ -4,14 +4,16 @@ Composite Endpoints
 Single-call endpoints that aggregate data from multiple sources so the
 frontend never needs to fan out parallel requests on page load.
 
-  GET /composite/prediction-dashboard   — predictions + upcoming + performance + roi + clv
-  GET /composite/analytics-dashboard   — performance + roi + clv + longshots
-  GET /agent/value-bets-full            — value bets (cleanup runs in background, not blocking)
+  GET /composite/prediction-dashboard        — predictions + upcoming + performance + roi + clv
+  GET /composite/analytics-dashboard        — performance + roi + clv + longshots
+  GET /composite/competition-special/dashboard — all tracked competitions summary
+  GET /agent/value-bets-full                 — value bets (cleanup runs in background, not blocking)
 """
 from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Query
@@ -114,3 +116,45 @@ def get_analytics_dashboard(days: int = Query(default=30, ge=1, le=365)):
         "clv":         results.get("clv"),
         "longshots":   results.get("longshots"),
     }
+
+
+# ── Competition Special Dashboard — 31 → 1 ─────────────────────────────────────
+
+@router.get("/composite/competition-special/dashboard")
+def get_competition_special_dashboard(
+    buffer_limit: int = Query(default=50, ge=1, le=200),
+    analysis_limit: int = Query(default=1, ge=1, le=10),
+):
+    """
+    Single endpoint that replaces 31+ parallel calls on the competition dashboard:
+
+      - GET /competition-special/competitions
+      - GET /competition-special/{key}/settings   (×31)
+      - GET /competition-special/{key}/buffer     (×31)
+      - GET /competition-special/{key}/status     (×31)
+      - GET /competition/{key}/analysis/latest    (×31)
+
+    Returns a unified view of all tracked competitions with their settings,
+    buffer health, match counts, and latest analysis.  Individual competition
+    failures are captured in the `errors` array so the page still renders
+    with partial data.
+    """
+    from app.competition_special import list_all_competition_summaries
+
+    try:
+        result = list_all_competition_summaries(
+            buffer_limit=buffer_limit,
+            analysis_limit=analysis_limit,
+        )
+        return result
+    except Exception as exc:
+        _logger.error("composite/competition-special/dashboard failed: %s", exc)
+        return {
+            "status": "error",
+            "detail": str(exc),
+            "total_tracked": 0,
+            "enabled_count": 0,
+            "competitions": [],
+            "errors": [{"error": str(exc)}],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }

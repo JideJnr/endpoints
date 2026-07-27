@@ -5,6 +5,8 @@ import sqlite3
 from collections import Counter
 from typing import Any
 
+from app.league_memory import DB_PATH, _init_db, _conn
+
 from app.dixon_coles import run_dixon_coles
 from app.contextual_intelligence import apply_contextual_adjustment, build_contextual_intelligence
 from app.elo import elo_prediction
@@ -20,6 +22,74 @@ from app.config import get_settings
 
 
 LONGSHOT_MIN_DECIMAL_ODDS = 2.0
+
+# ── Feature Importance Tracking ───────────────────────────────────────────────
+# Tracks which signals/features actually drive correct predictions.
+# Used by the learning system to weight signals more accurately.
+
+_FEATURE_IMPORTANCE_CACHE: dict[str, dict[str, float]] = {}
+_FEATURE_IMPORTANCE_CACHE_HITS = 0
+_FEATURE_IMPORTANCE_CACHE_REFRESH = 100
+
+
+def get_feature_importance(league: str = "") -> dict[str, float]:
+    """Return per-signal win rates used as feature importance weights."""
+    global _FEATURE_IMPORTANCE_CACHE, _FEATURE_IMPORTANCE_CACHE_HITS
+    _FEATURE_IMPORTANCE_CACHE_HITS += 1
+    cache_key = league or "__global__"
+    if (
+        not _FEATURE_IMPORTANCE_CACHE
+        or _FEATURE_IMPORTANCE_CACHE_HITS % _FEATURE_IMPORTANCE_CACHE_REFRESH == 0
+    ):
+        try:
+            _FEATURE_IMPORTANCE_CACHE = _load_feature_importance()
+        except Exception:
+            _FEATURE_IMPORTANCE_CACHE = {}
+    return _FEATURE_IMPORTANCE_CACHE.get(cache_key, _FEATURE_IMPORTANCE_CACHE.get("__global__", {}))
+
+
+def _load_feature_importance() -> dict[str, dict[str, float]]:
+    """Load signal win rates from signal_outcomes table."""
+    try:
+        _init_db()
+        with _conn(timeout=10) as conn:
+            rows = conn.execute("""
+                select signal_name,
+                       count(*) as samples,
+                       sum(case when result = 'win' then 1 else 0 end) as wins,
+                       sum(case when result = 'loss' then 1 else 0 end) as losses
+                from signal_outcomes
+                where result in ('win', 'loss')
+                  and signal_name is not null
+                  and signal_name != ''
+                group by signal_name
+                having samples >= 5
+                order by samples desc
+            """).fetchall()
+            global_weights: dict[str, float] = {}
+            for row in rows:
+                name = str(row["signal_name"] or "")
+                samples = int(row["samples"] or 0)
+                wins = int(row["wins"] or 0)
+                if samples >= 5:
+                    global_weights[name] = round(wins / samples, 4)
+            return {"__global__": global_weights}
+    except Exception:
+        return {}
+
+
+def _apply_feature_importance(signals: list[dict[str, Any]], league: str = "") -> list[dict[str, Any]]:
+    """Attach feature importance scores to signals based on historical win rates."""
+    importance = get_feature_importance(league)
+    if not importance:
+        return signals
+    for signal in signals or []:
+        name = str(signal.get("name") or "")
+        if name and name in importance:
+            signal["feature_importance"] = importance[name]
+            signal["historical_win_rate"] = importance[name]
+    return signals
+
 
 NOISY_SUPPORT_SIGNALS = {
     "goal_pressure",
@@ -408,8 +478,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             "value": close_strength_context,
             "impact": _close_strength_adjustment(ensemble, close_strength_context),
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "finished_memory_failed", exc)
 
     # ── Odds pattern signal ───────────────────────────────────────────────────
     odds_pattern_signal: dict[str, Any] = {}
@@ -427,8 +498,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "value":  odds_pattern_signal,
                 "impact": pattern_adj,
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "odds_pattern_failed", exc)
 
     try:
         from app.market import get_movement
@@ -445,8 +517,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 },
                 "impact": market_adj,
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "market_movement_failed", exc)
 
     # ── SofaScore grade signal ────────────────────────────────────────────────
     longshot_signal = _consensus_longshot_value_signal(doc, ensemble, poisson, dixon, elo, rules, odds_movement)
@@ -494,8 +567,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     },
                     "impact": learned_signal_adj,
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "learned_signal_weights_failed", exc)
 
     # Time-decay for live matches
     minute = rules.get("minute") or 0
@@ -566,6 +640,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         pick["confidence_floor_applied"] = floor_applied
     candidate_pool = [dict(pick) for pick in picks]
 
+    # ── Feature importance: attach historical win rates to signals ─────────────
+    try:
+        importance_map = get_feature_importance()
+        if importance_map:
+            _apply_feature_importance(signals, importance_map)
+    except Exception as exc:
+        record_health_event("feature_importance_error", str(exc))
+
     # ── Calibration: adjust confidence based on historical win rates ──────────
     try:
         from app.confidence_calibrator import calibrate_confidence, stake_multiplier
@@ -606,6 +688,27 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "learned_signal_adjustment": pick_learned_adj,
                 "confidence_floor_applied": bool(pick.get("confidence_floor_applied")),
             }
+            # ── Calibration gap monitoring ─────────────────────────────────────
+            try:
+                from app.confidence_calibrator import compute_calibration_gap
+                gap_info = compute_calibration_gap(pick.get("type") or "match_result", raw_conf)
+                pick["calibration"]["gap"] = gap_info
+                if gap_info.get("gap_severity") == "severe":
+                    signals.append({
+                        "name": "calibration_gap_severe",
+                        "value": gap_info,
+                        "impact": -8,
+                        "reason": f"Confidence {raw_conf}% exceeds historical win rate by {gap_info['gap']} points",
+                    })
+                elif gap_info.get("gap_severity") == "moderate":
+                    signals.append({
+                        "name": "calibration_gap_moderate",
+                        "value": gap_info,
+                        "impact": -4,
+                        "reason": f"Confidence {raw_conf}% exceeds historical win rate by {gap_info['gap']} points",
+                    })
+            except Exception as exc:
+                record_health_event("calibration_gap_error", str(exc))
             if memory.get("blended_win_rate") is not None:
                 signals.append({
                     "name": "prediction_memory",
@@ -624,11 +727,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     pick["calibration"]["stake_source"] = "win_rate"
             except Exception as exc:
                 from app.health_counters import record_health_event
-
                 record_health_event("enriched_prediction", "clv_stake_multiplier_failed", exc)
     except Exception as exc:
         from app.health_counters import record_health_event
-
         record_health_event("enriched_prediction", "calibration_block_failed", exc)
 
     contextual_intelligence = build_contextual_intelligence(
@@ -754,8 +855,9 @@ def _rules_prediction(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, 
                 rules_detail.get("home_last_matches") or [],
                 rules_detail.get("away_last_matches") or [],
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            from app.health_counters import record_health_event
+            record_health_event("enriched_prediction", "rules_prediction_failed", exc)
     sporty_doc = {
         **doc,
         "id": doc.get("id") or doc.get("sportybet_id"),
@@ -804,8 +906,9 @@ def _fallback_market_prediction(
             from app.market import get_movement
             match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
             odds_movement = get_movement(match_id_str) if match_id_str else {}
-        except Exception:
-            odds_movement = {}
+        except Exception as exc:
+            from app.health_counters import record_health_event
+            record_health_event("enriched_prediction", "fallback_market_movement_failed", exc)
     live_picks = _live_inplay_picks(doc, detail, rules, {}, {}, odds_movement) if is_live else []
     picks.extend(live_picks)
     if not is_live and _provider_state(doc) != "sportybet":
@@ -1033,7 +1136,9 @@ def _candidate_memory(doc: dict[str, Any], pick_type: str, selection: str | None
         from app.league_memory import weighted_candidate_memory
 
         return weighted_candidate_memory(doc, pick_type, selection)
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "candidate_memory_failed", exc)
         return {"allow": True, "blended_win_rate": None, "scopes": {}}
 
 
@@ -1305,7 +1410,9 @@ def _longshot_quality_context(
         tournament = detail.get("tournament") or doc.get("tournament") or {}
         tournament_name = tournament.get("name") if isinstance(tournament, dict) else str(tournament or "")
         match_strength = league_strength_score(tournament_name)
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "league_strength_failed", exc)
         home_strength = {"sample_size": 0, "avg_score": 55}
         away_strength = {"sample_size": 0, "avg_score": 55}
         match_strength = {"score": 55, "basis": "unknown"}
@@ -2009,9 +2116,10 @@ def _learned_signal_adjustment_for_pick(
                 direction = 1 if impact >= 0 else -1
                 adjustment += round(float(weight_adj) * 3 * direction)
         return max(-8, min(8, adjustment))
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "learned_signal_adjustment_failed", exc)
         return 0
-
 
 def _cap_learned_signal_adjustment(signals: list[dict[str, Any]], adjustment: int) -> int:
     if adjustment <= 0:
@@ -2036,10 +2144,10 @@ def _cap_learned_signal_adjustment(signals: list[dict[str, Any]], adjustment: in
 
 def _global_signal_stats(signal_name: str) -> dict[str, Any]:
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.league_memory import DB_PATH, _init_db, _conn
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        with _conn(timeout=5) as conn:
             row = conn.execute(
                 """
                 select count(*) as samples,
@@ -2050,7 +2158,9 @@ def _global_signal_stats(signal_name: str) -> dict[str, Any]:
                 """,
                 (signal_name,),
             ).fetchone()
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "global_signal_stats_failed", exc)
         return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
     samples = int((row or [0])[0] or 0)
     wins = int((row or [0, 0])[1] or 0)
@@ -2364,8 +2474,7 @@ def _pick_family(pick: dict[str, Any]) -> str:
 def _candidate_role_memory(doc: dict[str, Any], pick_type: str, selection: str) -> dict[str, Any]:
     """Learn whether this market works better as primary or secondary in similar context."""
     try:
-        import sqlite3
-        from app.league_memory import DB_PATH, _init_db
+        from app.league_memory import DB_PATH, _init_db, _conn
 
         league = str(doc.get("tournament") or doc.get("league_name") or "")
         country = str(doc.get("category") or doc.get("country") or "")
@@ -2373,8 +2482,7 @@ def _candidate_role_memory(doc: dict[str, Any], pick_type: str, selection: str) 
         movement_signature = _current_movement_signature(doc)
         selection_key = _selection_key(selection)
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
-            conn.row_factory = sqlite3.Row
+        with _conn(timeout=20) as conn:
             params: list[Any] = [pick_type]
             clauses = ["c.pick_type = ?"]
             scope_sql = ["1 = 1"]
@@ -2470,7 +2578,9 @@ def _candidate_role_memory(doc: dict[str, Any], pick_type: str, selection: str) 
             "movement_profile_used": bool(movement_signature),
             "context_quality": _role_context_quality(primary_samples + secondary_samples, bool(odds_profile), bool(movement_signature)),
         }
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "candidate_role_memory_failed", exc)
         return {"primary_adjustment": 0}
 
 
@@ -2576,7 +2686,9 @@ def _current_movement_signature(doc: dict[str, Any]) -> dict[str, str] | None:
         direction = str(pull.get("direction") or "").lower()
         if selection in {"home", "draw", "away"} and direction in {"backed", "faded"}:
             return {"selection": selection, "direction": direction}
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "current_movement_signature_failed", exc)
         return None
     return None
 
@@ -2763,10 +2875,10 @@ def _pick_signal_stats(pick_type: str, selection: str, signal_name: str) -> dict
     if not pick_type or not selection or not signal_name:
         return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.league_memory import DB_PATH, _init_db, _conn
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        with _conn(timeout=5) as conn:
             row = conn.execute(
                 """
                 select count(*) as samples,
@@ -2780,7 +2892,9 @@ def _pick_signal_stats(pick_type: str, selection: str, signal_name: str) -> dict
                 """,
                 (pick_type, selection, signal_name),
             ).fetchone()
-    except Exception:
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "global_signal_stats_failed", exc)
         return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
     samples = int((row or [0])[0] or 0)
     wins = int((row or [0, 0])[1] or 0)
@@ -3128,11 +3242,10 @@ def _selection_score_memory(pick_type: str, selection: str) -> dict[str, Any]:
     if not pick_type or not selection:
         return {"available": False, "reason": "missing_pick"}
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.league_memory import DB_PATH, _init_db, _conn
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=5) as conn:
-            conn.row_factory = sqlite3.Row
+        with _conn(timeout=5) as conn:
             exact = _selection_score_scope(
                 conn,
                 "exact_selection",

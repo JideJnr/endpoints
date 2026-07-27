@@ -25,7 +25,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.league_memory import DB_PATH, _init_db, _conn
 
 MIN_SAMPLES = 30          # bands with fewer samples are not adjusted
 DOUBLE_DOWN_MIN_SAMPLES = 50
@@ -87,9 +87,8 @@ def rebuild_calibration() -> dict[str, Any]:
     Call this after grading runs (scheduler does it every 6 hrs).
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_calibration_table(conn)
-        conn.row_factory = sqlite3.Row
         conn.execute("delete from confidence_calibration")
 
         rows = conn.execute(f"""
@@ -149,9 +148,8 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
     """
     band_low = min(80, (raw_confidence // 10) * 10)
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_calibration_table(conn)
-        conn.row_factory = sqlite3.Row
         row = conn.execute("""
             select samples, wins, losses, win_rate
             from confidence_calibration
@@ -221,9 +219,8 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
 def get_calibration_table() -> list[dict[str, Any]]:
     """Return the full calibration table sorted by pick_type, band."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_calibration_table(conn)
-        conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             select pick_type, band_low, samples, wins, losses, win_rate, last_updated
             from confidence_calibration
@@ -243,6 +240,108 @@ def get_calibration_table() -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+# ── Calibration gap monitoring ─────────────────────────────────────────────────
+
+def compute_calibration_gap(pick_type: str, raw_confidence: int) -> dict[str, Any]:
+    """
+    Compute the gap between raw confidence and historical win rate.
+    
+    Returns:
+        - gap: raw_confidence - historical_win_rate (positive = overconfident)
+        - gap_severity: 'none' | 'moderate' | 'severe'
+        - calibrated_confidence: what history suggests the confidence should be
+        - recommendation: 'proceed' | 'caution' | 'reduce_confidence'
+    """
+    cal = calibrate_confidence(pick_type, raw_confidence)
+    
+    if not cal["calibrated"] or cal["win_rate"] is None:
+        return {
+            "gap": None,
+            "gap_severity": "none",
+            "calibrated_confidence": raw_confidence,
+            "recommendation": "proceed",
+            "samples": cal.get("samples", 0),
+        }
+    
+    historical_conf = cal["win_rate"]  # Already in percentage form (0-100)
+    gap = round(raw_confidence - historical_conf, 1)
+    
+    if gap <= 10:
+        severity = "none"
+        recommendation = "proceed"
+    elif gap <= 20:
+        severity = "moderate"
+        recommendation = "caution"
+    else:
+        severity = "severe"
+        recommendation = "reduce_confidence"
+    
+    return {
+        "gap": gap,
+        "gap_severity": severity,
+        "calibrated_confidence": round(historical_conf, 1),
+        "recommendation": recommendation,
+        "samples": cal.get("samples", 0),
+        "raw_confidence": raw_confidence,
+    }
+
+
+def get_calibration_gap_report(pick_type: str = "match_result") -> dict[str, Any]:
+    """
+    Generate a calibration gap report for all confidence bands.
+    Useful for monitoring dashboard and alerting.
+    """
+    _init_db()
+    with _conn() as conn:
+        _init_calibration_table(conn)
+        rows = conn.execute("""
+            select pick_type, band_low, samples, wins, losses, win_rate, last_updated
+            from confidence_calibration
+            where pick_type = ?
+            order by band_low asc
+        """, (pick_type,)).fetchall()
+    
+    gaps = []
+    for row in rows:
+        if row["win_rate"] is None or row["samples"] < MIN_SAMPLES:
+            continue
+        band_mid = row["band_low"] + 5
+        historical_conf = round(row["win_rate"] * 100, 1)
+        gap = round(band_mid - historical_conf, 1)
+        
+        if gap > 15:
+            severity = "severe"
+        elif gap > 8:
+            severity = "moderate"
+        else:
+            severity = "none"
+        
+        gaps.append({
+            "band": f"{row['band_low']}-{row['band_low'] + 9}%",
+            "band_low": row["band_low"],
+            "samples": row["samples"],
+            "wins": row["wins"],
+            "losses": row["losses"],
+            "historical_win_rate": historical_conf,
+            "expected_confidence": band_mid,
+            "gap": gap,
+            "severity": severity,
+            "last_updated": row["last_updated"],
+        })
+    
+    severe_gaps = [g for g in gaps if g["severity"] == "severe"]
+    moderate_gaps = [g for g in gaps if g["severity"] == "moderate"]
+    
+    return {
+        "pick_type": pick_type,
+        "total_bands": len(gaps),
+        "severe_gaps": len(severe_gaps),
+        "moderate_gaps": len(moderate_gaps),
+        "gaps": gaps,
+        "alert": severe_gaps if severe_gaps else (moderate_gaps if moderate_gaps else None),
+    }
 
 
 # ── Stake multiplier based on calibration ─────────────────────────────────────

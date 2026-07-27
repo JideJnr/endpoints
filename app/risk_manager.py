@@ -55,10 +55,15 @@ def apply_risk_controls(
             **gate,
         })
         if gate.get("bootstrap_mode"):
+            bootstrap_cap = (
+                settings.risk_manager_bootstrap_confidence_ceiling + 6
+                if _pick_has_model_consensus(pick, models)
+                else settings.risk_manager_bootstrap_confidence_ceiling
+            )
             _cap_pick_confidence(
                 pick,
                 report,
-                settings.risk_manager_bootstrap_confidence_ceiling,
+                bootstrap_cap,
                 "validation bootstrap confidence ceiling",
             )
         if not gate.get("allowed", False):
@@ -84,7 +89,7 @@ def apply_risk_controls(
     if _publishable_despite_medium_risk(real_picks, report, models):
         report["hard_block"] = False
         _refresh_risk_level(report)
-    hard_block = report["hard_block"] and highest_conf < 82
+    hard_block = report["hard_block"] and not _strong_signal_override(real_picks, report, models)
     if hard_block:
         report["block_reason_summary"] = list(report.get("hard_block_reasons") or report["violations"][:4])
         reasons = "; ".join(report["block_reason_summary"]) or "risk controls blocked publication"
@@ -201,7 +206,7 @@ def _apply_pick_limits(
         cap = min(cap, 68)
         reasons.append("high risk context caps confidence")
     elif report["risk_level"] == "medium":
-        cap = min(cap, 82)
+        cap = min(cap, 90)
         reasons.append("medium risk context caps confidence")
     if decimal_odds >= EXTREME_LONGSHOT_ODDS:
         cap = min(cap, 68)
@@ -212,12 +217,12 @@ def _apply_pick_limits(
 
     disagreement = _model_disagreement(pick, models)
     if disagreement["opposing_models"] > 0:
-        cap = min(cap, 78 - disagreement["opposing_models"] * 4)
+        cap = min(cap, 82 - disagreement["opposing_models"] * 3)
         reasons.append(f"{disagreement['opposing_models']} model(s) oppose pick")
     if decimal_odds >= EXTREME_LONGSHOT_ODDS and disagreement["opposing_models"] >= 2:
         _add_violation(report, "extreme_longshot_model_disagreement", hard=True)
         reasons.append("extreme longshot opposed by multiple models")
-    if _negative_signal_count(signals) >= 3 and _positive_signal_count(signals) <= 3:
+    if _negative_signal_count(signals) >= 4 and _positive_signal_count(signals) <= 3:
         cap = min(cap, 72)
         reasons.append("risk signals outnumber support")
         if decimal_odds >= LONGSHOT_ODDS:
@@ -353,13 +358,38 @@ def _publishable_despite_medium_risk(real_picks: list[dict[str, Any]], report: d
     if not real_picks:
         return False
     highest = max(int(pick.get("confidence") or 0) for pick in real_picks)
-    if highest < 65:
+    if highest < 55:
         return False
     if "learned_history_high_risk" in report.get("violations", []):
         return False
     if "readiness_not_ready" in report.get("violations", []):
         return False
-    return _available_model_count(models) >= 2
+    model_count = _available_model_count(models)
+    return model_count >= 2 or (model_count >= 1 and highest >= 72)
+
+
+def _strong_signal_override(real_picks: list[dict[str, Any]], report: dict[str, Any], models: dict[str, Any]) -> bool:
+    """Allow hard-block bypass only when confidence AND model consensus are both strong."""
+    if not real_picks:
+        return False
+    highest = max(int(pick.get("confidence") or 0) for pick in real_picks)
+    if highest < 72:
+        return False
+    if "learned_history_high_risk" in report.get("hard_block_reasons", []):
+        return False
+    if "readiness_not_ready" in report.get("hard_block_reasons", []):
+        return False
+    # Require at least one pick with no opposing models
+    for pick in real_picks:
+        disagreement = _model_disagreement(pick, models)
+        if disagreement["opposing_models"] == 0 and disagreement["supporting_models"] >= 1:
+            return True
+    return False
+
+
+def _pick_has_model_consensus(pick: dict[str, Any], models: dict[str, Any]) -> bool:
+    disagreement = _model_disagreement(pick, models)
+    return disagreement["opposing_models"] == 0 and disagreement["supporting_models"] >= 2
 
 
 def _available_model_count(models: dict[str, Any]) -> int:

@@ -18,6 +18,50 @@ from app.config import get_settings
 DB_PATH = get_settings().database_path
 _DB_SCHEMA_READY = False
 _DB_SCHEMA_LOCK = threading.RLock()
+_local = threading.local()
+
+
+def get_db() -> sqlite3.Connection:
+    """Return a thread-local persistent connection, creating it on first use."""
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma journal_mode = wal")
+        conn.execute("pragma synchronous = normal")
+        conn.execute("pragma busy_timeout = 30000")
+        conn.execute("pragma cache_size = -8000")  # 8 MB page cache
+        _local.conn = conn
+    return conn
+
+
+def close_db() -> None:
+    """Close and discard the thread-local connection (call at end of request/task)."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _conn(timeout: int = 30):
+    """Yield the thread-local pooled connection; fall back to a fresh one if unavailable."""
+    try:
+        yield get_db()
+    except sqlite3.OperationalError:
+        # If the pooled connection is in a bad state, open a fresh one for this call.
+        with sqlite3.connect(DB_PATH, timeout=timeout) as fresh:
+            fresh.row_factory = sqlite3.Row
+            fresh.execute("pragma journal_mode = wal")
+            fresh.execute("pragma synchronous = normal")
+            fresh.execute("pragma busy_timeout = 30000")
+            yield fresh
 
 
 def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
@@ -47,8 +91,7 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
     if minute > 0:
         is_live = True
 
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn(timeout=15) as conn:
         duplicate_info = _detect_duplicate_or_replay(conn, source, match_id, league, match, home_goals, away_goals, minute, is_finished)
         _upsert_match(conn, source, match_id, league, match, home_goals, away_goals, is_finished)
         timeline_snapshot_recorded = False
@@ -123,8 +166,7 @@ def league_memory_for_match(match: dict[str, Any]) -> dict[str, Any]:
 
 def get_league_memory(league: str | None = None) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn(timeout=15) as conn:
         if league:
             key = normalize_league(league)
             row = conn.execute(
@@ -160,6 +202,7 @@ def get_league_memory(league: str | None = None) -> dict[str, Any]:
         return {"leagues": [_memory_row(row) for row in rows]}
 
 
+
 def get_snapshot_memory(
     league: str | None = None,
     minute_bucket: str | None = None,
@@ -167,8 +210,7 @@ def get_snapshot_memory(
     min_samples: int = 1,
 ) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         _aggregate_resolved_snapshots(conn)
         conn.commit()
 
@@ -185,8 +227,7 @@ def get_snapshot_memory(
         params.append(score_state)
     where = " and ".join(clauses)
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             f"""
             select
@@ -222,8 +263,7 @@ def list_memory_matches(limit: int = 200, league: str | None = None, source: str
     if source:
         clauses.append("source = ?")
         params.append(source)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             f"""
             select source, match_id, league_key, league_name, home_team, away_team,
@@ -240,8 +280,7 @@ def list_memory_matches(limit: int = 200, league: str | None = None, source: str
 
 def list_duplicate_matches(limit: int = 200) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select *
@@ -275,8 +314,7 @@ def get_memory_match(match_id: str, source: str | None = None) -> dict[str, Any]
     if source:
         clauses.append("source = ?")
         params.append(source)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         match = conn.execute(
             f"""
             select source, match_id, league_key, league_name, home_team, away_team,
@@ -317,8 +355,7 @@ def get_memory_match(match_id: str, source: str | None = None) -> dict[str, Any]
 
 def list_countries_from_memory() -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select league_key, max(league_name) as league_name, max(country_name) as country_name, count(*) as matches
@@ -380,8 +417,7 @@ def run_memory_maintenance(raw_retention_days: int = 30, odds_retention_days: in
             "odds_retention_days": odds_retention_days,
         }
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         before = conn.total_changes
         _aggregate_resolved_snapshots(conn)
         conn.execute(
@@ -455,7 +491,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
         return
     if (best_pick.get("confidence") or 0) < 55:
         return
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         existing = conn.execute(
             """
             select id
@@ -578,7 +614,7 @@ def _record_prediction_decision(
         or prediction.get("prediction_readiness")
         or {}
     )
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         existing = conn.execute(
             """
             select id
@@ -759,7 +795,7 @@ def _record_prediction_candidates(
         ))
     if not rows:
         return
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         fresh_rows = []
         for row in rows:
             existing = conn.execute(
@@ -806,8 +842,7 @@ def weighted_prediction_memory(
     pick_type = pick_type or ""
     selection = selection or ""
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         scopes = {
             "tournament": _prediction_scope_stats(
                 conn,
@@ -866,8 +901,7 @@ def weighted_candidate_memory(
     country = _country_from_match(match, league)
     pick_type = pick_type or ""
     selection = selection or ""
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         scopes = {
             "tournament": _candidate_scope_stats(conn, "league_name = ? and pick_type = ?", (league, pick_type)),
             "country": _candidate_scope_stats(conn, "country_name = ? and pick_type = ?", (country, pick_type)),
@@ -947,8 +981,7 @@ def weighted_finished_match_memory(match: dict[str, Any]) -> dict[str, Any]:
     league = _league_from_match(match)
     country = _country_from_match(match, league)
     odds_profile = _match_1x2_odds_profile(match)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         scopes = _finished_memory_scopes(conn, league, country, odds_profile)
 
     base_weights = {
@@ -1010,8 +1043,7 @@ def close_match_strength_context(match: dict[str, Any], limit: int = 8) -> dict[
     home = _team_name(match, "home") or ""
     away = _team_name(match, "away") or ""
     odds_profile = _match_1x2_odds_profile(match)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         team_rows = conn.execute(
             """
             select home_team, away_team, final_home_goals, final_away_goals, league_name, country_name, start_time
@@ -1152,8 +1184,7 @@ def _same_team(left: Any, right: Any) -> bool:
 
 def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         row = conn.execute("select * from prediction_history where id = ?", (prediction_id,)).fetchone()
         if not row:
             return {"graded": False, "reason": "not found"}
@@ -1330,7 +1361,7 @@ def store_local_signal_outcomes(
         ))
     if not rows:
         return 0
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _ensure_signal_outcomes_table(conn)
         conn.executemany(
             """
@@ -1376,14 +1407,13 @@ def get_local_signal_stats(
         params.append(f"%{country.lower()}%")
         scope = f"device:country:{country}"
     params.append(max(1, int(min_samples or 5)))
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _ensure_signal_outcomes_table(conn)
         existing = conn.execute("select count(*) from signal_outcomes").fetchone()[0]
     if not existing:
         _backfill_local_signal_outcomes_from_history()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _ensure_signal_outcomes_table(conn)
-        conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
             select signal_name,
@@ -1452,8 +1482,7 @@ def _backfill_local_signal_outcomes_from_history(limit: int = 5000) -> int:
         from app.self_learner import _decision_signals_for_row
     except Exception:
         _decision_signals_for_row = None
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select *
@@ -1507,8 +1536,7 @@ def _grade_candidate_predictions_for_match(
     keys = [match_id, *sofa_ids]
     placeholders = ",".join("?" for _ in keys)
     signal_payloads: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             f"""
             select *
@@ -1543,8 +1571,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
     if not finished:
         return {"graded": 0, "skipped": 0, "no_finished_events": True}
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select *
@@ -1584,7 +1611,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         grade_info["result"] = result
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with _conn() as conn:
             conn.execute(
                 """
                 update prediction_history
@@ -1781,9 +1808,8 @@ def check_and_grade_match_result(match_id: str, hours_back: int = 72) -> dict[st
     import time as _time
 
     match_id = str(match_id)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _ensure_buffer_tables(conn)
-        conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
             select ? as match_id,
@@ -1848,9 +1874,8 @@ def check_and_grade_match_result(match_id: str, hours_back: int = 72) -> dict[st
 
 
 def _pending_matches_for_grading(cutoff_seconds: float, limit: int) -> list[sqlite3.Row]:
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _ensure_buffer_tables(conn)
-        conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             with pending as (
@@ -1909,8 +1934,7 @@ def _grade_match_predictions_by_ids(match_id: str, linked_ids: list[str], final_
     placeholders = ",".join("?" for _ in keys)
     primary = candidate = 0
     signal_payloads: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn(timeout=15) as conn:
         rows = conn.execute(
             f"""
             select *
@@ -1975,8 +1999,7 @@ def _grade_decision_logs_by_ids(keys: list[str], final_home: int, final_away: in
         return 0
     placeholders = ",".join("?" for _ in clean_keys)
     graded = 0
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn(timeout=15) as conn:
         rows = conn.execute(
             f"""
             select *
@@ -2062,7 +2085,7 @@ def _mark_buffer_finished(match_id: str, final_home: Any, final_away: Any) -> No
     except Exception:
         archive_finished_match_from_buffer = None
 
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
+    with _conn(timeout=15) as conn:
         _ensure_buffer_tables(conn)
         for table in ("match_buffer", "future_match_buffer"):
             try:
@@ -2193,8 +2216,7 @@ def _sofascore_ids_for_predictions(conn: sqlite3.Connection, match_ids: list[str
 
 def get_grading_metrics() -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         totals = conn.execute(
             """
             select
@@ -2407,8 +2429,7 @@ def list_prediction_history(limit: int = 200, match_id: str | None = None) -> di
     if match_id:
         clauses.append("match_id = ?")
         params.append(str(match_id))
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         order_clause = "datetime(created_at) asc, id asc" if match_id else "datetime(created_at) desc, id desc"
         rows = conn.execute(
             f"""
@@ -2430,8 +2451,7 @@ def list_prediction_decisions(limit: int = 200, match_id: str | None = None) -> 
     if match_id:
         clauses.append("match_id = ?")
         params.append(match_id)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             f"""
             select *
@@ -2452,7 +2472,7 @@ def save_betbuilder(
     request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         cursor = conn.execute(
             """
             insert into betbuilder_history (selections_json, combined_odds, confidence, request_json, created_at)
@@ -2470,8 +2490,7 @@ def save_betbuilder(
 def list_betbuilder_history(limit: int = 100, auto_grade: bool = True) -> dict[str, Any]:
     _init_db()
     grade_summary = grade_betbuilder_history(limit=min(max(limit, 1), 1000)) if auto_grade else {"graded": 0, "pending": 0}
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select *
@@ -2504,8 +2523,7 @@ def list_betbuilder_history(limit: int = 100, auto_grade: bool = True) -> dict[s
 def grade_betbuilder_history(limit: int = 200) -> dict[str, Any]:
     """Resolve saved betbuilder slips from graded leg predictions."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select id, selections_json
@@ -2691,8 +2709,7 @@ def betbuilder_pick_memory(
         return {"samples": 0, "win_rate": None, "adjustment": 0}
     odds_band = _odds_band(odds)
     scopes = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         for label, where, params, weight in [
             ("league_odds", "pick_type=? and selection=? and league_name=? and odds_band=?", (pick_type, selection, league or "", odds_band), 0.45),
             ("country_odds", "pick_type=? and selection=? and country_name=? and odds_band=?", (pick_type, selection, country or "", odds_band), 0.30),
@@ -2802,8 +2819,7 @@ def _upsert_betbuilder_leg_grade(conn: sqlite3.Connection, bet_id: int, leg: dic
 
 
 def _betbuilder_leg_results(bet_id: int) -> dict[str, dict[str, Any]]:
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select *
@@ -2908,8 +2924,7 @@ _TEAM_HISTORY_CACHE_DAYS = 7
 def get_cached_team_history(team_id: int) -> list[dict[str, Any]] | None:
     """Return cached team history if fresh enough, else None."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         row = conn.execute(
             "select events_json, cached_at from team_history_cache where team_id = ?",
             (str(team_id),),
@@ -2932,7 +2947,7 @@ def store_team_history(team_id: int, events: list[dict[str, Any]]) -> None:
     """Persist team history to SQLite cache."""
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         conn.execute(
             """
             insert into team_history_cache (team_id, events_json, cached_at)
@@ -2946,7 +2961,7 @@ def store_team_history(team_id: int, events: list[dict[str, Any]]) -> None:
 
 def set_engine_status(engine_id: str, status: str) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         conn.execute(
             """
             insert into engine_state (id, status, updated_at)
@@ -2961,7 +2976,7 @@ def set_engine_status(engine_id: str, status: str) -> dict[str, Any]:
 
 def get_engine_states() -> dict[str, str]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         rows = conn.execute("select id, status from engine_state").fetchall()
     return {row[0]: row[1] for row in rows}
 
@@ -2970,7 +2985,7 @@ def store_enriched_matches(documents: list[dict[str, Any]]) -> int:
     _init_db()
     if not documents:
         return 0
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         for doc in documents:
             match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
             if not match_id:
@@ -3035,8 +3050,7 @@ def get_enriched_matches(match_date: str | None = None, limit: int = 500) -> lis
     if match_date:
         clauses.append("match_date = ?")
         params.append(match_date)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             f"""
             select raw_json
@@ -3060,8 +3074,7 @@ def get_enriched_matches(match_date: str | None = None, limit: int = 500) -> lis
 
 def get_enriched_match(match_id: str) -> dict[str, Any] | None:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         row = conn.execute("select raw_json from enriched_matches where match_id = ?", (str(match_id),)).fetchone()
     if row:
         return json.loads(row["raw_json"])
@@ -3087,8 +3100,7 @@ def patch_enriched_match_live(
     if not match_id:
         return False
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         row = conn.execute(
             "select raw_json from enriched_matches where match_id = ?", (match_id,)
         ).fetchone()
@@ -3113,8 +3125,7 @@ def get_live_matches_from_buffer(limit: int = 200) -> list[dict[str, Any]]:
     from the enriched_matches buffer, regardless of match_date.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.row_factory = sqlite3.Row
+    with _conn() as conn:
         rows = conn.execute(
             """
             select raw_json from enriched_matches
