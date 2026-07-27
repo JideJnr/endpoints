@@ -639,9 +639,10 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
 
     # ── Feature importance: attach historical win rates to signals ─────────────
     try:
-        importance_map = get_feature_importance()
-        if importance_map:
-            _apply_feature_importance(signals, importance_map)
+        _fi_league = doc.get("tournament") or doc.get("category") or ""
+        if isinstance(_fi_league, dict):
+            _fi_league = _fi_league.get("name") or ""
+        _apply_feature_importance(signals, str(_fi_league))
     except Exception as exc:
         from app.health_counters import record_health_event
         record_health_event("feature_importance_error", str(exc))

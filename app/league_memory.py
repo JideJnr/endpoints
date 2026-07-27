@@ -51,17 +51,14 @@ from contextlib import contextmanager
 
 @contextmanager
 def _conn(timeout: int = 30):
-    """Yield the thread-local pooled connection; fall back to a fresh one if unavailable."""
-    try:
-        yield get_db()
-    except sqlite3.OperationalError:
-        # If the pooled connection is in a bad state, open a fresh one for this call.
-        with sqlite3.connect(DB_PATH, timeout=timeout) as fresh:
-            fresh.row_factory = sqlite3.Row
-            fresh.execute("pragma journal_mode = wal")
-            fresh.execute("pragma synchronous = normal")
-            fresh.execute("pragma busy_timeout = 30000")
-            yield fresh
+    """Yield a fresh per-call connection to avoid cross-thread SQLite errors."""
+    with sqlite3.connect(DB_PATH, timeout=timeout) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma journal_mode = wal")
+        conn.execute("pragma synchronous = normal")
+        conn.execute("pragma busy_timeout = 30000")
+        conn.execute("pragma cache_size = -4000")
+        yield conn
 
 
 def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
@@ -3189,7 +3186,7 @@ def _existing_schema_can_be_trusted() -> bool:
                 select count(*)
                 from sqlite_master
                 where type = 'table'
-                  and name in ('prediction_history', 'match_buffer', 'job_runs', 'team_behaviour_profiles')
+                  and name in ('prediction_history', 'match_buffer', 'job_runs', 'team_behaviour_profiles', 'user_behavior')
                 """
             ).fetchone()
         return int(row[0] if row else 0) >= 3

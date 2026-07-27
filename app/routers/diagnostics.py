@@ -75,7 +75,7 @@ def prediction_coverage() -> dict[str, Any]:
             conn.row_factory = sqlite3.Row
             # Total matches in buffer
             total = conn.execute(
-                "select count(*) as count from match_buffer where status in ('upcoming', 'live', 'inplay')"
+                "select count(*) as count from match_buffer where is_finished = 0"
             ).fetchone()["count"]
 
             # Matches with predictions
@@ -111,7 +111,7 @@ def prediction_coverage() -> dict[str, Any]:
                 """
                 select count(*) as count
                 from match_buffer mb
-                where mb.status in ('upcoming', 'live', 'inplay')
+                where mb.is_finished = 0
                   and (mb.raw_enriched is null or mb.enriched_at is null
                        or datetime(mb.enriched_at) < datetime('now', '-6 hours'))
                 """
@@ -122,7 +122,7 @@ def prediction_coverage() -> dict[str, Any]:
                 """
                 select count(*) as count
                 from match_buffer mb
-                where mb.status in ('upcoming', 'live', 'inplay')
+                where mb.is_finished = 0
                   and not exists (
                       select 1 from prediction_history ph
                       where ph.match_id = mb.match_id
