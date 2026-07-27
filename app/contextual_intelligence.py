@@ -131,7 +131,10 @@ def _match_context(doc: dict[str, Any], time_context: dict[str, Any]) -> dict[st
     if any(key in text for key in ("relegation", "survival", "drop zone")):
         tags.append("relegation_pressure")
         pressure = "high"
-        adjustment -= 3
+        # Don't apply a flat penalty — form trajectory signals carry the real weight.
+        # A team in a relegation battle that is improving vs strong opponents is
+        # different from one losing to everyone. Apply a small base penalty only.
+        adjustment -= 1
     if any(key in text for key in ("title race", "title decider", "must win", "promotion")):
         tags.append("title_or_promotion_pressure")
         pressure = "high"
@@ -313,6 +316,25 @@ def _risk_profile(
         score -= 1
     elif learned.get("pre_match_history", {}).get("classification") == "weak":
         score += 1
+
+    # Form trajectory risk: a team losing to everyone in a relegation battle
+    # is genuinely dangerous to back regardless of other signals.
+    if "relegation_pressure" in (context.get("tags") or []):
+        signals = doc.get("signals") or []
+        for sig in signals:
+            name = sig.get("name") or ""
+            val = sig.get("value") or {}
+            if name in ("home_form_trajectory", "away_form_trajectory") and isinstance(val, dict):
+                if val.get("trajectory") == "poor" or val.get("all_recent_losses"):
+                    reasons.append(f"{name}_all_losses_in_relegation_battle")
+                    score += 3
+                elif val.get("trajectory") == "declining":
+                    reasons.append(f"{name}_declining_in_relegation_battle")
+                    score += 1
+                elif val.get("trajectory") == "improving":
+                    # Improving form in relegation context reduces risk
+                    score -= 1
+
     score = max(0, score)
     level = "high" if score >= 7 else "medium" if score >= 3 else "low"
     return {"level": level, "score": score, "reasons": reasons[:10]}

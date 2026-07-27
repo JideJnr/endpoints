@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.league_memory import DB_PATH, _init_db, _conn
 from app.market import snapshot_odds
 from app.match_state import classify_match_state
 from app.normalise import normalise
@@ -144,7 +144,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     from datetime import date as _date
     today = _date.today().isoformat()
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
         count = 0
         for m in matches:
@@ -232,7 +232,7 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
         count = 0
         for m in matches:
@@ -364,9 +364,8 @@ def get_unenriched_batch(
     today = date_cls.today().isoformat()
     tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
-        conn.row_factory = sqlite3.Row
         if live_only and not future_only:
             live_clause = "and is_live = 1"
         elif exclude_live:
@@ -460,7 +459,7 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     """Write the enriched document back into the buffer row."""
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
         table = "match_buffer"
         row = conn.execute("select raw_sporty, raw_enriched from match_buffer where match_id = ?", (match_id,)).fetchone()
@@ -502,9 +501,8 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
     so the frontend always gets something even before enrichment runs.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
-        conn.row_factory = sqlite3.Row
         clauses = ["is_finished = 0"]
         params: list[Any] = []
         if match_date:
@@ -550,9 +548,8 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
     """Returns the enriched doc for a single match, or raw sporty if not yet enriched."""
     _init_db()
     lookup_ids = _buffer_lookup_ids(str(match_id))
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
-        conn.row_factory = sqlite3.Row
         row = None
         for lookup_id in lookup_ids:
             row = conn.execute(
@@ -588,9 +585,8 @@ def _buffer_lookup_ids(match_id: str) -> list[str]:
 def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
     """All currently live matches from the buffer."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
-        conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             select raw_enriched, raw_sporty
@@ -728,7 +724,7 @@ def purge_ghost_matches() -> int:
     now_ts = datetime.now(timezone.utc).timestamp()
     cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
     today = date_cls.today().isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
 
         # 1. Ghost not-started: kick-off passed but never went live
@@ -785,7 +781,7 @@ def get_buffer_stats() -> dict[str, Any]:
     _init_db()
     from datetime import date
     today = date.today().isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
         total       = conn.execute("select count(*) from match_buffer").fetchone()[0]
         future_total = conn.execute("select count(*) from future_match_buffer").fetchone()[0]
@@ -1950,7 +1946,7 @@ def _sync_enriched_sporty_fields(
 def _mark_missing_from_sporty(match_id: str) -> None:
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
         for table in ("match_buffer", "future_match_buffer"):
             row = conn.execute(f"select raw_enriched from {table} where match_id = ?", (str(match_id),)).fetchone()
@@ -2299,7 +2295,7 @@ def _try_archive_finished(match_id: str) -> None:
         print(f"[buffer] archive failed for {match_id}: {exc}")
         # Last resort: ensure is_finished=1 so get_buffered_matches filters it out
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _conn() as conn:
                 conn.execute("update match_buffer set is_finished = 1 where match_id = ?", (match_id,))
                 conn.commit()
         except Exception:
@@ -2310,7 +2306,7 @@ def _archive_finished_locally(match_id: str) -> None:
     """Write finished match to local SQLite finished_matches table and delete from buffer."""
     import json as _json
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _conn() as conn:
         _init_buffer_table(conn)
         # Ensure finished_matches table exists
         conn.execute("""
