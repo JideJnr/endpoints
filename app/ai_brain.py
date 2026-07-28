@@ -118,7 +118,7 @@ def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] |
     if provider in {"hf", "huggingface", "hugging-face"}:
         return _huggingface_review(payload)
     if provider == "ollama":
-        return _ollama_review(payload)
+        return _router_review(payload)  # route through OpenRouter instead
     if provider in {"groq", "auto"}:
         return _router_review(payload)
     return None
@@ -170,34 +170,6 @@ def _huggingface_review(payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
     return _review_result("huggingface", model, parsed)
 
-
-def _ollama_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    settings = get_settings()
-    model = settings.ollama_model or DEFAULT_OLLAMA_MODEL
-    body = {
-        "model": model,
-        "stream": False,
-        "messages": _review_messages(payload),
-        "options": {"temperature": 0.1},
-        "keep_alive": "24h",
-    }
-    try:
-        req = request.Request(
-            settings.ollama_url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=min(settings.ai_timeout_seconds, 8)) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (OSError, TimeoutError, ValueError, error.URLError):
-        return None
-
-    content = ((data.get("message") or {}).get("content") or "").strip()
-    parsed = _parse_json_object(content)
-    if not parsed:
-        return None
-    return _review_result("ollama", model, parsed)
 
 
 def _rule_review(prediction: dict[str, Any], memory_context: dict[str, Any] | None = None) -> dict[str, Any]:

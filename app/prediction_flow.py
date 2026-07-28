@@ -47,9 +47,9 @@ def predict_and_record_enriched(
         from app.config import get_settings
         use_ollama_pipeline = get_settings().ollama_pipeline_enabled
     if use_ollama_pipeline:
-        from app.ollama_pipeline import is_ollama_available
-        if is_ollama_available():
-            from app.ollama_pipeline import run_ollama_pipeline
+        from app.ollama_pipeline import run_ollama_pipeline
+        from app.config import get_settings as _gs
+        if _gs().openrouter_api_key:
             prediction = run_ollama_pipeline(doc, attach_brain=attach_brain)
             prediction["audit"] = build_prediction_audit(prediction, doc)
             resolved_match_id = str(

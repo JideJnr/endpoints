@@ -879,18 +879,29 @@ def _incorporate_ai_analysis(conn: sqlite3.Connection, graded_rows: list) -> int
 
 def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> int:
     """
-    Adjust signal weights based on user behavior (accepts, rejects, picks).
-    This creates a feedback loop where the system learns from user preferences.
+    Adjust signal weights based on user behavior feedback.
+
+    Scoring per match (net_signal drives the adjustment magnitude):
+      accepted            → +1   (user agreed with the model pick)
+      user_pick (agrees)  → +3   (user picked same as model = strong agreement)
+      user_pick (differs) → -2   (user picked differently = disagreement)
+      rejected            → -1   (user dismissed the pick)
+      prediction_dismissed→ -0.5 (soft negative)
+      bet_placed (agrees) → +2   (user put money on the model pick)
+      bet_graded win      → +2   (bet won = model + user were right)
+      bet_graded loss     → -1   (bet lost = penalise slightly)
+
+    When user pick == model pick the signals that drove that pick get an
+    extra agreement_bonus on top of the normal net_signal adjustment.
     """
     try:
-        from app.league_memory import get_user_behavior_summary, get_behavior_weighted_picks
+        from app.league_memory import get_user_behavior_summary
     except Exception:
         return 0
 
     if not graded_rows:
         return 0
 
-    # Collect unique match_ids from graded predictions
     match_ids = list({row["match_id"] for row in graded_rows if row.get("match_id")})
     if not match_ids:
         return 0
@@ -898,49 +909,85 @@ def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> i
     behavior_adjustments = 0
     now = datetime.now(timezone.utc).isoformat()
 
-    for match_id in match_ids[:50]:  # limit to avoid overload
+    for match_id in match_ids[:50]:
         try:
             summary = get_user_behavior_summary(match_id=match_id, days=7)
             if summary["total_interactions"] == 0:
                 continue
 
-            # Get the prediction for this match
             pred = conn.execute(
                 """
-                select ph.pick_type, ph.selection, ph.confidence, ph.signals_json, ph.league_name
-                from prediction_history ph
-                where ph.match_id = ? and ph.result is null
-                order by ph.confidence desc limit 1
+                select pick_type, selection, confidence, signals_json, league_name
+                from prediction_history
+                where match_id = ?
+                order by confidence desc limit 1
                 """,
                 (match_id,),
             ).fetchone()
-
             if not pred:
                 continue
 
-            pick_type = pred["pick_type"] or "unknown"
-            selection = pred["selection"] or ""
-            signals = _safe_json(pred["signals_json"])
+            pick_type  = pred["pick_type"] or "unknown"
+            model_sel  = (pred["selection"] or "").lower().strip()
+            signals    = _safe_json(pred["signals_json"])
             league_key = _norm_league(pred["league_name"] or "")
+            by_action  = summary["by_action"]
 
-            # User accepted this pick → boost signal weights
-            # User rejected this pick → suppress signal weights
-            accept_count = summary["by_action"].get("accept", {}).get("count", 0)
-            reject_count = summary["by_action"].get("reject", {}).get("count", 0)
-            pick_count = summary["by_action"].get("pick", {}).get("count", 0)
-            user_pick_count = summary["by_action"].get("user_pick", {}).get("count", 0)
+            def _count(action: str) -> int:
+                return int((by_action.get(action) or {}).get("count") or 0)
 
-            net_user_signal = accept_count + user_pick_count * 2 - reject_count
-            if net_user_signal == 0:
+            # ── Resolve user_pick selection ───────────────────────────────────
+            user_pick_selections = list(
+                (by_action.get("user_pick") or {}).get("selections", {}).keys()
+            )
+            user_sel = user_pick_selections[0].lower().strip() if user_pick_selections else ""
+            user_agrees = bool(model_sel and user_sel and model_sel == user_sel)
+
+            # ── Resolve bet_placed selection ──────────────────────────────────
+            bet_selections = list(
+                (by_action.get("bet_placed") or {}).get("selections", {}).keys()
+            )
+            bet_sel = bet_selections[0].lower().strip() if bet_selections else ""
+            bet_agrees = bool(model_sel and bet_sel and model_sel == bet_sel)
+
+            # ── Net signal score ──────────────────────────────────────────────
+            net = 0.0
+            net += _count("accepted") * 1.0
+            net += _count("user_pick") * (3.0 if user_agrees else -2.0)
+            net += _count("rejected") * -1.0
+            net += _count("prediction_dismissed") * -0.5
+            net += _count("bet_placed") * (2.0 if bet_agrees else 0.0)
+            # bet_graded: check metadata for win/loss
+            for action_key in ("bet_graded",):
+                graded_data = by_action.get(action_key) or {}
+                graded_meta = graded_data.get("selections") or {}
+                for sel_key, cnt in graded_meta.items():
+                    if "win" in sel_key.lower():
+                        net += cnt * 2.0
+                    elif "loss" in sel_key.lower():
+                        net += cnt * -1.0
+
+            if net == 0.0:
                 continue
 
-            # Adjust signal weights for signals in this prediction
+            # ── Agreement bonus: extra boost when user + model agree ──────────
+            # Applied on top of net_signal for the signals that drove the pick.
+            # This makes those signals progressively stronger over time.
+            agreement_bonus = 0.0
+            if user_agrees:
+                agreement_bonus += 0.08 * _count("user_pick")
+            if bet_agrees:
+                agreement_bonus += 0.06 * _count("bet_placed")
+
+            # ── Apply to signal_weights ───────────────────────────────────────
+            base_adj   = round(net * 0.04, 4)   # ±4% per unit of net signal
+            bonus_adj  = round(agreement_bonus, 4)
+
             for sig in signals:
                 name = str(sig.get("name") or "")
                 if not name:
                     continue
 
-                # Get current weight
                 current = conn.execute(
                     """
                     select weight_adj from signal_weights
@@ -950,32 +997,21 @@ def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> i
                     """,
                     (name, league_key, league_key),
                 ).fetchone()
-
-                current_adj = float(current["weight_adj"]) if current else 0.0
-
-                # Apply user behavior adjustment
-                # Positive net accepts → boost, negative → suppress
-                adjustment = round(net_user_signal * 0.05, 3)  # max ±5% per interaction cycle
-                new_adj = round(current_adj + adjustment, 3)
-                new_adj = max(-1.0, min(1.0, new_adj))  # clamp
+                cur_adj = float((current or {}).get("weight_adj") or 0.0)
+                new_adj = max(-1.0, min(1.0, round(cur_adj + base_adj + bonus_adj, 4)))
 
                 conn.execute("""
                     insert into signal_weights
                         (signal_name, league_key, samples, wins, losses, win_rate, weight_adj, last_updated)
                     values (?, ?, 0, 0, 0, NULL, ?, ?)
                     on conflict(signal_name, league_key) do update set
-                        weight_adj = excluded.weight_adj,
+                        weight_adj   = excluded.weight_adj,
                         last_updated = excluded.last_updated
                 """, (name, league_key, new_adj, now))
                 behavior_adjustments += 1
 
-            # Also adjust pick-type specific weights
-            for sig in signals:
-                name = str(sig.get("name") or "")
-                if not name:
-                    continue
-
-                current = conn.execute(
+                # ── Apply to signal_pick_weights (market-scoped) ──────────────
+                current_pt = conn.execute(
                     """
                     select weight_adj from signal_pick_weights
                     where signal_name = ? and league_key = ? and pick_type = ?
@@ -983,20 +1019,17 @@ def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> i
                     """,
                     (name, league_key, pick_type),
                 ).fetchone()
-
-                current_adj = float(current["weight_adj"]) if current else 0.0
-                adjustment = round(net_user_signal * 0.03, 3)
-                new_adj = round(current_adj + adjustment, 3)
-                new_adj = max(-1.0, min(1.0, new_adj))
+                cur_pt = float((current_pt or {}).get("weight_adj") or 0.0)
+                new_pt = max(-1.0, min(1.0, round(cur_pt + base_adj + bonus_adj, 4)))
 
                 conn.execute("""
                     insert into signal_pick_weights
                         (signal_name, league_key, pick_type, samples, wins, losses, win_rate, weight_adj, last_updated)
                     values (?, ?, ?, 0, 0, 0, NULL, ?, ?)
                     on conflict(signal_name, league_key, pick_type) do update set
-                        weight_adj = excluded.weight_adj,
+                        weight_adj   = excluded.weight_adj,
                         last_updated = excluded.last_updated
-                """, (name, league_key, pick_type, new_adj, now))
+                """, (name, league_key, pick_type, new_pt, now))
 
         except Exception:
             continue

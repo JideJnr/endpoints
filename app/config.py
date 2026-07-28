@@ -35,6 +35,9 @@ class Settings:
     hf_token_present: bool
     ollama_url: str
     ollama_model: str
+    openrouter_api_key: str
+    openrouter_model: str
+    openrouter_base_url: str
     ai_timeout_seconds: int
     web_search_enabled: bool
     web_search_backends: list[str]
@@ -64,6 +67,12 @@ class Settings:
 _cached_settings: Settings | None = None
 
 
+def invalidate_settings_cache() -> None:
+    """Call after changing .env at runtime to pick up new values."""
+    global _cached_settings
+    _cached_settings = None
+
+
 def get_settings() -> Settings:
     global _cached_settings
     if _cached_settings is not None:
@@ -79,6 +88,9 @@ def get_settings() -> Settings:
         hf_token_present=bool(_hf_token()),
         ollama_url=os.getenv("PREDICTX_OLLAMA_URL", "http://localhost:11434/api/chat"),
         ollama_model=os.getenv("PREDICTX_AI_MODEL", "llama3.2:3b"),
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+        openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         ai_timeout_seconds=_int_env("PREDICTX_AI_TIMEOUT_SECONDS", 15),
         web_search_enabled=_bool_env("PREDICTX_WEB_SEARCH_ENABLED", True),
         web_search_backends=_csv(os.getenv("PREDICTX_SEARCH_BACKENDS", "duckduckgo")),

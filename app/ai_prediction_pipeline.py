@@ -373,11 +373,31 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                     (doc.get("competition_special") or {}).get("key")
                     or (doc.get("known_competition") or {}).get("key")
                 )
-        chain = []
-        for fn, fallback in ((_step_h2h,H2H_FALLBACK), (_step_common_opponent,COMMON_FALLBACK), (_step_form,FORM_FALLBACK), (_step_odds,ODDS_FALLBACK), (_step_similar_matches,SIMILAR_FALLBACK)):
-            try: sentence = fn(doc, model)
-            except Exception as exc: logger.warning("AI step %s failed: %s", fn.__name__, exc); sentence = fallback
-            chain.append(sentence or fallback); logger.debug("AI step %s: %s", fn.__name__, chain[-1])
+        # Run all 5 evidence steps in parallel — they are fully independent.
+        # Sequential execution was the single biggest AI pipeline bottleneck
+        # (5 × 20s timeout = up to 100s; parallel = ~20s worst case).
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        _steps = [
+            (_step_h2h,             H2H_FALLBACK,     0),
+            (_step_common_opponent, COMMON_FALLBACK,  1),
+            (_step_form,            FORM_FALLBACK,    2),
+            (_step_odds,            ODDS_FALLBACK,    3),
+            (_step_similar_matches, SIMILAR_FALLBACK, 4),
+        ]
+        chain = [fallback for _, fallback, _ in _steps]  # pre-fill with fallbacks
+        with ThreadPoolExecutor(max_workers=5) as _pool:
+            _futures = {
+                _pool.submit(fn, doc, model): (fallback, idx)
+                for fn, fallback, idx in _steps
+            }
+            for _future in _as_completed(_futures):
+                _fallback, _idx = _futures[_future]
+                try:
+                    sentence = _future.result()
+                    chain[_idx] = sentence or _fallback
+                    logger.debug("AI step idx=%d: %s", _idx, chain[_idx])
+                except Exception as exc:
+                    logger.warning("AI step idx=%d failed: %s", _idx, exc)
         markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
         decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context)
         from app.prediction_flow import apply_prediction_state
@@ -417,16 +437,30 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
     for match_id, date, raw in rows:
         try: docs.append({**json.loads(raw), "match_id":match_id, "match_date":date})
         except Exception: summary["errors"] += 1
-    for doc in sort_gate(docs)[:batch_size]:
-        try:
-            outcome = run_ai_prediction_with_fallback(doc, match_id=str(doc.get("match_id") or ""), match_date=doc.get("match_date"))
-            # The queue owns this state transition, so persist it before moving
-            # on; otherwise the same match would be selected on every interval.
-            from app.buffer import store_enriched
-            doc["ai_prediction_queue_pending"] = False
-            store_enriched(str(doc.get("match_id") or ""), doc)
-            summary["processed"] += 1
-            summary["ollama_used" if outcome.get("prediction_source") == "ollama_pipeline" else "fallback_used"] += 1
-        except Exception as exc: logger.exception("AI queue match failed: %s", exc); summary["errors"] += 1
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+    from app.buffer import store_enriched as _store
+
+    def _process_one(doc: dict) -> dict:
+        outcome = run_ai_prediction_with_fallback(
+            doc,
+            match_id=str(doc.get("match_id") or ""),
+            match_date=doc.get("match_date"),
+        )
+        doc["ai_prediction_queue_pending"] = False
+        _store(str(doc.get("match_id") or ""), doc)
+        return outcome
+
+    # Run up to 3 matches concurrently — each prediction is I/O-bound
+    # (SportyBet HTTP + Ollama HTTP) so threads don't contend on the GIL.
+    with _TPE(max_workers=3) as pool:
+        futures = {pool.submit(_process_one, doc): doc for doc in sort_gate(docs)[:batch_size]}
+        for future in _ac(futures):
+            try:
+                outcome = future.result()
+                summary["processed"] += 1
+                summary["ollama_used" if outcome.get("prediction_source") == "ollama_pipeline" else "fallback_used"] += 1
+            except Exception as exc:
+                logger.exception("AI queue match failed: %s", exc)
+                summary["errors"] += 1
     record_activity("AI prediction queue completed", job="ai_prediction_queue", status="ok" if not summary["errors"] else "error", details=summary)
     return summary

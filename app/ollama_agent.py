@@ -1,37 +1,26 @@
 """
-Ollama local LLM prediction agent.
-Supports two models:
-  - qwen3:8b   (Best Overall — strong reasoning + coding)
-  - deepseek-r1:8b (Best Reasoning — great for Team A vs Team B analysis)
+OpenRouter prediction agent.
+Replaces the Ollama agent — uses OpenRouter cloud inference (fast, no local model load).
 
-Requires Ollama running locally: https://ollama.com
-Pull models first:
-  ollama pull qwen3:8b
-  ollama pull deepseek-r1:8b
-
-Set PREDICTX_OLLAMA_URL in .env (default: http://localhost:11434)
+Uses the free OpenRouter model (openrouter/free by default).
+Set OPENROUTER_API_KEY in .env.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from datetime import datetime, timezone
 from typing import Any
 from urllib import request as urllib_request
+from urllib.error import HTTPError
 
 from app.config import get_settings
 
-OLLAMA_MODELS = {
-    "qwen3:8b": {
-        "label": "Qwen3 8B",
-        "role": "Best Overall — excellent reasoning, strong coding, long context",
+OPENROUTER_MODELS = {
+    "openrouter/free": {
+        "label": "OpenRouter Free",
+        "role": "Best Overall — free tier, excellent reasoning and general analysis",
         "emoji": "🥇",
-    },
-    "deepseek-r1:8b": {
-        "label": "DeepSeek-R1 8B",
-        "role": "Best Reasoning — Team A vs Team B analysis, explains predictions",
-        "emoji": "🥈",
     },
 }
 
@@ -62,77 +51,82 @@ Output format:
 }"""
 
 
-def _ollama_url() -> str:
+def _openrouter_url() -> str:
     settings = get_settings()
-    return settings.ollama_url.replace("/api/chat", "").rstrip("/")
+    return settings.openrouter_base_url.rstrip("/")
 
 
 def is_ollama_available(model: str | None = None) -> bool:
-    """Check if Ollama is reachable and the model is available."""
-    try:
-        url = _ollama_url() + "/api/tags"
-        req = urllib_request.Request(url, method="GET")
-        with urllib_request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        if model:
-            names = [m.get("name", "") for m in (data.get("models") or [])]
-            return any(model in name for name in names)
-        return True
-    except Exception:
+    """Check if OpenRouter is reachable (API key is set)."""
+    settings = get_settings()
+    if not settings.openrouter_api_key:
         return False
-
-
-async def _call_ollama_async(model: str, prompt: str, timeout: int = 120) -> str:
-    """
-    Async-safe Ollama call.
-    Runs the blocking urllib request in a thread pool to avoid blocking the event loop.
-    """
-    def _sync_call() -> str:
-        url = _ollama_url() + "/api/generate"
+    try:
+        url = _openrouter_url() + "/chat/completions"
         payload = json.dumps({
-            "model": model,
-            "prompt": f"{SYSTEM_PROMPT}\n\n{prompt}",
-            "stream": False,
-            "think": False,
-            "keep_alive": "24h",
-            "options": {"temperature": 0, "num_predict": 256},
+            "model": settings.openrouter_model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "temperature": 0,
+            "max_tokens": 1,
         }).encode("utf-8")
         req = urllib_request.Request(
             url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {settings.openrouter_api_key}",
+                "HTTP-Referer": "https://predictx.app",
+                "X-Title": "PredictX",
+            },
             method="POST",
         )
-        with urllib_request.urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-        return raw.get("response", "")
+        with urllib_request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if model:
+            return True
+        return bool(data.get("choices"))
+    except Exception:
+        return False
 
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_call)
 
+def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
+    """Call OpenRouter chat completions (OpenAI-compatible)."""
+    settings = get_settings()
+    if not settings.openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
 
-def _call_ollama(model: str, prompt: str, timeout: int = 120) -> str:
-    """Sync wrapper for backward compatibility."""
+    url = _openrouter_url() + "/chat/completions"
+    payload = json.dumps({
+        "model": settings.openrouter_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 512,
+    }).encode("utf-8")
+    req = urllib_request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "HTTP-Referer": "https://predictx.app",
+            "X-Title": "PredictX",
+        },
+        method="POST",
+    )
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're in an async context (e.g., FastAPI request handler)
-            # Can't use asyncio.run() or run_until_complete()
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, _call_ollama_async(model, prompt, timeout))
-                return future.result(timeout=timeout + 10)
-        return loop.run_until_complete(_call_ollama_async(model, prompt, timeout))
-    except RuntimeError:
-        # Fallback: run in a new event loop (for sync contexts)
-        return asyncio.run(_call_ollama_async(model, prompt, timeout))
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
+
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    return re.sub(r"</think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 def _parse_response(raw: str) -> dict[str, Any]:
-    """Extract JSON from model response, stripping <think> blocks and markdown fences."""
-    # Strip DeepSeek-R1 <think>...</think> reasoning blocks
-    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    # Strip markdown fences
+    """Extract JSON from model response, stripping </think> blocks and markdown fences."""
+    text = re.sub(r"</think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     if "```" in text:
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -142,14 +136,14 @@ def _parse_response(raw: str) -> dict[str, Any]:
 
 def run_ollama_match_analysis(
     doc: dict[str, Any],
-    model: str = "qwen3:8b",
+    model: str = "openrouter/free",
 ) -> dict[str, Any]:
     """
-    Run a single Ollama model analysis for one enriched match document.
+    Run a single OpenRouter model analysis for one enriched match document.
 
     Args:
         doc:   enriched match document (same format as groq_agent)
-        model: ollama model name, e.g. "qwen3:8b" or "deepseek-r1:8b"
+        model: OpenRouter model name (ignored — uses configured model)
 
     Returns:
         analysis dict with status, recommendation, confidence, reasoning, etc.
@@ -157,14 +151,7 @@ def run_ollama_match_analysis(
     if not is_ollama_available():
         return {
             "status": "ollama_unavailable",
-            "message": "Ollama is not running. Start it with: ollama serve",
-            "model": model,
-        }
-
-    if not is_ollama_available(model):
-        return {
-            "status": "model_unavailable",
-            "message": f"Model {model} not found. Pull it with: ollama pull {model}",
+            "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env",
             "model": model,
         }
 
@@ -174,7 +161,6 @@ def run_ollama_match_analysis(
     except Exception:
         pass
 
-    # Reuse the same summariser from groq_agent to keep prompts consistent
     try:
         from app.groq_agent import _summarise_doc
         summary = _summarise_doc(doc)
@@ -182,7 +168,7 @@ def run_ollama_match_analysis(
         return {"status": "error", "message": f"Failed to summarise doc: {exc}", "model": model}
 
     try:
-        raw = _call_ollama(model, summary)
+        raw = _call_llm(model, summary)
         result = _parse_response(raw)
     except json.JSONDecodeError as exc:
         return {"status": "error", "message": f"Model returned non-JSON: {exc}", "model": model}
@@ -195,7 +181,7 @@ def run_ollama_match_analysis(
     except (TypeError, ValueError):
         confidence = None
 
-    model_info = OLLAMA_MODELS.get(model, {"label": model, "role": "", "emoji": "🤖"})
+    model_info = OPENROUTER_MODELS.get(model, {"label": model, "role": "", "emoji": "🤖"})
 
     return {
         "status": result.get("status") or "predicted",
@@ -208,7 +194,7 @@ def run_ollama_match_analysis(
         "btts": result.get("btts"),
         "over_2_5": result.get("over_2_5"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "ollama",
+        "source": "openrouter",
         "model": model,
         "model_label": model_info["label"],
         "model_role": model_info["role"],
@@ -218,22 +204,22 @@ def run_ollama_match_analysis(
 
 def run_ollama_all_models(doc: dict[str, Any]) -> dict[str, Any]:
     """
-    Run both Ollama models (qwen3:8b + deepseek-r1:8b) on one match document.
+    Run OpenRouter models on one match document.
 
     Returns a combined result with individual model outputs and a consensus.
     """
+    settings = get_settings()
+    model = settings.openrouter_model
     results: dict[str, Any] = {}
-    for model in OLLAMA_MODELS:
-        results[model] = run_ollama_match_analysis(doc, model=model)
+    results[model] = run_ollama_match_analysis(doc, model=model)
 
-    # Build consensus: if both models agree on the same prediction, flag it
     predictions = [
         r.get("recommendation")
         for r in results.values()
         if r.get("status") == "predicted" and r.get("recommendation")
     ]
     consensus = None
-    if len(predictions) == len(OLLAMA_MODELS) and len(set(predictions)) == 1:
+    if len(predictions) == len(results) and len(set(predictions)) == 1:
         consensus = predictions[0]
 
     avg_confidence = None
@@ -255,16 +241,16 @@ def run_ollama_predictions(
     match_date: str | None = None,
     docs: list[dict[str, Any]] | None = None,
     limit: int = 50,
-    model: str = "qwen3:8b",
+    model: str = "openrouter/free",
 ) -> dict[str, Any]:
     """
-    Run Ollama predictions over enriched match documents (batch).
+    Run OpenRouter predictions over enriched match documents (batch).
 
     Args:
         match_date: YYYY-MM-DD, defaults to today
         docs:       pre-loaded enriched docs (skips DB fetch if provided)
         limit:      max matches to predict
-        model:      which Ollama model to use
+        model:      which OpenRouter model to use (ignored — uses configured model)
 
     Returns:
         summary dict with predictions list
@@ -272,7 +258,7 @@ def run_ollama_predictions(
     from datetime import date as dt
 
     if not is_ollama_available():
-        return {"status": "ollama_unavailable", "message": "Ollama is not running. Start it with: ollama serve"}
+        return {"status": "ollama_unavailable", "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env"}
 
     target_date = match_date or dt.today().isoformat()
 
@@ -284,7 +270,7 @@ def run_ollama_predictions(
         return {"status": "no_matches", "date": target_date, "predictions": []}
 
     docs = docs[:limit]
-    print(f"[ollama_agent] predicting {len(docs)} matches for {target_date} using {model}")
+    print(f"[openrouter_agent] predicting {len(docs)} matches for {target_date} using {model}")
 
     predictions = []
     value_bets = 0
@@ -292,7 +278,7 @@ def run_ollama_predictions(
 
     for i, doc in enumerate(docs, 1):
         name = doc.get("sportybet_name") or doc.get("name") or "unknown"
-        print(f"[ollama_agent] [{i}/{len(docs)}] {name}")
+        print(f"[openrouter_agent] [{i}/{len(docs)}] {name}")
         pred = run_ollama_match_analysis(doc, model=model)
         pred["sportybet_id"] = doc.get("sportybet_id")
         pred["match_id"] = doc.get("sportybet_id")

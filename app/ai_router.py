@@ -5,14 +5,12 @@ Single source of truth for all LLM dispatch in PredictX.
 
 Priority chain
 ~~~~~~~~~~~~~~
-  1. Ollama Pipeline — small-context multi-stage pipeline (form, H2H, odds,
-                       standings, models specialists → final synthesis)
-  2. qwen3:8b       — primary for match analysis, general reasoning, JSON output
-  3. deepseek-r1:8b — primary for deep step-by-step reasoning tasks (H2H, form,
-                      evidence chains); fallback for qwen3 when unavailable
-  4. Groq           — cloud fallback when both local models are unavailable
-                      (rate-limited; used only as last resort)
-  5. Rules engine   — deterministic fallback, never fails
+  1. OpenRouter Pipeline — small-context multi-stage pipeline (form, H2H, odds,
+                           standings, models specialists → final synthesis)
+  2. OpenRouter free model — primary for match analysis, general reasoning, JSON output
+  3. Groq                 — cloud fallback when OpenRouter is unavailable
+                       (rate-limited; used only as last resort)
+  4. Rules engine         — deterministic fallback, never fails
 
 Each call type declares which model is its *primary* so the router dispatches
 to the right strength first, then cascades down the chain automatically.
@@ -23,13 +21,13 @@ Usage
 
     router = AIRouter()
 
-    # Match analysis (JSON prediction) — pipeline primary, then qwen3
+    # Match analysis (JSON prediction) — pipeline primary, then OpenRouter
     text = router.call_analysis(prompt)
 
-    # Step reasoning (H2H, form, evidence) — deepseek primary
+    # Step reasoning (H2H, form, evidence) — OpenRouter primary
     text = router.call_reasoning(prompt)
 
-    # Supervisor review (compact JSON) — qwen3 primary
+    # Supervisor review (compact JSON) — OpenRouter primary
     text = router.call_review(messages)
 
     # Full pipeline prediction — uses small-context multi-stage approach
@@ -37,7 +35,7 @@ Usage
 
     # Availability checks
     model = router.best_available()          # first ready model name or None
-    router.is_available("qwen3:8b")          # True/False
+    router.is_available("openrouter/free")  # True/False
     router.status()                          # full status dict for the API
 """
 from __future__ import annotations
@@ -47,25 +45,20 @@ import logging
 import re
 from typing import Any
 
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
 
-# ── Model catalogue ────────────────────────────────────────────────────────────
+# ── Model catalogue ────────────────────────────────────────────────────────
 
 # Ordered by preference. The router walks this list top-to-bottom.
-OLLAMA_CHAIN: list[dict[str, Any]] = [
+OPENROUTER_MODELS: list[dict[str, Any]] = [
     {
-        "model": "qwen3:8b",
-        "label": "Qwen3 8B",
+        "model": "openrouter/free",
+        "label": "OpenRouter Free",
         "strength": "general",
-        "primary_for": ["analysis", "review", "supervisor"],
+        "primary_for": ["analysis", "review", "supervisor", "pipeline"],
         "emoji": "🥇",
-    },
-    {
-        "model": "deepseek-r1:8b",
-        "label": "DeepSeek-R1 8B",
-        "strength": "reasoning",
-        "primary_for": ["reasoning", "h2h", "form", "evidence"],
-        "emoji": "🥈",
     },
 ]
 
@@ -81,18 +74,18 @@ class AIRouter:
     All availability checks are lazy — nothing is imported until a call is made.
     """
 
-    def __init__(self, timeout_analysis: int = 180, timeout_reasoning: int = 120, timeout_review: int = 90) -> None:
+    def __init__(self, timeout_analysis: int = 30, timeout_reasoning: int = 30, timeout_review: int = 30) -> None:
         self._timeout_analysis = timeout_analysis
         self._timeout_reasoning = timeout_reasoning
         self._timeout_review = timeout_review
         self._availability_cache: dict[str, bool] = {}
 
-    # ── Public call surface ────────────────────────────────────────────────────
+    # ── Public call surface ────────────────────────────────────────────────
 
     def call_analysis(self, prompt: str) -> str:
         """
         Full match analysis → JSON prediction.
-        Primary: Ollama Pipeline  →  qwen3:8b  →  deepseek-r1:8b  →  Groq
+        Primary: OpenRouter Pipeline  →  OpenRouter free model  →  Groq
         """
         # Try pipeline first if we have a doc context (passed via prompt prefix)
         pipeline_result = self._try_pipeline_from_prompt(prompt)
@@ -103,14 +96,14 @@ class AIRouter:
     def call_reasoning(self, prompt: str) -> str:
         """
         Step-by-step evidence reasoning (H2H, form, odds, similar matches).
-        Primary: deepseek-r1:8b  →  qwen3:8b  →  Groq
+        Primary: OpenRouter free model  →  Groq
         """
         return self._dispatch(prompt, task="reasoning", timeout=self._timeout_reasoning)
 
     def call_review(self, messages: list[dict[str, str]]) -> str:
         """
         Supervisor / brain review using a messages list (system + user).
-        Primary: qwen3:8b  →  deepseek-r1:8b  →  Groq
+        Primary: OpenRouter free model  →  Groq
         """
         return self._dispatch_messages(messages, task="review", timeout=self._timeout_review)
 
@@ -120,7 +113,7 @@ class AIRouter:
 
     def call_pipeline(self, doc: dict[str, Any]) -> dict[str, Any]:
         """
-        Full small-context multi-stage Ollama pipeline prediction.
+        Full small-context multi-stage OpenRouter pipeline prediction.
         Returns a prediction dict (not just text) with specialist results.
         """
         from app.ollama_pipeline import run_ollama_pipeline
@@ -133,20 +126,20 @@ class AIRouter:
         from app.ollama_pipeline import run_ollama_pipeline_batch
         return run_ollama_pipeline_batch(docs, limit=limit, attach_brain=True)
 
-    # ── Availability helpers ───────────────────────────────────────────────────
+    # ── Availability helpers ───────────────────────────────────────────────
 
     def is_available(self, model: str) -> bool:
         if model not in self._availability_cache:
-            self._availability_cache[model] = self._check_ollama(model)
+            self._availability_cache[model] = self._check_openrouter(model)
         return self._availability_cache[model]
 
     def is_pipeline_available(self) -> bool:
-        """Check if the small-context pipeline is available (needs at least one Ollama model)."""
+        """Check if the small-context pipeline is available (OpenRouter key set)."""
         return self.best_available() is not None
 
     def best_available(self) -> str | None:
-        """Return the name of the first ready Ollama model, or None."""
-        for entry in OLLAMA_CHAIN:
+        """Return the name of the first ready OpenRouter model, or None."""
+        for entry in OPENROUTER_MODELS:
             if self.is_available(entry["model"]):
                 return entry["model"]
         return None
@@ -166,7 +159,7 @@ class AIRouter:
     def status(self) -> dict[str, Any]:
         """Full availability status — used by the API /ai/status endpoint."""
         models = []
-        for entry in OLLAMA_CHAIN:
+        for entry in OPENROUTER_MODELS:
             available = self.is_available(entry["model"])
             models.append({
                 "model": entry["model"],
@@ -177,33 +170,30 @@ class AIRouter:
                 "emoji": entry["emoji"],
             })
         return {
-            "ollama_models": models,
-            "ollama_pipeline_available": self.is_pipeline_available(),
+            "openrouter_models": models,
+            "openrouter_pipeline_available": self.is_pipeline_available(),
             "groq_available": self.is_groq_available(),
             "any_available": self.any_available(),
             "primary_model": self.best_available(),
-            "chain": [e["model"] for e in OLLAMA_CHAIN] + (["groq"] if self.is_groq_available() else []),
+            "chain": [e["model"] for e in OPENROUTER_MODELS] + (["groq"] if self.is_groq_available() else []),
         }
 
     def invalidate_cache(self) -> None:
-        """Force re-check on next call (useful after ollama pull)."""
+        """Force re-check on next call (useful after model changes)."""
         self._availability_cache.clear()
 
-    # ── Dispatch internals ─────────────────────────────────────────────────────
+    # ── Dispatch internals ─────────────────────────────────────────────────
 
     def _ordered_chain(self, task: str) -> list[str]:
         """
         Return model names in dispatch order for this task type.
-        deepseek-primary tasks swap the first two entries.
         """
-        chain = [e["model"] for e in OLLAMA_CHAIN]
-        if task in _DEEPSEEK_PRIMARY_TASKS and len(chain) >= 2:
-            chain[0], chain[1] = chain[1], chain[0]
+        chain = [e["model"] for e in OPENROUTER_MODELS]
         return chain
 
     def _try_pipeline_from_prompt(self, prompt: str) -> str | None:
         """
-        If the prompt contains a JSON doc prefix (sent by groq_agent or ollama_agent),
+        If the prompt contains a JSON doc prefix (sent by groq_agent or openrouter_agent),
         try running the full pipeline instead of a single large-context call.
         Returns the pipeline result as a JSON string, or None if pipeline not applicable.
         """
@@ -252,7 +242,7 @@ class AIRouter:
                 logger.debug("ai_router: %s unavailable, skipping", model)
                 continue
             try:
-                result = self._call_ollama(model, prompt, timeout)
+                result = self._call_openrouter(model, prompt, timeout)
                 logger.debug("ai_router: %s succeeded for task=%s", model, task)
                 return result
             except Exception as exc:
@@ -273,8 +263,8 @@ class AIRouter:
         raise RuntimeError(f"ai_router: all providers exhausted for task={task}")
 
     def _dispatch_messages(self, messages: list[dict[str, str]], task: str, timeout: int) -> str:
-        """Dispatch a messages list (system+user) — converts to prompt for Ollama."""
-        # Build a flat prompt from messages for Ollama (which uses /api/generate)
+        """Dispatch a messages list (system+user) — converts to prompt for OpenRouter."""
+        # Build a flat prompt from messages for OpenRouter (which uses chat completions)
         prompt = "\n\n".join(
             f"[{m.get('role', 'user').upper()}]\n{m.get('content', '')}"
             for m in messages
@@ -283,7 +273,7 @@ class AIRouter:
             if not self.is_available(model):
                 continue
             try:
-                result = self._call_ollama(model, prompt, timeout)
+                result = self._call_openrouter(model, prompt, timeout)
                 logger.debug("ai_router: %s succeeded for task=%s (messages)", model, task)
                 return result
             except Exception as exc:
@@ -302,11 +292,11 @@ class AIRouter:
 
         raise RuntimeError(f"ai_router: all providers exhausted for task={task}")
 
-    # ── Provider calls ─────────────────────────────────────────────────────────
+    # ── Provider calls ─────────────────────────────────────────────────────
 
-    def _call_ollama(self, model: str, prompt: str, timeout: int) -> str:
-        from app.ollama_agent import _call_ollama
-        return _call_ollama(model, prompt, timeout=timeout)
+    def _call_openrouter(self, model: str, prompt: str, timeout: int) -> str:
+        from app.ollama_agent import _call_llm
+        return _call_llm(model, prompt, timeout=timeout)
 
     def _call_groq(self, prompt: str, timeout: int) -> str:
         from app.llm import get_llm
@@ -319,7 +309,7 @@ class AIRouter:
         return str(response.content if hasattr(response, "content") else response).strip()
 
     @staticmethod
-    def _check_ollama(model: str) -> bool:
+    def _check_openrouter(model: str) -> bool:
         try:
             from app.ollama_agent import is_ollama_available
             return is_ollama_available(model)
@@ -332,7 +322,7 @@ class AIRouter:
 def parse_json_response(raw: str) -> dict[str, Any]:
     """
     Extract a JSON object from a model response.
-    Strips <think>...</think> blocks (DeepSeek-R1) and markdown fences.
+    Strips </think>...</think> blocks (DeepSeek-R1) and markdown fences.
     Raises json.JSONDecodeError if no valid JSON found.
     """
     # Strip DeepSeek-R1 chain-of-thought blocks

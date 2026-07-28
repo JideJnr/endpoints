@@ -44,11 +44,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[startup] job recovery failed: {exc}")
     try:
+        import threading as _threading
         from app.ollama_model_manager import preload_all_models, start_keep_alive
-        preload_results = preload_all_models()
-        loaded = sum(1 for v in preload_results.values() if v)
-        total = len(preload_results)
-        print(f"[startup] ollama preload: {loaded}/{total} models loaded")
+        def _bg_preload():
+            preload_results = preload_all_models()
+            loaded = sum(1 for v in preload_results.values() if v)
+            total = len(preload_results)
+            print(f"[startup] ollama preload: {loaded}/{total} models loaded")
+        _threading.Thread(target=_bg_preload, daemon=True, name="ollama_preload").start()
         start_keep_alive(interval_seconds=120)
         print("[startup] ollama keep-alive thread started")
     except Exception as exc:

@@ -392,6 +392,8 @@ def _readiness_score(missing: list[str]) -> int:
 
 def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     """Run every available model against the richest document we have for a match."""
+    global _SIGNAL_STATS_BATCH_CACHE
+    _SIGNAL_STATS_BATCH_CACHE = {}  # reset per-prediction batch cache
     readiness = prediction_readiness(doc)
     if not readiness["ready"]:
         raise ValueError(f"Prediction deferred until full signal is ready: {', '.join(readiness['missing'])}")
@@ -2165,6 +2167,13 @@ def _cap_learned_signal_adjustment(signals: list[dict[str, Any]], adjustment: in
         return max(-8, adjustment)
     weak_support = 0
     checked = 0
+    # Batch-fetch all signal stats in one query instead of one per signal.
+    signal_names = [
+        str(s.get("name") or "")
+        for s in (signals or [])
+        if s.get("name") and s.get("name") not in BACKGROUND_CONTEXT_SIGNALS
+    ]
+    _prefetch_signal_stats(signal_names)
     for signal in signals or []:
         name = str(signal.get("name") or "")
         if not name or name in BACKGROUND_CONTEXT_SIGNALS:
@@ -2182,6 +2191,10 @@ def _cap_learned_signal_adjustment(signals: list[dict[str, Any]], adjustment: in
 
 
 def _global_signal_stats(signal_name: str) -> dict[str, Any]:
+    # Use the batch cache if it was pre-populated for this prediction pass.
+    cached = _SIGNAL_STATS_BATCH_CACHE.get(signal_name)
+    if cached is not None:
+        return cached
     try:
         from app.league_memory import DB_PATH, _init_db, _conn
 
@@ -2210,6 +2223,50 @@ def _global_signal_stats(signal_name: str) -> dict[str, Any]:
         "losses": losses,
         "win_rate": round(wins / samples * 100, 1) if samples else None,
     }
+
+
+# Batch cache populated once per prediction pass to avoid N separate DB
+# connections inside _cap_learned_signal_adjustment's per-signal loop.
+_SIGNAL_STATS_BATCH_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _prefetch_signal_stats(signal_names: list[str]) -> None:
+    """Load stats for all signal names in one query and populate the batch cache."""
+    global _SIGNAL_STATS_BATCH_CACHE
+    if not signal_names:
+        return
+    try:
+        from app.league_memory import DB_PATH, _init_db, _conn
+        _init_db()
+        placeholders = ",".join("?" * len(signal_names))
+        with _conn(timeout=5) as conn:
+            rows = conn.execute(
+                f"""
+                select signal_name,
+                       count(*) as samples,
+                       sum(case when result = 'win' then 1 else 0 end) as wins,
+                       sum(case when result = 'loss' then 1 else 0 end) as losses
+                from signal_outcomes
+                where signal_name in ({placeholders}) and result in ('win', 'loss')
+                group by signal_name
+                """,
+                signal_names,
+            ).fetchall()
+        for row in rows:
+            name = row["signal_name"]
+            samples = int(row["samples"] or 0)
+            wins = int(row["wins"] or 0)
+            _SIGNAL_STATS_BATCH_CACHE[name] = {
+                "samples": samples,
+                "wins": wins,
+                "losses": int(row["losses"] or 0),
+                "win_rate": round(wins / samples * 100, 1) if samples else None,
+            }
+        # Fill missing names with empty stats so the loop doesn't re-query.
+        for name in signal_names:
+            _SIGNAL_STATS_BATCH_CACHE.setdefault(name, {"samples": 0, "wins": 0, "losses": 0, "win_rate": None})
+    except Exception:
+        pass
 
 
 def _live_prematch_prior(ensemble: dict[str, Any]) -> dict[str, float]:

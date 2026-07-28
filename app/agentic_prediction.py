@@ -93,7 +93,13 @@ def run_agentic_match_prediction(
     }
 
     queue = _initial_plan(state)
-    trace["local_llm_advice"] = _local_llm_plan_advice(objective, queue, state)
+    # Only call the local LLM planner when explicitly configured — this call
+    # blocks the entire agentic loop start and adds 2-10s on cold Ollama.
+    url = os.getenv("PREDICTX_LOCAL_LLM_URL", "").strip()
+    trace["local_llm_advice"] = (
+        _local_llm_plan_advice(objective, queue, state)
+        if url else {"enabled": False, "reason": "PREDICTX_LOCAL_LLM_URL not configured"}
+    )
     seen_actions: set[str] = set()
 
     for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
