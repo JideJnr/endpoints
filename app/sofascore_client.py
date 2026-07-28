@@ -450,7 +450,7 @@ def fetch_standings(tournament_id: int, season_id: int) -> list[dict]:
 
 
 def fetch_event_detail(event: dict) -> dict:
-    time.sleep(random.uniform(0.5, 1.5))  # jitter to avoid rate limiting
+    time.sleep(random.uniform(0.3, 0.8))  # single jitter, not per-call
     event_id = event["id"]
     if not event.get("season_id") or not ((event.get("tournament") or {}).get("tournament_id")):
         fresh_event = fetch_event(event_id)
@@ -467,21 +467,28 @@ def fetch_event_detail(event: dict) -> dict:
         except Exception:
             return None
 
-    return {
-        **event,
-        "h2h": safe(fetch_h2h, event_id),
-        "statistics": safe(fetch_event_statistics, event_id),
-        "incidents": safe(fetch_event_incidents, event_id),
-        "lineups": safe(fetch_event_lineups, event_id),
-        "pregame_form": safe(fetch_pregame_form, event_id),
-        "managers": safe(fetch_managers, event_id),
-        "home_last_matches": _team_history_events(home_id),
-        "away_last_matches": _team_history_events(away_id),
-        "home_featured_players": safe(fetch_featured_players, home_id),
-        "away_featured_players": safe(fetch_featured_players, away_id),
-        "odds_featured": safe(fetch_odds_featured, event_id),
-        "standings": safe(fetch_standings, tournament_id, season_id),
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    tasks = {
+        "h2h":                   (fetch_h2h, event_id),
+        "statistics":            (fetch_event_statistics, event_id),
+        "incidents":             (fetch_event_incidents, event_id),
+        "lineups":               (fetch_event_lineups, event_id),
+        "pregame_form":          (fetch_pregame_form, event_id),
+        "managers":              (fetch_managers, event_id),
+        "home_last_matches":     (_team_history_events, home_id),
+        "away_last_matches":     (_team_history_events, away_id),
+        "home_featured_players": (fetch_featured_players, home_id),
+        "away_featured_players": (fetch_featured_players, away_id),
+        "odds_featured":         (fetch_odds_featured, event_id),
+        "standings":             (fetch_standings, tournament_id, season_id),
     }
+    results: dict = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(safe, fn, *args): key for key, (fn, *args) in tasks.items()}
+        for future in _as_completed(futures):
+            results[futures[future]] = future.result()
+
+    return {**event, **results}
 
 
 def fetch_event_detail_live_refresh(event_id: int, existing_detail: dict) -> dict:
@@ -575,9 +582,11 @@ def _parse_standing_row(row: dict) -> dict:
 def fetch_h2h(event_id: int) -> dict:
     url = SOFASCORE_H2H_URL.format(event_id=event_id)
     d = _get(url).json()
+    events = [_parse_event(e) for e in d.get("events", []) if isinstance(e, dict)]
     return {
         "team_duel": d.get("teamDuel"),
         "manager_duel": d.get("managerDuel"),
+        "events": events,
     }
 
 

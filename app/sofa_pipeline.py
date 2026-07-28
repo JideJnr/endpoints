@@ -94,13 +94,6 @@ def set_sofa_pipeline_mode(enabled: bool) -> dict[str, Any]:
 # ── Stage 1: Ingest from SofaScore ────────────────────────────────────────────
 
 def _sofa_event_to_buffer_doc(event: dict[str, Any], match_date: str) -> dict[str, Any]:
-    """
-    Convert a SofaScore parsed event into a buffer-compatible document.
-
-    The match_id is prefixed with `sofa:` so it never collides with SportyBet IDs.
-    We synthesise a minimal `raw_sporty` dict so the buffer schema is satisfied
-    (raw_sporty is NOT NULL) while clearly marking the source as sofascore.
-    """
     sofa_id = str(event.get("id") or "")
     match_id = f"{SOFA_ID_PREFIX}{sofa_id}"
     home = event.get("home_team") or {}
@@ -118,10 +111,9 @@ def _sofa_event_to_buffer_doc(event: dict[str, Any], match_date: str) -> dict[st
     except Exception:
         pass
 
-    start_ts = event.get("start_timestamp")  # Unix seconds from SofaScore
+    start_ts = event.get("start_timestamp")
     start_time_ms = int(start_ts) * 1000 if start_ts else None
 
-    # SofaScore status → period string
     status = event.get("status") or {}
     status_type = str(status.get("type") or "").lower()
     period = "Not start"
@@ -135,8 +127,6 @@ def _sofa_event_to_buffer_doc(event: dict[str, Any], match_date: str) -> dict[st
     score = event.get("score") or {}
     state = classify_match_state(event)
 
-    # Synthesise a minimal raw_sporty so the buffer schema is satisfied.
-    # We set markets=[] because we have no SportyBet odds.
     raw_sporty = {
         "id": match_id,
         "name": name,
@@ -167,13 +157,12 @@ def _sofa_event_to_buffer_doc(event: dict[str, Any], match_date: str) -> dict[st
         "is_live": bool(state.get("is_live")),
         "is_finished": bool(state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}),
         "raw_sporty": raw_sporty,
-        # SofaScore event embedded so enrichment can find it immediately
         "sofascore_event": event,
         "sofascore_name": name,
         "source": "sofascore",
-        "sportybet_id": match_id,  # used as the primary key throughout the system
+        "sportybet_id": match_id,
         "sportybet_name": name,
-        "sofascore_match_status": "matched",  # already matched by definition
+        "sofascore_match_status": "matched",
         "markets": [],
         "sportybet_markets": [],
     }
@@ -184,17 +173,10 @@ def ingest_from_sofascore(
     include_live: bool = True,
     limit: int = 300,
 ) -> dict[str, Any]:
-    """
-    Stage 1: Fetch SofaScore events for `match_date` and write them into
-    `match_buffer`. Skips finished/terminal events.
-
-    Returns a summary dict.
-    """
     _init_db()
     target_date = match_date or date_cls.today().isoformat()
     now = datetime.now(timezone.utc).isoformat()
 
-    # Collect events
     raw_events: list[dict] = []
     try:
         raw_events = fetch_all_scheduled_events(target_date)
@@ -213,12 +195,7 @@ def ingest_from_sofascore(
         except Exception as exc:
             logger.warning("sofa_pipeline.ingest: fetch_live_events failed: %s", exc)
 
-    # Filter: skip terminal and future-dated events we can't use
-    usable = []
-    for event in raw_events[:limit]:
-        if is_terminal_event(event):
-            continue
-        usable.append(event)
+    usable = [event for event in raw_events[:limit] if not is_terminal_event(event)]
 
     inserted = updated = skipped = 0
 
@@ -319,7 +296,6 @@ def _get_sofa_buffer_matches(
 ) -> list[dict[str, Any]]:
     """Return buffered matches that were ingested via SofaScore pipeline."""
     _init_db()
-    today = date_cls.today().isoformat()
     clauses = [
         "is_finished = 0",
         "match_id like 'sofa:%'",
@@ -350,17 +326,17 @@ def _get_sofa_buffer_matches(
             (*params, limit),
         ).fetchall()
 
-    result = []
-    for row in rows:
-        result.append({
+    return [
+        {
             "match_id": row["match_id"],
             "sofascore_id": row["sofascore_id"],
             "is_live": bool(row["is_live"]),
             "match_date": row["match_date"],
             "raw_sporty": json.loads(row["raw_sporty"]) if row["raw_sporty"] else {},
             "existing": json.loads(row["raw_enriched"]) if row["raw_enriched"] else None,
-        })
-    return result
+        }
+        for row in rows
+    ]
 
 
 def enrich_sofa_pipeline(
@@ -371,6 +347,8 @@ def enrich_sofa_pipeline(
     """
     Stage 2: Enrich SofaScore-source buffer matches with full SofaScore detail.
     Uses parallel fetch for detail calls.
+    Stage 3 (predict) runs after all enrichment writes are done — decoupled so
+    a slow Ollama call cannot block the enrichment of the next match.
     """
     _init_db()
     target_date = match_date or date_cls.today().isoformat()
@@ -391,34 +369,31 @@ def enrich_sofa_pipeline(
         sofa_id = item.get("sofascore_id")
         existing = item.get("existing") or {}
         sofa_event = existing.get("sofascore_event") or item["raw_sporty"].get("sofascore_event") or {}
-
         if not sofa_event and sofa_id:
-            # Reconstruct a minimal event stub so fetch_event_detail works
             sofa_event = {"id": int(sofa_id), "home_team": {}, "away_team": {}, "tournament": {}}
-
         if not sofa_event or not sofa_event.get("id"):
             return item, None
         try:
-            detail = fetch_event_detail(sofa_event)
-            return item, detail
+            return item, fetch_event_detail(sofa_event)
         except Exception as exc:
             logger.warning("sofa_pipeline.enrich: detail fetch failed for %s: %s", sofa_id, exc)
             return item, None
 
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
         futures = {pool.submit(_fetch_detail, item): item for item in batch}
-        results: list[tuple[dict, dict | None]] = []
-        for future in as_completed(futures):
-            results.append(future.result())
+        results: list[tuple[dict, dict | None]] = [
+            future.result() for future in as_completed(futures)
+        ]
 
+    # ── Stage 2: store all enriched docs first ────────────────────────────────
+    enriched_docs: list[tuple[str, dict]] = []
     for item, detail in results:
         match_id = item["match_id"]
         try:
             existing = item.get("existing") or {}
             raw_sporty = item["raw_sporty"]
 
-            # Rebuild the sofa_event from the existing doc or the raw_sporty
-            sofa_event = (existing.get("sofascore_event") or {})
+            sofa_event = existing.get("sofascore_event") or {}
             if not sofa_event:
                 sofa_event = {"id": int(item["sofascore_id"])} if item.get("sofascore_id") else {}
 
@@ -434,13 +409,11 @@ def enrich_sofa_pipeline(
 
             doc = {
                 **existing,
-                # Primary identifiers
                 "sportybet_id": match_id,
                 "sofascore_id": item.get("sofascore_id"),
                 "match_id": match_id,
                 "source": "sofascore",
                 "data_source": "sofascore",
-                # Match metadata
                 "name": raw_sporty.get("name"),
                 "sportybet_name": raw_sporty.get("name"),
                 "sofascore_name": raw_sporty.get("name"),
@@ -452,7 +425,6 @@ def enrich_sofa_pipeline(
                 "start_time": raw_sporty.get("start_time"),
                 "period": raw_sporty.get("period"),
                 "score": raw_sporty.get("score") or {},
-                # SofaScore data
                 "sofascore_event": sofa_event,
                 "sofascore_detail": detail,
                 "live_data_sofascore": _sofa_live_data(detail),
@@ -463,7 +435,6 @@ def enrich_sofa_pipeline(
                 "league_table": (detail or {}).get("standings") or [],
                 "sofascore_match_status": "matched",
                 "minimum_enrichment_status": "full_provider_match" if detail else "sofascore_only",
-                # No SportyBet data — mark explicitly
                 "sportybet_markets": [],
                 "markets": [],
                 "sportybet_detail": {
@@ -483,7 +454,6 @@ def enrich_sofa_pipeline(
                     "refreshed_at": now,
                 },
                 "sportybet_data_status": "unavailable_cloud_mode",
-                # Context
                 "time_context": time_ctx,
                 "match_state": match_state,
                 "web_context": existing.get("web_context") or {},
@@ -522,20 +492,22 @@ def enrich_sofa_pipeline(
 
             store_enriched(match_id, doc)
             enriched_count += 1
-
-            # Stage 3: Predict inline
-            try:
-                from app.prediction_flow import apply_prediction_state
-                fresh_doc = get_buffered_match(match_id) or doc
-                pred_result = apply_prediction_state(fresh_doc, match_id=match_id)
-                if pred_result.get("status") == "predicted":
-                    predicted_count += 1
-            except Exception as exc:
-                logger.debug("sofa_pipeline: prediction failed for %s: %s", match_id, exc)
+            enriched_docs.append((match_id, doc))
 
         except Exception as exc:
             logger.error("sofa_pipeline.enrich: failed for %s: %s", item.get("match_id"), exc)
             errors += 1
+
+    # ── Stage 3: Predict after all enrichment writes are done (decoupled) ─────
+    from app.prediction_flow import apply_prediction_state
+    for match_id, doc in enriched_docs:
+        try:
+            fresh_doc = get_buffered_match(match_id) or doc
+            pred_result = apply_prediction_state(fresh_doc, match_id=match_id)
+            if pred_result.get("status") == "predicted":
+                predicted_count += 1
+        except Exception as exc:
+            logger.debug("sofa_pipeline: prediction failed for %s: %s", match_id, exc)
 
     logger.info(
         "sofa_pipeline.enrich: date=%s enriched=%d predicted=%d errors=%d",
@@ -559,11 +531,6 @@ def run_sofa_pipeline_cycle(
     enrich_batch: int = 20,
     include_live: bool = True,
 ) -> dict[str, Any]:
-    """
-    Run one full Ingest → Enrich → Predict cycle for a given date.
-    This is the function called by the manual endpoint and optionally
-    by a scheduler job when the toggle is enabled.
-    """
     from app.activity_log import record_activity
 
     target_date = match_date or date_cls.today().isoformat()
@@ -584,7 +551,6 @@ def run_sofa_pipeline_cycle(
         batch_size=enrich_batch,
     )
 
-    # If there are live matches, run a second enrich pass for them
     live_result = {}
     if ingest_result.get("fetched", 0) > 0:
         live_result = enrich_sofa_pipeline(

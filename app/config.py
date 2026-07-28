@@ -61,8 +61,14 @@ class Settings:
     ollama_keep_alive_interval: int
 
 
+_cached_settings: Settings | None = None
+
+
 def get_settings() -> Settings:
-    return Settings(
+    global _cached_settings
+    if _cached_settings is not None:
+        return _cached_settings
+    _cached_settings = Settings(
         app_name=os.getenv("PREDICTX_APP_NAME", "PredictX Football Stats Agent"),
         environment=os.getenv("PREDICTX_ENV", "development"),
         cors_origins=_csv(os.getenv("PREDICTX_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
@@ -98,6 +104,7 @@ def get_settings() -> Settings:
         ollama_pipeline_enabled=_bool_env("PREDICTX_OLLAMA_PIPELINE_ENABLED", True),
         ollama_keep_alive_interval=_int_env("PREDICTX_OLLAMA_KEEP_ALIVE_INTERVAL", 120),
     )
+    return _cached_settings
 
 
 def public_settings() -> dict[str, object]:

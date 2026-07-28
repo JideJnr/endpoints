@@ -179,7 +179,7 @@ def _ollama_review(payload: dict[str, Any]) -> dict[str, Any] | None:
         "stream": False,
         "messages": _review_messages(payload),
         "options": {"temperature": 0.1},
-        "keep_alive": "-1",
+        "keep_alive": "24h",
     }
     try:
         req = request.Request(

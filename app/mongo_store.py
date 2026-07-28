@@ -14,17 +14,25 @@ from app.config import get_settings
 
 _client = None
 _db = None
+_settings_cache = None
+
+
+def _get_settings():
+    global _settings_cache
+    if _settings_cache is None:
+        _settings_cache = get_settings()
+    return _settings_cache
 
 
 def is_configured() -> bool:
-    settings = get_settings()
+    settings = _get_settings()
     return bool(settings.mongodb_uri) and not settings.local_storage_only and MongoClient is not None
 
 
 def _get_db():
     global _client, _db
     if _db is None:
-        settings = get_settings()
+        settings = _get_settings()
         if not settings.mongodb_uri:
             raise RuntimeError("MONGODB_URI is not configured")
         if MongoClient is None:
@@ -46,7 +54,7 @@ def init_mongo() -> dict[str, Any]:
         [("match_id", 1), ("pick_type", 1), ("selection", 1), ("signal_name", 1)],
         name="uniq_signal_outcome_pick",
     )
-    return {"configured": True, "database": get_settings().mongodb_db}
+    return {"configured": True, "database": _get_settings().mongodb_db}
 
 
 # ── The only write: archive a finished match ──────────────────────────────────
@@ -331,7 +339,7 @@ def mongo_status() -> dict[str, Any]:
         return {"configured": False}
     db = _get_db()
     counts = {c: db[c].estimated_document_count() for c in db.list_collection_names()}
-    return {"configured": True, "database": get_settings().mongodb_db, "collections": counts}
+    return {"configured": True, "database": _get_settings().mongodb_db, "collections": counts}
 
 
 # ── Stubs kept so existing imports don't break ────────────────────────────────
@@ -342,7 +350,7 @@ def flush_buffer_to_mongo(match_date: str | None = None) -> dict[str, Any]:
 def cleanup_buffer() -> dict[str, Any]:
     from app.league_memory import DB_PATH, _init_db
     from datetime import datetime, timezone
-    settings = get_settings()
+    settings = _get_settings()
     _init_db()
 
     now_ts = datetime.now(timezone.utc).timestamp()

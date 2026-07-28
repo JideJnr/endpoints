@@ -799,7 +799,7 @@ def _local_llm_plan_advice(
             "model": model,
             "prompt": json.dumps(prompt, default=str),
             "stream": False,
-            "keep_alive": "-1",
+            "keep_alive": "24h",
             "options": {"temperature": 0},
         }).encode("utf-8")
         req = urllib_request.Request(
@@ -849,7 +849,7 @@ def _local_llm_context_advice(state: dict[str, Any]) -> dict[str, Any]:
             "model": model,
             "prompt": json.dumps(prompt, default=str),
             "stream": False,
-            "keep_alive": "-1",
+            "keep_alive": "24h",
             "options": {"temperature": 0},
         }).encode("utf-8")
         req = urllib_request.Request(

@@ -2984,8 +2984,8 @@ def set_engine_status(engine_id: str, status: str) -> dict[str, Any]:
 
 def get_engine_states() -> dict[str, str]:
     _init_db()
-    with _conn() as conn:
-        rows = conn.execute("select id, status from engine_state").fetchall()
+    conn = get_db()
+    rows = conn.execute("select id, status from engine_state").fetchall()
     return {row[0]: row[1] for row in rows}
 
 

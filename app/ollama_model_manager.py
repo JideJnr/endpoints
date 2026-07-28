@@ -24,7 +24,7 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_KEEP_ALIVE_DURATION = "-1"
+_KEEP_ALIVE_DURATION = "24h"
 
 _model_lock = threading.Lock()
 _loaded_models: dict[str, float] = {}
