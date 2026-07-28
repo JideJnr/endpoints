@@ -7,6 +7,7 @@ from app.enriched_prediction import predict_enriched_match, prediction_readiness
 from app.league_memory import DB_PATH, record_deferred_prediction_decision, record_prediction
 from app.prediction_audit import build_deferred_prediction_audit, build_prediction_audit
 from app.match_state import classify_match_state
+from app.config import get_settings
 
 import sqlite3
 
@@ -27,6 +28,7 @@ def predict_and_record_enriched(
     match_date: str | None = None,
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
+    use_ollama_pipeline: bool | None = None,
 ) -> dict[str, Any]:
     """
     Single prediction write path for enriched buffer documents.
@@ -39,6 +41,33 @@ def predict_and_record_enriched(
     doc["prediction_readiness"] = readiness
     if not readiness.get("ready"):
         raise PredictionDeferred(readiness)
+
+    # Use small-context Ollama pipeline if requested and available
+    if use_ollama_pipeline is None:
+        from app.config import get_settings
+        use_ollama_pipeline = get_settings().ollama_pipeline_enabled
+    if use_ollama_pipeline:
+        from app.ollama_pipeline import is_ollama_available
+        if is_ollama_available():
+            from app.ollama_pipeline import run_ollama_pipeline
+            prediction = run_ollama_pipeline(doc, attach_brain=attach_brain)
+            prediction["audit"] = build_prediction_audit(prediction, doc)
+            resolved_match_id = str(
+                match_id
+                or prediction.get("match_id")
+                or doc.get("sportybet_id")
+                or doc.get("id")
+                or ""
+            )
+            record_prediction({
+                **prediction,
+                "match_id": resolved_match_id,
+                "sportybet_id": prediction.get("sportybet_id") or resolved_match_id,
+                "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
+                "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
+                "source": source,
+            })
+            return prediction
 
     prediction = predict_enriched_match(doc)
     if attach_brain:
@@ -71,6 +100,7 @@ def apply_prediction_state(
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
     allow_repeat: bool = False,
+    use_ollama_pipeline: bool | None = None,
 ) -> dict[str, Any]:
     """
     Apply the single prediction state transition used by workers and endpoints.
@@ -78,6 +108,9 @@ def apply_prediction_state(
     Prediction history remains append-only. The mutable buffer document only
     carries the current state: predicted, deferred, or error.
     """
+    if use_ollama_pipeline is None:
+        from app.config import get_settings
+        use_ollama_pipeline = get_settings().ollama_pipeline_enabled
     try:
         resolved_match_id = str(match_id or doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
@@ -106,6 +139,7 @@ def apply_prediction_state(
             match_date=match_date,
             source=_prediction_source(source, readiness),
             attach_brain=attach_brain,
+            use_ollama_pipeline=use_ollama_pipeline,
         )
         readiness = doc.get("prediction_readiness") or prediction.get("prediction_readiness") or prediction_readiness(doc)
         doc["prediction"] = prediction

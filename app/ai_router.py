@@ -5,12 +5,14 @@ Single source of truth for all LLM dispatch in PredictX.
 
 Priority chain
 ~~~~~~~~~~~~~~
-  1. qwen3:8b       — primary for match analysis, general reasoning, JSON output
-  2. deepseek-r1:8b — primary for deep step-by-step reasoning tasks (H2H, form,
+  1. Ollama Pipeline — small-context multi-stage pipeline (form, H2H, odds,
+                       standings, models specialists → final synthesis)
+  2. qwen3:8b       — primary for match analysis, general reasoning, JSON output
+  3. deepseek-r1:8b — primary for deep step-by-step reasoning tasks (H2H, form,
                       evidence chains); fallback for qwen3 when unavailable
-  3. Groq           — cloud fallback when both local models are unavailable
+  4. Groq           — cloud fallback when both local models are unavailable
                       (rate-limited; used only as last resort)
-  4. Rules engine   — deterministic fallback, never fails
+  5. Rules engine   — deterministic fallback, never fails
 
 Each call type declares which model is its *primary* so the router dispatches
 to the right strength first, then cascades down the chain automatically.
@@ -21,7 +23,7 @@ Usage
 
     router = AIRouter()
 
-    # Match analysis (JSON prediction) — qwen3 primary
+    # Match analysis (JSON prediction) — pipeline primary, then qwen3
     text = router.call_analysis(prompt)
 
     # Step reasoning (H2H, form, evidence) — deepseek primary
@@ -29,6 +31,9 @@ Usage
 
     # Supervisor review (compact JSON) — qwen3 primary
     text = router.call_review(messages)
+
+    # Full pipeline prediction — uses small-context multi-stage approach
+    result = router.call_pipeline(doc)
 
     # Availability checks
     model = router.best_available()          # first ready model name or None
@@ -76,7 +81,7 @@ class AIRouter:
     All availability checks are lazy — nothing is imported until a call is made.
     """
 
-    def __init__(self, timeout_analysis: int = 60, timeout_reasoning: int = 30, timeout_review: int = 20) -> None:
+    def __init__(self, timeout_analysis: int = 180, timeout_reasoning: int = 120, timeout_review: int = 90) -> None:
         self._timeout_analysis = timeout_analysis
         self._timeout_reasoning = timeout_reasoning
         self._timeout_review = timeout_review
@@ -87,8 +92,12 @@ class AIRouter:
     def call_analysis(self, prompt: str) -> str:
         """
         Full match analysis → JSON prediction.
-        Primary: qwen3:8b  →  deepseek-r1:8b  →  Groq
+        Primary: Ollama Pipeline  →  qwen3:8b  →  deepseek-r1:8b  →  Groq
         """
+        # Try pipeline first if we have a doc context (passed via prompt prefix)
+        pipeline_result = self._try_pipeline_from_prompt(prompt)
+        if pipeline_result is not None:
+            return pipeline_result
         return self._dispatch(prompt, task="analysis", timeout=self._timeout_analysis)
 
     def call_reasoning(self, prompt: str) -> str:
@@ -109,12 +118,31 @@ class AIRouter:
         """Generic call — task hint selects the primary model."""
         return self._dispatch(prompt, task=task, timeout=self._timeout_analysis)
 
+    def call_pipeline(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """
+        Full small-context multi-stage Ollama pipeline prediction.
+        Returns a prediction dict (not just text) with specialist results.
+        """
+        from app.ollama_pipeline import run_ollama_pipeline
+        return run_ollama_pipeline(doc, attach_brain=True)
+
+    def call_pipeline_batch(self, docs: list[dict[str, Any]], limit: int = 50) -> dict[str, Any]:
+        """
+        Batch small-context pipeline predictions.
+        """
+        from app.ollama_pipeline import run_ollama_pipeline_batch
+        return run_ollama_pipeline_batch(docs, limit=limit, attach_brain=True)
+
     # ── Availability helpers ───────────────────────────────────────────────────
 
     def is_available(self, model: str) -> bool:
         if model not in self._availability_cache:
             self._availability_cache[model] = self._check_ollama(model)
         return self._availability_cache[model]
+
+    def is_pipeline_available(self) -> bool:
+        """Check if the small-context pipeline is available (needs at least one Ollama model)."""
+        return self.best_available() is not None
 
     def best_available(self) -> str | None:
         """Return the name of the first ready Ollama model, or None."""
@@ -150,6 +178,7 @@ class AIRouter:
             })
         return {
             "ollama_models": models,
+            "ollama_pipeline_available": self.is_pipeline_available(),
             "groq_available": self.is_groq_available(),
             "any_available": self.any_available(),
             "primary_model": self.best_available(),
@@ -172,7 +201,52 @@ class AIRouter:
             chain[0], chain[1] = chain[1], chain[0]
         return chain
 
+    def _try_pipeline_from_prompt(self, prompt: str) -> str | None:
+        """
+        If the prompt contains a JSON doc prefix (sent by groq_agent or ollama_agent),
+        try running the full pipeline instead of a single large-context call.
+        Returns the pipeline result as a JSON string, or None if pipeline not applicable.
+        """
+        # Check if prompt starts with a JSON object (doc summary format)
+        prompt_stripped = prompt.strip()
+        if not prompt_stripped.startswith("{"):
+            return None
+
+        try:
+            # Try to parse the prefix as JSON to extract doc info
+            # The prompt format is: SYSTEM_PROMPT + "\n\n" + doc_summary
+            # We look for the doc summary part
+            parts = prompt.split("\n\n", 1)
+            if len(parts) < 2:
+                return None
+
+            doc_summary = parts[1]
+            # Try to extract key fields from the summary
+            doc = {}
+            for line in doc_summary.split("\n"):
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    doc[key.strip()] = value.strip()
+
+            # Only use pipeline if we have minimal match info
+            if not doc.get("sportybet_name") and not doc.get("name"):
+                return None
+
+            # Run pipeline
+            result = self.call_pipeline(doc)
+            if result.get("status") == "predicted":
+                return json.dumps(result.get("reasoning") or result)
+            return None
+        except Exception:
+            return None
+
     def _dispatch(self, prompt: str, task: str, timeout: int) -> str:
+        # Try pipeline first for analysis tasks if doc context is present
+        if task == "analysis":
+            pipeline_result = self._try_pipeline_from_prompt(prompt)
+            if pipeline_result is not None:
+                return pipeline_result
+
         for model in self._ordered_chain(task):
             if not self.is_available(model):
                 logger.debug("ai_router: %s unavailable, skipping", model)

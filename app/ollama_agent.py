@@ -13,6 +13,7 @@ Set PREDICTX_OLLAMA_URL in .env (default: http://localhost:11434)
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -81,28 +82,49 @@ def is_ollama_available(model: str | None = None) -> bool:
         return False
 
 
-def _call_ollama(model: str, prompt: str, timeout: int = 60) -> str:
-    """Call Ollama /api/generate and return the response text."""
-    url = _ollama_url() + "/api/generate"
-    payload = json.dumps({
-        "model": model,
-        "prompt": f"{SYSTEM_PROMPT}\n\n{prompt}",
-        "stream": False,
-        # Qwen's thinking mode can consume the entire generation on a small
-        # local CPU before it emits a final answer. Pipeline calls need concise
-        # factual output, so keep local fallback generations bounded.
-        "think": False,
-        "options": {"temperature": 0, "num_predict": 192},
-    }).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib_request.urlopen(req, timeout=timeout) as resp:
-        raw = json.loads(resp.read().decode("utf-8"))
-    return raw.get("response", "")
+async def _call_ollama_async(model: str, prompt: str, timeout: int = 120) -> str:
+    """
+    Async-safe Ollama call.
+    Runs the blocking urllib request in a thread pool to avoid blocking the event loop.
+    """
+    def _sync_call() -> str:
+        url = _ollama_url() + "/api/generate"
+        payload = json.dumps({
+            "model": model,
+            "prompt": f"{SYSTEM_PROMPT}\n\n{prompt}",
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 256},
+        }).encode("utf-8")
+        req = urllib_request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        return raw.get("response", "")
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync_call)
+
+
+def _call_ollama(model: str, prompt: str, timeout: int = 120) -> str:
+    """Sync wrapper for backward compatibility."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're in an async context (e.g., FastAPI request handler)
+            # Can't use asyncio.run() or run_until_complete()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, _call_ollama_async(model, prompt, timeout))
+                return future.result(timeout=timeout + 10)
+        return loop.run_until_complete(_call_ollama_async(model, prompt, timeout))
+    except RuntimeError:
+        # Fallback: run in a new event loop (for sync contexts)
+        return asyncio.run(_call_ollama_async(model, prompt, timeout))
 
 
 def _parse_response(raw: str) -> dict[str, Any]:

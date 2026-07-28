@@ -216,13 +216,23 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
 def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     """
     Run a match analysis for one enriched document.
-    Routes through AIRouter: qwen3:8b → deepseek-r1:8b → Groq.
+    Routes through AIRouter: Ollama Pipeline → qwen3:8b → deepseek-r1:8b → Groq.
     """
     from app.ai_router import get_router, parse_json_response
 
     router = get_router()
     if not router.any_available():
         return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
+
+    # Try small-context pipeline first if available
+    if router.is_pipeline_available():
+        try:
+            from app.ollama_pipeline import run_ollama_pipeline
+            pipeline_result = run_ollama_pipeline(doc, attach_brain=False)
+            if pipeline_result.get("status") == "predicted":
+                return pipeline_result
+        except Exception as exc:
+            logger.warning("groq_agent: pipeline failed, falling back to single-call: %s", exc)
 
     try:
         from app.competition_special import apply_known_competition_context

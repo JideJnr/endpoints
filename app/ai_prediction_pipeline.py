@@ -348,8 +348,8 @@ def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
     return result
 
 
-def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None = None, match_date: str | None = None, source: str = "enriched_ensemble", attach_brain: bool = False, allow_repeat: bool = False) -> dict[str, Any]:
-    kwargs = dict(match_id=match_id, match_date=match_date, source=source, attach_brain=attach_brain, allow_repeat=allow_repeat)
+def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None = None, match_date: str | None = None, source: str = "enriched_ensemble", attach_brain: bool = False, allow_repeat: bool = False, use_ollama_pipeline: bool | None = None) -> dict[str, Any]:
+    kwargs = dict(match_id=match_id, match_date=match_date, source=source, attach_brain=attach_brain, allow_repeat=allow_repeat, use_ollama_pipeline=use_ollama_pipeline)
     try:
         from app.ai_router import get_router
         router = get_router()

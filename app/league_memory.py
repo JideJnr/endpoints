@@ -3200,7 +3200,8 @@ def _existing_schema_can_be_trusted() -> bool:
                   and name in ('prediction_history', 'match_buffer', 'job_runs', 'team_behaviour_profiles', 'user_behavior')
                 """
             ).fetchone()
-        return int(row[0] if row else 0) >= 3
+        # Require ALL core tables to exist, not just 3
+        return int(row[0] if row else 0) >= 5
     except sqlite3.OperationalError as exc:
         if _is_sqlite_lock(exc):
             return True
