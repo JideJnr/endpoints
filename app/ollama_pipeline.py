@@ -203,6 +203,7 @@ async def _call_ollama_async(model: str, prompt: str, timeout: int = 60) -> str:
             "prompt": prompt,
             "stream": False,
             "think": False,
+            "keep_alive": "-1",
             "options": {"temperature": 0, "num_predict": 256},
         }).encode("utf-8")
         req = urllib_request.Request(

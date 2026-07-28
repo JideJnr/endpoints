@@ -6,6 +6,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings, public_settings
 from app.league_memory import DB_PATH, _init_db, close_db
+from app.ollama_model_manager import preload_all_models, start_keep_alive, stop_keep_alive
 from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore, user_behavior, betbuilder
 from app.routers import sofa_pipeline as sofa_pipeline_router
 from app.routers import pipelines as pipelines_router
@@ -21,7 +22,6 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_db()
-    # ── Initialize default pipeline states on first boot ──────────────────────
     try:
         from app.pipeline_registry import ensure_default_states
         initialised = ensure_default_states()
@@ -29,7 +29,6 @@ async def lifespan(app: FastAPI):
             print(f"[startup] pipeline defaults set: {initialised}")
     except Exception as exc:
         print(f"[startup] pipeline default init failed: {exc}")
-    # Clean up any finished matches left in buffer from previous run
     try:
         from app.mongo_store import cleanup_buffer
         result = cleanup_buffer()
@@ -45,6 +44,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[startup] job recovery failed: {exc}")
     try:
+        from app.ollama_model_manager import preload_all_models, start_keep_alive
+        preload_results = preload_all_models()
+        loaded = sum(1 for v in preload_results.values() if v)
+        total = len(preload_results)
+        print(f"[startup] ollama preload: {loaded}/{total} models loaded")
+        start_keep_alive(interval_seconds=120)
+        print("[startup] ollama keep-alive thread started")
+    except Exception as exc:
+        print(f"[startup] ollama preload failed: {exc}")
+    try:
         if settings.environment != "test":
             start_scheduler()
         print(
@@ -58,6 +67,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await _close_live_websockets()
+        stop_keep_alive()
         from app.scheduler import stop_scheduler
         stop_scheduler(wait=True)
 

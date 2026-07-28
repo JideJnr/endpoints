@@ -453,6 +453,7 @@ def get_ollama_status():
     """Check if Ollama is running and which models are available."""
     try:
         from app.ollama_agent import is_ollama_available, OLLAMA_MODELS
+        from app.ollama_model_manager import get_model_status, is_model_loaded
         reachable = is_ollama_available()
         model_status = {}
         if reachable:
@@ -461,6 +462,7 @@ def get_ollama_status():
                 model_status[model] = {
                     **info,
                     "available": is_ollama_available(model),
+                    "resident": is_model_loaded(model),
                     "pull_command": f"ollama pull {model}",
                 }
         return {
@@ -468,6 +470,7 @@ def get_ollama_status():
             "ollama_running": reachable,
             "message": "Ollama ready" if reachable else "Ollama not running. Start with: ollama serve",
             "models": model_status,
+            "model_manager": get_model_status(),
         }
     except Exception as e:
         return {"status": "error", "ollama_running": False, "detail": str(e)}

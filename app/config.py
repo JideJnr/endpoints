@@ -58,6 +58,7 @@ class Settings:
     risk_manager_bootstrap_confidence_ceiling: int
     clear_winner_probability_gap: float
     ollama_pipeline_enabled: bool
+    ollama_keep_alive_interval: int
 
 
 def get_settings() -> Settings:
@@ -95,6 +96,7 @@ def get_settings() -> Settings:
         risk_manager_bootstrap_confidence_ceiling=_int_env("RISK_MANAGER_BOOTSTRAP_CONFIDENCE_CEILING", 78),
         clear_winner_probability_gap=float(os.getenv("CLEAR_WINNER_PROBABILITY_GAP", "12")),
         ollama_pipeline_enabled=_bool_env("PREDICTX_OLLAMA_PIPELINE_ENABLED", True),
+        ollama_keep_alive_interval=_int_env("PREDICTX_OLLAMA_KEEP_ALIVE_INTERVAL", 120),
     )
 
 
@@ -112,8 +114,9 @@ def public_settings() -> dict[str, object]:
             "ollama_url": settings.ollama_url,
             "ollama_model": settings.ollama_model,
             "timeout_seconds": settings.ai_timeout_seconds,
-            "pipeline_enabled": settings.ollama_pipeline_enabled,
-        },
+        "pipeline_enabled": settings.ollama_pipeline_enabled,
+        "keep_alive_interval_seconds": settings.ollama_keep_alive_interval,
+      },
         "web_search": {
             "enabled": settings.web_search_enabled,
             "backends": settings.web_search_backends,

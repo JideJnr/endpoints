@@ -94,6 +94,7 @@ async def _call_ollama_async(model: str, prompt: str, timeout: int = 120) -> str
             "prompt": f"{SYSTEM_PROMPT}\n\n{prompt}",
             "stream": False,
             "think": False,
+            "keep_alive": "-1",
             "options": {"temperature": 0, "num_predict": 256},
         }).encode("utf-8")
         req = urllib_request.Request(
