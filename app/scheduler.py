@@ -1341,15 +1341,17 @@ def start_scheduler():
         next_run_time=now + timedelta(seconds=10),
     )
 
-    # enrichment worker — every 30 sec, processes today/live first
+    # enrichment worker — every 30 sec, processes today/live first.
+    # It can overlap because each pass works in small batches and row-level
+    # state handles duplicate avoidance better than a coarse scheduler lock.
     scheduler.add_job(
-        _safe(job_enrich_worker),
+        _safe_no_guard(job_enrich_worker),
         IntervalTrigger(seconds=_scheduler_interval("enrich_worker")),
         id="enrich_worker",
         name="Enrichment + prediction worker (live + today)",
         replace_existing=True,
-        max_instances=1,
-        coalesce=True,
+        max_instances=4,
+        coalesce=False,
         misfire_grace_time=120,
         next_run_time=now + timedelta(seconds=45),
     )
@@ -1851,6 +1853,24 @@ def _safe(fn):
             return {"status": "shutdown", "job": fn.__name__}
         try:
             return run_job_with_guard(fn, *args, **kwargs)
+        except RuntimeError as exc:
+            if _is_shutdown_runtime_error(exc):
+                return {"status": "shutdown", "job": fn.__name__}
+            print(f"[scheduler] {fn.__name__} failed: {exc}")
+            record_activity(f"{fn.__name__} failed: {exc}", job=fn.__name__, status="error")
+        except Exception as exc:
+            print(f"[scheduler] {fn.__name__} failed: {exc}")
+            record_activity(f"{fn.__name__} failed: {exc}", job=fn.__name__, status="error")
+    return wrapper
+
+
+def _safe_no_guard(fn):
+    """Wrap a scheduler job without the persistent single-run guard."""
+    def wrapper(*args, **kwargs):
+        if is_shutting_down():
+            return {"status": "shutdown", "job": fn.__name__}
+        try:
+            return fn(*args, **kwargs)
         except RuntimeError as exc:
             if _is_shutdown_runtime_error(exc):
                 return {"status": "shutdown", "job": fn.__name__}
