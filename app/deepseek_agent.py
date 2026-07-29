@@ -1,23 +1,20 @@
 """
-Groq LangChain Prediction Agent
----------------------------------
-Ported from migrated predictz/agent.py.
-Full 10-step reasoning agent using llama-3.3-70b-versatile via Groq.
-
-This is an OPTIONAL enhancement on top of the existing rules-based prediction_agent.py.
-Falls back gracefully if GROQ_API_KEY is not set.
-
-Usage:
-    from app.groq_agent import run_groq_predictions
-    results = run_groq_predictions(match_date="2026-05-16", docs=enriched_docs)
+DeepSeek Prediction Agent
+--------------------------
+Routes all predictions through DeepSeek via AIRouter.
+The public API (run_deepseek_match_analysis, run_deepseek_predictions) is kept
+for backward compatibility with existing callers.
 """
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date as dt, datetime, timezone
 from typing import Any
 
 from app.league_memory import record_prediction
+
+logger = logging.getLogger(__name__)
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -55,20 +52,27 @@ _SYSTEM_PROMPT_LANGCHAIN = SYSTEM_PROMPT.replace("{", "{{").replace("}", "}}")
 # ── Agent builder ─────────────────────────────────────────────────────────────
 
 def _build_agent():
+    """Build a tool-calling agent using DeepSeek via LangChain OpenAI-compatible wrapper."""
     from langchain.agents import create_tool_calling_agent, AgentExecutor
     from langchain_core.prompts import ChatPromptTemplate
-    from app.llm import get_llm
+    from langchain_openai import ChatOpenAI
+    from app.config import get_settings
     from app.agent_tools import ALL_TOOLS
-    from datetime import datetime, timezone
 
     @__import__("langchain.tools", fromlist=["tool"]).tool
     def get_current_time() -> dict:
-        """Returns the current UTC time. Use to check if a match has already started."""
+        """Returns the current UTC time."""
         now = datetime.now(timezone.utc)
         return {"utc": now.isoformat(), "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M")}
 
+    settings = get_settings()
+    llm = ChatOpenAI(
+        model=settings.deepseek_model,
+        api_key=settings.deepseek_api_key,
+        base_url=settings.deepseek_base_url,
+        temperature=0,
+    )
     tools = ALL_TOOLS + [get_current_time]
-    llm = get_llm()
     prompt = ChatPromptTemplate.from_messages([
         ("system", _SYSTEM_PROMPT_LANGCHAIN),
         ("human", "{input}"),
@@ -82,7 +86,7 @@ def _build_agent():
 
 def _summarise_doc(doc: dict[str, Any]) -> str:
     """
-    Distil an enriched match doc into a tight summary for Groq.
+    Distil an enriched match doc into a tight summary for DeepSeek.
     Hard target: < 800 tokens total. No JSON blobs, no full history arrays.
     """
     detail = doc.get("sofascore_detail") or {}
@@ -161,8 +165,8 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
     web = doc.get("web_context") or {}
     snippets = web.get("snippets") or []
     web_str = str((snippets[0].get("snippet") if snippets else None) or "none")[:150]
-    grok_web = web.get("grok_analysis") or {}
-    grok_web_str = str(grok_web.get("summary") or "none")[:600]
+    deepseek_web = web.get("deepseek_analysis") or {}
+    deepseek_web_str = str(deepseek_web.get("summary") or "none")[:600]
 
     return (
         f"{doc.get('sportybet_name') or doc.get('name')} | "
@@ -179,7 +183,7 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         f"KNOWN_COMPETITION: {competition_line}\n"
         f"ODDS: {odds_str}\n"
         f"WEB: {web_str}\n"
-        f"GROK_WEB_RESEARCH: {grok_web_str}\n"
+        f"DEEPSEEK_WEB_RESEARCH: {deepseek_web_str}\n"
         f"\nOutput prediction as JSON."
     )
 
@@ -199,7 +203,7 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
         parsed = json.loads(raw.strip())
         parsed["sportybet_id"] = doc.get("sportybet_id")
         parsed["match_id"] = doc.get("sportybet_id")
-        parsed["source"] = "groq_agent"
+        parsed["source"] = "deepseek_agent"
         return parsed
     except Exception as exc:
         return {
@@ -207,24 +211,22 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
             "sportybet_id": doc.get("sportybet_id"),
             "status": "error",
             "error": str(exc),
-            "source": "groq_agent",
+            "source": "deepseek_agent",
         }
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
+def run_deepseek_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     """
-    Run a match analysis for one enriched document.
-    Routes through AIRouter: Ollama Pipeline → qwen3:8b → deepseek-r1:8b → Groq.
+    Run a match analysis for one enriched document via DeepSeek.
     """
     from app.ai_router import get_router, parse_json_response
 
     router = get_router()
     if not router.any_available():
-        return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
+        return {"status": "ai_unavailable", "message": "No AI provider available. Set DEEPSEEK_API_KEY in .env."}
 
-    # Try small-context pipeline first if available
     if router.is_pipeline_available():
         try:
             from app.ollama_pipeline import run_ollama_pipeline
@@ -232,7 +234,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
             if pipeline_result.get("status") == "predicted":
                 return pipeline_result
         except Exception as exc:
-            logger.warning("groq_agent: pipeline failed, falling back to single-call: %s", exc)
+            logger.warning("deepseek_agent: pipeline failed, falling back to single-call: %s", exc)
 
     try:
         from app.competition_special import apply_known_competition_context
@@ -256,7 +258,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         confidence = None
 
     status_info = router.status()
-    active_model = status_info.get("primary_model") or "groq"
+    active_model = status_info.get("primary_model") or "deepseek-chat"
 
     return {
         "status": result.get("status") or "predicted",
@@ -269,30 +271,23 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         "btts": result.get("btts"),
         "over_2_5": result.get("over_2_5"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "ai_router",
+        "source": "deepseek",
         "model": active_model,
     }
 
 
-def run_groq_predictions(
+def run_deepseek_predictions(
     match_date: str | None = None,
     docs: list[dict[str, Any]] | None = None,
     limit: int = 50,
 ) -> dict[str, Any]:
     """
-    Run the Groq LangChain agent over enriched match documents.
-
-    Args:
-        match_date: YYYY-MM-DD, defaults to today
-        docs:       pre-loaded enriched docs (skips DB fetch if provided)
-        limit:      max matches to predict in one call
-
-    Returns:
-        summary dict with predictions list
+    Run DeepSeek predictions over enriched match documents.
+    Function name kept for backward compatibility.
     """
     from app.ai_router import get_router
     if not get_router().any_available():
-        return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
+        return {"status": "ai_unavailable", "message": "No AI provider available. Set DEEPSEEK_API_KEY in .env."}
 
     target_date = match_date or dt.today().isoformat()
 
@@ -304,7 +299,7 @@ def run_groq_predictions(
         return {"status": "no_matches", "date": target_date, "predictions": []}
 
     docs = docs[:limit]
-    print(f"[groq_agent] predicting {len(docs)} matches for {target_date}")
+    print(f"[deepseek_agent] predicting {len(docs)} matches for {target_date}")
 
     try:
         executor = _build_agent()
@@ -317,7 +312,7 @@ def run_groq_predictions(
 
     for i, doc in enumerate(docs, 1):
         name = doc.get("sportybet_name") or doc.get("name") or "unknown"
-        print(f"[groq_agent] [{i}/{len(docs)}] {name}")
+        print(f"[deepseek_agent] [{i}/{len(docs)}] {name}")
         pred = _predict_one(executor, doc)
         predictions.append(pred)
 
@@ -329,7 +324,7 @@ def run_groq_predictions(
                     **pred,
                     "match_id": str(doc.get("sportybet_id") or ""),
                     "match_date": target_date,
-                    "source": "groq_agent",
+                    "source": "deepseek_agent",
                 })
             except Exception:
                 pass
