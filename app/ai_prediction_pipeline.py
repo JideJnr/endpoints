@@ -262,6 +262,84 @@ def _history_for_team(team_name: str, conn: sqlite3.Connection) -> list[tuple[in
     return result
 
 
+def _previous_matches_for_team(team_name: str, conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
+    if not team_name:
+        return []
+    rows = conn.execute(
+        """select home_team, away_team, final_home_goals, final_away_goals, league_name, country_name, match_date
+           from matches
+           where is_finished=1 and (lower(home_team)=lower(?) or lower(away_team)=lower(?))
+           order by coalesce(match_date, last_seen_at) desc
+           limit ?""",
+        (team_name, team_name, limit),
+    ).fetchall()
+    matches: list[dict[str, Any]] = []
+    for home, away, hg, ag, league, country, match_date in rows:
+        try:
+            home_goals = int(hg)
+            away_goals = int(ag)
+        except (TypeError, ValueError):
+            continue
+        is_home = str(home).lower() == team_name.lower()
+        scored = home_goals if is_home else away_goals
+        conceded = away_goals if is_home else home_goals
+        matches.append(
+            {
+                "date": match_date,
+                "league": league,
+                "country": country,
+                "home": home,
+                "away": away,
+                "score": f"{home_goals}-{away_goals}",
+                "team_side": "home" if is_home else "away",
+                "team_goals": scored,
+                "opponent_goals": conceded,
+                "result": "W" if scored > conceded else "D" if scored == conceded else "L",
+            }
+        )
+    return matches
+
+
+def _team_history_summary(team_name: str, matches: list[dict[str, Any]]) -> str:
+    if not matches:
+        return f"{team_name}: no finished previous-match history found."
+    played = len(matches)
+    wins = sum(1 for row in matches if row["result"] == "W")
+    draws = sum(1 for row in matches if row["result"] == "D")
+    losses = sum(1 for row in matches if row["result"] == "L")
+    goals_for = sum(float(row["team_goals"]) for row in matches)
+    goals_against = sum(float(row["opponent_goals"]) for row in matches)
+    btts = sum(1 for row in matches if row["team_goals"] > 0 and row["opponent_goals"] > 0)
+    over25 = sum(1 for row in matches if row["team_goals"] + row["opponent_goals"] > 2)
+    recent = ", ".join(f"{row['result']} {row['score']} {row['home']} vs {row['away']}" for row in matches[:6])
+    return (
+        f"{team_name}: {played} previous finished matches, W-D-L {wins}-{draws}-{losses}, "
+        f"GF {goals_for:.0f}, GA {goals_against:.0f}, BTTS {btts/played:.0%}, over 2.5 {over25/played:.0%}. "
+        f"Recent: {recent}."
+    )
+
+
+def _step_team_history(doc: dict, model: str, timeout: int = 25) -> str:
+    try:
+        home, away = _teams(doc)
+        if not home or not away:
+            return "Team history unavailable because team names are missing."
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            home_matches = _previous_matches_for_team(home, conn)
+            away_matches = _previous_matches_for_team(away, conn)
+        evidence = _team_history_summary(home, home_matches) + " " + _team_history_summary(away, away_matches)
+        prompt = (
+            "You are the dedicated Team Previous Matches Analyst. Your trained knowledge is team trend reading: "
+            "recent W-D-L, goals for/against, BTTS, over/under profile, home/away context, and opponent quality. "
+            "Use only the supplied previous-match evidence and give one cautious prediction insight. "
+            f"Evidence: {evidence}"
+        )
+        return _ollama(model, prompt, timeout) or evidence
+    except Exception as exc:
+        logger.warning("AI step team_history failed: %s", exc)
+        return "Team previous-match history analyst unavailable."
+
+
 def derive_team_profile(team_name: str, conn: sqlite3.Connection) -> TeamBehaviourProfile:
     history = _history_for_team(team_name, conn)
     n = len(history); now = datetime.now(timezone.utc).isoformat()
@@ -384,9 +462,10 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             (_step_form,            FORM_FALLBACK,    2),
             (_step_odds,            ODDS_FALLBACK,    3),
             (_step_similar_matches, SIMILAR_FALLBACK, 4),
+            (_step_team_history,     "Team previous-match history unavailable.", 5),
         ]
         chain = [fallback for _, fallback, _ in _steps]  # pre-fill with fallbacks
-        with ThreadPoolExecutor(max_workers=5) as _pool:
+        with ThreadPoolExecutor(max_workers=len(_steps)) as _pool:
             _futures = {
                 _pool.submit(fn, doc, model): (fallback, idx)
                 for fn, fallback, idx in _steps
@@ -409,6 +488,14 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             **asdict(ReasoningContext(_name(doc), *chain)),
             # Preserve the ordered evidence chain for the API/UI and audits.
             "response_chain": chain,
+            "analysts": [
+                {"name": "H2H Analyst", "trained_knowledge": "Historical meetings and rivalry pattern reading", "finding": chain[0]},
+                {"name": "Common Opponent Analyst", "trained_knowledge": "Shared-opponent performance comparison", "finding": chain[1]},
+                {"name": "Form Analyst", "trained_knowledge": "Standings, recent form, ratings, and table pressure", "finding": chain[2]},
+                {"name": "Market Odds Analyst", "trained_knowledge": "Odds movement, pricing pressure, and market signal quality", "finding": chain[3]},
+                {"name": "Similar Match Analyst", "trained_knowledge": "Tier-comparable historical match outcomes", "finding": chain[4]},
+                {"name": "Team Previous Matches Analyst", "trained_knowledge": "Both teams' full recent finished-match profiles", "finding": chain[5]},
+            ],
         }
         prediction.update({"prediction_source":"ollama_pipeline", "ai_provider":model, "reasoning_context":reasoning_context, "market":decision["market"], "outcome":decision["outcome"], "key_factors":decision["key_factors"], "reasoning":decision["reasoning"], "confidence":_convert_confidence(decision["confidence"]), "value_bet":decision["value_bet"], "btts":decision["btts"], "over_2_5":decision["over_2_5"]})
         result["prediction_source"] = "ollama_pipeline"; result["reasoning_context"] = prediction["reasoning_context"]

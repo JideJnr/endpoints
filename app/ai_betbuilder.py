@@ -71,19 +71,43 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
 def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
     target_odds = max(1.01, _to_float(payload.get("target_odds")) or 5.0)
     max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 1.35)
-    candidates = upcoming_prediction_candidates(limit=50)
+    # This endpoint is user-facing. Keep the specialist pass bounded so it can
+    # return a useful slip instead of serially analysing an entire fixture list.
+    candidate_limit = max(4, min(_to_int(payload.get("candidate_limit"), 6), 8))
+    candidates = upcoming_prediction_candidates(limit=candidate_limit)
     analyses: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    if not candidates:
+        return {
+            "status": "error",
+            "message": "No current prediction-engine candidates are available",
+            "groq_powered": True,
+            "candidate_count": 0,
+            "candidate_limit": candidate_limit,
+        }
 
-    for candidate in candidates:
+    def _analyse_candidate(candidate: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         match_id = str(candidate.get("match_id") or "")
         if not match_id:
-            continue
-        analysis = enriched_match_analysis(match_id)
-        if analysis.get("status") != "success":
-            failures.append({"match_id": match_id, "match": candidate.get("match_name"), "status": analysis.get("status"), "message": analysis.get("message")})
-            continue
-        analyses.append(analysis)
+            return candidate, {"status": "skipped", "message": "Candidate has no match id"}
+        return candidate, enriched_match_analysis(match_id)
+
+    # A few independent specialist reviews can happen together, but keep this
+    # deliberately small: it shares the API process and must not monopolise it.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
+        futures = [pool.submit(_analyse_candidate, candidate) for candidate in candidates]
+        for future in as_completed(futures):
+            candidate, analysis = future.result()
+            if analysis.get("status") != "success":
+                failures.append({
+                    "match_id": candidate.get("match_id"),
+                    "match": candidate.get("match_name"),
+                    "status": analysis.get("status"),
+                    "message": analysis.get("message"),
+                })
+                continue
+            analyses.append(analysis)
 
     if len(analyses) < 2:
         return {
@@ -101,6 +125,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
         "groq_powered": True,
         "request": {"target_odds": target_odds, "max_total_odds": max_total_odds},
         "candidate_count": len(candidates),
+        "candidate_limit": candidate_limit,
         "analyses_run": len(candidates),
         "analyses_succeeded": len(analyses),
         "failures": failures,
@@ -132,9 +157,21 @@ def synthesize_sure_picks(
     for item in clean[:20]:
         groq_conf = _to_int(item.get("groq_confidence") or item.get("confidence"), 0)
         similar_used = _to_int(item.get("similar_matches_used"), 0)
-        conviction = round(groq_conf * (1 + 0.10 * similar_used), 2)
         engine_pick = item.get("prediction_engine_pick") or {}
         confirmed = bool(item.get("confirmed")) or _same_outcome(engine_pick.get("selection"), item.get("groq_recommendation"))
+        odds = round(_to_float(item.get("estimated_odds")) or _pick_decimal_odds(engine_pick), 3)
+        try:
+            from app.league_memory import betbuilder_pick_memory
+            learning = betbuilder_pick_memory(
+                engine_pick.get("type") or item.get("pick_type"),
+                item.get("groq_recommendation") or engine_pick.get("selection"),
+                item.get("league_name"),
+                item.get("country_name"),
+                odds,
+            )
+        except Exception:
+            learning = {"samples": 0, "win_rate": None, "adjustment": 0}
+        conviction = round(groq_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0), 2)
         ranked.append({
             "match_id": item.get("match_id") or item.get("sportybet_id"),
             "match": item.get("match_name") or item.get("match"),
@@ -145,9 +182,10 @@ def synthesize_sure_picks(
             "selection": item.get("groq_recommendation") or engine_pick.get("selection"),
             "groq_confidence": groq_conf,
             "confidence": groq_conf,
-            "odds": round(_to_float(item.get("estimated_odds")) or _pick_decimal_odds(engine_pick), 3),
-            "estimated_odds": round(_to_float(item.get("estimated_odds")) or _pick_decimal_odds(engine_pick), 3),
+            "odds": odds,
+            "estimated_odds": odds,
             "conviction_score": conviction,
+            "learning": learning,
             "confirmed": confirmed,
             "similar_matches_used": similar_used,
             "source": "groq",

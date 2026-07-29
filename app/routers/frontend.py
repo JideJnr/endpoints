@@ -1125,6 +1125,194 @@ def get_signal_attribution(min_samples: int = Query(default=5, ge=1, le=100), li
     return signal_attribution_report(min_samples=min_samples, limit=limit)
 
 
+ENGINE_CATALOG: dict[str, dict[str, Any]] = {
+    "value_hunter": {
+        "name": "Value Hunter",
+        "category": "value",
+        "description": "Finds picks where model confidence beats market price.",
+        "pick_types": {"value_bet", "market_value", "consensus_longshot_value"},
+        "signal_names": {"odds_edge", "market_steam", "odds_progression"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "over_specialist": {
+        "name": "Over Specialist",
+        "category": "goals",
+        "description": "Targets goal overs from team scoring profile, models, and league memory.",
+        "pick_types": {"goals", "live_goals", "live_total_goals"},
+        "signal_names": {"goal_pressure", "poisson_model", "dixon_coles_model", "finished_database_memory"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "under_specialist": {
+        "name": "Under Specialist",
+        "category": "goals",
+        "description": "Targets unders when scoring pressure, memory, and market context are restrained.",
+        "pick_types": {"goals", "live_total_goals"},
+        "signal_names": {"goal_pressure", "finished_database_memory", "poisson_model"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "gg_hunter": {
+        "name": "BTTS Hunter",
+        "category": "goals",
+        "description": "Reads both-teams-to-score conditions from form, models, and finished memory.",
+        "pick_types": {"goals"},
+        "signal_names": {"goal_pressure", "finished_database_memory", "poisson_model", "dixon_coles_model"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "safe_home": {
+        "name": "Safe Home",
+        "category": "result",
+        "description": "Looks for home/double-chance protection with strong table and model support.",
+        "pick_types": {"match_result", "double_chance", "ensemble_1x2"},
+        "signal_names": {"league_position_edge", "h2h_edge", "ensemble_model", "elo_model"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "draw_specialist": {
+        "name": "Draw Specialist",
+        "category": "result",
+        "description": "Finds draw-shaped fixtures from model balance and matchup context.",
+        "pick_types": {"match_result", "ensemble_1x2"},
+        "signal_names": {"ensemble_model", "poisson_model", "dixon_coles_model"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "ht_ft_double": {
+        "name": "HT/FT Full-Match Reader",
+        "category": "special",
+        "description": "Needs whole-match context to reason about half-time/full-time game script.",
+        "pick_types": {"ht_ft_double", "match_result"},
+        "signal_names": {"h2h_edge", "league_strength_edge", "common_opponent_edge", "form_momentum"},
+        "power": ["manual_rules", "ai_full_match"],
+        "requires_full_match": True,
+    },
+    "form_momentum": {
+        "name": "Form Momentum",
+        "category": "special",
+        "description": "Certifies games where recent form and motivation support a side.",
+        "pick_types": {"market_value", "match_result", "double_chance"},
+        "signal_names": {"recent_history_edge", "league_position_edge", "league_strength_edge"},
+        "power": ["manual_rules", "ai_context"],
+    },
+    "sharp_follower": {
+        "name": "Sharp Follower",
+        "category": "sharp",
+        "description": "Follows meaningful market shortening and backed selections.",
+        "pick_types": {"market_value", "value_bet"},
+        "signal_names": {"market_steam", "odds_progression", "odds_edge"},
+        "power": ["manual_rules", "ai_context"],
+    },
+}
+
+
+def _engine_row_matches(engine: dict[str, Any], pick_type: str, selection: str, signals: list[dict[str, Any]]) -> bool:
+    pick_type = str(pick_type or "")
+    selection_text = str(selection or "").lower()
+    if pick_type in engine.get("pick_types", set()):
+        if engine.get("name") == "Under Specialist":
+            return "under" in selection_text or pick_type == "live_total_goals"
+        if engine.get("name") == "Over Specialist":
+            return "over" in selection_text or pick_type in {"live_goals", "live_total_goals"}
+        if engine.get("name") == "BTTS Hunter":
+            return "btts" in selection_text or "both teams" in selection_text
+        if engine.get("name") == "Draw Specialist":
+            return "draw" in selection_text or pick_type == "ensemble_1x2"
+        return True
+    signal_names = {str(signal.get("name") or "") for signal in signals if isinstance(signal, dict)}
+    return bool(signal_names.intersection(engine.get("signal_names", set())))
+
+
+def _engine_work_rows(limit: int = 3000) -> list[dict[str, Any]]:
+    from app.league_memory import DB_PATH, _init_db
+    import json
+    import sqlite3
+
+    _init_db()
+    rows: list[dict[str, Any]] = []
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        query = """
+            select * from (
+                select id, match_id, match_name, league_name, country_name, pick_type,
+                       selection, confidence, reason, result, final_home, final_away,
+                       graded_at, created_at, signals_json, '{}' as context_json, 'primary' as role
+                from prediction_history
+                where pick_type != 'no_bet'
+                union all
+                select id, match_id, match_name, league_name, country_name, pick_type,
+                       selection, confidence, reason, result, final_home, final_away,
+                       graded_at, created_at, signals_json, context_json, coalesce(role, 'candidate') as role
+                from prediction_candidate_history
+                where pick_type != 'no_bet'
+            )
+            order by datetime(created_at) desc
+            limit ?
+        """
+        for row in conn.execute(query, (limit,)).fetchall():
+            try:
+                signals = json.loads(row["signals_json"] or "[]")
+            except Exception:
+                signals = []
+            rows.append({**dict(row), "signals": signals})
+    return rows
+
+
+def _engine_projection(engine_id: str, limit: int = 3000) -> dict[str, Any]:
+    engine = ENGINE_CATALOG.get(engine_id)
+    if not engine:
+        raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
+    matches: list[dict[str, Any]] = []
+    for row in _engine_work_rows(limit=limit):
+        if not _engine_row_matches(engine, row.get("pick_type") or "", row.get("selection") or "", row.get("signals") or []):
+            continue
+        result = row.get("result")
+        graded = bool(row.get("graded_at"))
+        matches.append({
+            "id": row.get("id"),
+            "match_id": row.get("match_id"),
+            "match_name": row.get("match_name"),
+            "league_name": row.get("league_name"),
+            "country_name": row.get("country_name"),
+            "pick_type": row.get("pick_type"),
+            "selection": row.get("selection"),
+            "confidence": row.get("confidence"),
+            "reason": row.get("reason"),
+            "role": row.get("role"),
+            "result": result,
+            "graded": graded,
+            "final_home": row.get("final_home"),
+            "final_away": row.get("final_away"),
+            "graded_at": row.get("graded_at"),
+            "created_at": row.get("created_at"),
+            "certified_by": sorted({str(s.get("name") or "") for s in row.get("signals") or [] if isinstance(s, dict) and s.get("name")}),
+        })
+    graded_rows = [item for item in matches if item.get("graded")]
+    wins = sum(1 for item in graded_rows if item.get("result") == "win")
+    losses = sum(1 for item in graded_rows if item.get("result") == "loss")
+    pending = len([item for item in matches if not item.get("graded")])
+    return {
+        "engine_id": engine_id,
+        "engine": {k: v for k, v in engine.items() if k not in {"pick_types", "signal_names"}},
+        "stats": {
+            "total": len(matches),
+            "graded": len(graded_rows),
+            "wins": wins,
+            "losses": losses,
+            "pending": pending,
+            "accuracy": round(wins / len(graded_rows) * 100, 1) if graded_rows else None,
+        },
+        "matches": matches[:200],
+    }
+
+
+@router.get("/engines/dashboard")
+def get_engines_dashboard(limit: int = Query(default=3000, ge=100, le=20000)):
+    projections = [_engine_projection(engine_id, limit=limit) for engine_id in ENGINE_CATALOG]
+    return {"status": "success", "engines": projections, "source": "prediction_history"}
+
+
+@router.get("/engines/{engine_id}/work")
+def get_engine_work(engine_id: str, limit: int = Query(default=3000, ge=100, le=20000)):
+    return {"status": "success", **_engine_projection(engine_id, limit=limit), "source": "prediction_history"}
+
+
 @router.post("/analytics/calibration/rebuild")
 def rebuild_calibration_endpoint():
     """Force-rebuild the calibration table from all graded predictions."""
@@ -1921,15 +2109,32 @@ def predict_single_match(
         raise HTTPException(status_code=409, detail={"message": str(exc), "agent": exc.trace})
 
     state = result.get("prediction_state") or {}
+    try:
+        doc = get_buffered_match(sportybet_id)
+        if doc is not None:
+            doc["manual_prediction_state"] = state
+            if state.get("prediction"):
+                doc["prediction"] = state["prediction"]
+                doc["prediction_error"] = None
+            elif state.get("message"):
+                doc["prediction_error"] = state.get("message")
+            store_enriched(sportybet_id, doc)
+    except Exception as exc:
+        _logger.debug("Could not persist manual prediction state for %s: %s", sportybet_id, exc)
+
     if result.get("status") == "deferred":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": state.get("message") or "Prediction deferred until full signal is ready",
-                "readiness": result.get("readiness"),
-                "agent": result.get("agent"),
-            },
-        )
+        return {
+            "status": "success",
+            "sportybet_id": sportybet_id,
+            "sporty_refresh": result.get("sporty_refresh"),
+            "prediction": None,
+            "prediction_state": state,
+            "manual_prediction_state": state,
+            "deferred": True,
+            "message": state.get("message") or "Prediction deferred until full signal is ready",
+            "readiness": result.get("readiness"),
+            "agent": result.get("agent"),
+        }
     if result.get("status") == "error":
         raise HTTPException(status_code=500, detail={"message": state.get("message") or "Prediction failed", "agent": result.get("agent")})
     if result.get("status") == "skipped":
@@ -1938,8 +2143,11 @@ def predict_single_match(
             "sportybet_id": sportybet_id,
             "sporty_refresh": result.get("sporty_refresh"),
             "prediction": result.get("prediction") or _latest_prediction(sportybet_id),
+            "prediction_state": state,
+            "manual_prediction_state": state,
             "skipped": True,
             "skip_reason": state.get("skip_reason"),
+            "message": state.get("message") or state.get("skip_reason"),
             "agent": result.get("agent"),
         }
 
@@ -1948,37 +2156,87 @@ def predict_single_match(
         "sportybet_id": sportybet_id,
         "sporty_refresh": result.get("sporty_refresh"),
         "prediction": result.get("prediction"),
+        "prediction_state": state,
+        "manual_prediction_state": state,
+        "message": state.get("message") or "Prediction complete",
         "agent": result.get("agent"),
+    }
+
+
+def _first_prediction_pick(prediction: dict[str, Any]) -> dict[str, Any]:
+    picks = prediction.get("picks") or []
+    if isinstance(picks, list) and picks:
+        primary = next((p for p in picks if isinstance(p, dict) and p.get("role") == "primary"), None)
+        return primary or next((p for p in picks if isinstance(p, dict)), {})
+    return {}
+
+
+def _normalise_ai_pipeline_analysis(state: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:
+    prediction = state.get("prediction") or {}
+    primary = _first_prediction_pick(prediction)
+    reasoning_context = prediction.get("reasoning_context") or state.get("reasoning_context") or {}
+    recommendation = (
+        prediction.get("outcome")
+        or prediction.get("recommendation")
+        or primary.get("selection")
+        or primary.get("pick")
+        or prediction.get("market")
+    )
+    confidence = prediction.get("confidence", primary.get("confidence"))
+    return {
+        "status": "predicted" if recommendation else state.get("status", "completed"),
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "value_bet": bool(prediction.get("value_bet") or primary.get("value_bet")),
+        "key_factors": prediction.get("key_factors") or primary.get("key_factors") or [],
+        "reasoning": prediction.get("reasoning") or {},
+        "reasoning_context": reasoning_context,
+        "analysts": reasoning_context.get("analysts") or [],
+        "market_signal": prediction.get("market_signal") or prediction.get("market"),
+        "btts": prediction.get("btts"),
+        "over_2_5": prediction.get("over_2_5"),
+        "provider": prediction.get("ai_provider") or state.get("ai_provider") or state.get("prediction_source") or "ai_pipeline",
+        "source": state.get("prediction_source") or prediction.get("prediction_source") or "ai_pipeline",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "match": doc.get("sportybet_name") or doc.get("name"),
+        "pipeline_state_status": state.get("status"),
     }
 
 
 @router.post("/matches/{sportybet_id}/ai-analysis")
 def analyze_match_with_ai(sportybet_id: str):
     """
-    Run AI analysis with fallback: try Groq first, then Ollama.
-    Returns the result from the first successful provider.
+    Run the rebuilt one-call-per-analyst AI prediction pipeline and persist the result.
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in the buffer")
 
-    from app.groq_agent import run_groq_match_analysis
-    from app.ollama_agent import run_ollama_all_models
+    from app.ai_prediction_pipeline import run_ai_prediction_with_fallback
 
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        doc["ai_analysis"] = analysis
-        store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+    state = run_ai_prediction_with_fallback(
+        doc,
+        match_id=sportybet_id,
+        match_date=doc.get("match_date"),
+        source="manual_ai_prediction",
+        attach_brain=True,
+        allow_repeat=True,
+    )
+    if state.get("status") not in {"predicted", "success"} and not state.get("prediction"):
+        raise HTTPException(status_code=503, detail=state.get("message") or "AI analysis is unavailable")
 
-    ollama_result = run_ollama_all_models(doc)
-    if ollama_result.get("status") == "success":
-        doc["ai_analysis_ollama"] = ollama_result
-        store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
-
-    raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
+    analysis = _normalise_ai_pipeline_analysis(state, doc)
+    doc["ai_analysis"] = analysis
+    doc["ai_prediction_state"] = state
+    store_enriched(sportybet_id, doc)
+    return {
+        "status": "success",
+        "sportybet_id": sportybet_id,
+        "analysis": analysis,
+        "provider": analysis.get("provider"),
+        "pipeline_state": state,
+    }
 
 
 @router.get("/matches/{sportybet_id}/ai-analysis-all")
@@ -2187,6 +2445,8 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "start_time": doc.get("start_time"),
         "ai_analysis": doc.get("ai_analysis"),
         "ai_analysis_ollama": doc.get("ai_analysis_ollama"),
+        "ai_prediction_state": doc.get("ai_prediction_state"),
+        "manual_prediction_state": doc.get("manual_prediction_state"),
         "period": doc.get("period"),
         "played_seconds": doc.get("played_seconds"),
         "is_live": bool(match_state.get("is_live")),
@@ -2262,7 +2522,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "prediction_error": doc.get("prediction_error") or (
             "Prediction deferred until full signal is ready"
             + (f": {', '.join(readiness.get('missing') or [])}" if readiness.get("missing") else "")
-            if not readiness.get("ready")
+            if not readiness.get("ready") and not current_prediction
             else None
         ),
         "stale_prediction": _latest_prediction(sportybet_id) if not readiness.get("ready") else None,
@@ -2600,9 +2860,8 @@ def _manager_name(managers: dict[str, Any], side: str) -> str | None:
 
 
 def _current_prediction_for_detail(match_id: str, readiness: dict[str, Any], doc: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    if not readiness.get("ready"):
-        return None
     current_state = classify_match_state(doc or {})
+    # Always show an existing prediction — readiness only gates running a new one
     current = (doc or {}).get("prediction")
     if isinstance(current, dict) and current.get("picks"):
         if _prediction_mode_conflicts(current, current_state):
