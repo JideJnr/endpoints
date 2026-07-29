@@ -429,6 +429,20 @@ def _init_db_unlocked() -> None:
                 cached_at  text not null
             )
         """)
+        conn.execute("""
+            create table if not exists specialist_performance (
+                specialist_name  text not null,
+                league_key       text not null default '__global__',
+                pick_type        text not null default '__all__',
+                samples          integer not null default 0,
+                wins             integer not null default 0,
+                losses           integer not null default 0,
+                win_rate         real,
+                weight           real not null default 1.0,
+                last_updated     text not null default current_timestamp,
+                primary key (specialist_name, league_key, pick_type)
+            )
+        """)
         _ensure_column(conn, "matches", "match_fingerprint", "text")
         _ensure_column(conn, "matches", "start_time", "text")
         conn.execute("create index if not exists idx_matches_league on matches(league_key)")

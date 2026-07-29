@@ -2904,6 +2904,31 @@ def _grade_signal_stats(graded: int) -> dict[str, Any]:
 
 # ── Brain / Self-Learning Analytics ──────────────────────────────────────────
 
+@router.get("/analytics/brain/specialists")
+def get_specialist_performance(league: str = Query(default=""), pick_type: str = Query(default="")):
+    """
+    Return learned performance stats for each AI specialist analyst.
+    Shows win rate, sample count, and learned weight (0.3–2.0).
+    Weight > 1.0 = specialist is trusted more; < 1.0 = suppressed.
+    """
+    from app.ai_prediction_pipeline import get_specialist_summary, get_specialist_weights
+    summary = get_specialist_summary()
+    weights = get_specialist_weights(
+        league=league or None,
+        pick_type=pick_type or None,
+    )
+    # Merge scoped weights into summary
+    for item in summary:
+        item["scoped_weight"] = round(weights.get(item["specialist"], 1.0), 3)
+    return {
+        "status": "success",
+        "scope": {"league": league or "global", "pick_type": pick_type or "all"},
+        "min_samples_to_trust": 10,
+        "specialists": summary,
+        "weights": weights,
+    }
+
+
 @router.get("/analytics/brain/summary")
 def get_brain_summary():
     """

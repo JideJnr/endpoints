@@ -17,7 +17,143 @@ from app.league_memory import DB_PATH, _init_db
 
 logger = logging.getLogger(__name__)
 
-H2H_FALLBACK = "No H2H history available for this fixture."
+SPECIALIST_NAMES = [
+    "H2H Analyst",
+    "Common Opponent Analyst",
+    "Form Analyst",
+    "Market Odds Analyst",
+    "Similar Match Analyst",
+    "Team Previous Matches Analyst",
+]
+
+MIN_SPECIALIST_SAMPLES = 10   # minimum graded predictions before trusting a specialist's ratio
+
+
+def get_specialist_weights(league: str | None = None, pick_type: str | None = None) -> dict[str, float]:
+    """
+    Return {specialist_name: weight} for the given scope.
+    Falls back to global weights, then to 1.0 (neutral) if no data.
+    """
+    _init_db()
+    league_key = (league or "").lower().strip().replace(" ", "_")[:60] or "__global__"
+    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            select specialist_name, weight, league_key, samples
+            from specialist_performance
+            where league_key in (?, '__global__')
+              and pick_type in (?, '__all__')
+              and samples >= ?
+            order by
+                case when league_key = ? then 0 else 1 end,
+                case when pick_type = ? then 0 else 1 end
+        """, (league_key, pick_type or "__all__", MIN_SPECIALIST_SAMPLES, league_key, pick_type or "__all__")).fetchall()
+    weights: dict[str, float] = {}
+    for row in rows:
+        name = row["specialist_name"]
+        if name not in weights:  # league-specific wins over global
+            weights[name] = round(float(row["weight"]), 4)
+    # Fill missing specialists with neutral weight 1.0
+    for name in SPECIALIST_NAMES:
+        weights.setdefault(name, 1.0)
+    return weights
+
+
+def record_specialist_outcome(
+    specialist_name: str,
+    result: str,           # 'win' or 'loss'
+    league: str | None = None,
+    pick_type: str | None = None,
+) -> None:
+    """
+    Record one graded outcome for a specialist.
+    Called after a prediction is graded — the specialist contributed if its
+    evidence_status was 'available' for that prediction.
+    """
+    _init_db()
+    league_key = (league or "").lower().strip().replace(" ", "_")[:60] or "__global__"
+    pt = pick_type or "__all__"
+    win = 1 if result == "win" else 0
+    loss = 1 if result == "loss" else 0
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        for lk in (league_key, "__global__"):
+            for pk in ({pt, "__all__"}):
+                conn.execute("""
+                    insert into specialist_performance
+                        (specialist_name, league_key, pick_type, samples, wins, losses, win_rate, weight, last_updated)
+                    values (?, ?, ?, 1, ?, ?, null, 1.0, ?)
+                    on conflict(specialist_name, league_key, pick_type) do update set
+                        samples      = samples + 1,
+                        wins         = wins + excluded.wins,
+                        losses       = losses + excluded.losses,
+                        last_updated = excluded.last_updated
+                """, (specialist_name, lk, pk, win, loss, now))
+        # Recompute win_rate and weight for touched rows
+        conn.execute("""
+            update specialist_performance
+            set win_rate = cast(wins as real) / samples,
+                weight   = max(0.3, min(2.0, 0.3 + (cast(wins as real) / samples) * 1.7))
+            where specialist_name = ? and samples >= ?
+        """, (specialist_name, MIN_SPECIALIST_SAMPLES))
+        conn.commit()
+
+
+def grade_specialist_contributions(
+    reasoning_context: dict[str, Any],
+    result: str,
+    league: str | None = None,
+    pick_type: str | None = None,
+) -> int:
+    """
+    After a prediction is graded, credit each specialist whose evidence was
+    'available' (i.e. actually contributed, not a fallback placeholder).
+    Returns the number of specialists credited.
+    """
+    analysts: list[dict[str, Any]] = reasoning_context.get("analysts") or []
+    if not analysts:
+        return 0
+    credited = 0
+    for analyst in analysts:
+        name = str(analyst.get("name") or "")
+        status = str(analyst.get("evidence_status") or "available")  # default available for legacy rows
+        if not name or status == "unavailable":
+            continue
+        try:
+            record_specialist_outcome(name, result, league=league, pick_type=pick_type)
+            credited += 1
+        except Exception:
+            pass
+    return credited
+
+
+def get_specialist_summary() -> list[dict[str, Any]]:
+    """Return global specialist performance for the analytics endpoint."""
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            select specialist_name, samples, wins, losses, win_rate, weight
+            from specialist_performance
+            where league_key = '__global__' and pick_type = '__all__'
+            order by coalesce(win_rate, 0) desc
+        """).fetchall()
+    return [
+        {
+            "specialist": row["specialist_name"],
+            "samples":    row["samples"],
+            "wins":       row["wins"],
+            "losses":     row["losses"],
+            "win_rate":   round(float(row["win_rate"]) * 100, 1) if row["win_rate"] is not None else None,
+            "weight":     round(float(row["weight"]), 3),
+            "status":     "trusted" if (row["samples"] or 0) >= MIN_SPECIALIST_SAMPLES else "learning",
+        }
+        for row in rows
+    ]
+
+
+
+H2H_FALLBACK = "No H2H history found between these teams."
 COMMON_FALLBACK = "No common opponents found in recent history."
 FORM_FALLBACK = "Standings data unavailable; form data not present."
 ODDS_FALLBACK = "Odds movement data unavailable."
@@ -53,6 +189,19 @@ class MarketCandidate:
     market_key: str
     label: str
     score: float
+
+
+def _evidence_status(statement: str) -> str:
+    """Expose absent specialist evidence to both the decider and the UI."""
+    text = str(statement or "").lower()
+    unavailable_markers = (
+        "no h2h history",
+        "no common opponents",
+        "unavailable",
+        "not present",
+        "0 previous finished matches",
+    )
+    return "unavailable" if any(marker in text for marker in unavailable_markers) else "available"
 
 
 def _name(doc: dict[str, Any]) -> str:
@@ -112,9 +261,12 @@ def sort_gate(matches: list[dict]) -> list[dict]:
 
 
 def _apply_recency_decay(h2h_matches: list[dict]) -> list[dict]:
+    result = []
     for index, match in enumerate(h2h_matches):
-        match["weight"] = 1.0 if index < 2 else 0.6 if index < 5 else 0.3
-    return h2h_matches
+        m = dict(match) if isinstance(match, dict) else {}
+        m["weight"] = 1.0 if index < 2 else 0.6 if index < 5 else 0.3
+        result.append(m)
+    return result
 
 
 def _score(match: dict, side: str) -> float | None:
@@ -127,8 +279,18 @@ def _score(match: dict, side: str) -> float | None:
     return None
 
 
-def _build_h2h_statement(h2h_matches: list[dict]) -> str:
-    if not h2h_matches: return H2H_FALLBACK
+def _build_h2h_statement(h2h_matches: list[dict], team_duel: dict | None = None) -> str:
+    if not h2h_matches:
+        # Fall back to teamDuel aggregate when individual events are absent
+        if team_duel and isinstance(team_duel, dict):
+            hw = int(team_duel.get("homeWins") or 0)
+            aw = int(team_duel.get("awayWins") or 0)
+            dr = int(team_duel.get("draws") or 0)
+            total = hw + aw + dr
+            if total:
+                return (f"H2H aggregate ({total} meetings): home wins {hw/total:.0%}, "
+                        f"draws {dr/total:.0%}, away wins {aw/total:.0%}.")
+        return H2H_FALLBACK
     rows = _apply_recency_decay(h2h_matches)
     total = home = draw = away = 0.0
     for row in rows:
@@ -165,13 +327,27 @@ def _ollama(model: str, prompt: str, timeout: int) -> str:
 
 def _step_h2h(doc: dict, model: str, timeout: int = 20) -> str:
     try:
-        matches = list(doc.get("h2h") or doc.get("h2h_matches") or [])
+        # h2h may be a dict {events: [...], teamDuel: {...}} or a bare list
+        raw_h2h = doc.get("h2h") or (doc.get("sofascore_detail") or {}).get("h2h") or doc.get("h2h_matches")
+        if isinstance(raw_h2h, dict):
+            matches = list(raw_h2h.get("events") or [])
+            team_duel = raw_h2h.get("teamDuel") or raw_h2h.get("team_duel")
+        elif isinstance(raw_h2h, list):
+            matches = list(raw_h2h)
+            team_duel = None
+        else:
+            matches = []
+            team_duel = None
         event_id = doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id"))
-        if not matches and event_id:
+        if not matches and not team_duel and event_id:
             from app.sofascore_client import fetch_h2h
-            raw = fetch_h2h(int(event_id)) or {}
-            matches = raw.get("events", raw) if isinstance(raw, dict) else raw
-        evidence = _build_h2h_statement(matches if isinstance(matches, list) else [])
+            fetched = fetch_h2h(int(event_id)) or {}
+            if isinstance(fetched, dict):
+                matches = list(fetched.get("events") or [])
+                team_duel = fetched.get("teamDuel") or fetched.get("team_duel")
+            else:
+                matches = list(fetched) if isinstance(fetched, list) else []
+        evidence = _build_h2h_statement(matches, team_duel=team_duel)
         if evidence == H2H_FALLBACK: return evidence
         return _ollama(model, f"Summarise this H2H evidence for a football prediction in one factual sentence: {evidence}", timeout) or evidence
     except Exception as exc:
@@ -266,10 +442,10 @@ def _previous_matches_for_team(team_name: str, conn: sqlite3.Connection, limit: 
     if not team_name:
         return []
     rows = conn.execute(
-        """select home_team, away_team, final_home_goals, final_away_goals, league_name, country_name, match_date
+        """select home_team, away_team, final_home_goals, final_away_goals, league_name, country_name, start_time
            from matches
            where is_finished=1 and (lower(home_team)=lower(?) or lower(away_team)=lower(?))
-           order by coalesce(match_date, last_seen_at) desc
+           order by coalesce(start_time, last_seen_at) desc
            limit ?""",
         (team_name, team_name, limit),
     ).fetchall()
@@ -319,14 +495,59 @@ def _team_history_summary(team_name: str, matches: list[dict[str, Any]]) -> str:
     )
 
 
+def _parse_sofa_last_matches(events: list[dict], team_name: str) -> list[dict[str, Any]]:
+    """Convert SofaScore home_last_matches / away_last_matches events to the
+    same normalised format that _team_history_summary expects."""
+    result: list[dict[str, Any]] = []
+    for ev in events:
+        status = (ev.get("status") or {}).get("type", "")
+        if status not in ("finished", "ended"):
+            continue
+        ht = ev.get("homeTeam") or ev.get("home_team") or {}
+        at = ev.get("awayTeam") or ev.get("away_team") or {}
+        hn = ht.get("name", "") if isinstance(ht, dict) else str(ht)
+        an = at.get("name", "") if isinstance(at, dict) else str(at)
+        hsc = ev.get("homeScore") or {}
+        asc = ev.get("awayScore") or {}
+        try:
+            hg = int(hsc.get("current") if isinstance(hsc, dict) else hsc)
+            ag = int(asc.get("current") if isinstance(asc, dict) else asc)
+        except (TypeError, ValueError):
+            continue
+        is_home = hn.lower() == team_name.lower()
+        scored = hg if is_home else ag
+        conceded = ag if is_home else hg
+        result.append({
+            "date": ev.get("startTimestamp") or ev.get("start_timestamp"),
+            "league": (ev.get("tournament") or {}).get("name", ""),
+            "country": "",
+            "home": hn,
+            "away": an,
+            "score": f"{hg}-{ag}",
+            "team_side": "home" if is_home else "away",
+            "team_goals": scored,
+            "opponent_goals": conceded,
+            "result": "W" if scored > conceded else "D" if scored == conceded else "L",
+        })
+    return result
+
+
 def _step_team_history(doc: dict, model: str, timeout: int = 25) -> str:
     try:
         home, away = _teams(doc)
         if not home or not away:
             return "Team history unavailable because team names are missing."
+        # Primary: query SQLite finished matches
         with sqlite3.connect(DB_PATH, timeout=10) as conn:
             home_matches = _previous_matches_for_team(home, conn)
             away_matches = _previous_matches_for_team(away, conn)
+        # Fallback: use SofaScore last_matches arrays already in the doc
+        if not home_matches:
+            raw = doc.get("home_last_matches") or (doc.get("sofascore_detail") or {}).get("home_last_matches") or []
+            home_matches = _parse_sofa_last_matches(raw, home)
+        if not away_matches:
+            raw = doc.get("away_last_matches") or (doc.get("sofascore_detail") or {}).get("away_last_matches") or []
+            away_matches = _parse_sofa_last_matches(raw, away)
         evidence = _team_history_summary(home, home_matches) + " " + _team_history_summary(away, away_matches)
         prompt = (
             "You are the dedicated Team Previous Matches Analyst. Your trained knowledge is team trend reading: "
@@ -401,10 +622,38 @@ def _get_competition_context(doc: dict, conn) -> str | None:
         return None
 
 
-def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None) -> dict:
+def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None, specialist_weights: dict[str, float] | None = None) -> dict:
     from app.ai_router import get_router, parse_json_response
     context_block = f"Competition context: {competition_context} | " if competition_context else ""
-    prompt = f"Decide football prediction for {match_name}. {context_block}Evidence: {' | '.join(response_chain)}. Markets: {[asdict(x) for x in shortlisted_markets]}. Return JSON only with market,outcome,confidence,value_bet,btts,over_2_5,key_factors,reasoning."
+    unavailable = [
+        label for label, statement in zip(
+            ("H2H", "common opponents", "form", "odds", "similar matches", "team previous matches"),
+            response_chain,
+        ) if _evidence_status(statement) == "unavailable"
+    ]
+    # Build weighted analyst block so the AI agent knows which specialists to trust more
+    weights = specialist_weights or {}
+    analyst_labels = [
+        "H2H Analyst", "Common Opponent Analyst", "Form Analyst",
+        "Market Odds Analyst", "Similar Match Analyst", "Team Previous Matches Analyst",
+    ]
+    weighted_evidence = [
+        {
+            "analyst": analyst_labels[i],
+            "finding": response_chain[i],
+            "weight": round(weights.get(analyst_labels[i], 1.0), 3),
+            "available": _evidence_status(response_chain[i]) == "available",
+        }
+        for i in range(len(response_chain))
+    ]
+    prompt = (
+        f"Decide football prediction for {match_name}. {context_block}"
+        f"Weighted analyst findings (weight reflects historical accuracy — higher = more reliable): "
+        f"{json.dumps(weighted_evidence, default=str)[:600]}. "
+        f"Unavailable evidence: {unavailable or 'none'}. Do not present unavailable evidence as a positive factor. "
+        f"Markets: {[asdict(x) for x in shortlisted_markets]}. "
+        "Return JSON only with market,outcome,confidence,value_bet,btts,over_2_5,key_factors,reasoning."
+    )
     started = time.monotonic()
     raw = get_router().call_analysis(prompt)
     logger.debug("AI decider elapsed_ms=%d", (time.monotonic()-started)*1000)
@@ -479,26 +728,47 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                 except Exception as exc:
                     logger.warning("AI step idx=%d failed: %s", _idx, exc)
         markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
-        decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context)
+        specialist_weights = get_specialist_weights(league=_tournament(doc))
+        decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context, specialist_weights=specialist_weights)
         from app.prediction_flow import apply_prediction_state
+
         result = apply_prediction_state(doc, **kwargs)
         if result.get("status") != "predicted": return result
         prediction = result["prediction"]
         reasoning_context = {
             **asdict(ReasoningContext(_name(doc), *chain)),
-            # Preserve the ordered evidence chain for the API/UI and audits.
             "response_chain": chain,
+            "evidence_availability": {
+                label: _evidence_status(statement)
+                for label, statement in zip(
+                    ("h2h", "common_opponents", "form", "odds", "similar_matches", "team_previous_matches"),
+                    chain,
+                )
+            },
             "analysts": [
-                {"name": "H2H Analyst", "trained_knowledge": "Historical meetings and rivalry pattern reading", "finding": chain[0]},
-                {"name": "Common Opponent Analyst", "trained_knowledge": "Shared-opponent performance comparison", "finding": chain[1]},
-                {"name": "Form Analyst", "trained_knowledge": "Standings, recent form, ratings, and table pressure", "finding": chain[2]},
-                {"name": "Market Odds Analyst", "trained_knowledge": "Odds movement, pricing pressure, and market signal quality", "finding": chain[3]},
-                {"name": "Similar Match Analyst", "trained_knowledge": "Tier-comparable historical match outcomes", "finding": chain[4]},
-                {"name": "Team Previous Matches Analyst", "trained_knowledge": "Both teams' full recent finished-match profiles", "finding": chain[5]},
+                {"name": "H2H Analyst",                   "trained_knowledge": "Historical meetings and rivalry pattern reading",          "finding": chain[0], "evidence_status": _evidence_status(chain[0]), "weight": specialist_weights.get("H2H Analyst", 1.0)},
+                {"name": "Common Opponent Analyst",        "trained_knowledge": "Shared-opponent performance comparison",                   "finding": chain[1], "evidence_status": _evidence_status(chain[1]), "weight": specialist_weights.get("Common Opponent Analyst", 1.0)},
+                {"name": "Form Analyst",                   "trained_knowledge": "Standings, recent form, ratings, and table pressure",      "finding": chain[2], "evidence_status": _evidence_status(chain[2]), "weight": specialist_weights.get("Form Analyst", 1.0)},
+                {"name": "Market Odds Analyst",            "trained_knowledge": "Odds movement, pricing pressure, and market signal quality","finding": chain[3], "evidence_status": _evidence_status(chain[3]), "weight": specialist_weights.get("Market Odds Analyst", 1.0)},
+                {"name": "Similar Match Analyst",          "trained_knowledge": "Tier-comparable historical match outcomes",                 "finding": chain[4], "evidence_status": _evidence_status(chain[4]), "weight": specialist_weights.get("Similar Match Analyst", 1.0)},
+                {"name": "Team Previous Matches Analyst",  "trained_knowledge": "Both teams' full recent finished-match profiles",          "finding": chain[5], "evidence_status": _evidence_status(chain[5]), "weight": specialist_weights.get("Team Previous Matches Analyst", 1.0)},
             ],
         }
-        prediction.update({"prediction_source":"ollama_pipeline", "ai_provider":model, "reasoning_context":reasoning_context, "market":decision["market"], "outcome":decision["outcome"], "key_factors":decision["key_factors"], "reasoning":decision["reasoning"], "confidence":_convert_confidence(decision["confidence"]), "value_bet":decision["value_bet"], "btts":decision["btts"], "over_2_5":decision["over_2_5"]})
-        result["prediction_source"] = "ollama_pipeline"; result["reasoning_context"] = prediction["reasoning_context"]
+        prediction.update({
+            "prediction_source": "ollama_pipeline",
+            "ai_provider": model,
+            "reasoning_context": reasoning_context,
+            "market": decision["market"],
+            "outcome": decision["outcome"],
+            "key_factors": decision["key_factors"],
+            "reasoning": decision["reasoning"],
+            "confidence": _convert_confidence(decision["confidence"]),
+            "value_bet": decision["value_bet"],
+            "btts": decision["btts"],
+            "over_2_5": decision["over_2_5"],
+        })
+        result["prediction_source"] = "ollama_pipeline"
+        result["reasoning_context"] = prediction["reasoning_context"]
         result["competition_analysis_used"] = competition_context is not None
         result["competition_analysis_key"] = competition_analysis_key
         logger.info("AI pipeline completed match=%s outcome=%s", _name(doc), decision["outcome"])
@@ -514,17 +784,21 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
 def job_ai_prediction_queue(batch_size: int = 10) -> dict:
     from app.activity_log import record_activity
     from app.pipeline_registry import is_pipeline_enabled
-    if not is_pipeline_enabled("ai_prediction_queue"): return {"status":"skipped", "reason":"pipeline_disabled"}
+    if not is_pipeline_enabled("ai_prediction_queue"):
+        return {"status": "skipped", "reason": "pipeline_disabled"}
     record_activity("AI prediction queue started", job="ai_prediction_queue", status="running")
-    _init_db(); summary = {"status":"ok", "job":"job_ai_prediction_queue", "batch_size":batch_size, "processed":0, "ollama_used":0, "fallback_used":0, "errors":0}
+    _init_db()
+    summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "ollama_used": 0, "fallback_used": 0, "errors": 0}
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         rows = conn.execute("""select match_id, match_date, raw_enriched from match_buffer
             where raw_enriched is not null and is_finished=0 and is_live=0
               and json_extract(raw_enriched, '$.prediction') is null""").fetchall()
     docs = []
     for match_id, date, raw in rows:
-        try: docs.append({**json.loads(raw), "match_id":match_id, "match_date":date})
-        except Exception: summary["errors"] += 1
+        try:
+            docs.append({**json.loads(raw), "match_id": match_id, "match_date": date})
+        except Exception:
+            summary["errors"] += 1
     from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
     from app.buffer import store_enriched as _store
 
@@ -538,8 +812,6 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
         _store(str(doc.get("match_id") or ""), doc)
         return outcome
 
-    # Run up to 3 matches concurrently — each prediction is I/O-bound
-    # (SportyBet HTTP + Ollama HTTP) so threads don't contend on the GIL.
     with _TPE(max_workers=3) as pool:
         futures = {pool.submit(_process_one, doc): doc for doc in sort_gate(docs)[:batch_size]}
         for future in _ac(futures):

@@ -347,6 +347,9 @@ def run_learning_cycle() -> dict[str, Any]:
     # ── 6. Incorporate user behavior for self-learning ────────────
     behavior_updates = _incorporate_user_behavior(conn, rows)
 
+    # ── 7. Grade specialist contributions ─────────────────────────
+    specialist_updates = _grade_specialists_from_history(rows)
+
     conn.commit()
 
     print(
@@ -355,7 +358,8 @@ def run_learning_cycle() -> dict[str, Any]:
         f"{league_updates} league accuracy rows | "
         f"{model_updates} model weights updated | "
         f"{ai_updates} AI analysis adjustments | "
-        f"{behavior_updates} behavior adjustments"
+        f"{behavior_updates} behavior adjustments | "
+        f"{specialist_updates} specialist credits"
     )
     return {
         "status": "ok",
@@ -365,6 +369,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "model_weight_updates": model_updates,
         "ai_analysis_adjustments": ai_updates,
         "behavior_adjustments": behavior_updates,
+        "specialist_credits": specialist_updates,
     }
 
 
@@ -756,6 +761,74 @@ def _calibration_verdict(gap: float | None) -> str:
     if g < -0.10:
         return "overconfident"    # model claims more than it delivers
     return "well_calibrated"
+
+
+def _grade_specialists_from_history(graded_rows: list) -> int:
+    """
+    For every graded prediction that has reasoning_context.analysts,
+    credit each available specialist with the outcome.
+    """
+    try:
+        from app.ai_prediction_pipeline import grade_specialist_contributions
+    except Exception:
+        return 0
+
+    credited = 0
+    for row in graded_rows:
+        result = row["result"] if "result" in row.keys() else None
+        if result not in ("win", "loss"):
+            continue
+        # reasoning_context lives in audit_json for prediction_history rows
+        audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
+        reasoning_context = audit.get("reasoning_context") or {}
+        # Also check context_json (candidate history)
+        if not reasoning_context.get("analysts"):
+            ctx = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)
+            reasoning_context = ctx.get("reasoning_context") or reasoning_context
+        if not reasoning_context.get("analysts"):
+            continue
+        league = row["league_name"] if "league_name" in row.keys() else None
+        pick_type = row["pick_type"] if "pick_type" in row.keys() else None
+        try:
+            credited += grade_specialist_contributions(
+                reasoning_context, result, league=league, pick_type=pick_type
+            )
+        except Exception:
+            continue
+    return credited
+
+
+def _grade_specialists_from_history(graded_rows: list) -> int:
+    """
+    For every graded prediction that has reasoning_context.analysts,
+    credit each available specialist with the outcome.
+    """
+    try:
+        from app.ai_prediction_pipeline import grade_specialist_contributions
+    except Exception:
+        return 0
+
+    credited = 0
+    for row in graded_rows:
+        result = row["result"] if "result" in row.keys() else None
+        if result not in ("win", "loss"):
+            continue
+        audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
+        reasoning_context = audit.get("reasoning_context") or {}
+        if not reasoning_context.get("analysts"):
+            ctx = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)
+            reasoning_context = ctx.get("reasoning_context") or reasoning_context
+        if not reasoning_context.get("analysts"):
+            continue
+        league = row["league_name"] if "league_name" in row.keys() else None
+        pick_type = row["pick_type"] if "pick_type" in row.keys() else None
+        try:
+            credited += grade_specialist_contributions(
+                reasoning_context, result, league=league, pick_type=pick_type
+            )
+        except Exception:
+            continue
+    return credited
 
 
 def _incorporate_ai_analysis(conn: sqlite3.Connection, graded_rows: list) -> int:
