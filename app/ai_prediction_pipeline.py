@@ -396,8 +396,49 @@ def _step_form(doc: dict, model: str, timeout: int = 20) -> str:
         if not standings or standings == "None" or standings == "null": return FORM_FALLBACK
         if isinstance(standings, list) and len(standings) == 0: return FORM_FALLBACK
         home, away = _teams(doc)
-        evidence = f"Form/standings for {home} vs {away}: {str(standings)[:380]}"
-        return _ollama(model, f"Summarise in one factual sentence: {evidence}", timeout) or evidence
+        if not home or not away: return FORM_FALLBACK
+
+        # Filter standings to only include the two teams of interest to prevent
+        # the LLM from hallucinating or discussing the wrong teams.
+        def _team_in_standings(team_name: str, standings_data: list) -> dict | None:
+            if not team_name:
+                return None
+            for row in standings_data:
+                row_team = (row.get("team") or {}).get("name") or ""
+                if team_name.lower() in row_team.lower() or row_team.lower() in team_name.lower():
+                    return row
+            return None
+
+        home_row = _team_in_standings(home, standings)
+        away_row = _team_in_standings(away, standings)
+
+        if home_row and away_row:
+            evidence = (
+                f"League standings for the match {home} vs {away}:\n"
+                f"{home}: position {home_row.get('position')}, points {home_row.get('points')}\n"
+                f"{away}: position {away_row.get('position')}, points {away_row.get('points')}\n"
+            )
+        elif home_row or away_row:
+            team = home if home_row else away
+            row = home_row or away_row
+            evidence = (
+                f"League standings for the match {home} vs {away}:\n"
+                f"{team}: position {row.get('position')}, points {row.get('points')}\n"
+            )
+        else:
+            # Neither team found in standings - provide truncated standings but emphasize teams
+            evidence = (
+                f"League standings for the match {home} vs {away}:\n"
+                f"{str(standings)[:380]}\n"
+            )
+
+        prompt = (
+            f"You are a football form analyst. Analyse the league standings for the match {home} vs {away}. "
+            f"CRITICAL: Only discuss {home} and {away}. Do NOT mention any other teams.\n\n"
+            f"{evidence}\n"
+            f"Summarise in one factual sentence which team has the better league position and why."
+        )
+        return _ollama(model, prompt, timeout) or evidence
     except Exception as exc:
         logger.warning("AI step form failed: %s", exc)
         return FORM_FALLBACK
