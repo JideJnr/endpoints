@@ -80,7 +80,7 @@ def get_settings() -> Settings:
     _cached_settings = Settings(
         app_name=os.getenv("PREDICTX_APP_NAME", "PredictX Football Stats Agent"),
         environment=os.getenv("PREDICTX_ENV", "development"),
-        cors_origins=_csv(os.getenv("PREDICTX_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
+        cors_origins=_cors_origins(os.getenv("PREDICTX_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,https://football-frontend-r6tg.onrender.com")),
         database_path=Path(os.getenv("PREDICTX_DB_PATH", str(BASE_DIR / "data" / "predictx_memory.sqlite3"))),
         ai_provider=os.getenv("PREDICTX_AI_PROVIDER", "auto").strip().lower(),
         hf_url=os.getenv("PREDICTX_HF_URL", "https://router.huggingface.co/v1/chat/completions"),
@@ -172,6 +172,13 @@ def _hf_token() -> str | None:
 
 def _csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _cors_origins(value: str) -> list[str]:
+    return [
+        origin.rstrip("/") if origin.startswith(("http://", "https://")) else origin
+        for origin in _csv(value)
+    ]
 
 
 def _int_env(name: str, default: int) -> int:

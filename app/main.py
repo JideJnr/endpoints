@@ -15,7 +15,7 @@ from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
 from app.routers import competition_analysis as competition_analysis_router
 from app.scheduler import start_scheduler
-
+import logging
 settings = get_settings()
 
 
@@ -84,6 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logging.info(settings.cors_origins)
 
 @app.middleware("http")
 async def _release_db_connection(request: Request, call_next):
