@@ -512,9 +512,9 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 source, match_id, match_name, league_name, pick_type, selection,
                 confidence, reason, signals_json, picks_json, audit_json,
                 country_name, sofascore_id, sportybet_id, prediction_mode,
-                data_source, live_data_sources_json, created_at
+                data_source, live_data_sources_json, models_json, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             """,
             (
                 source,
@@ -534,6 +534,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 prediction.get("prediction_mode") or "prematch",
                 prediction.get("data_source") or ((prediction.get("data_quality") or {}).get("prediction_readiness") or {}).get("data_source"),
                 json.dumps(prediction.get("live_data_sources") or []),
+                json.dumps(prediction.get("models") or {}),
             ),
         )
         conn.commit()
@@ -1188,6 +1189,8 @@ def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> di
         grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         grade_info["result"] = result
+        models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
+        grade_info["passed_models"] = _get_passed_models(models, result)
         conn.execute(
             """
             update prediction_history
@@ -1608,6 +1611,8 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
         grade_info["result"] = result
+        models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
+        grade_info["passed_models"] = _get_passed_models(models, result)
         with _conn() as conn:
             conn.execute(
                 """
@@ -1955,6 +1960,8 @@ def _grade_match_predictions_by_ids(match_id: str, linked_ids: list[str], final_
             grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
             result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
             grade_info["result"] = result
+            models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
+            grade_info["passed_models"] = _get_passed_models(models, result)
             conn.execute(
                 """
                 update prediction_history
@@ -3607,6 +3614,7 @@ def _init_db_unlocked() -> None:
         _ensure_column(conn, "prediction_history", "live_data_sources_json", "text not null default '[]'")
         _ensure_column(conn, "prediction_history", "audit_json", "text not null default '{}'")
         _ensure_column(conn, "prediction_history", "grading_reason_json", "text not null default '{}'")
+        _ensure_column(conn, "prediction_history", "models_json", "text not null default '{}'")
         if _run_legacy_backfills():
             conn.execute(
                 """
@@ -4267,9 +4275,48 @@ def _snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _get_passed_models(models: dict[str, Any], result: str) -> list[str]:
+    """Return the list of model names whose prediction matched the graded result."""
+    if not models or result not in ("win", "loss"):
+        return []
+    passed = []
+    for name, model in models.items():
+        if not isinstance(model, dict):
+            continue
+        probs = model.get("probabilities") if model else None
+        if probs and isinstance(probs, dict):
+            predicted = max(probs, key=probs.get)
+            matched = False
+            if result == "win" and predicted == "home_win":
+                matched = True
+            elif result == "loss" and predicted == "away_win":
+                matched = True
+            elif result == "draw" and predicted == "draw":
+                matched = True
+            if matched and name not in passed:
+                passed.append(name)
+            continue
+        prediction = model.get("prediction")
+        if prediction and isinstance(prediction, str):
+            pred_lower = prediction.lower()
+            matched = False
+            if result == "win" and ("home" in pred_lower or "home win" in pred_lower):
+                matched = True
+            elif result == "loss" and ("away" in pred_lower or "away win" in pred_lower):
+                matched = True
+            elif result == "draw" and "draw" in pred_lower:
+                matched = True
+            if matched and name not in passed:
+                passed.append(name)
+    return passed
+
+
 def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
     picks = _safe_json(row["picks_json"] if "picks_json" in row.keys() else "[]", [])
     stored_best = picks[0] if picks else {}
+    models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
+    result = row["result"] if "result" in row.keys() else None
+    passed_models = _get_passed_models(models, result) if result in ("win", "loss") else []
     return {
         "id": row["id"],
         "source": row["source"],
@@ -4285,6 +4332,8 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
         },
         "signals": _safe_json(row["signals_json"] if "signals_json" in row.keys() else "[]", []),
         "picks": picks,
+        "models": models,
+        "passed_models": passed_models,
         "audit": _safe_json(row["audit_json"] if "audit_json" in row.keys() else "{}", {}),
         "prediction_mode": row["prediction_mode"] if "prediction_mode" in row.keys() else "prematch",
         "data_source": row["data_source"] if "data_source" in row.keys() else None,

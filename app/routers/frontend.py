@@ -2242,7 +2242,7 @@ def analyze_match_with_ai(sportybet_id: str):
 @router.get("/matches/{sportybet_id}/ai-analysis-all")
 def get_all_ai_analyses(sportybet_id: str):
     """
-    Return all stored AI analyses for a match: Groq + Ollama (qwen3:8b + deepseek-r1:8b).
+    Return all stored AI analyses for a match: DeepSeek + Ollama (qwen3:8b + deepseek-r1:8b).
     Runs nothing — only returns what has already been computed and persisted.
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
@@ -2250,16 +2250,16 @@ def get_all_ai_analyses(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in the buffer")
 
-    groq_analysis = doc.get("ai_analysis")
+    DeepSeek_analysis = doc.get("ai_analysis")
     ollama_analysis = doc.get("ai_analysis_ollama")
 
     providers: dict[str, Any] = {}
-    if groq_analysis:
-        providers["groq"] = {
-            "label": "Groq (llama-3.3-70b)",
+    if DeepSeek_analysis:
+        providers["DeepSeek"] = {
+            "label": "DeepSeek (llama-3.3-70b)",
             "emoji": "⚡",
             "role": "Cloud LLM — fast, high-quality reasoning",
-            **groq_analysis,
+            **DeepSeek_analysis,
         }
     if ollama_analysis:
         for model_key, model_result in (ollama_analysis.get("models") or {}).items():
@@ -2294,7 +2294,7 @@ def analyze_match_snapshot(sportybet_id: str):
     """
     Full AI analysis of a finished match snapshot.
     Used after grading to see if the prediction was correct and how the match fared.
-    Tries Groq first, falls back to Ollama if Groq is unavailable.
+    Tries DeepSeek first, falls back to Ollama if DeepSeek is unavailable.
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
 
@@ -2306,28 +2306,45 @@ def analyze_match_snapshot(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in buffer or archive")
 
-    from app.groq_agent import run_groq_match_analysis
+    from app.DeepSeek_agent import run_DeepSeek_match_analysis
     from app.ollama_agent import run_ollama_all_models
 
-    # Run Groq analysis first
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        analysis["provider"] = "groq"
+    # Run DeepSeek analysis first
+    analysis = run_DeepSeek_match_analysis(doc)
+    if analysis.get("status") not in {"DeepSeek_unavailable", "agent_build_failed", "error"}:
+        analysis["provider"] = "DeepSeek"
         analysis["fallback"] = None
         doc["ai_analysis"] = analysis
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "DeepSeek"}
 
     # Fall back to Ollama
     ollama_result = run_ollama_all_models(doc)
     if ollama_result.get("status") == "success":
         ollama_result["provider"] = "ollama"
-        ollama_result["fallback"] = "groq_unavailable"
+        ollama_result["fallback"] = "DeepSeek_unavailable"
         doc["ai_analysis_ollama"] = ollama_result
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "DeepSeek_unavailable"}
 
     raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
+
+
+def _get_passed_models_from_db(match_id: str) -> list[str]:
+    """Look up passed_models from SQLite prediction_history for a graded match."""
+    try:
+        from app.league_memory import _conn, _safe_json
+        with _conn(timeout=5) as conn:
+            row = conn.execute(
+                "select models_json, grading_reason_json from prediction_history where match_id = ? and graded_at is not null order by created_at desc limit 1",
+                (str(match_id),),
+            ).fetchone()
+            if row:
+                grading_reason = _safe_json(row["grading_reason_json"], {})
+                return grading_reason.get("passed_models", [])
+    except Exception:
+        pass
+    return []
 
 
 @router.post("/matches/{sportybet_id}/ai-analyze-graded")
@@ -2344,37 +2361,39 @@ def analyze_graded_match(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Finished match not found")
 
-    from app.groq_agent import run_groq_match_analysis
+    from app.DeepSeek_agent import run_DeepSeek_match_analysis
     from app.ollama_agent import run_ollama_all_models
 
     # Add grading result context to the document
     prediction = doc.get("prediction")
     if prediction:
+        passed_models = _get_passed_models_from_db(sportybet_id)
         doc["_grading_result"] = {
             "prediction_pick": prediction.get("pick") or prediction.get("selection"),
             "prediction_confidence": prediction.get("confidence"),
             "prediction_type": prediction.get("type") or prediction.get("pick_type"),
+            "passed_models": passed_models,
         }
 
-    # Run Groq analysis first
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        analysis["provider"] = "groq"
+    # Run DeepSeek analysis first
+    analysis = run_DeepSeek_match_analysis(doc)
+    if analysis.get("status") not in {"DeepSeek_unavailable", "agent_build_failed", "error"}:
+        analysis["provider"] = "DeepSeek"
         analysis["fallback"] = None
         analysis["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis"] = analysis
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "DeepSeek"}
 
     # Fall back to Ollama
     ollama_result = run_ollama_all_models(doc)
     if ollama_result.get("status") == "success":
         ollama_result["provider"] = "ollama"
-        ollama_result["fallback"] = "groq_unavailable"
+        ollama_result["fallback"] = "DeepSeek_unavailable"
         ollama_result["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis_ollama"] = ollama_result
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "DeepSeek_unavailable"}
 
     raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
 
@@ -2382,22 +2401,24 @@ def analyze_graded_match(sportybet_id: str):
 def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | None:
     """
     Run AI analysis on a graded match to see what happened and if the prediction was correct.
-    Tries Groq first, falls back to Ollama.
+    Tries DeepSeek first, falls back to Ollama.
     """
-    from app.groq_agent import run_groq_match_analysis
+    from app.DeepSeek_agent import run_DeepSeek_match_analysis
     from app.ollama_agent import run_ollama_all_models
 
     prediction = doc.get("prediction")
     if prediction:
+        passed_models = _get_passed_models_from_db(str(doc.get("_id") or doc.get("sportybet_id") or ""))
         doc["_grading_result"] = {
             "prediction_pick": prediction.get("pick") or prediction.get("selection"),
             "prediction_confidence": prediction.get("confidence"),
             "prediction_type": prediction.get("type") or prediction.get("pick_type"),
+            "passed_models": passed_models,
         }
 
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        analysis["provider"] = "groq"
+    analysis = run_DeepSeek_match_analysis(doc)
+    if analysis.get("status") not in {"DeepSeek_unavailable", "agent_build_failed", "error"}:
+        analysis["provider"] = "DeepSeek"
         analysis["fallback"] = None
         analysis["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis"] = analysis
@@ -2407,7 +2428,7 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
     ollama_result = run_ollama_all_models(doc)
     if ollama_result.get("status") == "success":
         ollama_result["provider"] = "ollama"
-        ollama_result["fallback"] = "groq_unavailable"
+        ollama_result["fallback"] = "DeepSeek_unavailable"
         ollama_result["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis_ollama"] = ollama_result
         store_enriched(str(doc.get("_id") or doc.get("sportybet_id") or ""), doc)
@@ -2506,7 +2527,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
             "query": web.get("query"),
             "snippets": web.get("snippets", []),
             "articles": web.get("scraped", []) or web.get("articles", []),
-            "grok_analysis": web.get("grok_analysis") or {},
+            "deepseek_analysis": web.get("deepseek_analysis") or {},
             "error": web.get("error"),
             "disabled": web.get("disabled"),
             "diagnostics": web.get("diagnostics"),
@@ -2996,7 +3017,7 @@ def get_brain_league_profile(league_name: str):
 def get_brain_model_weights():
     """
     Return the current auto-tuned ensemble model weights.
-    Shows how much each model (Poisson, Dixon-Coles, ELO, Rules, Groq)
+    Shows how much each model (Poisson, Dixon-Coles, ELO, Rules, DeepSeek)
     has been adjusted based on historical accuracy.
     """
     from app.self_learner import get_learned_weights
@@ -3045,7 +3066,7 @@ def get_brain_health():
 
     try:
         weights = get_learned_weights()
-        defaults = {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "groq": 0.10}
+        defaults = {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "DeepSeek": 0.10}
         health["ensemble_weights"] = {
             "status": "ok",
             "weights": weights,

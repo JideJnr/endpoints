@@ -423,7 +423,135 @@ def post_betbuilder_book(payload: dict[str, Any] = Body(...)):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-@router.get("/betbuilder/history")
+@router.post("/betbuilder/book-smart")
+def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
+    """Book a slip, automatically dropping unavailable legs and re-asking Maya for replacements."""
+    from app.sportybet_booking import build_booking_payload, request_share_code
+
+    selections: list[dict[str, Any]] = list(payload.get("selections") or [])
+    stake = int(payload.get("stake") or 0)
+    if not selections:
+        raise HTTPException(status_code=400, detail="selections is required")
+
+    dropped: list[dict[str, Any]] = []
+    replaced: list[dict[str, Any]] = []
+    remaining = list(selections)
+
+    # Try to book; on each unavailable-leg error strip that leg and optionally
+    # ask Maya for a fresh pick on the same match before retrying.
+    for _attempt in range(len(selections) + 1):
+        if not remaining:
+            break
+        try:
+            booking_payload = build_booking_payload(remaining, stake=stake, loading_share_code=payload.get("loadingShareCode"))
+            result = request_share_code(booking_payload)
+            return {
+                **result,
+                "dropped": dropped,
+                "replaced": replaced,
+                "final_selections": remaining,
+            }
+        except ValueError as exc:
+            msg = str(exc)
+            # Identify which leg caused the error by matching event id in the message
+            from app.sportybet_booking import _resolve_sportybet_id
+            bad = next(
+                (
+                    s for s in remaining
+                    if _resolve_sportybet_id(str(s.get("sportybet_id") or s.get("match_id") or "")) in msg
+                    or str(s.get("sportybet_id") or s.get("match_id") or "") in msg
+                ),
+                None,
+            )
+            if not bad:
+                raise HTTPException(status_code=400, detail=msg)
+
+            # Try Maya for a fresh pick on this match
+            match_id = str(bad.get("sportybet_id") or bad.get("match_id") or "")
+            from app.sportybet_booking import _resolve_sportybet_id
+            match_id = _resolve_sportybet_id(match_id)
+            maya_pick: dict[str, Any] | None = None
+            if match_id:
+                try:
+                    from app.ai_betbuilder import enriched_match_analysis
+                    analysis = enriched_match_analysis(match_id, force_refresh=True)
+                    rec = analysis.get("deepseek_recommendation") or analysis.get("recommendation")
+                    pick_type = (analysis.get("prediction_engine_pick") or {}).get("type") or "match_result"
+                    if rec and analysis.get("status") == "success":
+                        maya_pick = {**bad, "selection": rec, "type": pick_type}
+                except Exception:
+                    pass
+
+            remaining = [s for s in remaining if s is not bad]
+            if maya_pick and maya_pick.get("selection") != bad.get("selection"):
+                remaining.append(maya_pick)
+                replaced.append({"original": bad, "replacement": maya_pick, "reason": msg})
+            else:
+                dropped.append({**bad, "reason": msg})
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    if not remaining:
+        raise HTTPException(status_code=400, detail={"message": "All selections became unavailable", "dropped": dropped})
+
+    # Final attempt with whatever survived
+    try:
+        booking_payload = build_booking_payload(remaining, stake=stake, loading_share_code=payload.get("loadingShareCode"))
+        result = request_share_code(booking_payload)
+        return {**result, "dropped": dropped, "replaced": replaced, "final_selections": remaining}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc), "dropped": dropped, "replaced": replaced})
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.get("/betbuilder/test-book/{sportybet_id}")
+def get_betbuilder_test_book(sportybet_id: str, stake: int = 100):
+    """Debug: fetch live markets for a match, run prediction, then attempt booking."""
+    from app.buffer import get_buffered_match, refresh_sporty_match_state
+    from app.sportybet_booking import build_booking_payload
+
+    refresh = refresh_sporty_match_state(sportybet_id)
+    doc = get_buffered_match(sportybet_id) or {}
+    markets = doc.get("sportybet_markets") or doc.get("markets") or []
+    market_summary = [
+        {
+            "id": m.get("id"),
+            "name": m.get("name"),
+            "outcomes": [{"id": o.get("id"), "name": o.get("name"), "is_active": o.get("is_active")} for o in (m.get("selections") or [])],
+        }
+        for m in markets[:10]
+    ]
+
+    prediction = doc.get("prediction") or {}
+    best_pick = (prediction.get("picks") or [{}])[0] if prediction.get("picks") else {}
+    selection = {
+        "sportybet_id": sportybet_id,
+        "type": best_pick.get("type") or best_pick.get("pick_type"),
+        "selection": best_pick.get("selection"),
+    }
+
+    booking_result = None
+    booking_error = None
+    if best_pick.get("selection"):
+        try:
+            booking_result = build_booking_payload([selection], stake=stake)
+        except Exception as exc:
+            booking_error = str(exc)
+
+    return {
+        "sportybet_id": sportybet_id,
+        "refresh": refresh,
+        "market_count": len(markets),
+        "markets_preview": market_summary,
+        "best_pick": best_pick,
+        "booking_selection": selection,
+        "booking_result": booking_result,
+        "booking_error": booking_error,
+    }
+
+
+
 def get_betbuilder_history(limit: int = Query(default=100, ge=1, le=1000), auto_grade: bool = True):
     return {"status": "success", **list_betbuilder_history(limit=limit, auto_grade=auto_grade)}
 
@@ -442,7 +570,7 @@ def post_enriched_match_analysis(sportybet_id: str, payload: dict[str, Any] = Bo
         result = enriched_match_analysis(sportybet_id, force_refresh=bool(payload.get("force_refresh")))
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    if result.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+    if result.get("status") in {"deepseek_unavailable", "agent_build_failed", "error"}:
         raise HTTPException(status_code=503, detail=result.get("message") or "AI analysis is unavailable")
     return result
 
@@ -470,7 +598,7 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
 
 @router.post("/betbuilder/auto")
 def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
-    """Build a Groq-powered slip from upcoming prediction-engine candidates."""
+    """Build a DeepSeek-powered slip from upcoming prediction-engine candidates."""
     from app.ai_betbuilder import build_ai_betbuilder
 
     result = build_ai_betbuilder(payload)

@@ -623,10 +623,10 @@ def _web_text(doc: dict[str, Any]) -> str:
             values.append(str(item.get("text") or item.get("snippet") or ""))
         else:
             values.append(str(item))
-    grok = web.get("grok_analysis") or {}
-    if grok.get("status") == "ok":
-        values.append(str(grok.get("summary") or ""))
-        for item in grok.get("evidence") or []:
+    deepseek = web.get("deepseek_analysis") or {}
+    if deepseek.get("status") == "ok":
+        values.append(str(deepseek.get("summary") or ""))
+        for item in deepseek.get("evidence") or []:
             if isinstance(item, dict):
                 values.append(str(item.get("claim") or ""))
     return " ".join(values)

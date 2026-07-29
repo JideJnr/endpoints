@@ -34,13 +34,13 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
         raise ValueError("No prediction-engine pick found for this match")
 
     gated = similarity_gate(doc, _similar_matches(doc, limit=10))[:5]
-    groq_input = _analysis_doc(doc, engine_pick, gated)
-    analysis = _run_groq_enriched(groq_input)
-    if analysis.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+    deepseek_input = _analysis_doc(doc, engine_pick, gated)
+    analysis = _run_deepseek_enriched(deepseek_input)
+    if analysis.get("status") in {"deepseek_unavailable", "agent_build_failed", "error"}:
         return analysis
 
-    groq_selection = analysis.get("recommendation") or analysis.get("groq_recommendation")
-    confirmed = _same_outcome(engine_pick.get("selection"), groq_selection)
+    deepseek_selection = analysis.get("recommendation") or analysis.get("deepseek_recommendation")
+    confirmed = _same_outcome(engine_pick.get("selection"), deepseek_selection)
     result = {
         "status": "success",
         "sportybet_id": cache_key,
@@ -48,8 +48,8 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
         "match_name": doc.get("sportybet_name") or doc.get("match_name") or doc.get("name") or cache_key,
         "league_name": doc.get("tournament") or doc.get("league_name"),
         "country_name": doc.get("category") or doc.get("country_name"),
-        "groq_recommendation": groq_selection,
-        "groq_confidence": _to_int(analysis.get("confidence"), 0),
+        "deepseek_recommendation": deepseek_selection,
+        "deepseek_confidence": _to_int(analysis.get("confidence"), 0),
         "value_bet": bool(analysis.get("value_bet")),
         "market_signal": analysis.get("market_signal"),
         "btts": analysis.get("btts"),
@@ -81,7 +81,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "error",
             "message": "No current prediction-engine candidates are available",
-            "groq_powered": True,
+            "deepseek_powered": True,
             "candidate_count": 0,
             "candidate_limit": candidate_limit,
         }
@@ -113,7 +113,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "error",
             "message": "Fewer than two AI analyses succeeded",
-            "groq_powered": True,
+            "deepseek_powered": True,
             "analyses_run": len(candidates),
             "analyses_succeeded": len(analyses),
             "failures": failures,
@@ -122,7 +122,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
     synthesis = synthesize_sure_picks(analyses, target_odds=target_odds, max_total_odds=max_total_odds)
     return {
         "status": "success",
-        "groq_powered": True,
+        "deepseek_powered": True,
         "request": {"target_odds": target_odds, "max_total_odds": max_total_odds},
         "candidate_count": len(candidates),
         "candidate_limit": candidate_limit,
@@ -149,29 +149,29 @@ def synthesize_sure_picks(
     target_odds: float,
     max_total_odds: float,
 ) -> dict[str, Any]:
-    clean = [item for item in analyses if item.get("status") == "success" or item.get("groq_recommendation")]
+    clean = [item for item in analyses if item.get("status") == "success" or item.get("deepseek_recommendation")]
     if len(clean) < 2:
         raise ValueError("At least two completed enriched analyses are required")
 
     ranked = []
     for item in clean[:20]:
-        groq_conf = _to_int(item.get("groq_confidence") or item.get("confidence"), 0)
+        deepseek_conf = _to_int(item.get("deepseek_confidence") or item.get("confidence"), 0)
         similar_used = _to_int(item.get("similar_matches_used"), 0)
         engine_pick = item.get("prediction_engine_pick") or {}
-        confirmed = bool(item.get("confirmed")) or _same_outcome(engine_pick.get("selection"), item.get("groq_recommendation"))
+        confirmed = bool(item.get("confirmed")) or _same_outcome(engine_pick.get("selection"), item.get("deepseek_recommendation"))
         odds = round(_to_float(item.get("estimated_odds")) or _pick_decimal_odds(engine_pick), 3)
         try:
             from app.league_memory import betbuilder_pick_memory
             learning = betbuilder_pick_memory(
                 engine_pick.get("type") or item.get("pick_type"),
-                item.get("groq_recommendation") or engine_pick.get("selection"),
+                item.get("deepseek_recommendation") or engine_pick.get("selection"),
                 item.get("league_name"),
                 item.get("country_name"),
                 odds,
             )
         except Exception:
             learning = {"samples": 0, "win_rate": None, "adjustment": 0}
-        conviction = round(groq_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0), 2)
+        conviction = round(deepseek_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0), 2)
         ranked.append({
             "match_id": item.get("match_id") or item.get("sportybet_id"),
             "match": item.get("match_name") or item.get("match"),
@@ -179,28 +179,28 @@ def synthesize_sure_picks(
             "country": item.get("country_name"),
             "type": engine_pick.get("type") or item.get("pick_type") or "ai_pick",
             "pick_type": engine_pick.get("type") or item.get("pick_type") or "ai_pick",
-            "selection": item.get("groq_recommendation") or engine_pick.get("selection"),
-            "groq_confidence": groq_conf,
-            "confidence": groq_conf,
+            "selection": item.get("deepseek_recommendation") or engine_pick.get("selection"),
+            "deepseek_confidence": deepseek_conf,
+            "confidence": deepseek_conf,
             "odds": odds,
             "estimated_odds": odds,
             "conviction_score": conviction,
             "learning": learning,
             "confirmed": confirmed,
             "similar_matches_used": similar_used,
-            "source": "groq",
+            "source": "deepseek",
             "synthesis_reasoning": "",
         })
-    ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"], item["groq_confidence"]), reverse=True)
+    ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"], item["deepseek_confidence"]), reverse=True)
 
     try:
-        model_plan = _run_groq_synthesis(ranked, target_odds, max_total_odds)
+        model_plan = _run_deepseek_synthesis(ranked, target_odds, max_total_odds)
         selected_ids = [str(item.get("match_id") or "") for item in model_plan.get("selected_picks") or []]
         selected = [item for item in ranked if str(item.get("match_id") or "") in selected_ids] if selected_ids else []
-        reasoning = model_plan.get("synthesis_reasoning") or "Groq ranked the completed analyses by consensus and conviction."
+        reasoning = model_plan.get("synthesis_reasoning") or "DeepSeek ranked the completed analyses by consensus and conviction."
     except Exception as exc:
         selected = []
-        reasoning = f"Deterministic synthesis used after Groq synthesis failed: {exc}"
+        reasoning = f"Deterministic synthesis used after DeepSeek synthesis failed: {exc}"
 
     if not selected:
         selected = _select_by_odds(ranked, target_odds, max_total_odds)
@@ -209,11 +209,11 @@ def synthesize_sure_picks(
         selected = ranked[:1]
     combined = _combined_odds(selected)
     target_not_met = combined < target_odds
-    avg_confidence = round(sum(float(item.get("groq_confidence") or 0) for item in selected) / len(selected)) if selected else 0
+    avg_confidence = round(sum(float(item.get("deepseek_confidence") or 0) for item in selected) / len(selected)) if selected else 0
     confirmed_count = len([item for item in selected if item.get("confirmed")])
     for item in selected:
         item["synthesis_reasoning"] = item.get("synthesis_reasoning") or (
-            "Prediction engine and Groq agree." if item.get("confirmed") else "Included as a high-conviction AI pick."
+            "Prediction engine and DeepSeek agree." if item.get("confirmed") else "Included as a high-conviction AI pick."
         )
     return {
         "status": "success",
@@ -287,33 +287,56 @@ def similarity_gate(doc: dict[str, Any], candidates: list[dict[str, Any]]) -> li
     return passing
 
 
-def _run_groq_enriched(doc: dict[str, Any]) -> dict[str, Any]:
-    from app.groq_agent import run_groq_match_analysis
+def _run_deepseek_enriched(doc: dict[str, Any]) -> dict[str, Any]:
+    from app.deepseek_agent import run_deepseek_match_analysis
+    from app.ai_router import get_router
 
-    return run_groq_match_analysis(doc)
+    result = run_deepseek_match_analysis(doc)
+    if result.get("status") not in {"ai_unavailable", "error", None}:
+        return result
+
+    # AI unavailable — fall back to learned behaviour from prediction_memory signals
+    prediction = doc.get("prediction") or {}
+    best_pick = (prediction.get("best_pick") or
+                 _best_pick_from_signals(prediction.get("picks") or []) or {})
+    signals = prediction.get("signals") or best_pick.get("signals") or []
+    memory_signal = next((s for s in signals if s.get("name") == "prediction_memory"), None)
+    blended_win_rate = float((memory_signal or {}).get("value", {}).get("blended_win_rate") or 0) if memory_signal else 0
+    selection = best_pick.get("selection") or prediction.get("selection")
+    confidence = int(blended_win_rate) if blended_win_rate >= 55 else _to_int(best_pick.get("confidence"), 0)
+    return {
+        "status": "success" if selection else "ai_unavailable",
+        "recommendation": selection,
+        "confidence": confidence,
+        "value_bet": blended_win_rate >= 70,
+        "key_factors": ["learned_behaviour_fallback"],
+        "reasoning": {"verdict": f"AI unavailable. Using learned win rate {blended_win_rate:.1f}% from {(memory_signal or {}).get('value', {}).get('league', 'global')} memory."},
+        "market_signal": None,
+        "btts": None,
+        "over_2_5": None,
+        "source": "learned_behaviour",
+        "model": "prediction_memory",
+    }
 
 
-def _run_groq_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_total_odds: float) -> dict[str, Any]:
-    from app.llm import get_llm
+def _best_pick_from_signals(picks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    usable = [p for p in picks if p.get("type") != "no_bet"]
+    return max(usable, key=lambda p: int(p.get("confidence") or 0)) if usable else None
+
+
+def _run_deepseek_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_total_odds: float) -> dict[str, Any]:
+    from app.ai_router import get_router, parse_json_response
 
     prompt = (
-        "You are an expert football betting slip analyst. Read these completed Groq enriched analyses. "
+        "You are an expert football betting slip analyst. Read these completed analyses. "
         "Return strict JSON with selected_picks (array of objects with match_id) and synthesis_reasoning. "
-        "Prefer confirmed picks where the prediction engine and Groq agree. Rank by conviction_score. "
+        "Prefer picks where source is deepseek over learned_behaviour. Rank by conviction_score. "
         f"Select enough picks to reach target odds {target_odds} without exceeding max odds {max_total_odds}. "
         "If target cannot be reached, return the best available picks.\n\n"
         + json.dumps(ranked[:20], ensure_ascii=False)
     )
-    response = get_llm().invoke([
-        {"role": "system", "content": "Return only valid JSON."},
-        {"role": "user", "content": prompt},
-    ])
-    raw = response.content if hasattr(response, "content") else str(response)
-    if "```" in raw:
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+    raw = get_router().call_analysis(prompt)
+    return parse_json_response(raw)
 
 
 def _analysis_doc(doc: dict[str, Any], engine_pick: dict[str, Any], similar: list[dict[str, Any]]) -> dict[str, Any]:

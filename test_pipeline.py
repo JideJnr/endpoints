@@ -1,4 +1,4 @@
-"""Quick test of the small-context Ollama pipeline."""
+"""Quick smoke test of the DeepSeek multi-stage prediction pipeline."""
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -12,8 +12,8 @@ from app.ollama_pipeline import (
     run_ollama_pipeline,
 )
 
-print("=== Ollama Pipeline Test ===")
-print(f"Ollama available: {is_ollama_available()}")
+print("=== DeepSeek Pipeline Test ===")
+print(f"DeepSeek available: {is_ollama_available()}")
 
 # Minimal test document
 doc = {

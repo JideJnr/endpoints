@@ -259,13 +259,14 @@ def _match_list_cache_set(key: bool | None, data: list) -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def fetch_matches_post(is_live: Optional[bool] = True) -> list[dict]:
+def fetch_matches_post(is_live: Optional[bool] = True, bypass_cache: bool = False) -> list[dict]:
     # ── Return cached result if fresh enough ──────────────────────────────────
     # List endpoints (live/upcoming) don't need a fresh HTTP call every time the
     # scheduler fires. The cache TTL is short enough to not miss meaningful changes.
-    cached = _match_list_cache_get(is_live)
-    if cached is not None:
-        return cached
+    if not bypass_cache:
+        cached = _match_list_cache_get(is_live)
+        if cached is not None:
+            return cached
 
     payload = {
         "sportId": "sr:sport:1",
@@ -332,7 +333,7 @@ def fetch_live_and_upcoming_matches_post() -> list[dict]:
     return live + [match for match in upcoming if match.get("id") not in seen]
 
 
-def fetch_match_info(match_id: str) -> dict[str, Any]:
+def fetch_match_info(match_id: str, bypass_cache: bool = False) -> dict[str, Any]:
     """
     Fetch one SportyBet event by id from the same API endpoint the live/upcoming
     pages use. This is endpoint-only lookup: no page HTML parsing.
@@ -346,7 +347,7 @@ def fetch_match_info(match_id: str) -> dict[str, Any]:
     errors: list[str] = []
     for scope, is_live in calls:
         try:
-            matches = fetch_matches_post(is_live=is_live)
+            matches = fetch_matches_post(is_live=is_live, bypass_cache=bypass_cache)
         except Exception as exc:
             errors.append(f"{scope}: {exc}")
             continue

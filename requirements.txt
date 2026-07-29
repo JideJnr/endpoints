@@ -8,11 +8,11 @@ trafilatura
 pymongo[srv]
 apscheduler
 rapidfuzz
-# Optional Groq/LangChain agent extras. The core scheduler and rules/learning
-# pipeline run without these; install manually only when GROQ_API_KEY is used.
+# Optional DeepSeek/LangChain agent extras. The core scheduler and rules/learning
+# pipeline run without these; install manually only when DEEPSEEK_API_KEY is used.
 # langchain
 # langchain-core
-# langchain-groq
+# langchain-deepseek
 numpy
 scipy
 scikit-learn

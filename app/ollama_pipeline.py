@@ -1,6 +1,6 @@
 """
-Multi-stage OpenRouter prediction pipeline.
-Same structure as before — HTTP call swapped from Ollama to OpenRouter.
+Multi-stage DeepSeek prediction pipeline.
+Same structure as before — HTTP call swapped from Ollama to DeepSeek.
 """
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 # kept for any external imports
-_SPECIALIST_MODEL = "openrouter"
-_REASONING_MODEL = "openrouter"
-_FINAL_MODEL = "openrouter"
+_SPECIALIST_MODEL = "deepseek"
+_REASONING_MODEL = "deepseek"
+_FINAL_MODEL = "deepseek"
 
 _TIMEOUT_SPECIALIST = 30
 _TIMEOUT_FINAL = 45
@@ -136,18 +136,18 @@ Return ONLY valid JSON:
 # ── Core LLM call ──────────────────────────────────────────────────────────────
 
 def is_ollama_available(model: str | None = None) -> bool:
-    """Kept for compatibility — pipeline now uses OpenRouter."""
-    return bool(get_settings().openrouter_api_key)
+    """Kept for compatibility — pipeline now uses DeepSeek."""
+    return bool(get_settings().deepseek_api_key)
 
 
 def _call_llm(prompt: str, timeout: int = 30) -> str:
-    """Call OpenRouter chat completions (OpenAI-compatible)."""
+    """Call DeepSeek chat completions (OpenAI-compatible)."""
     settings = get_settings()
-    if not settings.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
-    url = settings.openrouter_base_url.rstrip("/") + "/chat/completions"
+    if not settings.deepseek_api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is not set in .env")
+    url = settings.deepseek_base_url.rstrip("/") + "/chat/completions"
     payload = json.dumps({
-        "model": settings.openrouter_model,
+        "model": settings.deepseek_model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": 512,
@@ -157,9 +157,7 @@ def _call_llm(prompt: str, timeout: int = 30) -> str:
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://predictx.app",
-            "X-Title": "PredictX",
+            "Authorization": f"Bearer {settings.deepseek_api_key}",
         },
         method="POST",
     )
@@ -168,7 +166,7 @@ def _call_llm(prompt: str, timeout: int = 30) -> str:
             data = json.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
+        raise RuntimeError(f"DeepSeek HTTP {exc.code}: {body[:300]}") from exc
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
@@ -461,8 +459,8 @@ def run_final_synthesis(
             "btts": result.get("btts"),
             "over_2_5": result.get("over_2_5"),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "source": "openrouter_pipeline",
-            "model": get_settings().openrouter_model,
+            "source": "deepseek_pipeline",
+            "model": get_settings().deepseek_model,
             "specialist_results": specialist_results,
             "aggregation": aggregation,
         }
@@ -487,18 +485,18 @@ def run_brain_review(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[st
         raw = _call_llm(prompt, timeout=_TIMEOUT_BRAIN)
         result = _parse_safe(raw)
         if not result:
-            return {"status": "error", "provider": "openrouter", "message": "Failed to parse brain JSON"}
+            return {"status": "error", "provider": "deepseek", "message": "Failed to parse brain JSON"}
         return {
             "status": result.get("status") or "approved",
-            "provider": "openrouter",
-            "model": get_settings().openrouter_model,
+            "provider": "deepseek",
+            "model": get_settings().deepseek_model,
             "verdict": result.get("verdict"),
             "confidence_adjustment": _safe_int(result.get("confidence_adjustment"), 0),
             "risks": result.get("risks") or [],
             "reasons": result.get("reasons") or [],
         }
     except Exception as exc:
-        return {"status": "error", "provider": "openrouter", "message": str(exc)}
+        return {"status": "error", "provider": "deepseek", "message": str(exc)}
 
 
 # ── Main entry points ──────────────────────────────────────────────────────────
@@ -506,10 +504,10 @@ def run_brain_review(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[st
 def run_ollama_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str, Any]:
     """Run the full multi-stage OpenRouter prediction pipeline."""
     settings = get_settings()
-    if not settings.openrouter_api_key:
-        return {"status": "openrouter_unavailable", "message": "OPENROUTER_API_KEY is not set in .env"}
+    if not settings.deepseek_api_key:
+        return {"status": "deepseek_unavailable", "message": "DEEPSEEK_API_KEY is not set in .env"}
 
-    logger.info("[pipeline] running specialists via OpenRouter (%s)", settings.openrouter_model)
+    logger.info("[pipeline] running specialists via DeepSeek (%s)", settings.deepseek_model)
     specialist_results: list[dict[str, Any]] = []
     for name, runner in [
         ("form", run_form_specialist),
@@ -555,8 +553,8 @@ def run_ollama_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[
         "btts": final.get("btts"),
         "over_2_5": final.get("over_2_5"),
         "generated_at": final.get("generated_at"),
-        "source": "openrouter_pipeline",
-        "model": settings.openrouter_model,
+        "source": "deepseek_pipeline",
+        "model": settings.deepseek_model,
         "specialist_results": specialist_results,
         "aggregation": final.get("aggregation") or {},
         "brain_review": brain,
@@ -569,8 +567,8 @@ def run_ollama_pipeline_batch(
     attach_brain: bool = True,
 ) -> dict[str, Any]:
     settings = get_settings()
-    if not settings.openrouter_api_key:
-        return {"status": "openrouter_unavailable", "message": "OPENROUTER_API_KEY is not set in .env"}
+    if not settings.deepseek_api_key:
+        return {"status": "deepseek_unavailable", "message": "DEEPSEEK_API_KEY is not set in .env"}
     docs = docs[:limit]
     predictions: list[dict[str, Any]] = []
     errors = value_bets = 0

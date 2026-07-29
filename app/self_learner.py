@@ -35,7 +35,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.league_memory import DB_PATH, _init_db, _get_passed_models
 
 UNIQUE_GRADED_HISTORY = """
     select *
@@ -48,7 +48,7 @@ UNIQUE_GRADED_HISTORY = """
             ) as rn
         from (
             select id, match_id, league_name, country_name, pick_type,
-                   selection, confidence, result, signals_json, audit_json, '{}' as context_json,
+                   selection, confidence, result, signals_json, audit_json, models_json, '{}' as context_json,
                    created_at, graded_at
             from prediction_history
             where graded_at is not null
@@ -56,7 +56,7 @@ UNIQUE_GRADED_HISTORY = """
               and pick_type != 'no_bet'
             union all
             select id, match_id, league_name, country_name, pick_type,
-                   selection, confidence, result, signals_json, audit_json, context_json,
+                   selection, confidence, result, signals_json, audit_json, '{}' as models_json, context_json,
                    created_at, graded_at
             from prediction_candidate_history
             where graded_at is not null
@@ -207,7 +207,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "rules":       {"goal_pressure", "h2h_edge", "league_position_edge",
                         "recent_history_edge", "common_opponent_edge",
                         "avg_rating_edge", "market_steam", "odds_edge"},
-        "groq":        {"groq_agent", "ai_brain_review"},
+        "deepseek":    {"deepseek_agent", "ai_brain_review"},
     }
     model_stats: dict[str, dict] = {m: {"samples": 0, "wins": 0} for m in model_signal_map}
 
@@ -220,6 +220,23 @@ def run_learning_cycle() -> dict[str, Any]:
                 model_stats[model]["samples"] += 1
                 if result == "win":
                     model_stats[model]["wins"] += 1
+
+    # ── 3b. Direct model accuracy from models_json ──────────────────
+    # Uses the actual models stored with each prediction to determine
+    # which models passed, rather than inferring from signal names.
+    direct_model_stats: dict[str, dict] = {m: {"samples": 0, "wins": 0} for m in model_signal_map}
+
+    for row in rows:
+        models_json = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
+        if not models_json:
+            continue
+        result = row["result"]
+        passed = _get_passed_models(models_json, result)
+        for model_name in passed:
+            if model_name in direct_model_stats:
+                direct_model_stats[model_name]["samples"] += 1
+                if result == "win":
+                    direct_model_stats[model_name]["wins"] += 1
 
     # ── 4. Write everything to DB ─────────────────────────────────────────────
     signal_updates = 0
@@ -310,22 +327,28 @@ def run_learning_cycle() -> dict[str, Any]:
                   round(win_rate, 4), round(avg_conf, 2), calibration_gap, now))
             league_updates += 1
 
-        # Learned model weights
+        # Learned model weights — prefer direct models_json accuracy,
+        # fall back to signal-based heuristics when models_json is empty.
         base_weights = {
             "dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15,
-            "rules": 0.20, "groq": 0.10,
+            "rules": 0.20, "deepseek": 0.10,
         }
-        for model, stats in model_stats.items():
+        for model in base_weights:
+            direct = direct_model_stats.get(model, {"samples": 0, "wins": 0})
+            heuristic = model_stats.get(model, {"samples": 0, "wins": 0})
+            # Use direct data when we have enough samples, else fall back
+            use_direct = direct["samples"] >= MIN_SAMPLES
+            stats = direct if use_direct else heuristic
             samples = stats["samples"]
             wins = stats["wins"]
             if samples < MIN_SAMPLES:
                 continue
             win_rate = wins / samples
             base = base_weights.get(model, 0.20)
-            # Blend: if model win_rate > 55%, increase weight; < 45%, decrease
-            performance_factor = 0.5 + (win_rate - 0.50) * 2.0  # 0.0 to 1.0
+            performance_factor = 0.5 + (win_rate - 0.50) * 2.0
             learned = round(base * (1 - BLEND_WEIGHT) + base * performance_factor * BLEND_WEIGHT, 4)
-            learned = max(0.05, min(0.50, learned))  # clamp to sane range
+            learned = max(0.05, min(0.50, learned))
+            source = "models_json" if use_direct else "signal_heuristic"
             conn.execute("""
                 insert into learned_model_weights
                     (model_name, base_weight, learned_weight, samples, win_rate, last_updated)
@@ -430,7 +453,7 @@ def get_learned_weights() -> dict[str, float]:
 
     if not rows:
         # Return hardcoded defaults
-        return {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "groq": 0.10}
+        return {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "deepseek": 0.10}
 
     weights = {row["model_name"]: float(row["learned_weight"]) for row in rows}
     # Normalise so weights sum to 1.0
@@ -932,7 +955,7 @@ def _incorporate_ai_analysis(conn: sqlite3.Connection, graded_rows: list) -> int
             # If AI is more confident than our prediction, boost the model
             # If AI is less confident, suppress the model
             if abs(confidence_gap) > 0.1:
-                model_name = "groq" if doc.get("ai_analysis") else "ollama"
+                model_name = "deepseek" if doc.get("ai_analysis") else "ollama"
                 try:
                     conn.execute("""
                         update learned_model_weights
