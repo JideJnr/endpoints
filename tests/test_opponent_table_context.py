@@ -1,7 +1,6 @@
 import unittest
 
-from app.prediction_agent import _common_opponent_edge
-from app.web_context import _analyse_pages_with_grok
+from app.deepseek_agent import _analyse_pages_with_deepseek
 
 
 def _match(home, away, home_goals, away_goals):
@@ -35,18 +34,16 @@ class OpponentTableContextTests(unittest.TestCase):
         self.assertEqual(comparison["opponent_table"]["position"], 1)
         self.assertGreater(comparison["table_weight"], 1.0)
 
-    def test_grok_reader_is_explicitly_unavailable_without_key(self):
-        # No network call is attempted unless an xAI/Grok key is configured.
+    def test_deepseek_reader_is_explicitly_unavailable_without_key(self):
+        # No network call is attempted unless a DEEPSEEK_API_KEY is configured.
         import os
 
-        old_xai, old_grok = os.environ.pop("XAI_API_KEY", None), os.environ.pop("GROK_API_KEY", None)
+        old_key = os.environ.pop("DEEPSEEK_API_KEY", None)
         try:
-            result = _analyse_pages_with_grok("Home vs Away", [{"url": "https://example.test", "text": "Preview"}], "Home", "Away")
+            result = _analyse_pages_with_deepseek("Home vs Away", [{"url": "https://example.test", "text": "Preview"}], "Home", "Away")
         finally:
-            if old_xai is not None:
-                os.environ["XAI_API_KEY"] = old_xai
-            if old_grok is not None:
-                os.environ["GROK_API_KEY"] = old_grok
+            if old_key is not None:
+                os.environ["DEEPSEEK_API_KEY"] = old_key
         self.assertEqual(result["status"], "unavailable")
 
 

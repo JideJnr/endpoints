@@ -224,6 +224,17 @@ def _tournament(doc: dict[str, Any]) -> str:
 
 
 def _best_odds(doc: dict[str, Any]) -> float:
+    # Prefer the stored prematch 1X2 odds to avoid inflated live odds (e.g. 100.00
+    # for a team losing 5-1) skewing the low_value_odds flag and tier classification.
+    odds_1x2 = doc.get("odds_1x2") or {}
+    if odds_1x2:
+        try:
+            candidates = [float(v) for v in odds_1x2.values() if v is not None]
+            # Only use prematch 1X2 if values look like prematch (all < 20)
+            if candidates and all(v < 20 for v in candidates):
+                return max(candidates)
+        except (TypeError, ValueError):
+            pass
     odds = doc.get("odds") or doc.get("markets") or ((doc.get("sportybet") or {}).get("odds")) or {}
     values: list[float] = []
     def walk(value: Any) -> None:
@@ -234,7 +245,8 @@ def _best_odds(doc: dict[str, Any]) -> float:
         else:
             try:
                 n = float(value)
-                if n > 1: values.append(n)
+                # Cap at 20 to ignore live blowout odds (100.00 etc.)
+                if 1 < n <= 20: values.append(n)
             except (TypeError, ValueError): pass
     walk(odds)
     return max(values) if values else 0.0
@@ -380,7 +392,9 @@ def _step_common_opponent(doc: dict, model: str, timeout: int = 20) -> str:
 def _step_form(doc: dict, model: str, timeout: int = 20) -> str:
     try:
         standings = doc.get("standings") or ((doc.get("sofascore_detail") or {}).get("standings"))
-        if not standings: return FORM_FALLBACK
+        # SofaScore serialises missing standings as the string "None" — treat it as absent
+        if not standings or standings == "None" or standings == "null": return FORM_FALLBACK
+        if isinstance(standings, list) and len(standings) == 0: return FORM_FALLBACK
         home, away = _teams(doc)
         evidence = f"Form/standings for {home} vs {away}: {str(standings)[:380]}"
         return _ollama(model, f"Summarise in one factual sentence: {evidence}", timeout) or evidence
