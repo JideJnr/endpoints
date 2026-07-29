@@ -1,14 +1,14 @@
-# AI & Groq Layer
+# AI & DeepSeek Layer
 
-These modules add LLM-based reasoning on top of the statistical prediction engine. Groq is optional — all of these fall back gracefully when `GROQ_API_KEY` is not set.
+These modules add LLM-based reasoning on top of the statistical prediction engine. DeepSeek is optional — all of these fall back gracefully when `DEEPSEEK_API_KEY` is not set.
 
 ---
 
-## `groq_agent.py`
+## `deepseek_agent.py`
 
-The primary Groq integration. Sends a compact match summary to `llama-3.3-70b-versatile` and returns a structured JSON prediction.
+The primary DeepSeek integration. Sends a compact match summary to `deepseek-chat` and returns a structured JSON prediction.
 
-### Single match analysis: `run_groq_match_analysis(doc)`
+### Single match analysis: `run_deepseek_match_analysis(doc)`
 
 Used by the `/matches/{id}/ai-analysis` endpoint and the AI bet builder.
 
@@ -39,7 +39,7 @@ Used by the `/matches/{id}/ai-analysis` endpoint and the AI bet builder.
 
 **Design decision:** Uses a direct `llm.invoke()` call (no LangChain agent) so tool schemas are never injected into the context. This keeps requests within the 12,000 TPM on-demand limit.
 
-### Batch predictions: `run_groq_predictions(match_date, docs, limit)`
+### Batch predictions: `run_deepseek_predictions(match_date, docs, limit)`
 
 Runs single-match analysis over up to 50 enriched docs for a given date. Used for batch pre-analysis jobs.
 
@@ -50,17 +50,17 @@ Runs single-match analysis over up to 50 enriched docs for a given date. Used fo
 LLM provider abstraction.
 
 `get_llm()` — returns a configured LangChain LLM client. Provider selection order:
-1. **Groq** (if `GROQ_API_KEY` set) — fastest, lowest latency
+1. **DeepSeek** (if `DEEPSEEK_API_KEY` set) — fastest, lowest latency
 2. **HuggingFace** (if `HF_TOKEN` set) — good for Render/cloud deployments
 3. **Ollama** (local) — free, needs local install
 4. **Deterministic supervisor** — rules-only fallback
 
-`is_groq_available()` — returns `True` when `GROQ_API_KEY` is set and non-empty.
+`is_deepseek_available()` — returns `True` when `DEEPSEEK_API_KEY` is set and non-empty.
 
 **Env vars:**
-- `GROQ_API_KEY` — Groq API key
+- `DEEPSEEK_API_KEY` — DeepSeek API key
 - `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN` — HuggingFace token
-- `PREDICTX_AI_PROVIDER` — force a provider (`groq | huggingface | ollama | auto`)
+- `PREDICTX_AI_PROVIDER` — force a provider (`deepseek | huggingface | ollama | auto`)
 - `PREDICTX_HF_MODEL` — HF model ID (default `Qwen/Qwen2.5-7B-Instruct:fastest`)
 - `PREDICTX_AI_MODEL` — Ollama model (default `llama3.2:3b`)
 - `PREDICTX_AI_TIMEOUT_SECONDS` — request timeout (default 15)
@@ -79,15 +79,15 @@ The brain cannot override the risk manager or invent data. It can only nudge con
 
 ## `ai_betbuilder.py`
 
-AI-powered bet slip builder. Combines prediction engine picks with Groq analysis to build or validate a slip.
+AI-powered bet slip builder. Combines prediction engine picks with DeepSeek analysis to build or validate a slip.
 
-Designed to be called by the `/betbuilder/auto` endpoint when AI mode is enabled. Runs per-match Groq analysis on candidates, then synthesises a final slip recommendation.
+Designed to be called by the `/betbuilder/auto` endpoint when AI mode is enabled. Runs per-match DeepSeek analysis on candidates, then synthesises a final slip recommendation.
 
 ---
 
 ## `agent_tools.py`
 
-LangChain tool definitions used by the agent executor (`agentic_prediction.py` and `groq_agent._build_agent()`).
+LangChain tool definitions used by the agent executor (`agentic_prediction.py` and `deepseek_agent._build_agent()`).
 
 Available tools:
 - `poisson_model(home_team_id, away_team_id)` — run Poisson model
@@ -114,7 +114,7 @@ Used by the `/predictions/refresh` endpoint and the autopilot guardian.
 
 ## `chat_agent.py`
 
-Conversational agent for match Q&A. Allows users to ask questions about a specific match in natural language. Uses the same LLM abstraction as the Groq agent.
+Conversational agent for match Q&A. Allows users to ask questions about a specific match in natural language. Uses the same LLM abstraction as the DeepSeek agent.
 
 ---
 

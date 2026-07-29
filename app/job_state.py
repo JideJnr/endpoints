@@ -51,14 +51,16 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
     """
     Cross-process SQLite guard for scheduler and manual jobs.
 
-    A crashed process leaves a running row behind; a later process may recover it
-    after the stale window. This keeps reloads and priority lanes from duplicating
-    ingest/enrich/grade work.
+    The DB connection is closed before yielding so the write lock is not held
+    for the entire job duration — that was causing all concurrent jobs to see
+    'database is locked'.
     """
     _init_db()
     token = OWNER
     start = _now()
     stale_before = time.time() - max(30, stale_after_seconds)
+
+    # Acquire the guard in a short-lived connection — close before yielding.
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         _init_job_table(conn)
         conn.execute("begin immediate")
@@ -96,6 +98,7 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
                 (job_id, token, start, start),
             )
         conn.commit()
+    # Connection is now closed — DB lock released before the job runs.
 
     state = {"job_id": job_id, "owner": token, "started_at": start}
     try:

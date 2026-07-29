@@ -570,7 +570,7 @@ def post_enriched_match_analysis(sportybet_id: str, payload: dict[str, Any] = Bo
         result = enriched_match_analysis(sportybet_id, force_refresh=bool(payload.get("force_refresh")))
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    if result.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+    if result.get("status") in {"deepseek_unavailable", "agent_build_failed", "error"}:
         raise HTTPException(status_code=503, detail=result.get("message") or "AI analysis is unavailable")
     return result
 
@@ -598,7 +598,7 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
 
 @router.post("/betbuilder/auto")
 def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
-    """Build a Groq-powered slip from upcoming prediction-engine candidates."""
+    """Build a DeepSeek-powered slip from upcoming prediction-engine candidates."""
     from app.ai_betbuilder import build_ai_betbuilder
 
     result = build_ai_betbuilder(payload)

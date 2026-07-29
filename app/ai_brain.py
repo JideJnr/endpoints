@@ -14,13 +14,13 @@ DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     AI supervisor with memory-aware reasoning.
-    Routes through AIRouter (qwen3 → deepseek → groq) then falls back to
+    Routes through AIRouter (qwen3 → deepseek) then falls back to
     deterministic rules when no model is available.
     """
     safe_detail = detail if isinstance(detail, dict) else {}
     memory_context = _build_memory_context(prediction)
     prompt_payload = _compact_prediction(prediction, safe_detail, memory_context)
-    # Try AIRouter first (covers ollama + groq in one call)
+    # Try AIRouter first (covers ollama + deepseek in one call)
     from app.ai_router import get_router
     if get_router().any_available():
         ai = _router_review(prompt_payload)
@@ -118,14 +118,14 @@ def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] |
     if provider in {"hf", "huggingface", "hugging-face"}:
         return _huggingface_review(payload)
     if provider == "ollama":
-        return _router_review(payload)  # route through OpenRouter instead
-    if provider in {"groq", "auto"}:
+        return _router_review(payload)  # route through DeepSeek instead
+    if provider in {"deepseek", "auto"}:
         return _router_review(payload)
     return None
 
 
 def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Use AIRouter for supervisor review: qwen3 → deepseek → groq."""
+    """Use AIRouter for supervisor review: qwen3 → deepseek."""
     from app.ai_router import get_router, parse_json_safe
     try:
         messages = _review_messages(payload)
@@ -133,7 +133,7 @@ def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
         parsed = parse_json_safe(raw)
         if not parsed:
             return None
-        model = get_router().best_available() or "groq"
+        model = get_router().best_available() or "deepseek"
         return _review_result("ai_router", model, parsed)
     except Exception:
         return None

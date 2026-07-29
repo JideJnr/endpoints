@@ -1,9 +1,10 @@
 """
-OpenRouter prediction agent.
-Replaces the Ollama agent — uses OpenRouter cloud inference (fast, no local model load).
+DeepSeek prediction agent.
+Uses DeepSeek's OpenAI-compatible API for fast, cheap inference.
 
-Uses the free OpenRouter model (openrouter/free by default).
-Set OPENROUTER_API_KEY in .env.
+Set DEEPSEEK_API_KEY in .env.
+Default model: deepseek-chat (DeepSeek-V3, cheapest/fastest).
+For reasoning tasks set DEEPSEEK_MODEL=deepseek-reasoner.
 """
 from __future__ import annotations
 
@@ -16,11 +17,16 @@ from urllib.error import HTTPError
 
 from app.config import get_settings
 
-OPENROUTER_MODELS = {
-    "openrouter/free": {
-        "label": "OpenRouter Free",
-        "role": "Best Overall — free tier, excellent reasoning and general analysis",
+DEEPSEEK_MODELS = {
+    "deepseek-chat": {
+        "label": "DeepSeek Chat (V3)",
+        "role": "Best Overall — cheapest, fast, strong reasoning",
         "emoji": "🥇",
+    },
+    "deepseek-reasoner": {
+        "label": "DeepSeek Reasoner (R1)",
+        "role": "Deep reasoning — slower but more thorough",
+        "emoji": "🧠",
     },
 }
 
@@ -51,20 +57,20 @@ Output format:
 }"""
 
 
-def _openrouter_url() -> str:
+def _deepseek_url() -> str:
     settings = get_settings()
-    return settings.openrouter_base_url.rstrip("/")
+    return settings.deepseek_base_url.rstrip("/")
 
 
 def is_ollama_available(model: str | None = None) -> bool:
-    """Check if OpenRouter is reachable (API key is set)."""
+    """Check if DeepSeek API is reachable (API key is set)."""
     settings = get_settings()
-    if not settings.openrouter_api_key:
+    if not settings.deepseek_api_key:
         return False
     try:
-        url = _openrouter_url() + "/chat/completions"
+        url = _deepseek_url() + "/chat/completions"
         payload = json.dumps({
-            "model": settings.openrouter_model,
+            "model": settings.deepseek_model,
             "messages": [{"role": "user", "content": "ping"}],
             "temperature": 0,
             "max_tokens": 1,
@@ -74,30 +80,26 @@ def is_ollama_available(model: str | None = None) -> bool:
             data=payload,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {settings.openrouter_api_key}",
-                "HTTP-Referer": "https://predictx.app",
-                "X-Title": "PredictX",
+                "Authorization": f"Bearer {settings.deepseek_api_key}",
             },
             method="POST",
         )
         with urllib_request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        if model:
-            return True
         return bool(data.get("choices"))
     except Exception:
         return False
 
 
 def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
-    """Call OpenRouter chat completions (OpenAI-compatible)."""
+    """Call DeepSeek chat completions (OpenAI-compatible)."""
     settings = get_settings()
-    if not settings.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
+    if not settings.deepseek_api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is not set in .env")
 
-    url = _openrouter_url() + "/chat/completions"
+    url = _deepseek_url() + "/chat/completions"
     payload = json.dumps({
-        "model": settings.openrouter_model,
+        "model": settings.deepseek_model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": 512,
@@ -107,9 +109,7 @@ def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://predictx.app",
-            "X-Title": "PredictX",
+            "Authorization": f"Bearer {settings.deepseek_api_key}",
         },
         method="POST",
     )
@@ -118,10 +118,10 @@ def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
             data = json.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
+        raise RuntimeError(f"DeepSeek HTTP {exc.code}: {body[:300]}") from exc
 
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return re.sub(r"</think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 def _parse_response(raw: str) -> dict[str, Any]:
@@ -136,14 +136,14 @@ def _parse_response(raw: str) -> dict[str, Any]:
 
 def run_ollama_match_analysis(
     doc: dict[str, Any],
-    model: str = "openrouter/free",
+    model: str = "deepseek/deepseek-chat",
 ) -> dict[str, Any]:
     """
-    Run a single OpenRouter model analysis for one enriched match document.
+    Run a single DeepSeek model analysis for one enriched match document.
 
     Args:
-        doc:   enriched match document (same format as groq_agent)
-        model: OpenRouter model name (ignored — uses configured model)
+        doc:   enriched match document (same format as deepseek_agent)
+        model: DeepSeek model name (ignored — uses configured model)
 
     Returns:
         analysis dict with status, recommendation, confidence, reasoning, etc.
@@ -151,7 +151,7 @@ def run_ollama_match_analysis(
     if not is_ollama_available():
         return {
             "status": "ollama_unavailable",
-            "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env",
+            "message": "DeepSeek is not available. Check DEEPSEEK_API_KEY in .env",
             "model": model,
         }
 
@@ -162,7 +162,7 @@ def run_ollama_match_analysis(
         pass
 
     try:
-        from app.groq_agent import _summarise_doc
+        from app.deepseek_agent import _summarise_doc
         summary = _summarise_doc(doc)
     except Exception as exc:
         return {"status": "error", "message": f"Failed to summarise doc: {exc}", "model": model}
@@ -181,7 +181,7 @@ def run_ollama_match_analysis(
     except (TypeError, ValueError):
         confidence = None
 
-    model_info = OPENROUTER_MODELS.get(model, {"label": model, "role": "", "emoji": "🤖"})
+    model_info = DEEPSEEK_MODELS.get(model) or DEEPSEEK_MODELS.get(get_settings().deepseek_model) or {"label": model, "role": "", "emoji": "🤖"}
 
     return {
         "status": result.get("status") or "predicted",
@@ -194,7 +194,7 @@ def run_ollama_match_analysis(
         "btts": result.get("btts"),
         "over_2_5": result.get("over_2_5"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "openrouter",
+        "source": "deepseek",
         "model": model,
         "model_label": model_info["label"],
         "model_role": model_info["role"],
@@ -209,7 +209,7 @@ def run_ollama_all_models(doc: dict[str, Any]) -> dict[str, Any]:
     Returns a combined result with individual model outputs and a consensus.
     """
     settings = get_settings()
-    model = settings.openrouter_model
+    model = settings.deepseek_model
     results: dict[str, Any] = {}
     results[model] = run_ollama_match_analysis(doc, model=model)
 
@@ -241,16 +241,16 @@ def run_ollama_predictions(
     match_date: str | None = None,
     docs: list[dict[str, Any]] | None = None,
     limit: int = 50,
-    model: str = "openrouter/free",
+    model: str = "deepseek/deepseek-chat",
 ) -> dict[str, Any]:
     """
-    Run OpenRouter predictions over enriched match documents (batch).
+    Run DeepSeek predictions over enriched match documents (batch).
 
     Args:
         match_date: YYYY-MM-DD, defaults to today
         docs:       pre-loaded enriched docs (skips DB fetch if provided)
         limit:      max matches to predict
-        model:      which OpenRouter model to use (ignored — uses configured model)
+        model:      which DeepSeek model to use (ignored — uses configured model)
 
     Returns:
         summary dict with predictions list
@@ -258,7 +258,7 @@ def run_ollama_predictions(
     from datetime import date as dt
 
     if not is_ollama_available():
-        return {"status": "ollama_unavailable", "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env"}
+        return {"status": "ollama_unavailable", "message": "DeepSeek is not available. Check DEEPSEEK_API_KEY in .env"}
 
     target_date = match_date or dt.today().isoformat()
 
@@ -270,7 +270,7 @@ def run_ollama_predictions(
         return {"status": "no_matches", "date": target_date, "predictions": []}
 
     docs = docs[:limit]
-    print(f"[openrouter_agent] predicting {len(docs)} matches for {target_date} using {model}")
+    print(f"[deepseek_agent] predicting {len(docs)} matches for {target_date} using {model}")
 
     predictions = []
     value_bets = 0
@@ -278,7 +278,7 @@ def run_ollama_predictions(
 
     for i, doc in enumerate(docs, 1):
         name = doc.get("sportybet_name") or doc.get("name") or "unknown"
-        print(f"[openrouter_agent] [{i}/{len(docs)}] {name}")
+        print(f"[deepseek_agent] [{i}/{len(docs)}] {name}")
         pred = run_ollama_match_analysis(doc, model=model)
         pred["sportybet_id"] = doc.get("sportybet_id")
         pred["match_id"] = doc.get("sportybet_id")

@@ -323,9 +323,9 @@ def _ollama_model() -> str | None:
 
 
 def _call_provider(model: str, prompt: str, timeout: int) -> str:
-    """Route through AIRouter — Ollama primary, Groq final fallback."""
+    """Route through AIRouter — Ollama primary, DeepSeek final fallback."""
     from app.ai_router import get_router
-    task = "reasoning" if model not in ("groq",) else "analysis"
+    task = "reasoning" if model not in ("deepseek",) else "analysis"
     return get_router().call_auto(prompt, task=task)
 
 
@@ -695,7 +695,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
     try:
         from app.ai_router import get_router
         router = get_router()
-        model = router.best_available() or ("groq" if router.is_groq_available() else None)
+        model = router.best_available() or ("deepseek" if router.is_deepseek_available() else None)
         if not model:
             result = _rules_fallback(doc, "unavailable", **kwargs)
             result["competition_analysis_used"] = False

@@ -389,88 +389,65 @@ def _is_finished_doc(doc: dict) -> bool:
     return period in ("ft", "finished", "ended", "aet", "ap", "full time")
 
 
-# ── Groq LangChain agent endpoints ───────────────────────────────────────────
-# Ported from migrated predictz/agent.py
-# Requires GROQ_API_KEY in .env
+# ── DeepSeek agent endpoints ──────────────────────────────────────────────────
+# Requires DEEPSEEK_API_KEY in .env
+
+@router.post("/deepseek/predict")
+def post_deepseek_predictions(
+    match_date: Optional[str] = None,
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Run DeepSeek agent predictions over today's enriched matches."""
+    try:
+        from app.deepseek_agent import run_deepseek_predictions
+        return run_deepseek_predictions(match_date=match_date, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/deepseek/status")
+def get_deepseek_status():
+    """Check if DeepSeek is configured and available."""
+    try:
+        from app.ai_router import get_router
+        available = get_router().any_available()
+        return {
+            "status": "success",
+            "deepseek_available": available,
+            "message": "DeepSeek ready" if available else "Set DEEPSEEK_API_KEY in .env",
+        }
+    except Exception as e:
+        return {"status": "error", "deepseek_available": False, "detail": str(e)}
+
+
+# Keep /groq/* and /ollama/* as aliases for backward compatibility
 
 @router.post("/groq/predict")
 def post_groq_predictions(
     match_date: Optional[str] = None,
     limit: int = Query(default=20, ge=1, le=100),
 ):
-    """
-    Run the Groq LangChain agent over today's enriched matches.
-    Full 10-step reasoning: standings, H2H, Poisson, odds movement, SOS, web context.
-    Requires GROQ_API_KEY.
-    """
-    try:
-        from app.groq_agent import run_groq_predictions
-        return run_groq_predictions(match_date=match_date, limit=limit)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    """Alias for /deepseek/predict — kept for backward compatibility."""
+    return post_deepseek_predictions(match_date=match_date, limit=limit)
 
 
 @router.get("/groq/status")
 def get_groq_status():
-    """Check if Groq LLM is configured and available."""
-    try:
-        from app.llm import is_groq_available, get_llm
-        available = is_groq_available()
-        return {
-            "status": "success",
-            "groq_available": available,
-            "message": "Groq ready" if available else "Set GROQ_API_KEY in .env to enable Groq agent",
-        }
-    except Exception as e:
-        return {"status": "error", "groq_available": False, "detail": str(e)}
+    """Alias for /deepseek/status — kept for backward compatibility."""
+    return get_deepseek_status()
 
-
-# ── Ollama local LLM endpoints ────────────────────────────────────────────────
-# Requires Ollama running locally. Pull models:
-#   ollama pull qwen3:8b
-#   ollama pull deepseek-r1:8b
 
 @router.post("/ollama/predict")
 def post_ollama_predictions(
     match_date: Optional[str] = None,
     limit: int = Query(default=20, ge=1, le=100),
-    model: str = Query(default="qwen3:8b"),
+    model: str = Query(default="deepseek-chat"),
 ):
-    """
-    Run Ollama local LLM predictions over today's enriched matches.
-    Supported models: qwen3:8b (Best Overall), deepseek-r1:8b (Best Reasoning).
-    Requires Ollama running locally.
-    """
-    try:
-        from app.ollama_agent import run_ollama_predictions
-        return run_ollama_predictions(match_date=match_date, limit=limit, model=model)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    """Alias for /deepseek/predict — kept for backward compatibility."""
+    return post_deepseek_predictions(match_date=match_date, limit=limit)
 
 
 @router.get("/ollama/status")
 def get_ollama_status():
-    """Check if Ollama is running and which models are available."""
-    try:
-        from app.ollama_agent import is_ollama_available, OLLAMA_MODELS
-        from app.ollama_model_manager import get_model_status, is_model_loaded
-        reachable = is_ollama_available()
-        model_status = {}
-        if reachable:
-            for model in OLLAMA_MODELS:
-                info = OLLAMA_MODELS[model]
-                model_status[model] = {
-                    **info,
-                    "available": is_ollama_available(model),
-                    "resident": is_model_loaded(model),
-                    "pull_command": f"ollama pull {model}",
-                }
-        return {
-            "status": "success",
-            "ollama_running": reachable,
-            "message": "Ollama ready" if reachable else "Ollama not running. Start with: ollama serve",
-            "models": model_status,
-            "model_manager": get_model_status(),
-        }
-    except Exception as e:
-        return {"status": "error", "ollama_running": False, "detail": str(e)}
+    """Alias for /deepseek/status — kept for backward compatibility."""
+    return get_deepseek_status()

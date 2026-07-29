@@ -11,7 +11,7 @@ from app.config import get_settings
 
 
 def search_match_context(home: str, away: str, tournament: str = "") -> dict[str, Any]:
-    """Search, read the first result pages, then optionally extract evidence with Grok."""
+    """Search, read the first result pages, then optionally extract evidence with DeepSeek."""
     query = f"{home} vs {away} prediction preview {tournament}".strip()
     settings = get_settings()
 
@@ -35,21 +35,21 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
 
     # scrape pages in parallel with a hard wall-clock timeout
     scraped = _scrape_parallel(urls_to_scrape, settings.web_scrape_timeout_seconds)
-    grok_analysis = _analyse_pages_with_grok(query, scraped, home, away)
+    deepseek_analysis = _analyse_pages_with_deepseek(query, scraped, home, away)
 
     search_error = next((item.get("error") for item in reversed(attempts) if item.get("status") == "error"), None)
     return {
         "query": query,
         "snippets": snippets,
         "scraped": scraped,
-        "grok_analysis": grok_analysis,
+        "deepseek_analysis": deepseek_analysis,
         "error": search_error if not results else None,
         "diagnostics": {
             **_diagnostics(settings),
             "attempts": attempts,
             "results": len(results),
             "scraped": len(scraped),
-            "grok": grok_analysis.get("status"),
+            "deepseek": deepseek_analysis.get("status"),
         },
     }
 
@@ -70,7 +70,7 @@ def _search(query: str, max_results: int) -> tuple[list[dict[str, Any]], list[di
 
     # Fallback: ddgs library (if installed)
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS(timeout=settings.web_search_timeout_seconds) as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
         if results:
@@ -202,13 +202,13 @@ def _scrape_parallel(urls: list[str], timeout_per_url: int) -> list[dict[str, st
     return results
 
 
-def _analyse_pages_with_grok(
+def _analyse_pages_with_deepseek(
     query: str,
     scraped: list[dict[str, str]],
     home: str,
     away: str,
 ) -> dict[str, Any]:
-    """Use xAI Grok to turn the first three page extracts into bounded evidence.
+    """Use DeepSeek to turn the first three page extracts into bounded evidence.
 
     Page text is untrusted.  The prompt explicitly prevents it from becoming
     instructions, and the output is stored as evidence only; it never creates
@@ -216,9 +216,9 @@ def _analyse_pages_with_grok(
     """
     if not scraped:
         return {"status": "skipped", "reason": "no_pages_read", "evidence": []}
-    api_key = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        return {"status": "unavailable", "reason": "XAI_API_KEY_not_set", "evidence": []}
+        return {"status": "unavailable", "reason": "DEEPSEEK_API_KEY_not_set", "evidence": []}
 
     pages = [
         {"url": item.get("url", ""), "text": str(item.get("text", ""))[:1800]}
@@ -244,10 +244,10 @@ def _analyse_pages_with_grok(
         import requests
 
         response = requests.post(
-            os.getenv("XAI_API_URL", "https://api.x.ai/v1/chat/completions"),
+            os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": os.getenv("XAI_MODEL", "grok-4"),
+                "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
                 "messages": [

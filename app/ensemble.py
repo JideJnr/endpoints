@@ -10,7 +10,7 @@ _BASE_WEIGHTS = {
     "elo": 0.25,
     "poisson": 0.15,
     "rules": 0.20,
-    "groq": 0.10,
+    "deepseek": 0.10,
 }
 
 # Module-level cache so we don't hit SQLite on every prediction
@@ -46,7 +46,7 @@ def compute_ensemble_diversity(
     poisson: dict[str, Any] | None,
     rules_confidence: int,
     rules_pick: str,
-    groq: dict[str, Any] | None = None,
+    deepseek: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute diversity metrics across ensemble models.
     
@@ -87,11 +87,11 @@ def compute_ensemble_diversity(
     elif "draw" in pick:
         model_probs["rules"] = {"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}
     
-    if groq and groq.get("probabilities"):
-        model_probs["groq"] = {
-            "home_win": float(groq["probabilities"].get("home_win") or 0),
-            "draw": float(groq["probabilities"].get("draw") or 0),
-            "away_win": float(groq["probabilities"].get("away_win") or 0),
+    if deepseek and deepseek.get("probabilities"):
+        model_probs["deepseek"] = {
+            "home_win": float(deepseek["probabilities"].get("home_win") or 0),
+            "draw": float(deepseek["probabilities"].get("draw") or 0),
+            "away_win": float(deepseek["probabilities"].get("away_win") or 0),
         }
     
     if len(model_probs) < 2:
@@ -159,9 +159,9 @@ def ensemble_prediction(
     poisson: dict[str, Any] | None,
     rules_confidence: int,
     rules_pick: str,
-    groq: dict[str, Any] | None = None,
+    deepseek: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    diversity = compute_ensemble_diversity(dixon, elo, poisson, rules_confidence, rules_pick, groq)
+    diversity = compute_ensemble_diversity(dixon, elo, poisson, rules_confidence, rules_pick, deepseek)
     weights = _get_weights()
     scores = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
     total_weight = 0.0
@@ -204,9 +204,9 @@ def ensemble_prediction(
         _add({"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}, weights.get("rules", 0.20))
         models_used.append("rules")
 
-    if groq and groq.get("probabilities"):
-        _add(groq["probabilities"], weights.get("groq", 0.10))
-        models_used.append("groq")
+    if deepseek and deepseek.get("probabilities"):
+        _add(deepseek["probabilities"], weights.get("deepseek", 0.10))
+        models_used.append("deepseek")
 
     if total_weight == 0:
         neutral = {"home_win": 33.3, "draw": 33.4, "away_win": 33.3}
