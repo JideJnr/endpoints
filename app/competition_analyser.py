@@ -437,8 +437,12 @@ def build_analysis_prompt(ctx: AnalysisContext) -> str:
         f"Form:{form_str}\n"
         f"Results:{results_str}\n"
         f"OddsMovement:{odds_str}\n"
-        "Provide a concise 2-sentence analysis of this matchday: key results, standings impact, "
-        "and any notable odds movements. JSON: {\"analysis\":\"<text>\"}"
+        "Provide a structured JSON analysis of this matchday with:\n"
+        "- \"analysis\": 2-3 sentence summary of key results and standings impact\n"
+        "- \"top_table\": array of top 3-5 teams with position and points (e.g. [{\"pos\":1,\"team\":\"Name\",\"pts\":12}]) \n"
+        "- \"disappointments\": array of teams or results that disappointed this week (e.g. [\"Team X dropped to 5th\", \"Y lost at home\"]) \n"
+        "- \"standings_impact\": brief note on the biggest standings changes\n"
+        "JSON: {\"analysis\":\"...\", \"top_table\":[...], \"disappointments\":[...], \"standings_impact\":\"...\"}"
     )
 
     # Token budget check (len // 4 as proxy)
@@ -450,8 +454,12 @@ def build_analysis_prompt(ctx: AnalysisContext) -> str:
             f"Form:{form_str}\n"
             f"Results:{results_str}\n"
             f"OddsMovement:{odds_str}\n"
-            "Provide a concise 2-sentence analysis of this matchday: key results, standings impact, "
-            "and any notable odds movements. JSON: {\"analysis\":\"<text>\"}"
+            "Provide a structured JSON analysis of this matchday with:\n"
+            "- \"analysis\": 2-3 sentence summary\n"
+            "- \"top_table\": array of top 3 teams with position and points\n"
+            "- \"disappointments\": array of teams/results that disappointed\n"
+            "- \"standings_impact\": brief note on standings changes\n"
+            "JSON: {\"analysis\":\"...\", \"top_table\":[...], \"disappointments\":[...], \"standings_impact\":\"...\"}"
         )
 
     return prompt
@@ -519,16 +527,22 @@ def run_competition_analysis(
         )
         return {"status": "ollama_error", "competition_key": competition_key, "round_name": round_name, "error": str(exc)}
 
-    # Extract analysis text
+    # Extract structured analysis from JSON response
     analysis_text = raw.strip()
+    analysis_data: dict[str, Any] = {}
     try:
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start >= 0 and end > start:
             parsed = json.loads(raw[start:end])
-            analysis_text = parsed.get("analysis") or analysis_text
+            analysis_data = parsed if isinstance(parsed, dict) else {}
+            analysis_text = analysis_data.get("analysis") or analysis_text
     except Exception:
         pass
+
+    # Store the full structured JSON so the frontend can render top_table and disappointments
+    if analysis_data:
+        analysis_text = json.dumps(analysis_data)
 
     generated_at = datetime.now(timezone.utc).isoformat()
     _init_db()
@@ -551,6 +565,7 @@ def run_competition_analysis(
         "competition_key": competition_key,
         "round_name": round_name,
         "analysis_text": analysis_text,
+        "analysis_data": analysis_data,
         "generated_at": generated_at,
         "match_count": ctx.match_count,
         "model_used": model,

@@ -45,6 +45,7 @@ class ReasoningContext:
     form_statement: str
     odds_statement: str
     similar_matches_statement: str
+    team_history_statement: str
 
 
 @dataclass

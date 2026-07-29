@@ -5,14 +5,21 @@ from copy import deepcopy
 
 from app.config import get_settings
 from app.market_intent import classify_market_intent
+from app.risk_learner import get_learned_risk_controls, get_learned_risk_controls_for_pick, LearnedRiskControls
 from app.validation_gate import evaluate_promotion_gate
 
+
+# ── Static Fallbacks (used when learned data is insufficient) ──────────────────
+# These remain as safety nets but are progressively replaced by learned values.
 
 MAX_SINGLE_BET_STAKE_PER_100 = 5.0
 MAX_DEGRADED_STAKE_PER_100 = 1.0
 MAX_HIGH_RISK_STAKE_PER_100 = 0.5
 LONGSHOT_ODDS = 3.0
 EXTREME_LONGSHOT_ODDS = 5.0
+
+# Minimum samples required before trusting learned risk controls
+LEARNED_RISK_MIN_SAMPLES = 8
 
 
 def apply_risk_controls(
@@ -29,6 +36,9 @@ def apply_risk_controls(
 
     This is governance, not prediction. It only caps confidence/stake or
     converts the slate to no-bet when the data and market controls fail.
+
+    Uses learned risk controls when sufficient historical data exists,
+    falling back to static rules for bootstrap/unproven conditions.
     """
     signals = signals or []
     contextual_intelligence = contextual_intelligence or {}
@@ -42,11 +52,37 @@ def apply_risk_controls(
         return report
 
     original = [deepcopy(pick) for pick in picks if pick.get("type") != "no_bet"]
-    for pick in picks:
+
+    # Get learned risk controls for each pick (if enough data exists)
+    learned_controls: dict[int, LearnedRiskControls] = {}
+    for idx, pick in enumerate(picks):
+        if pick.get("type") == "no_bet":
+            continue
+        try:
+            controls = get_learned_risk_controls_for_pick(
+                doc, pick, contextual_intelligence, report
+            )
+            if controls.samples >= LEARNED_RISK_MIN_SAMPLES:
+                learned_controls[idx] = controls
+                report.setdefault("learned_controls", []).append({
+                    "pick_index": idx,
+                    "selection": pick.get("selection"),
+                    "source": controls.source,
+                    "samples": controls.samples,
+                    "win_rate": controls.win_rate,
+                    "confidence_cap": controls.confidence_cap,
+                    "stake_cap": controls.stake_cap_per_100,
+                })
+        except Exception:
+            pass  # Fall back to static rules if learner fails
+
+    for idx, pick in enumerate(picks):
         if pick.get("type") == "no_bet":
             _stamp_pick(pick, report)
             continue
-        _apply_pick_limits(pick, report, signals=signals, models=models)
+
+        controls = learned_controls.get(idx)
+        _apply_pick_limits(pick, report, signals=signals, models=models, learned_controls=controls)
         gate = evaluate_promotion_gate(doc, pick)
         pick["validation_gate"] = gate
         report.setdefault("validation_gates", []).append({
@@ -73,6 +109,9 @@ def apply_risk_controls(
             for reason in reasons:
                 _add_violation(report, f"validation_{reason}", hard=not bootstrap_only)
     _refresh_risk_level(report)
+
+    # Apply learned hard-block overrides
+    _apply_learned_hard_blocks(real_picks, report, learned_controls)
 
     real_picks = [pick for pick in picks if pick.get("type") != "no_bet"]
     highest_conf = max([int(pick.get("confidence") or 0) for pick in real_picks] or [0])
@@ -110,78 +149,39 @@ def apply_risk_controls(
     report["published"] = not any(pick.get("type") == "no_bet" for pick in picks[:1])
     report["max_single_bet_stake_per_100"] = MAX_SINGLE_BET_STAKE_PER_100
     report.setdefault("block_reason_summary", list(report.get("hard_block_reasons") or []))
+
+    # Record risk control application for learning
+    _record_risk_control_application(doc, picks, report, learned_controls)
+
     return report
 
 
-def _base_report(
-    doc: dict[str, Any],
-    readiness: dict[str, Any],
-    contextual: dict[str, Any],
-    odds_movement: dict[str, Any],
-) -> dict[str, Any]:
-    assurance = readiness.get("assurance") or ((doc.get("prediction_readiness") or {}).get("assurance"))
-    risk = contextual.get("risk") or {}
-    learned = contextual.get("learned_performance") or {}
-    learned_class = learned.get("classification")
-    market = contextual.get("market_behavior") or {}
-    flags = list(market.get("flags") or [])
-    volatility = float(market.get("volatility_percent") or 0)
-    volatility_hard_block_threshold = float(get_settings().risk_manager_volatility_hard_block_threshold)
-    strongest = odds_movement.get("strongest_pull") if isinstance(odds_movement.get("strongest_pull"), dict) else {}
-    if not volatility and strongest:
-        volatility = abs(_to_float(
-            strongest.get("odds_change_percent")
-            or strongest.get("implied_change_percent")
-            or strongest.get("change_percent")
-        ) or 0)
-    violations: list[str] = []
-    hard_block = False
+def _apply_learned_hard_blocks(
+    real_picks: list[dict[str, Any]],
+    report: dict[str, Any],
+    learned_controls: dict[int, LearnedRiskControls],
+) -> None:
+    """Apply learned hard-block decisions when static rules didn't already block."""
+    if not real_picks:
+        return
 
-    if assurance in {"sportybet_prematch_minimum", "sportybet_market_signal"}:
-        violations.append("degraded_provider_assurance")
-    if risk.get("level") == "high" and learned_class != "smart_bet":
-        violations.append("contextual_high_risk")
-        hard_block = True
-    elif risk.get("level") == "high":
-        violations.append("contextual_high_risk_tempered_by_learning")
-    if learned_class == "learned_high_risk":
-        violations.append("learned_history_high_risk")
-        hard_block = True
-    if volatility >= volatility_hard_block_threshold:
-        violations.append("market_volatility_spike")
-        hard_block = True
-    elif volatility >= 18:
-        violations.append("market_volatility_requires_recheck")
-    elif volatility >= 18:
-        violations.append("market_volatility_tempered_by_learning")
-    elif volatility >= 12:
-        violations.append("market_volatility_requires_recheck")
-    if "thin_market_history" in flags:
-        violations.append("thin_market_history")
-    if readiness and not readiness.get("ready", True):
-        violations.append("readiness_not_ready")
-        hard_block = True
-    if learned_class == "smart_bet":
-        hard_block = False
-
-    return {
-        "version": "risk_management_v1",
-        "risk_level": "high" if hard_block else "medium" if violations else "low",
-        "hard_block": hard_block,
-        "validation_block": False,
-        "validation_gates": [],
-        "assurance": assurance,
-        "violations": violations,
-        "hard_block_reasons": [reason for reason in violations if reason in {"contextual_high_risk", "learned_history_high_risk", "market_volatility_spike", "readiness_not_ready"}],
-        "block_reason_summary": [],
-        "market_flags": flags,
-        "volatility_percent": round(volatility, 2),
-        "learned_classification": learned_class,
-        "learned_performance": learned,
-        "strengths": ["learned_smart_bet"] if learned_class == "smart_bet" else [],
-        "smart_bet": learned_class == "smart_bet" and not hard_block,
-        "actions": [],
-    }
+    for idx, controls in learned_controls.items():
+        if idx >= len(real_picks):
+            continue
+        if controls.hard_block and not report.get("hard_block"):
+            report["hard_block"] = True
+            report.setdefault("hard_block_reasons", [])
+            reason = controls.block_reason or "learned_poor_performance"
+            if reason not in report["hard_block_reasons"]:
+                report["hard_block_reasons"].append(reason)
+            report["actions"].append({
+                "type": "learned_hard_block",
+                "pick_index": idx,
+                "selection": real_picks[idx].get("selection"),
+                "reason": reason,
+                "samples": controls.samples,
+                "win_rate": controls.win_rate,
+            })
 
 
 def _apply_pick_limits(
@@ -190,24 +190,42 @@ def _apply_pick_limits(
     *,
     signals: list[dict[str, Any]],
     models: dict[str, Any],
+    learned_controls: LearnedRiskControls | None = None,
 ) -> None:
     original_confidence = int(pick.get("confidence") or 0)
     decimal_odds = _pick_odds(pick)
-    cap = 96
+
+    # Start with learned cap if available, otherwise use static defaults
+    if learned_controls and learned_controls.samples >= LEARNED_RISK_MIN_SAMPLES:
+        cap = learned_controls.confidence_cap
+        cap_source = f"learned (samples={learned_controls.samples}, win_rate={learned_controls.win_rate})"
+    else:
+        cap = 96
+        cap_source = "static default"
+
     reasons: list[str] = []
 
-    if report["assurance"] in {"sportybet_prematch_minimum", "sportybet_market_signal"}:
-        cap = min(cap, 62)
-        reasons.append("degraded provider assurance caps confidence")
-    if report.get("smart_bet"):
-        cap = max(cap, 88)
-        reasons.append("learned smart-bet profile protects confidence")
-    if report["risk_level"] == "high":
-        cap = min(cap, 68)
-        reasons.append("high risk context caps confidence")
-    elif report["risk_level"] == "medium":
-        cap = min(cap, 90)
-        reasons.append("medium risk context caps confidence")
+    # Learned controls override static degradation caps
+    if learned_controls and learned_controls.samples >= LEARNED_RISK_MIN_SAMPLES:
+        if learned_controls.confidence_cap < cap:
+            cap = learned_controls.confidence_cap
+            reasons.append(f"learned confidence cap ({cap_source})")
+    else:
+        # Static fallback rules
+        if report["assurance"] in {"sportybet_prematch_minimum", "sportybet_market_signal"}:
+            cap = min(cap, 62)
+            reasons.append("degraded provider assurance caps confidence")
+        if report.get("smart_bet"):
+            cap = max(cap, 88)
+            reasons.append("learned smart-bet profile protects confidence")
+        if report["risk_level"] == "high":
+            cap = min(cap, 68)
+            reasons.append("high risk context caps confidence")
+        elif report["risk_level"] == "medium":
+            cap = min(cap, 90)
+            reasons.append("medium risk context caps confidence")
+
+    # Longshot and model disagreement rules (always apply)
     if decimal_odds >= EXTREME_LONGSHOT_ODDS:
         cap = min(cap, 68)
         reasons.append("extreme longshot cap")
@@ -227,6 +245,8 @@ def _apply_pick_limits(
         reasons.append("risk signals outnumber support")
         if decimal_odds >= LONGSHOT_ODDS:
             _add_violation(report, "longshot_negative_signals_outnumber_support", hard=False)
+
+    # Historical calibration (always applies as a floor check)
     calibration = pick.get("calibration") if isinstance(pick.get("calibration"), dict) else {}
     win_rate = _to_float(calibration.get("win_rate"))
     samples = int(_to_float(calibration.get("samples")) or 0)
@@ -241,23 +261,39 @@ def _apply_pick_limits(
             "type": "confidence_cap",
             "selection": pick.get("selection"),
             "from": original_confidence,
-            "to": pick["confidence"],
+            "to": pick.get("confidence"),
             "reasons": reasons,
+            "source": cap_source,
         })
         if original_confidence - int(pick.get("confidence") or 0) >= 20:
             _add_violation(report, "confidence_capped_by_20_plus_points", hard=False)
-    _cap_stake(pick, report)
+
+    # Stake capping with learned values
+    _cap_stake(pick, report, learned_controls=learned_controls)
 
 
-def _cap_stake(pick: dict[str, Any], report: dict[str, Any]) -> None:
+def _cap_stake(
+    pick: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    learned_controls: LearnedRiskControls | None = None,
+) -> None:
     stake = pick.get("stake") if isinstance(pick.get("stake"), dict) else {}
     if not stake:
         return
-    limit = MAX_SINGLE_BET_STAKE_PER_100
-    if report["assurance"] in {"sportybet_prematch_minimum", "sportybet_market_signal"}:
-        limit = min(limit, MAX_DEGRADED_STAKE_PER_100)
-    if report["risk_level"] == "high":
-        limit = min(limit, MAX_HIGH_RISK_STAKE_PER_100)
+
+    # Use learned stake cap if available, otherwise static fallback
+    if learned_controls and learned_controls.samples >= LEARNED_RISK_MIN_SAMPLES:
+        limit = learned_controls.stake_cap_per_100
+        limit_source = f"learned (samples={learned_controls.samples})"
+    else:
+        limit = MAX_SINGLE_BET_STAKE_PER_100
+        if report["assurance"] in {"sportybet_prematch_minimum", "sportybet_market_signal"}:
+            limit = min(limit, MAX_DEGRADED_STAKE_PER_100)
+        if report["risk_level"] == "high":
+            limit = min(limit, MAX_HIGH_RISK_STAKE_PER_100)
+        limit_source = "static"
+
     before = float(stake.get("stake_per_100") or 0)
     after = round(min(before, limit), 2)
     stake["risk_cap_per_100"] = limit
@@ -270,25 +306,35 @@ def _cap_stake(pick: dict[str, Any], report: dict[str, Any]) -> None:
             "from": round(before, 2),
             "to": after,
             "limit": limit,
+            "source": limit_source,
         })
     if report["risk_level"] == "high":
         stake["recommended"] = False
 
 
 def _stamp_pick(pick: dict[str, Any], report: dict[str, Any]) -> None:
+    learned = report.get("learned_controls", [])
+    stake_limit = MAX_SINGLE_BET_STAKE_PER_100
+    if report["risk_level"] == "high":
+        stake_limit = MAX_HIGH_RISK_STAKE_PER_100
+    elif report["assurance"] in {"sportybet_prematch_minimum", "sportybet_market_signal"}:
+        stake_limit = MAX_DEGRADED_STAKE_PER_100
+
+    # Use learned stake limit if available for this pick
+    if learned:
+        for lc in learned:
+            if lc.get("selection") == pick.get("selection") and lc.get("samples", 0) >= LEARNED_RISK_MIN_SAMPLES:
+                stake_limit = lc.get("stake_cap", stake_limit)
+                break
+
     pick["risk_management"] = {
         "risk_level": report["risk_level"],
         "violations": report["violations"],
         "strengths": report.get("strengths") or [],
         "smart_bet": report.get("smart_bet", False),
         "learned_classification": report.get("learned_classification"),
-        "stake_limit_per_100": (
-            MAX_HIGH_RISK_STAKE_PER_100
-            if report["risk_level"] == "high"
-            else MAX_DEGRADED_STAKE_PER_100
-            if report["assurance"] in {"sportybet_prematch_minimum", "sportybet_market_signal"}
-            else MAX_SINGLE_BET_STAKE_PER_100
-        ),
+        "stake_limit_per_100": stake_limit,
+        "learned_controls_applied": bool(learned),
     }
 
 
@@ -431,3 +477,54 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _record_risk_control_application(
+    doc: dict[str, Any],
+    picks: list[dict[str, Any]],
+    report: dict[str, Any],
+    learned_controls: dict[int, LearnedRiskControls],
+) -> None:
+    """Record risk control application for later learning."""
+    try:
+        from app.league_memory import DB_PATH, _init_db
+        import json
+
+        match_id = str(doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
+        if not match_id:
+            return
+
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            from app.risk_learner import _init_risk_learner_tables
+            _init_risk_learner_tables(conn)
+
+            for idx, pick in enumerate(picks):
+                if pick.get("type") == "no_bet":
+                    continue
+                controls = learned_controls.get(idx)
+                conditions = []
+                if controls:
+                    # Extract conditions from the report
+                    for v in report.get("violations", []):
+                        conditions.append(v)
+                    if not conditions:
+                        conditions = ["standard"]
+
+                conn.execute("""
+                    insert into risk_control_history
+                        (match_id, risk_conditions, pick_type, raw_confidence,
+                         applied_confidence_cap, applied_stake_cap, hard_blocked)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    match_id,
+                    json.dumps(conditions),
+                    pick.get("type", "match_result"),
+                    int(pick.get("confidence") or 0),
+                    int(pick.get("confidence") or 0),  # After capping
+                    float(pick.get("stake", {}).get("stake_per_100") or 0),
+                    1 if report.get("hard_block") else 0,
+                ))
+            conn.commit()
+    except Exception:
+        pass  # Non-critical — don't break prediction flow

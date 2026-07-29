@@ -153,11 +153,12 @@ PIPELINES: list[PipelineDef] = [
         engine_id="competition_analysis",
         label="Competition Analysis",
         description="Detects newly completed matchdays for enabled competitions and generates "
-                    "Ollama-powered post-matchday analysis. Runs once per day.",
+                    "Ollama-powered post-matchday analysis with top table and weekly disappointments. "
+                    "Runs automatically each match week.",
         interval="Every 24 hrs",
         source="Internal",
         job_ids=("competition_analysis",),
-        default="paused",
+        default="active",
     ),
     PipelineDef(
         engine_id="sporty_only_upcoming",
