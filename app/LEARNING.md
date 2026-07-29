@@ -85,7 +85,7 @@ Patterns tracked: sustained shortening, late steam, reversal, stable, etc.
 
 ## `similar_matches.py`
 
-Finds historical matches that are structurally similar to a target match. Used by the AI bet builder to give Groq contextual evidence.
+Finds historical matches that are structurally similar to a target match. Used by the AI bet builder to give DeepSeek contextual evidence.
 
 **Similarity dimensions:**
 - ELO proximity (weight 0.45) — same team strength balance

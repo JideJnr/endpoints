@@ -10,9 +10,28 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from app.buffer import get_buffered_match
+from app.buffer import get_buffered_match, refresh_sporty_match_state
 from app.market_intent import classify_market_intent
 from app.sportybet_client import _browser_headers, _get_session
+
+
+def _resolve_sportybet_id(raw_id: str) -> str:
+    """Extract the numeric SportyBet event ID from any match_id format.
+
+    Handles:
+      sr:match:72180092          → sr:match:72180092  (already canonical)
+      competition:eliteserien:15260867 → 15260867
+      15260867                   → 15260867
+    """
+    if not raw_id:
+        return raw_id
+    if raw_id.startswith("sr:match:"):
+        return raw_id
+    # competition:league-slug:NUMERIC_ID  →  take the last segment
+    parts = raw_id.split(":")
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return parts[-1]
+    return raw_id
 
 
 def build_booking_payload(
@@ -48,7 +67,7 @@ def request_share_code(payload: dict[str, Any]) -> dict[str, Any]:
 
     response = _get_session().post(
         endpoint,
-        params={"throwInvalidEvent": "true"},
+        params={"throwInvalidEvent": True},
         json=payload,
         headers=_browser_headers(referer="https://www.sportybet.com/ng/sport/football"),
         timeout=20,
@@ -66,9 +85,11 @@ def request_share_code(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_leg(selection: dict[str, Any], stake: int) -> dict[str, Any]:
-    event_id = str(selection.get("sportybet_id") or selection.get("eventId") or selection.get("match_id") or "")
-    if not event_id or event_id.startswith("sofa:"):
-        raise ValueError("Every booking leg must have a current SportyBet event ID")
+    raw_id = str(selection.get("sportybet_id") or selection.get("eventId") or selection.get("match_id") or "")
+    if not raw_id or raw_id.startswith("sofa:") or raw_id.startswith("competition:"):
+        raise ValueError(f"Match {raw_id!r} has no SportyBet event ID — cannot book")
+    event_id = _resolve_sportybet_id(raw_id)
+    refresh_sporty_match_state(event_id)
     doc = get_buffered_match(event_id) or {}
     markets = doc.get("sportybet_markets") or doc.get("markets") or []
     if not markets:
@@ -82,7 +103,7 @@ def _resolve_leg(selection: dict[str, Any], stake: int) -> dict[str, Any]:
     return {
         "eventId": event_id,
         "marketId": str(market.get("id")),
-        "specifier": market.get("specifier"),
+        "specifier": market.get("specifier") or None,
         "outcomeId": str(outcome.get("id")),
         "stake": stake,
     }
@@ -126,7 +147,12 @@ def _outcome_matches(raw: Any, market: str, direction: str, intent_name: Any) ->
     if market == "1x2":
         return (direction == "home" and value in {"1", "home", "home win"}) or (direction == "away" and value in {"2", "away", "away win"}) or (direction == "draw" and value in {"x", "draw"})
     if market == "double_chance":
-        return str(intent_name or "").replace("home_or_draw", "1x").replace("away_or_draw", "x2").replace("home_or_away", "12") == value
+        dc_map = {
+            "home_or_draw": {"1x", "home or draw", "draw or home"},
+            "away_or_draw": {"x2", "away or draw", "draw or away"},
+            "home_or_away": {"12", "home or away", "away or home"},
+        }
+        return value in dc_map.get(str(intent_name or ""), set())
     if market == "btts":
         return value == direction
     if market == "total_goals":

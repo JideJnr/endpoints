@@ -38,7 +38,6 @@ from app.competition_analyser import job_competition_analysis
 _scheduler = None
 _shutting_down = False
 _live_priority_lock = threading.Lock()
-_db_job_lock = threading.Lock()
 _watchdog_thread: threading.Thread | None = None
 _watchdog_stop = threading.Event()
 LIVE_PRIORITY_ENGINE_ID = "live_priority_mode"
@@ -80,23 +79,23 @@ _DB_WRITE_JOB_IDS = {
 }
 _JOB_STALE_SECONDS = {
     "ai_prediction_queue": 600,
-    "ingest_live": 150,
-    "ingest_upcoming": 180,
-    "enrich_worker": 180,
-    "live_priority_toggle": 180,
-    "live_priority": 180,
-    "flush_to_mongo": 180,
-    "system_supervisor": 300,
+    "ingest_live": 90,
+    "ingest_upcoming": 120,
+    "enrich_worker": 120,
+    "live_priority_toggle": 120,
+    "live_priority": 120,
+    "flush_to_mongo": 120,
+    "system_supervisor": 240,
     "prediction_monitor": 1800,
-    "archive_finished": 900,
-    "grade_overdue_predictions": 1200,
+    "archive_finished": 600,
+    "grade_overdue_predictions": 900,
     "grade_predictions": 3600,
-    "autopilot_guardian": 1200,
+    "autopilot_guardian": 900,
     "competition_special": 1800,
     "competition_analysis": 90000,
     "sofa_pipeline": 600,
-    "unified_upcoming": 600,
-    "unified_live": 180,
+    "unified_upcoming": 480,
+    "unified_live": 120,
 }
 
 
@@ -570,6 +569,7 @@ def job_unified_upcoming() -> dict[str, Any]:
     from app.sportybet_client import fetch_upcoming_matches_post
     from app.sofascore_client import fetch_all_scheduled_events, is_usable_event_for_mode, search_events
     from app.buffer import ingest_matches, get_unenriched_batch, store_enriched, get_buffered_match
+    from app.buffer import _extract_1x2
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.sofascore_client import fetch_event_detail
     from app.market import snapshot_odds
@@ -705,8 +705,20 @@ def job_unified_upcoming() -> dict[str, Any]:
         pairs.append((item, sofa, score))
 
     # Fetch SofaScore detail in parallel for all matched
-    needs_detail = [(i, sofa, item) for i, (item, sofa, _) in enumerate(pairs) if sofa]
+    # Skip detail fetch for already-enriched prematch matches — reuse saved detail
+    needs_detail = [
+        (i, sofa, item) for i, (item, sofa, _) in enumerate(pairs)
+        if sofa and not (
+            (item.get("existing") or {}).get("sofascore_detail")
+            and (item.get("existing") or {}).get("sofascore_id")
+        )
+    ]
     details: dict[int, dict | None] = {}
+    # Pre-populate with saved detail for already-enriched matches
+    for i, (item, sofa, _) in enumerate(pairs):
+        existing = item.get("existing") or {}
+        if sofa and existing.get("sofascore_detail") and existing.get("sofascore_id"):
+            details[i] = existing["sofascore_detail"]
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_fetch_detail_safe, sofa): i for i, sofa, item in needs_detail}
         for future in as_completed(futures):
@@ -737,6 +749,7 @@ def job_unified_upcoming() -> dict[str, Any]:
             "score":             sporty.get("score"),
             "sportybet_markets": sporty.get("markets", []),
             "markets":           sporty.get("markets", []),
+            "odds_1x2":          _extract_1x2(sporty.get("markets") or []),
             "sofascore_id":      sofa.get("id") if sofa else existing.get("sofascore_id"),
             "sofascore_event":   sofa,
             "sofascore_detail":  detail,
@@ -792,10 +805,11 @@ def job_unified_upcoming() -> dict[str, Any]:
 
 def job_unified_live() -> dict[str, Any]:
     """Unified Live Pipeline:
-    1. Fetch live matches from SportyBet
-    2. Patch scores in buffer
-    3. Run enrichment worker (live-only: matches Sporty → Sofa live, updates predictions)
-    Skips if pipeline is disabled.
+    1. Fetch live matches from SportyBet → ingest + patch scores + snapshot odds
+    2. Fetch Sofa live events once
+    3a. Already-matched live (have sofascore_id + detail) → lightweight live refresh
+    3b. Unmatched live → fuzzy match against live events → full fetch_event_detail
+    4. Build doc with fresh Sporty markets + odds_1x2 → store_enriched → apply_prediction_state
     """
     if is_shutting_down():
         return {"status": "shutdown", "job": "unified_live"}
@@ -807,9 +821,19 @@ def job_unified_live() -> dict[str, Any]:
         pass
 
     from app.sportybet_client import fetch_live_matches_post
-    from app.buffer import ingest_matches, patch_live_scores, run_enrichment_worker
+    from app.buffer import (
+        ingest_matches, patch_live_scores, get_unenriched_batch,
+        store_enriched, get_buffered_match, _extract_1x2,
+    )
+    from app.sofascore_client import fetch_live_events, fetch_event_detail, fetch_event_detail_live_refresh
+    from app.enrichment import _fuzzy_match, _is_junk, FUZZY_THRESHOLD
     from app.league_memory import observe_matches
     from app.market import snapshot_odds
+    from app.match_state import classify_match_state
+    from app.time_context import match_time_context
+    from app.prediction_flow import apply_prediction_state
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
 
     record_activity("Unified live pipeline starting", job="unified_live", status="running")
     try:
@@ -818,13 +842,12 @@ def job_unified_live() -> dict[str, Any]:
         record_activity(f"Unified live: SportyBet fetch failed: {exc}", job="unified_live", status="error")
         return {"status": "error", "job": "unified_live", "error": str(exc)}
 
+    # ── Step 1: Ingest + patch + snapshot ─────────────────────────────────────
     groups = _group_matches_by_local_date(matches)
     ingested = 0
     for match_date, dated_matches in groups.items():
         ingested += ingest_matches(dated_matches, match_date)
-
     patched = patch_live_scores(matches)
-
     for m in matches:
         try:
             snapshot_odds({"sportybet_id": m.get("id"), "sportybet_name": m.get("name"),
@@ -832,17 +855,124 @@ def job_unified_live() -> dict[str, Any]:
                            "time_context": _match_time(m)})
         except Exception:
             pass
-
     observe_matches("sportybet", matches)
-    enrich = run_enrichment_worker(batch_size=6, live_only=True, fetch_web_context=False)
+
+    # ── Step 2: Fetch Sofa live events once ───────────────────────────────────
+    try:
+        live_sofa_events = fetch_live_events()
+    except Exception:
+        live_sofa_events = []
+
+    # ── Step 3: Get live buffer items needing enrichment ──────────────────────
+    pending = get_unenriched_batch(limit=8, live_only=True)
+
+    # Build a sportybet_id → raw sporty map for fast lookup
+    sporty_by_id = {str(m.get("id")): m for m in matches if m.get("id")}
+
+    now = datetime.now(timezone.utc).isoformat()
+    matched_count = unmatched_count = stored_count = predicted_count = 0
+
+    def _fetch_detail_safe(sofa_id: int | str, existing_detail: dict | None) -> dict | None:
+        try:
+            if existing_detail:
+                return fetch_event_detail_live_refresh(int(sofa_id), existing_detail)
+            return fetch_event_detail({"id": sofa_id})
+        except Exception:
+            return None
+
+    # Split into fast-path (already matched) and match-needed
+    pairs: list[tuple[dict, str | None, dict | None]] = []  # (item, sofa_id, existing_detail)
+    for item in pending:
+        existing = item.get("existing") or {}
+        saved_sofa_id = existing.get("sofascore_id")
+        if saved_sofa_id and existing.get("sofascore_detail"):
+            pairs.append((item, str(saved_sofa_id), existing.get("sofascore_detail")))
+            matched_count += 1
+        else:
+            sporty = item["sporty"]
+            sofa, score = _fuzzy_match(sporty, live_sofa_events)
+            threshold = 0.62  # lower threshold for live
+            if sofa and score >= threshold:
+                pairs.append((item, str(sofa.get("id")), None))
+                matched_count += 1
+            else:
+                pairs.append((item, None, None))
+                unmatched_count += 1
+
+    # Fetch details in parallel
+    details: dict[int, dict | None] = {}
+    needs_detail = [(i, sofa_id, existing_detail) for i, (item, sofa_id, existing_detail) in enumerate(pairs) if sofa_id]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_fetch_detail_safe, sofa_id, existing_detail): i
+                   for i, sofa_id, existing_detail in needs_detail}
+        for future in as_completed(futures):
+            details[futures[future]] = future.result()
+
+    # ── Step 4: Build doc + store + predict ───────────────────────────────────
+    for i, (item, sofa_id, _) in enumerate(pairs):
+        existing = item.get("existing") or {}
+        # Use fresh sporty data from this cycle if available
+        sporty = sporty_by_id.get(str(item["sporty"].get("id") or "")) or item["sporty"]
+        detail = details.get(i)
+        match_state = classify_match_state(sporty)
+        time_ctx = match_time_context({**sporty, "sofascore_event": existing.get("sofascore_event")})
+
+        doc = {
+            **existing,
+            "data_source":       "both" if sofa_id else "sportybet",
+            "sportybet_id":      sporty.get("id"),
+            "match_id":          item.get("match_id"),
+            "name":              sporty.get("name"),
+            "sportybet_name":    sporty.get("name"),
+            "match_date":        time_ctx.get("local_date") or item["match_date"],
+            "tournament":        sporty.get("tournament"),
+            "category":          sporty.get("category"),
+            "start_time":        sporty.get("start_time"),
+            "period":            sporty.get("period"),
+            "played_seconds":    sporty.get("played_seconds"),
+            "score":             sporty.get("score"),
+            "sportybet_markets": sporty.get("markets", []),
+            "markets":           sporty.get("markets", []),
+            "odds_1x2":          _extract_1x2(sporty.get("markets") or []),
+            "sofascore_id":      sofa_id or existing.get("sofascore_id"),
+            "sofascore_detail":  detail or existing.get("sofascore_detail"),
+            "home_last_matches": (detail or existing.get("sofascore_detail") or {}).get("home_last_matches") or [],
+            "away_last_matches": (detail or existing.get("sofascore_detail") or {}).get("away_last_matches") or [],
+            "standings":         (detail or existing.get("sofascore_detail") or {}).get("standings") or [],
+            "sofascore_match_status": "matched" if sofa_id else existing.get("sofascore_match_status", "no_match"),
+            "raw_sporty":        sporty,
+            "time_context":      time_ctx,
+            "match_state":       match_state,
+            "enriched_at":       now,
+            "is_live":           True,
+            "is_finished":       False,
+        }
+        store_enriched(item["match_id"], doc)
+        stored_count += 1
+
+        if sofa_id:
+            try:
+                fresh = get_buffered_match(item["match_id"]) or doc
+                result = apply_prediction_state(fresh, match_id=str(item["match_id"]))
+                if result.get("status") == "predicted":
+                    predicted_count += 1
+            except Exception as exc:
+                _logger.debug("unified_live: prediction failed for %s: %s", item["match_id"], exc)
 
     record_activity(
-        f"Unified live done: {len(matches)} live, {patched} patched, {enrich.get('predicted')} predicted",
+        f"Unified live done: {len(matches)} live, {patched} patched, "
+        f"{matched_count}/{len(pending)} matched, {predicted_count} predicted",
         job="unified_live", status="ok",
         details={"live_count": len(matches), "new": ingested, "patched": patched,
-                 **{k: enrich.get(k) for k in ("matched", "unmatched", "stored", "predicted")}},
+                 "pending": len(pending), "matched": matched_count, "unmatched": unmatched_count,
+                 "stored": stored_count, "predicted": predicted_count},
     )
-    return {"status": "ok", "job": "unified_live", "live_count": len(matches), "new": ingested, "patched": patched, "enrich": enrich}
+    return {
+        "status": "ok", "job": "unified_live",
+        "live_count": len(matches), "new": ingested, "patched": patched,
+        "pending": len(pending), "matched": matched_count, "unmatched": unmatched_count,
+        "stored": stored_count, "predicted": predicted_count,
+    }
 
 
 def job_competition_special() -> dict[str, Any]:
@@ -1455,7 +1585,7 @@ def stop_scheduler(wait: bool = False) -> bool:
                 scheduler.remove_all_jobs()
             except Exception:
                 pass
-            scheduler.shutdown(wait=wait)
+            scheduler.shutdown(wait=False)
     except Exception as exc:
         message = str(exc).lower()
         if "not running" not in message and "shutdown" not in message:
@@ -1735,16 +1865,6 @@ def _safe(fn):
 def run_job_with_guard(fn, *args, guard_job_id: str | None = None, **kwargs):
     """Run a scheduler job through the persistent cross-process job ledger."""
     job_id = guard_job_id or (fn.__name__[4:] if fn.__name__.startswith("job_") else fn.__name__)
-    if job_id in _DB_WRITE_JOB_IDS:
-        stale_after = _JOB_STALE_SECONDS.get(job_id, 900)
-        acquired = _db_job_lock.acquire(timeout=min(30, stale_after // 2))
-        if not acquired:
-            _logger.warning("[scheduler] %s skipped: db_job_lock held too long (possible hung job)", job_id)
-            return {"status": "busy", "job": job_id, "reason": "db_job_lock timeout"}
-        try:
-            return _run_job_with_guard_locked(fn, *args, guard_job_id=job_id, **kwargs)
-        finally:
-            _db_job_lock.release()
     return _run_job_with_guard_locked(fn, *args, guard_job_id=job_id, **kwargs)
 
 

@@ -652,7 +652,7 @@ def refresh_sporty_match_state(match_id: str) -> dict[str, Any]:
     from app.sportybet_client import fetch_match_info
 
     match_id = str(match_id)
-    info = fetch_match_info(match_id)
+    info = fetch_match_info(match_id, bypass_cache=True)
     refreshed = info.get("match") if info.get("found") else None
     scope = info.get("scope")
     if not refreshed:
