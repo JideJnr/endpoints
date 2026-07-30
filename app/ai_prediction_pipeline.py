@@ -725,6 +725,7 @@ def _convert_confidence(raw: float) -> int:
 def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
     from app.prediction_flow import apply_prediction_state
     logger.warning("Rules-engine fallback invoked: %s", reason)
+    kwargs["use_ollama_pipeline"] = False
     result = apply_prediction_state(doc, **kwargs)
     result["prediction_source"] = "rules_engine_fallback"
     if isinstance(result.get("prediction"), dict): result["prediction"]["prediction_source"] = "rules_engine_fallback"
@@ -732,7 +733,14 @@ def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
 
 
 def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None = None, match_date: str | None = None, source: str = "enriched_ensemble", attach_brain: bool = False, allow_repeat: bool = False, use_ollama_pipeline: bool | None = None) -> dict[str, Any]:
-    kwargs = dict(match_id=match_id, match_date=match_date, source=source, attach_brain=attach_brain, allow_repeat=allow_repeat, use_ollama_pipeline=use_ollama_pipeline)
+    kwargs = dict(
+        match_id=match_id,
+        match_date=match_date,
+        source=source,
+        attach_brain=attach_brain,
+        allow_repeat=allow_repeat,
+        use_ollama_pipeline=True if use_ollama_pipeline is None else use_ollama_pipeline,
+    )
     try:
         from app.ai_router import get_router
         router = get_router()
@@ -839,15 +847,27 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
 def job_ai_prediction_queue(batch_size: int = 10) -> dict:
     from app.activity_log import record_activity
     from app.pipeline_registry import is_pipeline_enabled
+    from app.buffer import get_buffered_match as _get_buffered_match, store_enriched as _store
     if not is_pipeline_enabled("ai_prediction_queue"):
         return {"status": "skipped", "reason": "pipeline_disabled"}
     record_activity("AI prediction queue started", job="ai_prediction_queue", status="running")
     _init_db()
     summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "ollama_used": 0, "fallback_used": 0, "errors": 0}
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        rows = conn.execute("""select match_id, match_date, raw_enriched from match_buffer
-            where raw_enriched is not null and is_finished=0 and is_live=0
-              and json_extract(raw_enriched, '$.prediction') is null""").fetchall()
+        rows = conn.execute(
+            """
+            select match_id, match_date, raw_enriched
+            from match_buffer
+            where raw_enriched is not null
+              and is_finished = 0
+              and (
+                    json_extract(raw_enriched, '$.manual_prediction_state') is not null
+                 or json_extract(raw_enriched, '$.prediction') is not null
+                 or json_extract(raw_enriched, '$.ai_prediction_queue_pending') = 1
+              )
+              and json_extract(raw_enriched, '$.ai_prediction_state') is null
+            """,
+        ).fetchall()
     docs = []
     for match_id, date, raw in rows:
         try:
@@ -855,13 +875,22 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
         except Exception:
             summary["errors"] += 1
     from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
-    from app.buffer import store_enriched as _store
 
     def _process_one(doc: dict) -> dict:
+        if not doc.get("prediction_readiness") or not doc.get("sofascore_detail"):
+            try:
+                from app.match_enrichment import enrich_buffered_match
+                enrich_buffered_match(str(doc.get("match_id") or ""), auto_predict=False)
+                refreshed = _get_buffered_match(str(doc.get("match_id") or ""))
+                if refreshed:
+                    doc.update(refreshed)
+            except Exception:
+                pass
         outcome = run_ai_prediction_with_fallback(
             doc,
             match_id=str(doc.get("match_id") or ""),
             match_date=doc.get("match_date"),
+            use_ollama_pipeline=True,
         )
         doc["ai_prediction_queue_pending"] = False
         _store(str(doc.get("match_id") or ""), doc)

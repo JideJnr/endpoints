@@ -54,6 +54,51 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
     }
 
 
+def search_team_context(team: str, league: str = "", position: str | int | None = None) -> dict[str, Any]:
+    """Search quick online context for one team."""
+    query_bits = [team, "team news", "form"]
+    if league:
+        query_bits.append(str(league))
+    if position not in (None, ""):
+        query_bits.append(f"position {position}")
+    query = " ".join(bit for bit in query_bits if bit).strip()
+    settings = get_settings()
+
+    if not settings.web_search_enabled:
+        return {"query": query, "snippets": [], "scraped": [], "disabled": True, "diagnostics": _diagnostics(settings)}
+
+    results, attempts = _search(query, settings.web_search_max_results)
+    snippets = []
+    urls_to_scrape = []
+    for result in results:
+        url = result.get("href", "")
+        snippets.append({
+            "title": _ascii(result.get("title", "")),
+            "snippet": _ascii(result.get("body", "")),
+            "url": url,
+        })
+        if url:
+            urls_to_scrape.append(url)
+
+    scraped = _scrape_parallel(urls_to_scrape, settings.web_scrape_timeout_seconds)
+    grok_analysis = _analyse_pages_with_grok(query, scraped, team, league or team)
+    search_error = next((item.get("error") for item in reversed(attempts) if item.get("status") == "error"), None)
+    return {
+        "query": query,
+        "snippets": snippets,
+        "scraped": scraped,
+        "grok_analysis": grok_analysis,
+        "error": search_error if not results else None,
+        "diagnostics": {
+            **_diagnostics(settings),
+            "attempts": attempts,
+            "results": len(results),
+            "scraped": len(scraped),
+            "grok": grok_analysis.get("status"),
+        },
+    }
+
+
 def _search(query: str, max_results: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Try HTML scrape first (most reliable), then ddgs library as fallback."""
     settings = get_settings()

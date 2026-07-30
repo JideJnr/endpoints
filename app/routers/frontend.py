@@ -997,6 +997,58 @@ def get_competition_special_status(competition_key: str):
     return competition_status(competition_key)
 
 
+@router.get("/competition-special/{competition_key}/team-watchers")
+def get_competition_team_watchers(
+    competition_key: str,
+    limit: int = Query(default=80, ge=1, le=200),
+):
+    from app.competition_special import list_team_watchers
+
+    return list_team_watchers(competition_key, limit=limit)
+
+
+@router.get("/competition-special/{competition_key}/team-watchers/{team_id}")
+def get_competition_team_watcher(competition_key: str, team_id: str):
+    from app.competition_special import get_team_watcher
+
+    return get_team_watcher(competition_key, team_id)
+
+
+@router.get("/team-watchers")
+def get_ai_team_watchers(limit: int = Query(default=100, ge=1, le=300)):
+    from app.team_watcher import list_watchers
+
+    return list_watchers(limit=limit)
+
+
+@router.get("/team-watchers/inspect-sporty")
+def inspect_sporty_team_watcher_ids(limit: int = Query(default=20, ge=1, le=100)):
+    from app.team_watcher import inspect_sporty_team_ids
+
+    return inspect_sporty_team_ids(limit=limit)
+
+
+@router.get("/team-watchers/{team_key:path}")
+def get_ai_team_watcher(team_key: str, limit: int = Query(default=30, ge=1, le=100)):
+    from app.team_watcher import get_watcher
+
+    return get_watcher(team_key, limit=limit)
+
+
+@router.post("/team-watchers/backfill")
+def backfill_ai_team_watchers(limit: int = Query(default=200, ge=1, le=1000)):
+    from app.team_watcher import backfill_from_finished
+
+    return backfill_from_finished(limit=limit)
+
+
+@router.post("/team-watchers/observe-match/{match_id:path}")
+def observe_match_for_ai_team_watchers(match_id: str):
+    from app.team_watcher import observe_finished_match_by_id
+
+    return observe_finished_match_by_id(match_id)
+
+
 @router.get("/competition-special/{competition_key}/analysis/latest")
 def get_competition_analysis_latest(competition_key: str):
     """Most recent post-matchday Ollama analysis for a competition."""
@@ -1057,12 +1109,13 @@ def get_competition_page(
 ):
     """Single-call competition page: settings + buffer + status + latest analysis + history."""
     import sqlite3
-    from app.competition_special import competition_status, get_competition_settings, list_competition_buffer
+    from app.competition_special import competition_status, get_competition_settings, list_competition_buffer, list_team_watchers
     from app.competition_analyser import get_analysis_history, get_latest_analysis, init_competition_analysis_table
     from app.league_memory import DB_PATH, _init_db
 
     buffer = list_competition_buffer(competition_key, limit=buffer_limit)
     status = competition_status(competition_key)
+    watchers = list_team_watchers(competition_key, limit=80)
 
     _init_db()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -1077,6 +1130,8 @@ def get_competition_page(
         "buffer_summary": buffer.get("summary"),
         "buffer_status": status.get("buffer"),
         "matches": buffer.get("matches", []),
+        "team_watchers": watchers.get("watchers", []),
+        "team_watcher_count": watchers.get("count", 0),
         "latest_analysis": latest_analysis,
         "analysis_history": analysis_history,
     }
@@ -2094,19 +2149,50 @@ def predict_single_match(
     allow_repeat: bool = False,
     dry_run: bool = False,
 ):
-    """Plan, enrich only when needed, then predict with bounded agentic execution."""
-    from app.agentic_prediction import AgentExecutionError, run_agentic_match_prediction
+    """Run the deterministic/manual prediction pipeline without the AI agent."""
+    from app.match_enrichment import MatchEnrichmentError, enrich_buffered_match
+    from app.prediction_flow import apply_prediction_state
 
     try:
         sportybet_id = _resolve_buffer_match_id(sportybet_id)
-        result = run_agentic_match_prediction(
-            sportybet_id,
-            force_enrich=force_enrich,
+        doc = get_buffered_match(sportybet_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found")
+
+        if force_enrich or not doc.get("prediction_readiness"):
+            try:
+                enrich_buffered_match(sportybet_id, auto_predict=False)
+                refreshed = get_buffered_match(sportybet_id)
+                if refreshed:
+                    doc = refreshed
+            except MatchEnrichmentError as exc:
+                # Keep going with the buffered snapshot if the match is already
+                # present. Manual prediction should not depend on the AI agent.
+                _logger.debug("Manual enrichment for %s skipped: %s", sportybet_id, exc)
+
+        if dry_run:
+            return {
+                "status": "success",
+                "sportybet_id": sportybet_id,
+                "prediction": None,
+                "prediction_state": {"status": "planned", "dry_run": True},
+                "manual_prediction_state": {"status": "planned", "dry_run": True},
+                "message": "Dry run only",
+            }
+
+        result = apply_prediction_state(
+            doc,
+            match_id=sportybet_id,
+            match_date=doc.get("match_date"),
+            source="manual_deterministic",
+            attach_brain=False,
             allow_repeat=allow_repeat,
-            dry_run=dry_run,
+            use_ollama_pipeline=False,
         )
-    except AgentExecutionError as exc:
-        raise HTTPException(status_code=409, detail={"message": str(exc), "agent": exc.trace})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"message": f"Manual prediction failed: {exc}"})
 
     state = result.get("prediction_state") or {}
     try:
@@ -2222,6 +2308,7 @@ def analyze_match_with_ai(sportybet_id: str):
         source="manual_ai_prediction",
         attach_brain=True,
         allow_repeat=True,
+        use_ollama_pipeline=True,
     )
     if state.get("status") not in {"predicted", "success"} and not state.get("prediction"):
         raise HTTPException(status_code=503, detail=state.get("message") or "AI analysis is unavailable")
@@ -2309,14 +2396,14 @@ def analyze_match_snapshot(sportybet_id: str):
     from app.groq_agent import run_groq_match_analysis
     from app.ollama_agent import run_ollama_all_models
 
-    # Run Groq analysis first
+    # Run the router-backed AI analysis first
     analysis = run_groq_match_analysis(doc)
     if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        analysis["provider"] = "groq"
+        analysis["provider"] = analysis.get("provider") or "openrouter"
         analysis["fallback"] = None
         doc["ai_analysis"] = analysis
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": analysis["provider"]}
 
     # Fall back to Ollama
     ollama_result = run_ollama_all_models(doc)
@@ -2356,15 +2443,16 @@ def analyze_graded_match(sportybet_id: str):
             "prediction_type": prediction.get("type") or prediction.get("pick_type"),
         }
 
-    # Run Groq analysis first
+    # Run the router-backed AI analysis first
     analysis = run_groq_match_analysis(doc)
     if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        analysis["provider"] = "groq"
+        analysis["provider"] = analysis.get("provider") or "openrouter"
         analysis["fallback"] = None
         analysis["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis"] = analysis
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": "groq"}
+        _observe_team_watchers_after_analysis(doc, analysis)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": analysis["provider"]}
 
     # Fall back to Ollama
     ollama_result = run_ollama_all_models(doc)
@@ -2374,6 +2462,7 @@ def analyze_graded_match(sportybet_id: str):
         ollama_result["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis_ollama"] = ollama_result
         store_enriched(sportybet_id, doc)
+        _observe_team_watchers_after_analysis(doc, ollama_result)
         return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
 
     raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
@@ -2382,7 +2471,7 @@ def analyze_graded_match(sportybet_id: str):
 def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | None:
     """
     Run AI analysis on a graded match to see what happened and if the prediction was correct.
-    Tries Groq first, falls back to Ollama.
+    Tries the router-backed OpenRouter path first, then falls back if needed.
     """
     from app.groq_agent import run_groq_match_analysis
     from app.ollama_agent import run_ollama_all_models
@@ -2397,11 +2486,12 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
 
     analysis = run_groq_match_analysis(doc)
     if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
-        analysis["provider"] = "groq"
+        analysis["provider"] = analysis.get("provider") or "openrouter"
         analysis["fallback"] = None
         analysis["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis"] = analysis
         store_enriched(str(doc.get("_id") or doc.get("sportybet_id") or ""), doc)
+        _observe_team_watchers_after_analysis(doc, analysis)
         return analysis
 
     ollama_result = run_ollama_all_models(doc)
@@ -2411,9 +2501,18 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
         ollama_result["graded_result"] = doc.get("_grading_result")
         doc["ai_analysis_ollama"] = ollama_result
         store_enriched(str(doc.get("_id") or doc.get("sportybet_id") or ""), doc)
+        _observe_team_watchers_after_analysis(doc, ollama_result)
         return ollama_result
 
     return None
+
+
+def _observe_team_watchers_after_analysis(doc: dict[str, Any], analysis: dict[str, Any]) -> None:
+    try:
+        from app.team_watcher import observe_match
+        observe_match(doc, analysis=analysis)
+    except Exception as exc:
+        _logger.debug("Team watcher update failed for %s: %s", doc.get("_id") or doc.get("sportybet_id"), exc)
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:

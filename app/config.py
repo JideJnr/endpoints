@@ -82,7 +82,7 @@ def get_settings() -> Settings:
         environment=os.getenv("PREDICTX_ENV", "development"),
         cors_origins=_csv(os.getenv("PREDICTX_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
         database_path=Path(os.getenv("PREDICTX_DB_PATH", str(BASE_DIR / "data" / "predictx_memory.sqlite3"))),
-        ai_provider=os.getenv("PREDICTX_AI_PROVIDER", "auto").strip().lower(),
+        ai_provider=os.getenv("PREDICTX_AI_PROVIDER", "openrouter").strip().lower(),
         hf_url=os.getenv("PREDICTX_HF_URL", "https://router.huggingface.co/v1/chat/completions"),
         hf_model=os.getenv("PREDICTX_HF_MODEL", "Qwen/Qwen2.5-7B-Instruct:fastest"),
         hf_token_present=bool(_hf_token()),

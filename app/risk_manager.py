@@ -51,7 +51,8 @@ def apply_risk_controls(
         report["actions"].append({"type": "no_picks", "reason": "empty_pick_pool"})
         return report
 
-    original = [deepcopy(pick) for pick in picks if pick.get("type") != "no_bet"]
+    real_picks = [pick for pick in picks if pick.get("type") != "no_bet"]
+    original = [deepcopy(pick) for pick in real_picks]
 
     # Get learned risk controls for each pick (if enough data exists)
     learned_controls: dict[int, LearnedRiskControls] = {}
@@ -113,7 +114,6 @@ def apply_risk_controls(
     # Apply learned hard-block overrides
     _apply_learned_hard_blocks(real_picks, report, learned_controls)
 
-    real_picks = [pick for pick in picks if pick.get("type") != "no_bet"]
     highest_conf = max([int(pick.get("confidence") or 0) for pick in real_picks] or [0])
     if (
         report.get("hard_block")
@@ -182,6 +182,48 @@ def _apply_learned_hard_blocks(
                 "samples": controls.samples,
                 "win_rate": controls.win_rate,
             })
+
+
+def _base_report(
+    doc: dict[str, Any],
+    readiness: dict[str, Any],
+    contextual_intelligence: dict[str, Any],
+    odds_movement: dict[str, Any],
+) -> dict[str, Any]:
+    assurance = str(readiness.get("assurance") or "deferred")
+    learned_classification = contextual_intelligence.get("learned_classification")
+    smart_bet = bool(contextual_intelligence.get("smart_bet") or learned_classification == "smart_bet")
+    report = {
+        "match_id": str(doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or ""),
+        "assurance": assurance,
+        "risk_level": "low",
+        "hard_block": False,
+        "hard_block_reasons": [],
+        "violations": [],
+        "actions": [],
+        "strengths": [],
+        "smart_bet": smart_bet,
+        "learned_classification": learned_classification,
+        "contextual_intelligence": contextual_intelligence,
+        "odds_movement": odds_movement,
+        "readiness": readiness,
+        "validation_block": False,
+        "published": False,
+        "block_reason_summary": [],
+    }
+    if readiness.get("missing"):
+        report["violations"].append("readiness_not_ready")
+        if not readiness.get("ready"):
+            report["hard_block"] = True
+            report["hard_block_reasons"].append("readiness_not_ready")
+    if contextual_intelligence.get("risk") and isinstance(contextual_intelligence.get("risk"), dict):
+        report["contextual_risk"] = contextual_intelligence.get("risk")
+    if odds_movement:
+        report["odds_movement_summary"] = {
+            "sharp_signal": odds_movement.get("sharp_signal"),
+            "strongest_pull": odds_movement.get("strongest_pull"),
+        }
+    return report
 
 
 def _apply_pick_limits(

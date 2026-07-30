@@ -399,9 +399,9 @@ def post_groq_predictions(
     limit: int = Query(default=20, ge=1, le=100),
 ):
     """
-    Run the Groq LangChain agent over today's enriched matches.
+    Run the router-backed AI predictions over today's enriched matches.
     Full 10-step reasoning: standings, H2H, Poisson, odds movement, SOS, web context.
-    Requires GROQ_API_KEY.
+    OpenRouter is the primary provider, with fallback support when configured.
     """
     try:
         from app.groq_agent import run_groq_predictions
@@ -412,14 +412,14 @@ def post_groq_predictions(
 
 @router.get("/groq/status")
 def get_groq_status():
-    """Check if Groq LLM is configured and available."""
+    """Check whether the router-backed AI providers are configured and available."""
     try:
         from app.llm import is_groq_available, get_llm
         available = is_groq_available()
         return {
             "status": "success",
             "groq_available": available,
-            "message": "Groq ready" if available else "Set GROQ_API_KEY in .env to enable Groq agent",
+            "message": "AI router ready" if available else "Set OPENROUTER_API_KEY or GROQ_API_KEY in .env to enable AI routing",
         }
     except Exception as e:
         return {"status": "error", "groq_available": False, "detail": str(e)}

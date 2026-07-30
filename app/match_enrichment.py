@@ -162,6 +162,10 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
 
 
 def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_date: str) -> tuple[dict[str, Any] | None, float, str]:
+    team_bound_events = _team_bound_sofascore_match(doc, sporty, match_date)
+    if team_bound_events[0] is not None:
+        return team_bound_events
+
     saved_sofa_id = doc.get("sofascore_id")
     if saved_sofa_id:
         # A previously matched event is stable for the lifetime of a fixture.
@@ -212,6 +216,43 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
         sofa = None
         source = "no_match"
     return sofa, score, source
+
+
+def _team_bound_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_date: str) -> tuple[dict[str, Any] | None, float, str]:
+    try:
+        from app.team_watcher import team_watchers_for_match
+    except Exception:
+        return None, 0.0, "team_watcher_unavailable"
+
+    watchers = team_watchers_for_match({**doc, **sporty})
+    home_watcher = watchers.get("home") if isinstance(watchers, dict) else None
+    away_watcher = watchers.get("away") if isinstance(watchers, dict) else None
+    home_sofa_id = str((home_watcher or {}).get("sofascore_team_id") or "").strip()
+    away_sofa_id = str((away_watcher or {}).get("sofascore_team_id") or "").strip()
+    if not home_sofa_id and not away_sofa_id:
+        return None, 0.0, "team_watcher_no_sofascore_id"
+
+    try:
+        events = fetch_live_events() if _is_live_doc(doc) else fetch_all_scheduled_events(match_date)
+        events = [event for event in events if is_usable_event_for_mode(event, live=_is_live_doc(doc))]
+    except Exception:
+        events = []
+
+    for event in events:
+        home = event.get("home_team") or {}
+        away = event.get("away_team") or {}
+        event_home_id = str(home.get("id") or "").strip()
+        event_away_id = str(away.get("id") or "").strip()
+        if home_sofa_id and away_sofa_id:
+            if event_home_id == home_sofa_id and event_away_id == away_sofa_id:
+                return event, 1.0, "team_watcher_exact"
+            if event_home_id == away_sofa_id and event_away_id == home_sofa_id:
+                return event, 0.98, "team_watcher_reversed"
+        elif home_sofa_id and (event_home_id == home_sofa_id or event_away_id == home_sofa_id):
+            return event, 0.92, "team_watcher_partial"
+        elif away_sofa_id and (event_home_id == away_sofa_id or event_away_id == away_sofa_id):
+            return event, 0.92, "team_watcher_partial"
+    return None, 0.0, "team_watcher_no_exact_match"
 
 
 def _saved_sofascore_detail(doc: dict[str, Any], sofa: dict[str, Any] | None) -> dict[str, Any] | None:

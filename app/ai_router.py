@@ -79,6 +79,7 @@ class AIRouter:
         self._timeout_reasoning = timeout_reasoning
         self._timeout_review = timeout_review
         self._availability_cache: dict[str, bool] = {}
+        self._last_provider: str | None = None
 
     # ── Public call surface ────────────────────────────────────────────────
 
@@ -110,6 +111,10 @@ class AIRouter:
     def call_auto(self, prompt: str, task: str = "analysis") -> str:
         """Generic call — task hint selects the primary model."""
         return self._dispatch(prompt, task=task, timeout=self._timeout_analysis)
+
+    def last_provider(self) -> str | None:
+        """Return the provider used by the most recent successful dispatch."""
+        return self._last_provider
 
     def call_pipeline(self, doc: dict[str, Any]) -> dict[str, Any]:
         """
@@ -243,6 +248,7 @@ class AIRouter:
                 continue
             try:
                 result = self._call_openrouter(model, prompt, timeout)
+                self._last_provider = "openrouter"
                 logger.debug("ai_router: %s succeeded for task=%s", model, task)
                 return result
             except Exception as exc:
@@ -254,6 +260,7 @@ class AIRouter:
         if self.is_groq_available():
             try:
                 result = self._call_groq(prompt, timeout)
+                self._last_provider = "groq"
                 logger.debug("ai_router: groq succeeded for task=%s", task)
                 return result
             except Exception as exc:
@@ -274,6 +281,7 @@ class AIRouter:
                 continue
             try:
                 result = self._call_openrouter(model, prompt, timeout)
+                self._last_provider = "openrouter"
                 logger.debug("ai_router: %s succeeded for task=%s (messages)", model, task)
                 return result
             except Exception as exc:
@@ -284,6 +292,7 @@ class AIRouter:
         if self.is_groq_available():
             try:
                 result = self._call_groq_messages(messages, timeout)
+                self._last_provider = "groq"
                 logger.debug("ai_router: groq succeeded for task=%s (messages)", task)
                 return result
             except Exception as exc:

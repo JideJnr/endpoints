@@ -3215,6 +3215,22 @@ def _existing_schema_can_be_trusted() -> bool:
         return False
 
 
+def _ensure_prediction_history_columns(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "prediction_history", "result", "text")
+    _ensure_column(conn, "prediction_history", "final_home", "integer")
+    _ensure_column(conn, "prediction_history", "final_away", "integer")
+    _ensure_column(conn, "prediction_history", "graded_at", "text")
+    _ensure_column(conn, "prediction_history", "country_name", "text")
+    _ensure_column(conn, "prediction_history", "sofascore_id", "text")
+    _ensure_column(conn, "prediction_history", "sportybet_id", "text")
+    _ensure_column(conn, "prediction_history", "prediction_mode", "text not null default 'prematch'")
+    _ensure_column(conn, "prediction_history", "data_source", "text")
+    _ensure_column(conn, "prediction_history", "live_data_sources_json", "text not null default '[]'")
+    _ensure_column(conn, "prediction_history", "audit_json", "text not null default '{}'")
+    _ensure_column(conn, "prediction_history", "grading_reason_json", "text not null default '{}'")
+    _ensure_column(conn, "prediction_history", "models_json", "text not null default '{}'")
+
+
 def _init_db() -> None:
     global _DB_SCHEMA_READY
     if _DB_SCHEMA_READY:
@@ -3223,6 +3239,9 @@ def _init_db() -> None:
         if _DB_SCHEMA_READY:
             return
         if _existing_schema_can_be_trusted():
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                conn.execute("pragma busy_timeout = 30000")
+                _ensure_prediction_history_columns(conn)
             _DB_SCHEMA_READY = True
             return
         try:
@@ -3602,19 +3621,7 @@ def _init_db_unlocked() -> None:
         conn.execute("create index if not exists idx_odds_match on odds_snapshots(match_id)")
         conn.execute("create index if not exists idx_odds_date on odds_snapshots(match_date)")
         conn.execute("create index if not exists idx_odds_match_time on odds_snapshots(match_id, snapshot_time)")
-        _ensure_column(conn, "prediction_history", "result", "text")
-        _ensure_column(conn, "prediction_history", "final_home", "integer")
-        _ensure_column(conn, "prediction_history", "final_away", "integer")
-        _ensure_column(conn, "prediction_history", "graded_at", "text")
-        _ensure_column(conn, "prediction_history", "country_name", "text")
-        _ensure_column(conn, "prediction_history", "sofascore_id", "text")
-        _ensure_column(conn, "prediction_history", "sportybet_id", "text")
-        _ensure_column(conn, "prediction_history", "prediction_mode", "text not null default 'prematch'")
-        _ensure_column(conn, "prediction_history", "data_source", "text")
-        _ensure_column(conn, "prediction_history", "live_data_sources_json", "text not null default '[]'")
-        _ensure_column(conn, "prediction_history", "audit_json", "text not null default '{}'")
-        _ensure_column(conn, "prediction_history", "grading_reason_json", "text not null default '{}'")
-        _ensure_column(conn, "prediction_history", "models_json", "text not null default '{}'")
+        _ensure_prediction_history_columns(conn)
         if _run_legacy_backfills():
             conn.execute(
                 """

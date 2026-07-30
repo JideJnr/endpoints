@@ -22,6 +22,11 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
         if stored_contextual.get("learned_performance")
         else build_contextual_intelligence(doc, prediction or {})
     )
+    try:
+        from app.team_watcher import team_context_for_match
+        team_watchers = team_context_for_match(doc)
+    except Exception as exc:
+        team_watchers = {"available": False, "error": str(exc)}
     return {
         "version": "match_intelligence_v1",
         "provider_ids": {
@@ -62,6 +67,7 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
             "role_decision": (prediction or {}).get("learned_role_decision"),
             "regime": (prediction or {}).get("regime"),
             "risk_management": (prediction or {}).get("risk_management"),
+            "team_watchers": team_watchers,
         },
         "lifecycle": doc.get("lifecycle") or {},
     }

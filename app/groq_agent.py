@@ -216,13 +216,13 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
 def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     """
     Run a match analysis for one enriched document.
-    Routes through AIRouter: Ollama Pipeline → qwen3:8b → deepseek-r1:8b → Groq.
+    Routes through AIRouter with OpenRouter first, then Groq as fallback.
     """
     from app.ai_router import get_router, parse_json_response
 
     router = get_router()
     if not router.any_available():
-        return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
+        return {"status": "ai_unavailable", "message": "No AI provider available. Set OPENROUTER_API_KEY or enable a fallback provider."}
 
     # Try small-context pipeline first if available
     if router.is_pipeline_available():
@@ -256,7 +256,8 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         confidence = None
 
     status_info = router.status()
-    active_model = status_info.get("primary_model") or "groq"
+    active_model = status_info.get("primary_model") or "openrouter/free"
+    active_provider = router.last_provider() or ("openrouter" if status_info.get("primary_model") else "groq")
 
     return {
         "status": result.get("status") or "predicted",
@@ -270,6 +271,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         "over_2_5": result.get("over_2_5"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "ai_router",
+        "provider": active_provider,
         "model": active_model,
     }
 
@@ -292,7 +294,7 @@ def run_groq_predictions(
     """
     from app.ai_router import get_router
     if not get_router().any_available():
-        return {"status": "ai_unavailable", "message": "No AI provider available. Start Ollama or set GROQ_API_KEY."}
+        return {"status": "ai_unavailable", "message": "No AI provider available. Set OPENROUTER_API_KEY or enable a fallback provider."}
 
     target_date = match_date or dt.today().isoformat()
 

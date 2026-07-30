@@ -160,6 +160,45 @@ def init_competition_tables(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "competition_special_buffer", "importance_context_json", "text not null default '{}'")
     conn.execute("create index if not exists idx_comp_special_date on competition_special_buffer(competition_key, match_date)")
     conn.execute("create index if not exists idx_comp_special_start on competition_special_buffer(competition_key, start_time)")
+    conn.execute(
+        """
+        create table if not exists competition_team_watchers (
+            competition_key text not null,
+            team_id text not null,
+            team_name text not null,
+            analyst_name text not null,
+            profile_json text not null default '{}',
+            match_count integer not null default 0,
+            last_match_id text,
+            last_brief text,
+            updated_at text not null default current_timestamp,
+            primary key (competition_key, team_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists competition_team_watcher_matches (
+            competition_key text not null,
+            team_id text not null,
+            match_id text not null,
+            match_date text,
+            opponent text,
+            venue text,
+            goals_for integer,
+            goals_against integer,
+            result text,
+            status text,
+            prediction_json text,
+            brief text,
+            raw_match_json text not null default '{}',
+            created_at text not null default current_timestamp,
+            primary key (competition_key, team_id, match_id)
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_team_watchers_key on competition_team_watchers(competition_key, updated_at desc)")
+    conn.execute("create index if not exists idx_team_watcher_matches_team on competition_team_watcher_matches(competition_key, team_id, match_date desc)")
 
 
 def get_competition_settings(key: str = "world-cup-2026") -> dict[str, Any]:
@@ -352,6 +391,58 @@ def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
             "last_enriched_at": row[5],
             "last_predicted_at": row[6],
         },
+    }
+
+
+def list_team_watchers(key: str = "world-cup-2026", limit: int = 80) -> dict[str, Any]:
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        init_competition_tables(conn)
+        rows = conn.execute(
+            """
+            select *
+            from competition_team_watchers
+            where competition_key = ?
+            order by match_count desc, updated_at desc, team_name asc
+            limit ?
+            """,
+            (key, limit),
+        ).fetchall()
+    watchers = [_watcher_row(row) for row in rows]
+    return {"status": "success", "competition_key": key, "count": len(watchers), "watchers": watchers}
+
+
+def get_team_watcher(key: str, team_id: str) -> dict[str, Any]:
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        init_competition_tables(conn)
+        row = conn.execute(
+            """
+            select *
+            from competition_team_watchers
+            where competition_key = ? and team_id = ?
+            """,
+            (key, str(team_id)),
+        ).fetchone()
+        matches = conn.execute(
+            """
+            select *
+            from competition_team_watcher_matches
+            where competition_key = ? and team_id = ?
+            order by match_date desc, created_at desc
+            limit 20
+            """,
+            (key, str(team_id)),
+        ).fetchall()
+    if row is None:
+        return {"status": "not_found", "competition_key": key, "team_id": str(team_id)}
+    return {
+        "status": "success",
+        "competition_key": key,
+        "watcher": _watcher_row(row),
+        "matches": [_watcher_match_row(match) for match in matches],
     }
 
 
@@ -710,6 +801,7 @@ def _upsert_competition_event(conn: sqlite3.Connection, key: str, event: dict[st
             json.dumps(importance),
         ),
     )
+    _register_competition_teams(conn, key, event)
     _mirror_competition_event_to_main_buffer(conn, key, event, event_match_date, importance)
 
 
@@ -726,6 +818,7 @@ def _save_competition_detail(
     now = datetime.now(timezone.utc).isoformat()
     importance = _match_importance_context(key, event)
     doc = _competition_doc(key, event, detail)
+    _update_team_watchers_for_match(key, event, detail, prediction)
     intelligence = _competition_intelligence_context(key, event, detail, doc)
     doc["competition_intelligence"] = intelligence
     doc["team_strength_context"] = intelligence.get("team_strength")
@@ -935,6 +1028,49 @@ def _buffer_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _watcher_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        profile = json.loads(row["profile_json"] or "{}")
+    except Exception:
+        profile = {}
+    return {
+        "competition_key": row["competition_key"],
+        "team_id": row["team_id"],
+        "team_name": row["team_name"],
+        "analyst_name": row["analyst_name"],
+        "profile": profile,
+        "match_count": row["match_count"],
+        "last_match_id": row["last_match_id"],
+        "last_brief": row["last_brief"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _watcher_match_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        prediction = json.loads(row["prediction_json"] or "null") if row["prediction_json"] else None
+    except Exception:
+        prediction = None
+    try:
+        raw_match = json.loads(row["raw_match_json"] or "{}")
+    except Exception:
+        raw_match = {}
+    return {
+        "match_id": row["match_id"],
+        "match_date": row["match_date"],
+        "opponent": row["opponent"],
+        "venue": row["venue"],
+        "goals_for": row["goals_for"],
+        "goals_against": row["goals_against"],
+        "result": row["result"],
+        "status": row["status"],
+        "prediction": prediction,
+        "brief": row["brief"],
+        "raw_match": raw_match,
+        "created_at": row["created_at"],
+    }
+
+
 def _competition_summary(matches: list[dict[str, Any]]) -> dict[str, Any]:
     importance_scores = [
         int(((match.get("importance_context") or {}).get("importance_score")) or 0)
@@ -1087,8 +1223,11 @@ def _competition_intelligence_context(
     away_table = _team_standing_context(standings, away)
     home_strength = _recent_play_strength(detail.get("home_last_matches") or [], home)
     away_strength = _recent_play_strength(detail.get("away_last_matches") or [], away)
+    home_watcher = _team_watcher_context(key, home)
+    away_watcher = _team_watcher_context(key, away)
     table_edge = _safe_num((home_table or {}).get("points_per_game")) - _safe_num((away_table or {}).get("points_per_game"))
     strength_edge = _safe_num(home_strength.get("strength_score")) - _safe_num(away_strength.get("strength_score"))
+    watcher_edge = _safe_num((home_watcher.get("profile") or {}).get("team_score")) - _safe_num((away_watcher.get("profile") or {}).get("team_score"))
     return {
         "competition_key": key,
         "table": {
@@ -1104,6 +1243,14 @@ def _competition_intelligence_context(
             "edge": round(strength_edge, 2),
             "leader": "home" if strength_edge > 5 else "away" if strength_edge < -5 else "even",
             "basis": "recent_play_results_goal_difference_and_opponent_quality",
+        },
+        "team_watchers": {
+            "available": bool(home_watcher.get("available") or away_watcher.get("available")),
+            "home": home_watcher,
+            "away": away_watcher,
+            "edge": round(watcher_edge, 2),
+            "leader": "home" if watcher_edge > 5 else "away" if watcher_edge < -5 else "even",
+            "basis": "long_term_competition_team_ai_profiles",
         },
         "readiness_notes": _competition_readiness_notes(home_table, away_table, home_strength, away_strength),
     }
@@ -1212,6 +1359,331 @@ def _optional_score(value: Any) -> int | None:
         return int(value)
     except Exception:
         return None
+
+
+def _team_identity(team: dict[str, Any] | None) -> tuple[str, str]:
+    team = team or {}
+    team_id = str(team.get("id") or team.get("team_id") or team.get("name") or "").strip()
+    team_name = str(team.get("name") or team.get("short_name") or team_id or "Unknown Team").strip()
+    return team_id or team_name, team_name
+
+
+def _register_competition_teams(conn: sqlite3.Connection, key: str, event: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    for side in ("home_team", "away_team"):
+        team = event.get(side) if isinstance(event.get(side), dict) else {}
+        team_id, team_name = _team_identity(team)
+        if not team_id:
+            continue
+        conn.execute(
+            """
+            insert into competition_team_watchers
+                (competition_key, team_id, team_name, analyst_name, updated_at)
+            values (?, ?, ?, ?, ?)
+            on conflict(competition_key, team_id) do update set
+                team_name = excluded.team_name,
+                analyst_name = excluded.analyst_name,
+                updated_at = excluded.updated_at
+            """,
+            (key, team_id, team_name, f"{team_name} Watcher", now),
+        )
+
+
+def _update_team_watchers_for_match(
+    key: str,
+    event: dict[str, Any],
+    detail: dict[str, Any],
+    prediction: dict[str, Any] | None,
+) -> None:
+    status = str(((event.get("status") or {}).get("type") or (event.get("status") or {}).get("description") or "")).lower()
+    score = event.get("score") or {}
+    home_team = event.get("home_team") if isinstance(event.get("home_team"), dict) else {}
+    away_team = event.get("away_team") if isinstance(event.get("away_team"), dict) else {}
+    home_score = _optional_score(score.get("home"))
+    away_score = _optional_score(score.get("away"))
+    match_date = _event_match_date(event, date.today().isoformat())
+    rows = [
+        _team_match_observation(key, event, detail, prediction, home_team, away_team, "home", home_score, away_score, status, match_date),
+        _team_match_observation(key, event, detail, prediction, away_team, home_team, "away", away_score, home_score, status, match_date),
+    ]
+    rows = [row for row in rows if row]
+    if not rows:
+        return
+
+    _init_db()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        init_competition_tables(conn)
+        _register_competition_teams(conn, key, event)
+        for row in rows:
+            conn.execute(
+                """
+                insert into competition_team_watcher_matches
+                    (competition_key, team_id, match_id, match_date, opponent, venue,
+                     goals_for, goals_against, result, status, prediction_json, brief, raw_match_json, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(competition_key, team_id, match_id) do update set
+                    match_date = excluded.match_date,
+                    opponent = excluded.opponent,
+                    venue = excluded.venue,
+                    goals_for = excluded.goals_for,
+                    goals_against = excluded.goals_against,
+                    result = excluded.result,
+                    status = excluded.status,
+                    prediction_json = excluded.prediction_json,
+                    brief = excluded.brief,
+                    raw_match_json = excluded.raw_match_json
+                """,
+                (
+                    key,
+                    row["team_id"],
+                    row["match_id"],
+                    row["match_date"],
+                    row["opponent"],
+                    row["venue"],
+                    row["goals_for"],
+                    row["goals_against"],
+                    row["result"],
+                    row["status"],
+                    json.dumps(prediction) if prediction else None,
+                    row["brief"],
+                    json.dumps(row["raw_match"]),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            profile = _build_team_watcher_profile(conn, key, row["team_id"])
+            conn.execute(
+                """
+                update competition_team_watchers
+                set profile_json = ?,
+                    match_count = ?,
+                    last_match_id = ?,
+                    last_brief = ?,
+                    updated_at = ?
+                where competition_key = ? and team_id = ?
+                """,
+                (
+                    json.dumps(profile),
+                    int(profile.get("sample_size") or 0),
+                    row["match_id"],
+                    row["brief"],
+                    datetime.now(timezone.utc).isoformat(),
+                    key,
+                    row["team_id"],
+                ),
+            )
+        conn.commit()
+
+
+def _team_match_observation(
+    key: str,
+    event: dict[str, Any],
+    detail: dict[str, Any],
+    prediction: dict[str, Any] | None,
+    team: dict[str, Any],
+    opponent: dict[str, Any],
+    venue: str,
+    goals_for: int | None,
+    goals_against: int | None,
+    status: str,
+    match_date: str,
+) -> dict[str, Any] | None:
+    team_id, team_name = _team_identity(team)
+    if not team_id:
+        return None
+    _, opponent_name = _team_identity(opponent)
+    result = None
+    if goals_for is not None and goals_against is not None:
+        result = "win" if goals_for > goals_against else "loss" if goals_for < goals_against else "draw"
+    brief = _team_match_brief(team_name, opponent_name, venue, goals_for, goals_against, result, prediction)
+    return {
+        "team_id": team_id,
+        "team_name": team_name,
+        "match_id": str(event.get("id") or _prefixed_match_id(key, event.get("id"))),
+        "match_date": match_date,
+        "opponent": opponent_name,
+        "venue": venue,
+        "goals_for": goals_for,
+        "goals_against": goals_against,
+        "result": result,
+        "status": status,
+        "brief": brief,
+        "raw_match": {
+            "name": event.get("name"),
+            "round": event.get("round"),
+            "status": status,
+            "detail_sources": {
+                "standings": bool(detail.get("standings")),
+                "history": bool(detail.get("home_last_matches") or detail.get("away_last_matches")),
+                "statistics": bool(detail.get("statistics") or detail.get("match_statistics")),
+            },
+        },
+    }
+
+
+def _team_match_brief(
+    team_name: str,
+    opponent_name: str,
+    venue: str,
+    goals_for: int | None,
+    goals_against: int | None,
+    result: str | None,
+    prediction: dict[str, Any] | None,
+) -> str:
+    score_text = f"{goals_for}-{goals_against}" if goals_for is not None and goals_against is not None else "score unavailable"
+    result_text = result or "pending"
+    pick = ((prediction or {}).get("picks") or [{}])[0] if isinstance(prediction, dict) else {}
+    pick_text = f" Prediction leaned {pick.get('selection')}." if pick.get("selection") else ""
+    return f"{team_name} {result_text} vs {opponent_name} ({venue}, {score_text}).{pick_text}".strip()
+
+
+def _build_team_watcher_profile(conn: sqlite3.Connection, key: str, team_id: str) -> dict[str, Any]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        select *
+        from competition_team_watcher_matches
+        where competition_key = ? and team_id = ?
+        order by match_date desc, created_at desc
+        limit 20
+        """,
+        (key, team_id),
+    ).fetchall()
+    finished = [row for row in rows if row["goals_for"] is not None and row["goals_against"] is not None]
+    sample = len(finished)
+    wins = sum(1 for row in finished if row["result"] == "win")
+    draws = sum(1 for row in finished if row["result"] == "draw")
+    losses = sum(1 for row in finished if row["result"] == "loss")
+    gf = sum(int(row["goals_for"] or 0) for row in finished)
+    ga = sum(int(row["goals_against"] or 0) for row in finished)
+    over_25 = sum(1 for row in finished if int(row["goals_for"] or 0) + int(row["goals_against"] or 0) >= 3)
+    btts = sum(1 for row in finished if int(row["goals_for"] or 0) > 0 and int(row["goals_against"] or 0) > 0)
+    clean_sheets = sum(1 for row in finished if int(row["goals_against"] or 0) == 0)
+    failed_to_score = sum(1 for row in finished if int(row["goals_for"] or 0) == 0)
+    ppg = (wins * 3 + draws) / sample if sample else 0.0
+    gf_avg = gf / sample if sample else 0.0
+    ga_avg = ga / sample if sample else 0.0
+    team_score = max(1, min(99, 40 + ppg * 14 + (gf_avg - ga_avg) * 8 + (clean_sheets / sample * 8 if sample else 0)))
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+    if ppg >= 2:
+        strengths.append("results_consistency")
+    if gf_avg >= 1.7:
+        strengths.append("scoring_output")
+    if ga_avg <= 0.9 and sample:
+        strengths.append("defensive_control")
+    if sample and clean_sheets / sample >= 0.4:
+        strengths.append("clean_sheet_profile")
+    if ppg <= 1:
+        weaknesses.append("low_points_return")
+    if gf_avg <= 0.9 and sample:
+        weaknesses.append("chance_conversion")
+    if ga_avg >= 1.6:
+        weaknesses.append("defensive_leakage")
+    if sample and failed_to_score / sample >= 0.35:
+        weaknesses.append("blank_risk")
+    preferred_markets = _preferred_team_markets(sample, wins, losses, over_25, btts, clean_sheets, failed_to_score)
+    form = "".join(("W" if row["result"] == "win" else "D" if row["result"] == "draw" else "L") for row in finished[:6])
+    recent_briefs = [row["brief"] for row in rows[:5] if row["brief"]]
+    return {
+        "sample_size": sample,
+        "record": {"wins": wins, "draws": draws, "losses": losses, "form": form},
+        "goals": {
+            "for": gf,
+            "against": ga,
+            "for_avg": round(gf_avg, 2),
+            "against_avg": round(ga_avg, 2),
+            "over_2_5_rate": round(over_25 / sample, 3) if sample else 0,
+            "btts_rate": round(btts / sample, 3) if sample else 0,
+            "clean_sheet_rate": round(clean_sheets / sample, 3) if sample else 0,
+            "failed_to_score_rate": round(failed_to_score / sample, 3) if sample else 0,
+        },
+        "strengths": strengths or ["insufficient_clear_strength"],
+        "weaknesses": weaknesses or ["no_major_weakness_detected"],
+        "preferred_markets": preferred_markets,
+        "team_score": round(team_score, 2),
+        "trend": "rising" if form[:3].count("W") >= 2 else "falling" if form[:3].count("L") >= 2 else "stable",
+        "recent_briefs": recent_briefs,
+        "prediction_context": _watcher_prediction_context(sample, team_score, preferred_markets, strengths, weaknesses),
+    }
+
+
+def _preferred_team_markets(
+    sample: int,
+    wins: int,
+    losses: int,
+    over_25: int,
+    btts: int,
+    clean_sheets: int,
+    failed_to_score: int,
+) -> list[dict[str, Any]]:
+    if not sample:
+        return [{"market": "no_pick", "confidence": "low", "reason": "not_enough_team_history"}]
+    markets: list[dict[str, Any]] = []
+    if wins / sample >= 0.55:
+        markets.append({"market": "team_positive_result", "confidence": "medium", "reason": "win_rate_profile"})
+    if losses / sample <= 0.25:
+        markets.append({"market": "draw_no_bet_or_double_chance", "confidence": "medium", "reason": "low_loss_rate"})
+    if over_25 / sample >= 0.55:
+        markets.append({"market": "over_2_5", "confidence": "medium", "reason": "high_total_goals_rate"})
+    if btts / sample >= 0.55:
+        markets.append({"market": "btts_yes", "confidence": "medium", "reason": "both_teams_scoring_pattern"})
+    if clean_sheets / sample >= 0.4:
+        markets.append({"market": "opponent_under_or_btts_no", "confidence": "medium", "reason": "clean_sheet_rate"})
+    if failed_to_score / sample >= 0.35:
+        markets.append({"market": "team_under_goals", "confidence": "medium", "reason": "blank_risk"})
+    return markets[:4] or [{"market": "context_only", "confidence": "low", "reason": "mixed_team_profile"}]
+
+
+def _watcher_prediction_context(
+    sample: int,
+    team_score: float,
+    preferred_markets: list[dict[str, Any]],
+    strengths: list[str],
+    weaknesses: list[str],
+) -> dict[str, Any]:
+    return {
+        "usable": sample >= 3,
+        "confidence": "high" if sample >= 8 else "medium" if sample >= 4 else "low",
+        "team_score": round(team_score, 2),
+        "market_focus": [item.get("market") for item in preferred_markets[:3]],
+        "boost_signals": strengths[:3],
+        "risk_signals": weaknesses[:3],
+    }
+
+
+def _team_watcher_context(key: str, team: dict[str, Any]) -> dict[str, Any]:
+    team_id, team_name = _team_identity(team)
+    if not team_id:
+        return {"available": False, "team_name": team_name, "reason": "missing_team_id"}
+    try:
+        _init_db()
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            init_competition_tables(conn)
+            row = conn.execute(
+                """
+                select team_id, team_name, analyst_name, profile_json, match_count, last_brief, updated_at
+                from competition_team_watchers
+                where competition_key = ? and team_id = ?
+                """,
+                (key, team_id),
+            ).fetchone()
+        if not row:
+            return {"available": False, "team_id": team_id, "team_name": team_name, "reason": "watcher_not_ready"}
+        profile = json.loads(row["profile_json"] or "{}")
+        return {
+            "available": bool(profile),
+            "team_id": row["team_id"],
+            "team_name": row["team_name"],
+            "analyst_name": row["analyst_name"],
+            "match_count": row["match_count"],
+            "profile": profile,
+            "last_brief": row["last_brief"],
+            "updated_at": row["updated_at"],
+        }
+    except Exception as exc:
+        return {"available": False, "team_id": team_id, "team_name": team_name, "error": str(exc)}
 
 
 def _safe_num(value: Any) -> float:

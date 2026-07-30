@@ -28,7 +28,7 @@ def predict_and_record_enriched(
     match_date: str | None = None,
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
-    use_ollama_pipeline: bool | None = None,
+    use_ollama_pipeline: bool | None = False,
 ) -> dict[str, Any]:
     """
     Single prediction write path for enriched buffer documents.
@@ -43,9 +43,6 @@ def predict_and_record_enriched(
         raise PredictionDeferred(readiness)
 
     # Use small-context Ollama pipeline if requested and available
-    if use_ollama_pipeline is None:
-        from app.config import get_settings
-        use_ollama_pipeline = get_settings().ollama_pipeline_enabled
     if use_ollama_pipeline:
         from app.ollama_pipeline import run_ollama_pipeline
         from app.config import get_settings as _gs
@@ -100,7 +97,7 @@ def apply_prediction_state(
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
     allow_repeat: bool = False,
-    use_ollama_pipeline: bool | None = None,
+    use_ollama_pipeline: bool | None = False,
 ) -> dict[str, Any]:
     """
     Apply the single prediction state transition used by workers and endpoints.
@@ -108,9 +105,6 @@ def apply_prediction_state(
     Prediction history remains append-only. The mutable buffer document only
     carries the current state: predicted, deferred, or error.
     """
-    if use_ollama_pipeline is None:
-        from app.config import get_settings
-        use_ollama_pipeline = get_settings().ollama_pipeline_enabled
     try:
         resolved_match_id = str(match_id or doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)

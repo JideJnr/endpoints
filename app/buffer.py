@@ -1342,23 +1342,27 @@ def run_enrichment_worker(
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
-        # The AI queue owns prematch predictions when enabled.  Enrichment still
-        # writes the complete document to the buffer, then the queue prioritises
-        # all ready prematch rows in one deterministic batch.
+        # Enrichment owns the manual deterministic prediction path.
+        # The AI queue may add a later overlay, but it never blocks this lane.
         try:
             from app.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
-        if (sofa or item.get("is_live")) and (item.get("is_live") or not ai_queue_enabled):
-            from app.ai_prediction_pipeline import run_ai_prediction_with_fallback
+        if sofa or item.get("is_live"):
+            from app.prediction_flow import apply_prediction_state
 
-            state = run_ai_prediction_with_fallback(doc, match_id=str(item.get("match_id") or ""))
+            state = apply_prediction_state(
+                doc,
+                match_id=str(item.get("match_id") or ""),
+                use_ollama_pipeline=False,
+                attach_brain=False,
+            )
             readiness = state.get("readiness") or {}
             if state.get("status") == "predicted":
                 predicted += 1
                 record_activity(
-                    f"Prediction completed for {sporty.get('name') or item['match_id']}",
+                    f"Manual prediction completed for {sporty.get('name') or item['match_id']}",
                     job="enrich_worker",
                     status="predicted",
                     match_id=str(item.get("match_id") or ""),
@@ -1367,7 +1371,7 @@ def run_enrichment_worker(
                 )
             elif state.get("status") == "skipped":
                 record_activity(
-                    f"Prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
+                    f"Manual prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
                     job="enrich_worker",
                     status="skipped",
                     match_id=str(item.get("match_id") or ""),
@@ -1376,7 +1380,7 @@ def run_enrichment_worker(
                 )
             elif state.get("status") == "deferred":
                 record_activity(
-                    f"Prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
+                    f"Manual prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
                     job="enrich_worker",
                     status="waiting",
                     match_id=str(item.get("match_id") or ""),
@@ -1384,14 +1388,16 @@ def run_enrichment_worker(
                     details=readiness,
                 )
             else:
-                print(f"[buffer] auto prediction failed for {item['match_id']}: {state.get('error')}")
+                print(f"[buffer] manual prediction failed for {item['match_id']}: {state.get('error')}")
                 record_activity(
-                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
+                    f"Manual prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
                     job="enrich_worker",
                     status="error",
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
+            if ai_queue_enabled and not item.get("is_live"):
+                doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
             from app.enriched_prediction import prediction_readiness
 
@@ -1400,9 +1406,9 @@ def run_enrichment_worker(
             doc["prediction_readiness"] = prediction_readiness(doc)
             doc["ai_prediction_queue_pending"] = True
         else:
-            doc["prediction"] = None
             from app.enriched_prediction import prediction_readiness
 
+            doc["prediction"] = None
             readiness = prediction_readiness(doc)
             doc["prediction_readiness"] = readiness
             doc["prediction_error"] = (
@@ -1638,15 +1644,20 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
-        if (sofa or item.get("is_live")) and (item.get("is_live") or not ai_queue_enabled):
-            from app.ai_prediction_pipeline import run_ai_prediction_with_fallback
+        if sofa or item.get("is_live"):
+            from app.prediction_flow import apply_prediction_state
 
-            state = run_ai_prediction_with_fallback(doc, match_id=str(item.get("match_id") or ""))
+            state = apply_prediction_state(
+                doc,
+                match_id=str(item.get("match_id") or ""),
+                use_ollama_pipeline=False,
+                attach_brain=False,
+            )
             readiness = state.get("readiness") or {}
             if state.get("status") == "predicted":
                 predicted += 1
                 record_activity(
-                    f"Prediction completed for {sporty.get('name') or item['match_id']}",
+                    f"Manual prediction completed for {sporty.get('name') or item['match_id']}",
                     job="date_aware_enrichment",
                     status="predicted",
                     match_id=str(item.get("match_id") or ""),
@@ -1655,7 +1666,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                 )
             elif state.get("status") == "skipped":
                 record_activity(
-                    f"Prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
+                    f"Manual prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
                     job="date_aware_enrichment",
                     status="skipped",
                     match_id=str(item.get("match_id") or ""),
@@ -1664,7 +1675,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                 )
             elif state.get("status") == "deferred":
                 record_activity(
-                    f"Prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
+                    f"Manual prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
                     job="date_aware_enrichment",
                     status="waiting",
                     match_id=str(item.get("match_id") or ""),
@@ -1672,25 +1683,29 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                     details=readiness,
                 )
             else:
-                print(f"[buffer] sequential prediction failed for {item['match_id']}: {state.get('error')}")
+                print(f"[buffer] sequential manual prediction failed for {item['match_id']}: {state.get('error')}")
                 record_activity(
-                    f"Prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
+                    f"Manual prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
                     job="date_aware_enrichment",
                     status="error",
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
+            if ai_queue_enabled and not item.get("is_live"):
+                from app.enriched_prediction import prediction_readiness
+
+                doc["prediction_readiness"] = prediction_readiness(doc)
+                doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
             from app.enriched_prediction import prediction_readiness
 
             doc["prediction"] = None
             doc["prediction_error"] = None
-            doc["prediction_readiness"] = prediction_readiness(doc)
             doc["ai_prediction_queue_pending"] = True
         else:
-            doc["prediction"] = None
             from app.enriched_prediction import prediction_readiness
 
+            doc["prediction"] = None
             readiness = prediction_readiness(doc)
             doc["prediction_readiness"] = readiness
             doc["prediction_error"] = (
