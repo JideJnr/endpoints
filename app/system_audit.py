@@ -4,17 +4,19 @@ import sqlite3
 import time
 from typing import Any
 
+from app.db import db_conn
 from app.buffer import get_buffer_stats, get_buffered_match
 from app.enriched_prediction import prediction_readiness
 from app.job_state import list_job_states
-from app.league_memory import DB_PATH, _init_db
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 def prediction_system_audit(limit: int = 200) -> dict[str, Any]:
     """Fast operational audit of the ingest -> enrich -> predict -> grade flow."""
     _init_db()
     limit = max(20, min(int(limit or 200), 1000))
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         duplicate_buffer_rows = conn.execute(
             """

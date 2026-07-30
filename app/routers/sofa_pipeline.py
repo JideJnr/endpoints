@@ -15,6 +15,7 @@ import logging
 from datetime import date as dt
 from typing import Any, Optional
 
+from app.db import db_conn
 from fastapi import APIRouter, Body, HTTPException, Query
 
 _logger = logging.getLogger(__name__)
@@ -27,7 +28,8 @@ router = APIRouter(prefix="/sofa-pipeline", tags=["sofa-pipeline"])
 def get_sofa_pipeline_status():
     """Return toggle state + count of SofaScore-source matches in the buffer."""
     from app.sofa_pipeline import get_sofa_pipeline_mode
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     from app.buffer import _init_buffer_table
     import sqlite3
 
@@ -36,7 +38,7 @@ def get_sofa_pipeline_status():
     _init_db()
     counts: dict[str, int] = {}
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             _init_buffer_table(conn)
             row = conn.execute(
                 """

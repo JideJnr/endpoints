@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from app.db import db_conn
 from app.mongo_store import init_mongo, list_finished_matches, mongo_status, save_finished_match, flush_buffer_to_mongo, cleanup_buffer
 from app.scheduler import (
     job_ingest_upcoming,
@@ -200,12 +201,13 @@ def post_purge_junk_predictions(confirm: bool = False):
     non-destructive unless the caller explicitly confirms the purge.
     """
     import sqlite3
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     from datetime import date
 
     _init_db()
     today = date.today().isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         no_bet = conn.execute("select count(*) from prediction_history where pick_type = 'no_bet'").fetchone()[0]
         low_confidence = conn.execute("select count(*) from prediction_history where confidence < 55").fetchone()[0]
         stale_pending = conn.execute(

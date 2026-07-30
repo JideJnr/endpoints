@@ -29,7 +29,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 # ── Table ─────────────────────────────────────────────────────────────────────
@@ -161,7 +163,7 @@ def store_match_grades(
     _init_db()
     stored = 0
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_grades_table(conn)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -204,7 +206,7 @@ def get_team_rating_trend(team_id: str, last_n: int = 5) -> dict[str, Any]:
     Returns: avg_rating, trend ('improving'/'declining'/'stable'), delta
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_grades_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""

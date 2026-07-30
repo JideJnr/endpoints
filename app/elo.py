@@ -4,7 +4,9 @@ import math
 import sqlite3
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 K_FACTOR = 32
@@ -39,7 +41,7 @@ def _init_elo_table(conn: sqlite3.Connection) -> None:
 
 def get_elo(team_id: str) -> float:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_elo_table(conn)
         row = conn.execute("select rating from elo_ratings where team_id = ?", (str(team_id),)).fetchone()
     return float(row[0]) if row else 1500.0
@@ -72,7 +74,7 @@ def update_elo(
     new_home = home_elo + K_FACTOR * multiplier * (home_actual - home_expected)
     new_away = away_elo + K_FACTOR * multiplier * (away_actual - away_expected)
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_elo_table(conn)
         for team_id, name, rating in ((home_id, home_name, new_home), (away_id, away_name, new_away)):
             conn.execute(
@@ -107,7 +109,7 @@ def record_match_result_once(source: str, event: dict[str, Any]) -> dict[str, An
         return {"updated": False, "reason": "missing match/team id"}
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_elo_table(conn)
         try:
             conn.execute(

@@ -22,6 +22,7 @@ import threading
 from datetime import date as dt, datetime, timedelta, timezone
 from typing import Any
 
+from app.db import db_conn
 from app.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
 from app.buffer import (
     ingest_matches,
@@ -388,9 +389,10 @@ def _scheduler_interval(job_id: str) -> int:
     if not meta:
         return 60
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             _ensure_scheduler_interval_table(conn)
             row = conn.execute("select interval_seconds from scheduler_intervals where job_id = ?", (job_id,)).fetchone()
             if row:
@@ -436,11 +438,12 @@ def scheduler_intervals(active_only: bool = True) -> dict[str, Any]:
 
 def patch_scheduler_intervals(intervals: dict[str, int]) -> dict[str, Any]:
     from apscheduler.triggers.interval import IntervalTrigger
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     _init_db()
     applied: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _ensure_scheduler_interval_table(conn)
         for job_id, raw_value in intervals.items():
             if job_id not in SCHEDULER_INTERVAL_DEFAULTS:
@@ -509,12 +512,13 @@ def job_enrich_future() -> dict[str, Any]:
     """
     if is_shutting_down():
         return {"status": "shutdown", "job": "enrich_future"}
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     from app.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     _init_db()
-    with _sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_buffer_table(conn)
         pending = conn.execute(
             """
@@ -1757,10 +1761,11 @@ def _run_deep_supervisor(*, auto_correct: bool = True) -> dict[str, Any]:
 def _seconds_since_job_finished(job_id: str) -> float | None:
     try:
         from app.job_state import _init_job_table
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             _init_job_table(conn)
             row = conn.execute(
                 "select finished_at, heartbeat_at from job_runs where job_id = ?",
@@ -1778,11 +1783,12 @@ def _seconds_since_job_finished(job_id: str) -> float | None:
 
 def _seconds_since_supervisor_deep_audit() -> float | None:
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         from app.system_supervisor import _init_supervisor_table
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             _init_supervisor_table(conn)
             row = conn.execute(
                 """

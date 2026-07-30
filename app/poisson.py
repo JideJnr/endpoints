@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from app.db import db_conn
 from app.sofascore_client import fetch_team_history
 
 
@@ -110,11 +111,12 @@ def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
 def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
     """Pull finished matches for a team from our local SQLite finished_matches archive."""
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         import sqlite3 as _sqlite3
         import json as _json
         _init_db()
-        with _sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = _sqlite3.Row
             # Check if finished_matches table exists (MongoDB stub may not have it)
             tables = {r[0] for r in conn.execute("select name from sqlite_master where type='table'").fetchall()}

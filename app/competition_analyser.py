@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 logger = logging.getLogger(__name__)
 
@@ -475,7 +477,7 @@ def run_competition_analysis(
 
     # Determine round_name if not provided
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         if round_name is None:
             rounds = detect_newly_completed_rounds(conn)
@@ -546,7 +548,7 @@ def run_competition_analysis(
 
     generated_at = datetime.now(timezone.utc).isoformat()
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         persist_competition_analysis(
             conn,
@@ -583,7 +585,7 @@ def catchup_competition_scores(competition_key: str) -> dict[str, Any]:
 
     _init_db()
     refreshed = newly_finished = 0
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -684,7 +686,7 @@ def job_competition_analysis() -> dict[str, Any]:
         _init_db()
 
         # Step 1: catch up any stale/in-progress rows for all enabled competitions
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             init_competition_analysis_table(conn)
             enabled_keys = [
                 row[0] for row in conn.execute(
@@ -700,7 +702,7 @@ def job_competition_analysis() -> dict[str, Any]:
                 logger.debug("job_competition_analysis: catchup failed for %s: %s", key, exc)
 
         # Step 2: detect completed rounds and generate analysis
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             init_competition_analysis_table(conn)
             completed_rounds = detect_newly_completed_rounds(conn)
 

@@ -1,9 +1,9 @@
 import sqlite3, json
+from app.db import connect_db
 
-DB = "data/predictx_memory.sqlite3"
 MATCH_ID = "sr:match:72946560"
 
-conn = sqlite3.connect(DB, timeout=10)
+conn = connect_db(timeout=10)
 row = conn.execute(
     "select raw_enriched from match_buffer where match_id=?", (MATCH_ID,)
 ).fetchone()

@@ -9,56 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.db import DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db
 from app.market_intent import classify_market_intent, grade_market_intent
 from app.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
 
-from app.config import get_settings
-
-
-DB_PATH = get_settings().database_path
 _DB_SCHEMA_READY = False
 _DB_SCHEMA_LOCK = threading.RLock()
-_local = threading.local()
-
-
-def get_db() -> sqlite3.Connection:
-    """Return a thread-local persistent connection, creating it on first use."""
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("pragma journal_mode = wal")
-        conn.execute("pragma synchronous = normal")
-        conn.execute("pragma busy_timeout = 30000")
-        conn.execute("pragma cache_size = -8000")  # 8 MB page cache
-        _local.conn = conn
-    return conn
-
-
-def close_db() -> None:
-    """Close and discard the thread-local connection (call at end of request/task)."""
-    conn = getattr(_local, "conn", None)
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        _local.conn = None
-
-
-from contextlib import contextmanager
-
-
-@contextmanager
-def _conn(timeout: int = 30):
-    """Yield a fresh per-call connection to avoid cross-thread SQLite errors."""
-    with sqlite3.connect(DB_PATH, timeout=timeout) as conn:
-        conn.row_factory = sqlite3.Row
-        conn.execute("pragma journal_mode = wal")
-        conn.execute("pragma synchronous = normal")
-        conn.execute("pragma busy_timeout = 30000")
-        conn.execute("pragma cache_size = -4000")
-        yield conn
 
 
 def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
@@ -3198,7 +3154,7 @@ def _existing_schema_can_be_trusted() -> bool:
     if _run_schema_migrations() or not DB_PATH.exists():
         return False
     try:
-        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2) as conn:
+        with connect_readonly_db(timeout=2) as conn:
             row = conn.execute(
                 """
                 select count(*)
@@ -3239,7 +3195,7 @@ def _init_db() -> None:
         if _DB_SCHEMA_READY:
             return
         if _existing_schema_can_be_trusted():
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with db_conn(timeout=30) as conn:
                 conn.execute("pragma busy_timeout = 30000")
                 _ensure_prediction_history_columns(conn)
             _DB_SCHEMA_READY = True
@@ -3258,7 +3214,7 @@ def _init_db() -> None:
 
 def _init_db_unlocked() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+    with db_conn(timeout=60) as conn:
         conn.execute("pragma busy_timeout = 60000")
         try:
             conn.execute("pragma journal_mode = wal")

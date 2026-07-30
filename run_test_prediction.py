@@ -3,14 +3,12 @@ Shallow overview: pick a real match from the DB and run the full AI prediction p
 Prints every step so we can see if the system makes sense.
 """
 import sys, json, sqlite3, logging
+from app.db import connect_db
 sys.stdout.reconfigure(line_buffering=True)
 logging.basicConfig(level=logging.WARNING)  # suppress noise, we print manually
 
-DB = "data/predictx_memory.sqlite3"
-
 # ── 1. Pick a match ──────────────────────────────────────────────────────────
-conn = sqlite3.connect(DB, timeout=10)
-conn.row_factory = sqlite3.Row
+conn = connect_db(timeout=10)
 
 rows = conn.execute("""
     select match_id, match_date, raw_enriched

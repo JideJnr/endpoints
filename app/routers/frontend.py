@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from app.db import db_conn
 from app.buffer import (
     get_buffered_matches,
     get_buffered_match,
@@ -544,7 +545,8 @@ def refresh_predictions_today():
 def get_predictions_today():
     """Return today's latest predictions per match, sorted by confidence desc. Excludes no_bet."""
     from datetime import date
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     from app.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
@@ -555,7 +557,7 @@ def get_predictions_today():
     _init_db()
     buffer_status: dict[str, dict] = {}
     try:
-        with _sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = _sqlite3.Row
             _init_buffer_table(conn)
             rows = conn.execute(
@@ -759,13 +761,14 @@ def cleanup_finished_matches():
     """Immediately remove all finished, 90+, and ghost matches from the buffer."""
     from app.mongo_store import cleanup_buffer
     from app.buffer import purge_ghost_matches
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     import sqlite3 as _sqlite3
 
     # First pass: archive any is_finished=1 rows that weren't cleaned up
     _init_db()
     archived = 0
-    with _sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         rows = conn.execute(
             "select match_id from match_buffer where is_finished = 1"
         ).fetchall()
@@ -1015,10 +1018,13 @@ def get_competition_team_watcher(competition_key: str, team_id: str):
 
 
 @router.get("/team-watchers")
-def get_ai_team_watchers(limit: int = Query(default=100, ge=1, le=300)):
+def get_ai_team_watchers(
+    limit: int = Query(default=100, ge=1, le=300),
+    league_name: Optional[str] = None,
+):
     from app.team_watcher import list_watchers
 
-    return list_watchers(limit=limit)
+    return list_watchers(limit=limit, league_name=league_name)
 
 
 @router.get("/team-watchers/inspect-sporty")
@@ -1054,10 +1060,11 @@ def get_competition_analysis_latest(competition_key: str):
     """Most recent post-matchday Ollama analysis for a competition."""
     import sqlite3
     from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         row = get_latest_analysis(competition_key, conn)
 
@@ -1083,10 +1090,11 @@ def get_competition_analysis_history(
     """Paginated post-matchday analysis history for a competition."""
     import sqlite3
     from app.competition_analyser import get_analysis_history, init_competition_analysis_table
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         rows = get_analysis_history(competition_key, limit, conn)
 
@@ -1111,14 +1119,15 @@ def get_competition_page(
     import sqlite3
     from app.competition_special import competition_status, get_competition_settings, list_competition_buffer, list_team_watchers
     from app.competition_analyser import get_analysis_history, get_latest_analysis, init_competition_analysis_table
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     buffer = list_competition_buffer(competition_key, limit=buffer_limit)
     status = competition_status(competition_key)
     watchers = list_team_watchers(competition_key, limit=80)
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         latest_analysis = get_latest_analysis(competition_key, conn)
         analysis_history = get_analysis_history(competition_key, analysis_limit, conn)
@@ -1275,13 +1284,14 @@ def _engine_row_matches(engine: dict[str, Any], pick_type: str, selection: str, 
 
 
 def _engine_work_rows(limit: int = 3000) -> list[dict[str, Any]]:
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     import json
     import sqlite3
 
     _init_db()
     rows: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         query = """
             select * from (
@@ -1433,7 +1443,8 @@ def grade_results(hours_back: int = 24):
     import json
     from datetime import date as _date, timedelta as _timedelta
     from app.sportybet_client import fetch_results
-    from app.league_memory import DB_PATH, _init_db, _grade_pick_for_match, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
+    from app.db import DB_PATH
+    from app.league_memory import _init_db, _grade_pick_for_match, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
     from app.prediction_audit import grading_reason
     from app.mongo_store import archive_finished_match_from_buffer
     from app.sofascore_client import fetch_all_scheduled_events
@@ -1457,7 +1468,7 @@ def grade_results(hours_back: int = 24):
     graded = archived = skipped = 0
 
     # grade pending predictions
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         pending = conn.execute(
             "select id, match_id, match_name, league_name, country_name, pick_type, selection, "
@@ -1476,7 +1487,7 @@ def grade_results(hours_back: int = 24):
         grade_info = grading_reason(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
         outcome = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
         grade_info["result"] = outcome
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.execute(
                 "update prediction_history set result=?, final_home=?, final_away=?, "
                 "grading_reason_json=?, graded_at=current_timestamp where id=?",
@@ -1527,7 +1538,7 @@ def grade_results(hours_back: int = 24):
         graded += 1
 
     # archive buffer rows that now have a result
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         buffer_rows = conn.execute(
             "select match_id from match_buffer where is_finished=0"
@@ -1537,7 +1548,7 @@ def grade_results(hours_back: int = 24):
         if str(row["match_id"]) not in result_map:
             continue
         score = result_map[str(row["match_id"])]["score"]
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.execute(
                 "update match_buffer set period='Ended', score_home=?, score_away=?, "
                 "is_live=0, is_finished=1 where match_id=?",
@@ -1671,13 +1682,14 @@ def get_signal_matches(
     """List matches carrying a specific learned signal, with grading summary."""
     import json
     import sqlite3
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     signal_name = str(signal_name or "consensus_longshot_value")
     result = result if isinstance(result, str) else ""
     limit = int(limit) if isinstance(limit, int) else 300
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         if signal_name == "consensus_longshot_value":
             rows = conn.execute(
@@ -1789,7 +1801,8 @@ def get_model_explorer(
     import json
     import sqlite3
     from app.market_intent import classify_market_intent
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     def _pick_family(pick_type: str, selection: str, market_intent: dict[str, Any] | None = None) -> str:
         intent = market_intent or classify_market_intent(pick_type, selection)
@@ -1946,7 +1959,7 @@ def get_model_explorer(
         return bool(names & aliases.get(model_name, {model_name}))
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -2683,10 +2696,11 @@ def _local_finished_match(match_id: str) -> dict[str, Any] | None:
     try:
         import json
         import sqlite3
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "select coalesce(raw_doc, raw_json) as raw_doc from finished_matches where match_id = ?",
@@ -2707,10 +2721,11 @@ def _history_match_detail(match_id: str) -> dict[str, Any] | None:
     try:
         import json
         import sqlite3
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
 
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """

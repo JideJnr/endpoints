@@ -7,7 +7,9 @@ import sqlite3
 from threading import Lock
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 _MAX_EVENTS = 120
@@ -70,7 +72,7 @@ def get_activity(limit: int = 30) -> dict[str, Any]:
 def _persist_event(event: dict[str, Any]) -> None:
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             _init_activity_table(conn)
             conn.execute(
                 """
@@ -104,7 +106,7 @@ def _persist_event(event: dict[str, Any]) -> None:
 def _load_events(limit: int) -> list[dict[str, Any]]:
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             _init_activity_table(conn)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(

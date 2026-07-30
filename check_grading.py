@@ -1,10 +1,8 @@
 import sys, json
-sys.path.insert(0, 'app')
 import sqlite3
-from league_memory import DB_PATH
+from app.db import connect_db
 
-c = sqlite3.connect(str(DB_PATH))
-c.row_factory = sqlite3.Row
+c = connect_db()
 
 # 1. Total predictions and grading status
 print('=== PREDICTION GRADING STATUS ===')

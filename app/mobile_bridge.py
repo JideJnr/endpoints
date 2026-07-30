@@ -6,14 +6,15 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import connect_db, db_conn
+from app.league_memory import _init_db
 
 
 def init_mobile_bridge_db(conn: sqlite3.Connection | None = None) -> None:
     owns_conn = conn is None
     if conn is None:
         _init_db()
-        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn = connect_db(timeout=30)
     try:
         conn.execute("pragma busy_timeout = 30000")
         conn.execute("""
@@ -64,7 +65,7 @@ def receive_provider_packet(packet: dict[str, Any]) -> dict[str, Any]:
     request_json = json.dumps(request_payload, separators=(",", ":"), sort_keys=True)
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_mobile_bridge_db(conn)
         existing = conn.execute(
             "select packet_id, ingest_status, ingest_summary, status from mobile_provider_packets where packet_id = ?",
@@ -114,7 +115,7 @@ def receive_provider_packet(packet: dict[str, Any]) -> dict[str, Any]:
 
 def ingest_packet(packet_id: str) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_mobile_bridge_db(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -143,7 +144,7 @@ def ingest_packet(packet_id: str) -> dict[str, Any]:
 
 def list_provider_packets(status: str | None = None, limit: int = 100) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_mobile_bridge_db(conn)
         conn.row_factory = sqlite3.Row
         params: list[Any] = []
@@ -171,7 +172,7 @@ def list_provider_packets(status: str | None = None, limit: int = 100) -> dict[s
 
 def mobile_bridge_status() -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_mobile_bridge_db(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -195,7 +196,7 @@ def acknowledge_packets(packet_ids: list[str]) -> dict[str, Any]:
         return {"status": "success", "acknowledged": 0}
     now = datetime.now(timezone.utc).isoformat()
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_mobile_bridge_db(conn)
         count = 0
         for packet_id in packet_ids:
@@ -234,7 +235,7 @@ def _ingest_sportybet_response(response: dict[str, Any], scope: str | None) -> d
 
 
 def _update_ingest(packet_id: str, ingest_status: str, summary: dict[str, Any], error: str | None) -> None:
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_mobile_bridge_db(conn)
         conn.execute(
             """

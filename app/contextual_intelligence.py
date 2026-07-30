@@ -4,8 +4,10 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from app.db import db_conn
 from app.confidence_calibrator import calibrate_confidence
-from app.league_memory import DB_PATH, _init_db
+from app.db import DB_PATH
+from app.league_memory import _init_db
 from app.market_intent import classify_market_intent
 from app.match_state import classify_match_state
 from app.time_context import match_time_context
@@ -458,7 +460,7 @@ def _graded_pick_performance(
     scopes: list[dict[str, Any]] = []
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        with db_conn(timeout=5) as conn:
             conn.row_factory = sqlite3.Row
             exact = _graded_scope(conn, "exact_selection", "pick_type = ? and lower(selection) = lower(?)", (pick_type, selection))
             type_scope = _graded_scope(conn, "pick_type", "pick_type = ?", (pick_type,))

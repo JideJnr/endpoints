@@ -5,7 +5,8 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings, public_settings
-from app.league_memory import DB_PATH, _init_db, close_db
+from app.db import DB_PATH, close_db
+from app.league_memory import _init_db
 from app.ollama_model_manager import preload_all_models, start_keep_alive, stop_keep_alive
 from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore, user_behavior, betbuilder
 from app.routers import sofa_pipeline as sofa_pipeline_router

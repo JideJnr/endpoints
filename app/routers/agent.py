@@ -5,6 +5,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from app.db import db_conn
 from app.league_memory import (
     get_league_memory,
     get_snapshot_memory,
@@ -260,10 +261,11 @@ def get_roi_analysis():
     break-even odds instead of treating every win as a 1.00 return.
     """
     import sqlite3
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """

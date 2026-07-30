@@ -51,7 +51,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, _conn
+from app.db import db_conn
+from app.db import DB_PATH, _conn
+from app.league_memory import _init_db
 
 
 # ── Data Structures ────────────────────────────────────────────────────────────
@@ -161,7 +163,7 @@ def record_risk_outcome(
     band = _confidence_band(confidence)
     odds_range = _odds_range(decimal_odds)
 
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         _init_risk_learner_tables(conn)
         conn.execute("""
             insert into risk_outcomes
@@ -308,7 +310,7 @@ def get_learned_risk_controls(
     band = _confidence_band(confidence)
     odds_range = _odds_range(decimal_odds)
 
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
+    with db_conn(timeout=15) as conn:
         _init_risk_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute("""
@@ -334,7 +336,7 @@ def get_learned_risk_controls(
         )
 
     # Fallback: try broader match (any confidence band, any odds range)
-    with sqlite3.connect(DB_PATH, timeout=15) as conn:
+    with db_conn(timeout=15) as conn:
         _init_risk_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute("""
@@ -374,7 +376,7 @@ def get_learned_risk_controls(
 def get_risk_control_summary() -> dict[str, Any]:
     """Return a summary of all learned risk controls for the dashboard."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         _init_risk_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
@@ -415,7 +417,7 @@ def rebuild_risk_controls() -> dict[str, Any]:
     risk conditions at prediction time, and recomputes optimal caps.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_risk_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 

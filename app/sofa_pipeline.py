@@ -39,7 +39,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, normalize_league
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db, normalize_league
 from app.match_state import classify_match_state
 from app.sofascore_client import (
     fetch_all_scheduled_events,
@@ -199,7 +201,7 @@ def ingest_from_sofascore(
 
     inserted = updated = skipped = 0
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_buffer_table(conn)
         conn.execute("pragma busy_timeout = 30000")
 
@@ -312,7 +314,7 @@ def _get_sofa_buffer_matches(
     if live_only:
         clauses.append("is_live = 1")
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

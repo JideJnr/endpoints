@@ -43,7 +43,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 CLV_MIN_SAMPLES = 25
 
@@ -95,7 +97,7 @@ def record_clv_entry(
     if not entry_odds:
         return False
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         # Avoid duplicate entries for the same match+selection on the same day
@@ -119,7 +121,7 @@ def record_clv_entry(
 
 def _get_current_odds(match_id: str, selection: str) -> float | None:
     """Get the most recent odds snapshot for a selection."""
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         col = _primary_odds_column(selection)
         if col:
@@ -241,7 +243,7 @@ def compute_clv_for_date(match_date: str) -> dict[str, Any]:
     Returns count of entries updated.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         conn.row_factory = sqlite3.Row
@@ -353,7 +355,7 @@ def get_clv_summary(days: int = 30) -> dict[str, Any]:
       - recent: last 20 entries
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         conn.row_factory = sqlite3.Row
@@ -516,7 +518,7 @@ def clv_stake_multiplier(pick_type: str, confidence: int) -> float:
     whether you're finding real edges, not just getting lucky.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         _init_clv_table(conn)
         conn.row_factory = sqlite3.Row

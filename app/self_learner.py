@@ -35,7 +35,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, _get_passed_models
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db, _get_passed_models
 
 UNIQUE_GRADED_HISTORY = """
     select *
@@ -141,7 +143,7 @@ def run_learning_cycle() -> dict[str, Any]:
     Call this after every grading run.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 
@@ -243,7 +245,7 @@ def run_learning_cycle() -> dict[str, Any]:
     league_updates = 0
     model_updates = 0
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("delete from signal_weights")
@@ -405,7 +407,7 @@ def get_signal_weights(league: str | None = None, pick_type: str | None = None) 
     Used by enriched_prediction.py to adjust signal impacts.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 
@@ -444,7 +446,7 @@ def get_learned_weights() -> dict[str, float]:
     Falls back to hardcoded defaults if not enough data yet.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -470,7 +472,7 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
     """
     _init_db()
     league_key = _norm_league(league)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
@@ -503,7 +505,7 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
 def get_top_signals(limit: int = 20) -> list[dict[str, Any]]:
     """Return the highest and lowest performing signals globally."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
@@ -533,7 +535,7 @@ def get_top_signals(limit: int = 20) -> list[dict[str, Any]]:
 def get_learning_summary() -> dict[str, Any]:
     """Full summary of what the system has learned. Used by analytics endpoints."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 

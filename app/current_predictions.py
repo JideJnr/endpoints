@@ -4,16 +4,18 @@ import json
 import sqlite3
 from typing import Any
 
+from app.db import db_conn
 from app.buffer import get_buffered_match
 from app.enriched_prediction import prediction_readiness
-from app.league_memory import DB_PATH, _init_db
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 def list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list[dict[str, Any]]:
     """Recent ungraded rows that are still eligible for current-pick views."""
     _init_db()
     try:
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        with db_conn(timeout=20) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """

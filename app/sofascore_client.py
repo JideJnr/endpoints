@@ -1,3 +1,4 @@
+from app.db import db_conn
 import random
 import time
 from typing import Dict, List, Optional, Tuple
@@ -227,10 +228,11 @@ _CORE_TOURNAMENT_IDS: Dict[int, str] = {
 def _get_learned_tournament_ids() -> Dict[int, str]:
     """Load auto-learned tournament IDs from SQLite."""
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         import sqlite3 as _sqlite3
         _init_db()
-        with _sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             conn.execute("""
                 create table if not exists sofa_tournament_ids (
                     tournament_id integer primary key,
@@ -249,10 +251,11 @@ def learn_tournament_id(tournament_id: int, name: str) -> None:
     if not tournament_id:
         return
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         import sqlite3 as _sqlite3
         _init_db()
-        with _sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             conn.execute("""
                 create table if not exists sofa_tournament_ids (
                     tournament_id integer primary key,

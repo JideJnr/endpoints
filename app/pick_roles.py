@@ -3,7 +3,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 def learned_best_pick(picks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -29,7 +31,7 @@ def learned_best_pick(picks: list[dict[str, Any]]) -> dict[str, Any]:
 def load_role_memory_rows() -> dict[tuple[str, str], list[dict[str, Any]]]:
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        with db_conn(timeout=20) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """

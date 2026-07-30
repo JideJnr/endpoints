@@ -31,7 +31,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, _conn
+from app.db import DB_PATH, _conn
+from app.league_memory import _init_db
 from app.market import snapshot_odds
 from app.match_state import classify_match_state
 from app.normalise import normalise

@@ -5,7 +5,8 @@ import sqlite3
 from collections import Counter
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, _conn
+from app.db import DB_PATH, _conn
+from app.league_memory import _init_db
 
 from app.dixon_coles import run_dixon_coles
 from app.contextual_intelligence import apply_contextual_adjustment, build_contextual_intelligence
@@ -2196,7 +2197,9 @@ def _global_signal_stats(signal_name: str) -> dict[str, Any]:
     if cached is not None:
         return cached
     try:
-        from app.league_memory import DB_PATH, _init_db, _conn
+        from app.db import DB_PATH
+        from app.db import _conn
+        from app.league_memory import _init_db
 
         _init_db()
         with _conn(timeout=5) as conn:
@@ -2236,7 +2239,9 @@ def _prefetch_signal_stats(signal_names: list[str]) -> None:
     if not signal_names:
         return
     try:
-        from app.league_memory import DB_PATH, _init_db, _conn
+        from app.db import DB_PATH
+        from app.db import _conn
+        from app.league_memory import _init_db
         _init_db()
         placeholders = ",".join("?" * len(signal_names))
         with _conn(timeout=5) as conn:
@@ -2570,7 +2575,9 @@ def _pick_family(pick: dict[str, Any]) -> str:
 def _candidate_role_memory(doc: dict[str, Any], pick_type: str, selection: str) -> dict[str, Any]:
     """Learn whether this market works better as primary or secondary in similar context."""
     try:
-        from app.league_memory import DB_PATH, _init_db, _conn
+        from app.db import DB_PATH
+        from app.db import _conn
+        from app.league_memory import _init_db
 
         league = str(doc.get("tournament") or doc.get("league_name") or "")
         country = str(doc.get("category") or doc.get("country") or "")
@@ -2971,7 +2978,9 @@ def _pick_signal_stats(pick_type: str, selection: str, signal_name: str) -> dict
     if not pick_type or not selection or not signal_name:
         return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
     try:
-        from app.league_memory import DB_PATH, _init_db, _conn
+        from app.db import DB_PATH
+        from app.db import _conn
+        from app.league_memory import _init_db
 
         _init_db()
         with _conn(timeout=5) as conn:
@@ -3338,7 +3347,9 @@ def _selection_score_memory(pick_type: str, selection: str) -> dict[str, Any]:
     if not pick_type or not selection:
         return {"available": False, "reason": "missing_pick"}
     try:
-        from app.league_memory import DB_PATH, _init_db, _conn
+        from app.db import DB_PATH
+        from app.db import _conn
+        from app.league_memory import _init_db
 
         _init_db()
         with _conn(timeout=5) as conn:

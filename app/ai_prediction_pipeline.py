@@ -13,7 +13,9 @@ import sqlite3
 import time
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,7 @@ def get_specialist_weights(league: str | None = None, pick_type: str | None = No
     """
     _init_db()
     league_key = (league or "").lower().strip().replace(" ", "_")[:60] or "__global__"
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             select specialist_name, weight, league_key, samples
@@ -76,7 +78,7 @@ def record_specialist_outcome(
     win = 1 if result == "win" else 0
     loss = 1 if result == "loss" else 0
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         for lk in (league_key, "__global__"):
             for pk in ({pt, "__all__"}):
                 conn.execute("""
@@ -130,7 +132,7 @@ def grade_specialist_contributions(
 def get_specialist_summary() -> list[dict[str, Any]]:
     """Return global specialist performance for the analytics endpoint."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             select specialist_name, samples, wins, losses, win_rate, weight
@@ -371,7 +373,7 @@ def _step_common_opponent(doc: dict, model: str, timeout: int = 20) -> str:
     try:
         home, away = _teams(doc)
         if not home or not away: return COMMON_FALLBACK
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             rows = conn.execute("""select home_team, away_team, final_home_goals, final_away_goals from matches
                 where is_finished=1 and (lower(home_team)=lower(?) or lower(away_team)=lower(?) or lower(home_team)=lower(?) or lower(away_team)=lower(?))
                 order by last_seen_at desc limit 40""", (home, home, away, away)).fetchall()
@@ -593,7 +595,7 @@ def _step_team_history(doc: dict, model: str, timeout: int = 25) -> str:
         if not home or not away:
             return "Team history unavailable because team names are missing."
         # Primary: query SQLite finished matches
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             home_matches = _previous_matches_for_team(home, conn)
             away_matches = _previous_matches_for_team(away, conn)
         # Fallback: use SofaScore last_matches arrays already in the doc
@@ -755,7 +757,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         _init_db()
         competition_context: str | None = None
         competition_analysis_key: str | None = None
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        with db_conn(timeout=20) as conn:
             home, away = _teams(doc); hp, ap = derive_team_profile(home, conn), derive_team_profile(away, conn)
             persist_team_profile(hp, conn); persist_team_profile(ap, conn); conn.commit()
             competition_context = _get_competition_context(doc, conn)
@@ -853,7 +855,7 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
     record_activity("AI prediction queue started", job="ai_prediction_queue", status="running")
     _init_db()
     summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "ollama_used": 0, "fallback_used": 0, "errors": 0}
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         rows = conn.execute(
             """
             select match_id, match_date, raw_enriched

@@ -6,7 +6,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.league_memory import DB_PATH, _init_db, track_user_behavior, get_user_behavior_summary, get_behavior_weighted_picks
+from app.db import DB_PATH
+from app.league_memory import _init_db, track_user_behavior, get_user_behavior_summary, get_behavior_weighted_picks
 
 router = APIRouter(prefix="/user-behavior", tags=["user-behavior"])
 

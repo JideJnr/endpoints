@@ -5,7 +5,9 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import DB_PATH
+from app.league_memory import _init_db
+from app.db import db_conn
 from app.match_state import classify_match_state
 
 
@@ -88,6 +90,8 @@ def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
     doc["known_competition"] = context
     doc["competition_special"] = {"key": entry["key"], "name": entry["name"], "source": "known_competition_match"}
     doc["competition_intelligence"] = intelligence
+    doc["competition_team_watchers"] = intelligence.get("team_watchers")
+    doc["ai_team_watchers"] = intelligence.get("ai_team_watchers")
     doc["team_strength_context"] = intelligence.get("team_strength")
     doc["table_context"] = intelligence.get("table")
     return doc
@@ -203,7 +207,7 @@ def init_competition_tables(conn: sqlite3.Connection) -> None:
 
 def get_competition_settings(key: str = "world-cup-2026") -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
@@ -228,7 +232,7 @@ def update_competition_settings(key: str, payload: dict[str, Any]) -> dict[str, 
         "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else current.get("metadata") or {},
     }
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         init_competition_tables(conn)
         conn.execute(
             """
@@ -290,7 +294,7 @@ def sync_competition_fixtures(
     cursor_candidate: str | None = None
     cursor_blocked = False
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
         for offset in range(days):
@@ -336,7 +340,7 @@ def sync_competition_fixtures(
 
 def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
@@ -361,7 +365,7 @@ def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> di
 
 def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
         row = conn.execute(
@@ -396,7 +400,7 @@ def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
 
 def list_team_watchers(key: str = "world-cup-2026", limit: int = 80) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         rows = conn.execute(
@@ -415,7 +419,7 @@ def list_team_watchers(key: str = "world-cup-2026", limit: int = 80) -> dict[str
 
 def get_team_watcher(key: str, team_id: str) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         row = conn.execute(
@@ -455,7 +459,7 @@ def enrich_predict_competition(key: str = "world-cup-2026", limit: int = 12, all
     mirrored = ensure_competition_main_buffer(key)
     processed = enriched = predicted = deferred = errors = 0
     items: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         rows = conn.execute(
@@ -529,7 +533,7 @@ def ensure_competition_main_buffer(key: str = "world-cup-2026") -> int:
     """Backfill/mirror dedicated competition rows into the normal enrichment buffer."""
     _init_db()
     mirrored = 0
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         rows = conn.execute(
@@ -601,7 +605,7 @@ def refresh_competition_context(key: str = "world-cup-2026", limit: int = 12) ->
     _init_db()
     refreshed = errors = 0
     items: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         rows = conn.execute(
@@ -688,7 +692,7 @@ def purge_misclassified_competition_rows() -> dict[str, int]:
     """Remove regenerable rows created by the historic Brasileirão→MLS mix-up."""
     _init_db()
     removed_special = removed_main = 0
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         rows = conn.execute("""select match_id, raw_event from competition_special_buffer
@@ -720,7 +724,7 @@ def purge_misclassified_competition_rows() -> dict[str, int]:
 def _loaded_until(key: str) -> date | None:
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn() as conn:
             init_competition_tables(conn)
             row = conn.execute(
                 "select max(match_date) from competition_special_buffer where competition_key = ?",
@@ -748,7 +752,7 @@ def _mark_sync_cursor(key: str, scanned_end: str) -> None:
     metadata = settings.get("metadata") if isinstance(settings.get("metadata"), dict) else {}
     metadata["last_sync_end_date"] = scanned_end
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_tables(conn)
         conn.execute(
             """
@@ -830,7 +834,7 @@ def _save_competition_detail(
         intelligence["odds_movement"] = doc["odds_movement"]
     except Exception as exc:
         intelligence["odds_movement"] = {"error": str(exc)}
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_tables(conn)
         conn.execute(
             """
@@ -1225,6 +1229,12 @@ def _competition_intelligence_context(
     away_strength = _recent_play_strength(detail.get("away_last_matches") or [], away)
     home_watcher = _team_watcher_context(key, home)
     away_watcher = _team_watcher_context(key, away)
+    try:
+        from app.team_watcher import team_watchers_for_match
+
+        ai_team_watchers = team_watchers_for_match(doc)
+    except Exception as exc:
+        ai_team_watchers = {"available": False, "error": str(exc)}
     table_edge = _safe_num((home_table or {}).get("points_per_game")) - _safe_num((away_table or {}).get("points_per_game"))
     strength_edge = _safe_num(home_strength.get("strength_score")) - _safe_num(away_strength.get("strength_score"))
     watcher_edge = _safe_num((home_watcher.get("profile") or {}).get("team_score")) - _safe_num((away_watcher.get("profile") or {}).get("team_score"))
@@ -1252,6 +1262,7 @@ def _competition_intelligence_context(
             "leader": "home" if watcher_edge > 5 else "away" if watcher_edge < -5 else "even",
             "basis": "long_term_competition_team_ai_profiles",
         },
+        "ai_team_watchers": ai_team_watchers,
         "readiness_notes": _competition_readiness_notes(home_table, away_table, home_strength, away_strength),
     }
 
@@ -1411,7 +1422,7 @@ def _update_team_watchers_for_match(
         return
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         _register_competition_teams(conn, key, event)
@@ -1658,7 +1669,7 @@ def _team_watcher_context(key: str, team: dict[str, Any]) -> dict[str, Any]:
         return {"available": False, "team_name": team_name, "reason": "missing_team_id"}
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             init_competition_tables(conn)
             row = conn.execute(
@@ -1787,7 +1798,7 @@ def list_all_competition_summaries(
             buffer = list_competition_buffer(key, limit=buffer_limit)
             status = competition_status(key)
 
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with db_conn(timeout=30) as conn:
                 init_competition_tables(conn)
                 from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
                 init_competition_analysis_table(conn)

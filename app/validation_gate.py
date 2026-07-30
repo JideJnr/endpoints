@@ -5,7 +5,7 @@ import sqlite3
 from typing import Any
 
 from app.config import get_settings
-from app.league_memory import DB_PATH, _conn
+from app.db import DB_PATH, _conn
 
 
 MIN_CALIBRATION_SAMPLES = 30

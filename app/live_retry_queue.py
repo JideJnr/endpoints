@@ -4,7 +4,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 VALID_SOURCES = {"sportybet", "sofascore"}
@@ -43,7 +45,7 @@ def mark_pending(
     if not match_id or source not in VALID_SOURCES:
         return
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         ensure_live_retry_queue(conn)
         conn.execute(
             """
@@ -70,7 +72,7 @@ def mark_resolved(match_id: str, source: str) -> None:
     if not match_id or source not in VALID_SOURCES:
         return
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         ensure_live_retry_queue(conn)
         conn.execute(
             """
@@ -88,7 +90,7 @@ def mark_resolved(match_id: str, source: str) -> None:
 
 def expire_stale_entries() -> int:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         ensure_live_retry_queue(conn)
         cur = conn.execute(
             """
@@ -106,7 +108,7 @@ def expire_stale_entries() -> int:
 
 def active_pending_count() -> int:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         ensure_live_retry_queue(conn)
         row = conn.execute(
             """
@@ -121,7 +123,7 @@ def active_pending_count() -> int:
 
 def list_active(limit: int = 200) -> list[dict[str, Any]]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         ensure_live_retry_queue(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

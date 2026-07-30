@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.db import db_conn
 from app.ai_brain import oversee_prediction
 from app.enriched_prediction import predict_enriched_match, prediction_readiness
-from app.league_memory import DB_PATH, record_deferred_prediction_decision, record_prediction
+from app.db import DB_PATH
+from app.league_memory import record_deferred_prediction_decision, record_prediction
 from app.prediction_audit import build_deferred_prediction_audit, build_prediction_audit
 from app.match_state import classify_match_state
 from app.config import get_settings
@@ -185,7 +187,7 @@ def _recent_ungraded_prediction(match_id: str, *, minutes: int, prediction_mode:
     """Return the most recent ungraded prediction for match_id within a time window."""
     if not match_id or minutes <= 0:
         return None
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_conn(timeout=10) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """

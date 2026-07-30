@@ -5,7 +5,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _ensure_column, _init_db
+from app.db import DB_PATH
+from app.league_memory import _ensure_column, _init_db
+from app.db import db_conn
 from app.match_state import classify_match_state
 from app.time_context import match_time_context
 from app.web_context import search_team_context
@@ -13,6 +15,51 @@ from app.web_context import search_team_context
 
 def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
     conn.execute("pragma busy_timeout = 30000")
+    # Self-healing migration: drop stale NOT NULL columns added by a previous edit
+    _stale = {r[1] for r in conn.execute("pragma table_info(ai_team_watchers)").fetchall()}
+    if "primary_provider" in _stale or "provider_team_id" in _stale:
+        conn.execute("drop table if exists _tw_mig")
+        conn.execute("""
+            create table _tw_mig (
+                team_key text primary key,
+                team_name text not null,
+                sporty_team_id text,
+                sofascore_team_id text,
+                aliases_json text not null default '[]',
+                analyst_name text not null default '',
+                profile_json text not null default '{}',
+                match_count integer not null default 0,
+                last_match_id text,
+                last_analysis_json text,
+                league_name text,
+                position text,
+                table_json text not null default '{}',
+                web_context_json text not null default '{}',
+                overview_json text not null default '{}',
+                last_web_context_at text,
+                updated_at text not null default current_timestamp
+            )
+        """)
+        conn.execute("""
+            insert or ignore into _tw_mig
+                (team_key, team_name, sporty_team_id, sofascore_team_id, aliases_json,
+                 analyst_name, profile_json, match_count, last_match_id, last_analysis_json,
+                 league_name, position, table_json, web_context_json, overview_json,
+                 last_web_context_at, updated_at)
+            select team_key, team_name,
+                coalesce(sporty_team_id, provider_team_id),
+                sofascore_team_id, aliases_json,
+                coalesce(analyst_name, ''), coalesce(profile_json, '{}'),
+                coalesce(match_count, 0), last_match_id, last_analysis_json,
+                league_name, position,
+                coalesce(table_json, '{}'), coalesce(web_context_json, '{}'),
+                coalesce(overview_json, '{}'), last_web_context_at,
+                coalesce(updated_at, current_timestamp)
+            from ai_team_watchers
+        """)
+        conn.execute("drop table ai_team_watchers")
+        conn.execute("alter table _tw_mig rename to ai_team_watchers")
+        conn.commit()
     conn.execute(
         """
         create table if not exists ai_team_watchers (
@@ -21,7 +68,7 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
             sporty_team_id text,
             sofascore_team_id text,
             aliases_json text not null default '[]',
-            analyst_name text not null,
+            analyst_name text not null default '',
             profile_json text not null default '{}',
             match_count integer not null default 0,
             last_match_id text,
@@ -76,19 +123,25 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_ai_team_watcher_matches_team on ai_team_watcher_matches(team_key, match_date desc)")
 
 
-def list_watchers(limit: int = 100) -> dict[str, Any]:
+def list_watchers(limit: int = 100, league_name: str | None = None) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
+        params: list[Any] = []
+        league_clause = ""
+        if league_name:
+            league_clause = "where lower(coalesce(league_name, '')) like ?"
+            params.append(f"%{league_name.strip().lower()}%")
         rows = conn.execute(
             """
             select *
             from ai_team_watchers
+            {league_clause}
             order by match_count desc, updated_at desc, team_name asc
             limit ?
-            """,
-            (limit,),
+            """.format(league_clause=league_clause),
+            (*params, limit),
         ).fetchall()
     watchers = [_watcher_row(row) for row in rows]
     return {"status": "success", "count": len(watchers), "watchers": watchers}
@@ -96,7 +149,7 @@ def list_watchers(limit: int = 100) -> dict[str, Any]:
 
 def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
         row = _resolve_watcher_row(conn, team_key)
@@ -122,8 +175,7 @@ def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
 
 def inspect_sporty_team_ids(limit: int = 20) -> dict[str, Any]:
     _init_db()
-    examples: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
         for table in ("match_buffer", "future_match_buffer"):
@@ -163,7 +215,7 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
 
     _init_db()
     updated: list[dict[str, Any]] = []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
         for team in teams:
@@ -303,9 +355,11 @@ def _list_finished_matches_local_or_mongo(limit: int) -> list[dict[str, Any]]:
     # Local SQLite fallback (used when PREDICTX_LOCAL_STORAGE_ONLY=true)
     try:
         import json as _json
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
+        from app.db import db_conn
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "select coalesce(raw_doc, raw_json) as raw_doc from finished_matches order by finished_at desc limit ?",
@@ -331,7 +385,7 @@ def team_context_for_match(match_doc: dict[str, Any]) -> dict[str, Any]:
         return {"available": False, "reason": "no_team_identity"}
     _init_db()
     out: dict[str, Any] = {"available": False}
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
         for team in teams:
@@ -349,7 +403,7 @@ def team_watchers_for_match(match_doc: dict[str, Any]) -> dict[str, Any]:
         return {"available": False, "reason": "no_team_identity"}
     _init_db()
     out: dict[str, Any] = {"available": False}
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
         for team in teams:

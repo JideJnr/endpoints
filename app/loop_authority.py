@@ -9,7 +9,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 OWNER = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -62,7 +64,7 @@ def correction_authority(
     token = OWNER
     now = _now_iso()
     expires_at = _now_ts() + max(30, ttl_seconds)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_authority_table(conn)
         conn.execute("begin immediate")
         row = conn.execute(
@@ -93,7 +95,7 @@ def correction_authority(
     try:
         yield {"scope": scope, "source": source, "owner": token, "expires_at": expires_at}
     finally:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             _init_authority_table(conn)
             conn.execute(
                 "delete from correction_authority_leases where scope = ? and owner = ?",
@@ -104,7 +106,7 @@ def correction_authority(
 
 def authority_snapshot() -> list[dict[str, Any]]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_authority_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

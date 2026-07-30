@@ -6,7 +6,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
 
@@ -19,7 +21,7 @@ def live_prediction_gaps() -> dict[str, Any]:
 
         _init_db()
         gaps: list[dict[str, Any]] = []
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
@@ -71,7 +73,7 @@ def prediction_coverage() -> dict[str, Any]:
     """Show prediction coverage: which matches have predictions and which don't."""
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             # Total matches in buffer
             total = conn.execute(

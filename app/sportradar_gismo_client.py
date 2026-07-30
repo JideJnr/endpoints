@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
+from app.db import db_conn
+
 BASE = "https://widgets.fn.sportradar.com/common/en/Etc:UTC/gismo"
 HEADERS = {
     "Accept": "*/*",
@@ -41,9 +43,10 @@ _SEASON_CACHE_TTL = 300  # 5 minutes
 def _get_token() -> Optional[str]:
     """Return cached token if still valid, else fetch a fresh one."""
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             conn.execute("""
                 create table if not exists gismo_token (
                     id integer primary key check (id = 1),
@@ -99,9 +102,10 @@ def _fetch_fresh_token() -> Optional[str]:
 
         # Persist to SQLite
         try:
-            from app.league_memory import DB_PATH, _init_db
+            from app.db import DB_PATH
+            from app.league_memory import _init_db
             _init_db()
-            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            with db_conn(timeout=10) as conn:
                 conn.execute("""
                     create table if not exists gismo_token (
                         id integer primary key check (id = 1),
@@ -129,9 +133,10 @@ def store_token(token: str) -> None:
     try:
         exp_match = re.search(r'exp=(\d+)', token)
         exp = int(exp_match.group(1)) if exp_match else int(time.time()) + 86400
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_conn(timeout=10) as conn:
             conn.execute("""
                 create table if not exists gismo_token (
                     id integer primary key check (id = 1),

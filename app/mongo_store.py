@@ -10,6 +10,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency on local-only installs
     MongoClient = None
 
+from app.db import db_conn
 from app.config import get_settings
 
 _client = None
@@ -69,11 +70,12 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
     if not is_configured():
         return False
 
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     from app.market import get_movement
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "select match_id, match_date, raw_enriched, raw_sporty from match_buffer where match_id = ?",
@@ -348,7 +350,8 @@ def flush_buffer_to_mongo(match_date: str | None = None) -> dict[str, Any]:
     return {"status": "skipped", "reason": "only finished matches are stored in mongo"}
 
 def cleanup_buffer() -> dict[str, Any]:
-    from app.league_memory import DB_PATH, _init_db
+    from app.db import DB_PATH
+    from app.league_memory import _init_db
     from datetime import datetime, timezone
     settings = _get_settings()
     _init_db()
@@ -357,7 +360,7 @@ def cleanup_buffer() -> dict[str, Any]:
     # 2-hour grace period in ms
     ghost_cutoff_ms = (now_ts - 120 * 60) * 1000
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         rows_to_archive = conn.execute(
             """
@@ -381,7 +384,7 @@ def cleanup_buffer() -> dict[str, Any]:
         except Exception:
             pass
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         # Delete rows explicitly marked finished
         r1 = conn.execute("delete from match_buffer where is_finished = 1")
         # Delete rows whose period string indicates finished
@@ -507,9 +510,10 @@ def _to_int(value: Any) -> int | None:
 
 def _latest_prediction(match_id: str) -> dict[str, Any] | None:
     try:
-        from app.league_memory import DB_PATH, _init_db
+        from app.db import DB_PATH
+        from app.league_memory import _init_db
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "select pick_type, selection, confidence, reason from prediction_history where match_id = ? order by created_at desc limit 1",

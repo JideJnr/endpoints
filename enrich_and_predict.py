@@ -4,11 +4,11 @@ Step 2: Show every data layer that came back.
 Step 3: Re-run the full AI prediction pipeline on the enriched doc.
 """
 import sys, json, sqlite3, logging, time
+from app.db import connect_db
 sys.stdout.reconfigure(line_buffering=True)
 logging.basicConfig(level=logging.WARNING)
 
 MATCH_ID = "sr:match:72946560"
-DB = "data/predictx_memory.sqlite3"
 
 # ── STEP 1: Enrich ────────────────────────────────────────────────────────────
 print("=" * 60)
@@ -40,7 +40,7 @@ print("\n" + "=" * 60)
 print("  STEP 2 — DATA LAYERS AFTER ENRICHMENT")
 print("=" * 60)
 
-conn = sqlite3.connect(DB, timeout=10)
+conn = connect_db(timeout=10)
 row = conn.execute("select raw_enriched from match_buffer where match_id=?", (MATCH_ID,)).fetchone()
 conn.close()
 

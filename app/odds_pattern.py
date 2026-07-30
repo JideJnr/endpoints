@@ -35,7 +35,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 # ── Table ─────────────────────────────────────────────────────────────────────
@@ -76,7 +78,7 @@ def extract_pattern(match_id: str) -> list[dict[str, Any]]:
     Returns list of feature dicts.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_pattern_table(conn)
         conn.row_factory = sqlite3.Row
 
@@ -137,7 +139,7 @@ def extract_pattern(match_id: str) -> list[dict[str, Any]]:
             features.append(feat)
 
     # Persist
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_pattern_table(conn)
         for feat in features:
             conn.execute("""
@@ -274,7 +276,7 @@ def grade_patterns_for_date(match_date: str) -> dict[str, Any]:
     Joins odds_pattern_features with prediction_history on match_id.
     """
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_pattern_table(conn)
         # Get graded predictions for this date
         graded = conn.execute("""
@@ -325,7 +327,7 @@ def pattern_signal(match_id: str) -> dict[str, Any]:
     home_feat = next((f for f in features if f["selection"] == "home"), features[0])
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_pattern_table(conn)
         conn.row_factory = sqlite3.Row
 
@@ -420,7 +422,7 @@ def _pull_adjustment(feature: dict[str, Any]) -> int:
 def pattern_stats() -> dict[str, Any]:
     """Return aggregate stats on pattern features — useful for the analytics page."""
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_pattern_table(conn)
         conn.row_factory = sqlite3.Row
 

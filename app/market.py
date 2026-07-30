@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from fractions import Fraction
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 from app.config import get_settings
 
 
@@ -30,7 +32,7 @@ def snapshot_odds(doc: dict[str, Any]) -> bool:
     snapshot_time = datetime.now(timezone.utc).isoformat()
     wrote_any = False
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         _ensure_tables(conn)
         odds_state = _get_snapshot_state(conn, match_id, odds_source)
@@ -125,7 +127,7 @@ def snapshot_odds(doc: dict[str, Any]) -> bool:
 
 def get_movement(match_id: str) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         _ensure_tables(conn)
         conn.row_factory = sqlite3.Row
@@ -201,7 +203,7 @@ def get_all_movements(match_date: str | None = None) -> list[dict[str, Any]]:
     if match_date:
         query += " where match_date = ?"
         params = (match_date,)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.execute("pragma busy_timeout = 30000")
         rows = conn.execute(query, params).fetchall()
     return [get_movement(row[0]) for row in rows]

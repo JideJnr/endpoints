@@ -5,8 +5,10 @@ import sqlite3
 import time
 from typing import Any
 
+from app.db import db_conn
 from app.activity_log import record_activity
-from app.league_memory import DB_PATH, _init_db, get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions
+from app.db import DB_PATH
+from app.league_memory import _init_db, get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions
 
 
 SNAPSHOT_KEEP_ROWS = 1000
@@ -86,7 +88,7 @@ def run_prediction_monitor(*, auto_correct: bool = True) -> dict[str, Any]:
 def latest_prediction_monitor_snapshots(limit: int = 50) -> dict[str, Any]:
     _init_db()
     limit = max(1, min(int(limit or 50), 300))
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         _init_monitor_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -116,7 +118,7 @@ def _performance_trend() -> dict[str, Any]:
         ("last_7d", "-7 days", "+1 seconds"),
         ("previous_7d", "-14 days", "-7 days"),
     ]
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         by_window = {
             name: _window_stats(conn, start_modifier, end_modifier)
@@ -155,7 +157,7 @@ def _performance_trend() -> dict[str, Any]:
 
 def _mismatch_report(limit: int = 80) -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         losses = conn.execute(
             """
@@ -215,7 +217,7 @@ def _mismatch_report(limit: int = 80) -> dict[str, Any]:
 
 def _pipeline_health() -> dict[str, Any]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         pending = conn.execute(
             """
@@ -396,7 +398,7 @@ def _safe_call(name: str, fn, errors: list[str]) -> Any:
 def _persist_monitor_snapshot(result: dict[str, Any]) -> None:
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        with db_conn(timeout=20) as conn:
             _init_monitor_table(conn)
             conn.execute(
                 """

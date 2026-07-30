@@ -5,7 +5,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.league_memory import DB_PATH, _init_db, get_behavior_weighted_picks, track_user_behavior
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db, get_behavior_weighted_picks, track_user_behavior
 
 router = APIRouter(prefix="/betbuilder", tags=["betbuilder"])
 
@@ -24,7 +26,7 @@ def auto_suggestions(max_picks: int = 5, min_confidence: float = 65.0) -> dict[s
         _init_db()
         import sqlite3
 
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             # Get top predictions across all active matches
             preds = conn.execute(
@@ -96,7 +98,7 @@ def auto_place(body: AutoPlaceRequest) -> dict[str, Any]:
         import sqlite3
 
         placed = []
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
 
             for sel in body.selections:

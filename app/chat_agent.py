@@ -5,7 +5,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from app.league_memory import DB_PATH, normalize_league, observe_matches, record_prediction
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import normalize_league, observe_matches, record_prediction
 from app.prediction_agent import predict_sporty_match
 from app.sportybet_client import fetch_live_matches_post
 
@@ -341,7 +343,7 @@ def _minute_bucket(minute: int) -> str:
 
 def _memory_for(league: str, bucket: str, state: str) -> dict[str, dict[str, Any]]:
     key = normalize_league(league)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         exact = conn.execute(
             """

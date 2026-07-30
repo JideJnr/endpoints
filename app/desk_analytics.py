@@ -5,7 +5,9 @@ import sqlite3
 from collections import defaultdict
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 from app.system_audit import prediction_system_audit
 
 
@@ -105,7 +107,7 @@ def desk_observability(limit: int = 200) -> dict[str, Any]:
     """Operational desk view: breaks, pending work, risk log health."""
     _init_db()
     audit = prediction_system_audit(limit=max(20, min(limit, 1000)))
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         risk_actions = conn.execute(
             """
@@ -160,7 +162,7 @@ def desk_observability(limit: int = 200) -> dict[str, Any]:
 
 def _graded_rows(limit: int = 5000) -> list[sqlite3.Row]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(
             """

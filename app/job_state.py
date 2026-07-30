@@ -10,7 +10,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from app.league_memory import DB_PATH, _init_db
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 
 OWNER = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -59,7 +61,7 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
     token = OWNER
     start = _now()
     stale_before = time.time() - max(30, stale_after_seconds)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_job_table(conn)
         conn.execute("begin immediate")
         row = conn.execute(
@@ -113,7 +115,7 @@ def finish_job(
     result: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> None:
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_job_table(conn)
         conn.execute(
             """
@@ -141,7 +143,7 @@ def finish_job(
 
 
 def heartbeat(job_id: str, *, owner: str) -> None:
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_conn(timeout=10) as conn:
         _init_job_table(conn)
         conn.execute(
             "update job_runs set heartbeat_at = ? where job_id = ? and owner = ?",
@@ -152,7 +154,7 @@ def heartbeat(job_id: str, *, owner: str) -> None:
 
 def list_job_states() -> list[dict[str, Any]]:
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_job_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -189,7 +191,7 @@ def recover_abandoned_jobs(stale_after_seconds: int = 300) -> dict[str, Any]:
     """Mark stale running jobs from crashed/reloaded processes as recovered."""
     _init_db()
     cutoff = time.time() - max(30, stale_after_seconds)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         _init_job_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

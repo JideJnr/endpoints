@@ -5,10 +5,12 @@ import sqlite3
 import json
 from typing import Any
 
+from app.db import db_conn
 from app.activity_log import record_activity
 from app.buffer import get_buffer_stats, purge_ghost_matches
 from app.job_state import list_job_states, recover_abandoned_jobs
-from app.league_memory import DB_PATH, _init_db
+from app.db import DB_PATH
+from app.league_memory import _init_db
 from app.mongo_store import cleanup_buffer
 
 
@@ -84,7 +86,7 @@ def latest_supervisor_snapshots(limit: int = 50) -> dict[str, Any]:
     """Return recent supervisor observations for review after being away."""
     _init_db()
     limit = max(1, min(int(limit or 50), 300))
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         _init_supervisor_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -113,7 +115,7 @@ def _supervisor_audit(*, deep: bool = False) -> dict[str, Any]:
         return prediction_system_audit(limit=80)
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=20) as conn:
+    with db_conn(timeout=20) as conn:
         conn.row_factory = sqlite3.Row
         duplicate_buffer_rows = conn.execute(
             """
@@ -202,7 +204,7 @@ def _safe_call(name: str, fn, errors: list[str]) -> Any:
 def _persist_supervisor_snapshot(result: dict[str, Any]) -> None:
     try:
         _init_db()
-        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+        with db_conn(timeout=20) as conn:
             _init_supervisor_table(conn)
             conn.execute(
                 """

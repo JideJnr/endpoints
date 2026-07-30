@@ -100,7 +100,6 @@ def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
         "model": settings.openrouter_model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "max_tokens": 512,
     }).encode("utf-8")
     req = urllib_request.Request(
         url,

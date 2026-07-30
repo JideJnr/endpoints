@@ -18,7 +18,9 @@ import logging
 import sqlite3
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, normalize_league
+from app.db import db_conn
+from app.db import DB_PATH
+from app.league_memory import _init_db, normalize_league
 
 logger = logging.getLogger(__name__)
 
@@ -494,7 +496,7 @@ def find_similar_matches(
     # ── Implied odds for target ───────────────────────────────────────────────
     target_implied = _extract_target_odds_implied(doc)
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
 
         # ── Candidate pool ────────────────────────────────────────────────────

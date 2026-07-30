@@ -18,8 +18,9 @@ def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None
     deterministic rules when no model is available.
     """
     safe_detail = detail if isinstance(detail, dict) else {}
+    match_context = _build_match_context(prediction, safe_detail)
     memory_context = _build_memory_context(prediction)
-    prompt_payload = _compact_prediction(prediction, safe_detail, memory_context)
+    prompt_payload = _compact_prediction(prediction, safe_detail, memory_context, match_context)
     # Try AIRouter first (covers ollama + groq in one call)
     from app.ai_router import get_router
     if get_router().any_available():
@@ -35,6 +36,39 @@ def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None
             ai["memory_context_used"] = bool(memory_context)
             return ai
     return _rule_review(prediction, memory_context)
+
+
+def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Attach competition and team watcher context to the AI review payload."""
+    context: dict[str, Any] = {}
+    match_doc: dict[str, Any] = {}
+    if isinstance(detail, dict):
+        match_doc.update(detail)
+    if isinstance(prediction, dict):
+        match_doc.update(prediction)
+
+    try:
+        from app.competition_special import apply_known_competition_context
+        apply_known_competition_context(match_doc)
+        context["known_competition"] = match_doc.get("known_competition")
+        context["competition_special"] = match_doc.get("competition_special")
+        context["competition_intelligence"] = match_doc.get("competition_intelligence")
+    except Exception:
+        pass
+
+    try:
+        from app.team_watcher import team_context_for_match
+        team_watchers = team_context_for_match(match_doc)
+        context["team_watchers"] = team_watchers
+    except Exception:
+        pass
+
+    competition_intelligence = context.get("competition_intelligence") or {}
+    if isinstance(competition_intelligence, dict):
+        ai_watchers = competition_intelligence.get("ai_team_watchers")
+        if ai_watchers is not None:
+            context["ai_team_watchers"] = ai_watchers
+    return context
 
 
 def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
@@ -226,7 +260,12 @@ def _rule_review(prediction: dict[str, Any], memory_context: dict[str, Any] | No
     }
 
 
-def _compact_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None, memory_context: dict[str, Any] | None = None) -> dict[str, Any]:
+def _compact_prediction(
+    prediction: dict[str, Any],
+    detail: dict[str, Any] | None,
+    memory_context: dict[str, Any] | None = None,
+    match_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = {
         "match": prediction.get("name"),
         "tournament": prediction.get("tournament"),
@@ -244,6 +283,8 @@ def _compact_prediction(prediction: dict[str, Any], detail: dict[str, Any] | Non
     }
     if memory_context:
         payload["memory_context"] = memory_context
+    if match_context:
+        payload["match_context"] = match_context
     return payload
 
 
@@ -254,7 +295,7 @@ def _review_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
             "content": (
                 "You are PredictX AI Brain, a cautious football prediction reviewer with memory. "
                 "You receive the current match signals AND a memory_context block showing what has "
-                "historically worked: signal win rates, league accuracy, CLV trend, and model weights. "
+                "historically worked, plus a match_context block with competition and team watcher context. "
                 "Use memory_context to calibrate your confidence adjustment — if a signal has a 65%+ "
                 "win rate historically, trust it more. If a signal has <40% win rate, flag it as a risk. "
                 "If CLV is positive, the system is beating the market — be less conservative. "

@@ -11,8 +11,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.db import db_conn
 from app.competition_special import DEFAULT_WORLD_CUP, TOP_30_COMPETITIONS
-from app.league_memory import DB_PATH, _init_db
+from app.db import DB_PATH
+from app.league_memory import _init_db
 
 router = APIRouter(prefix="/competition", tags=["competition_analysis"])
 
@@ -30,7 +32,7 @@ def get_latest_analysis_endpoint(competition_key: str) -> dict[str, Any]:
     from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         row = get_latest_analysis(competition_key, conn)
 
@@ -57,7 +59,7 @@ def get_analysis_history_endpoint(
     from app.competition_analyser import get_analysis_history, init_competition_analysis_table
 
     _init_db()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_conn(timeout=30) as conn:
         init_competition_analysis_table(conn)
         rows = get_analysis_history(competition_key, limit, conn)
 

@@ -25,7 +25,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from app.league_memory import DB_PATH, _init_db, _conn
+from app.db import DB_PATH, _conn
+from app.league_memory import _init_db
 
 MIN_SAMPLES = 30          # bands with fewer samples are not adjusted
 DOUBLE_DOWN_MIN_SAMPLES = 50
