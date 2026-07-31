@@ -41,6 +41,7 @@ def match_summary(doc: dict[str, Any]) -> dict[str, Any]:
         "has_lineups": bool(detail.get("lineups")),
         "has_last_matches": bool(detail.get("home_last_matches") or detail.get("away_last_matches")),
         "has_web_context": bool(doc.get("web_context")),
+        "has_league_sentiment": bool(doc.get("league_sentiment")),
         "lifecycle": doc.get("lifecycle"),
     }
 

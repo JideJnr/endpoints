@@ -4205,6 +4205,53 @@ def _model_signals(
             "impact": web_impact,
         }
     )
+    # Add sentiment signal from Grok analysis when available
+    sentiment = grok.get("sentiment") or {}
+    if isinstance(sentiment, dict) and sentiment.get("home_sentiment"):
+        sentiment_conf = sentiment.get("confidence", 50)
+        home_sent = sentiment.get("home_sentiment", "neutral")
+        away_sent = sentiment.get("away_sentiment", "neutral")
+        overall_sent = sentiment.get("overall_sentiment", "neutral")
+        # Derive a directional impact: positive sentiment for home = positive impact
+        sentiment_direction = {"positive": 1, "negative": -1, "neutral": 0, "mixed": 0}
+        home_dir = sentiment_direction.get(home_sent, 0)
+        away_dir = sentiment_direction.get(away_sent, 0)
+        net_direction = home_dir - away_dir
+        signals.append(
+            {
+                "name": "web_sentiment",
+                "value": {
+                    "home_sentiment": home_sent,
+                    "away_sentiment": away_sent,
+                    "overall_sentiment": overall_sent,
+                    "confidence": sentiment_conf,
+                    "net_direction": net_direction,
+                },
+                "impact": round(net_direction * sentiment_conf / 25, 2),
+                "role": "supporting_evidence",
+            }
+        )
+    # Add probability signal from Grok analysis when available
+    probability = grok.get("probability") or {}
+    if isinstance(probability, dict) and any(
+        probability.get(k) is not None for k in ("implied_home_win", "implied_draw", "implied_away_win")
+    ):
+        prob_home = probability.get("implied_home_win")
+        prob_draw = probability.get("implied_draw")
+        prob_away = probability.get("implied_away_win")
+        signals.append(
+            {
+                "name": "web_probability",
+                "value": {
+                    "implied_home_win": prob_home,
+                    "implied_draw": prob_draw,
+                    "implied_away_win": prob_away,
+                    "source": "web_research",
+                },
+                "impact": round((prob_home - 50) / 10 if prob_home is not None else 0, 2),
+                "role": "supporting_evidence",
+            }
+        )
     return signals
 
 

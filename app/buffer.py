@@ -1065,7 +1065,7 @@ def run_enrichment_worker(
     from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.sportradar_client import fetch_match_intelligence
-    from app.web_context import search_match_context
+    from app.web_context import search_league_sentiment, search_match_context
     from app.time_context import match_time_context
     from app.activity_log import record_activity
     from datetime import date
@@ -1321,6 +1321,7 @@ def run_enrichment_worker(
             "league_table":      (detail or {}).get("standings") or [],
             "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
             "web_context":       web_context,
+            "league_sentiment":  league_sentiment,
             "match_score":       round(score, 3),
             "sofascore_match_status": match_status,
             "sofascore_candidate_count": int(item.get("sofascore_candidate_count") or 0),
@@ -1442,7 +1443,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
     from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.sportradar_client import fetch_match_intelligence
-    from app.web_context import search_match_context
+    from app.web_context import search_league_sentiment, search_match_context
     from app.time_context import match_time_context
     from app.activity_log import record_activity
 
@@ -1574,6 +1575,16 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         except Exception:
             web_context = {"query": "", "snippets": [], "scraped": []}
 
+        league_sentiment = {}
+        try:
+            from app.config import get_settings
+
+            settings = get_settings()
+            if settings.web_search_league_sentiment_enabled:
+                league_sentiment = search_league_sentiment(sporty.get("tournament") or "")
+        except Exception:
+            pass
+
         try:
             sportradar_detail = fetch_match_intelligence(sporty.get("id") or item.get("match_id"))
         except Exception:
@@ -1618,6 +1629,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "league_table":      (detail or {}).get("standings") or [],
             "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
             "web_context":       web_context,
+            "league_sentiment":  league_sentiment,
             "match_score":       round(score, 3),
             "match_source":      source,
             "sofascore_match_status": match_status,

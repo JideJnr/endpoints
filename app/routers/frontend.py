@@ -711,6 +711,7 @@ def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=100
                 "data_quality": {
                     "has_sofascore_detail": bool(doc.get("sofascore_detail")),
                     "has_web_context": bool((doc.get("web_context") or {}).get("snippets")),
+                    "has_league_sentiment": bool(doc.get("league_sentiment")),
                     "has_raw_sporty": bool(doc.get("raw_sporty")),
                     "has_raw_sofascore": bool(doc.get("raw_sofascore_event") or doc.get("sofascore_event")),
                 },
@@ -2678,6 +2679,7 @@ def _archived_match_detail(match_id: str) -> dict[str, Any] | None:
         "data_sources": archived.get("data_sources") or {},
         "sportybet_markets": archived.get("sportybet_markets") or [],
         "web_context": archived.get("web_context") or {},
+        "league_sentiment": archived.get("league_sentiment") or {},
         "time_context": archived.get("time_context"),
         "lifecycle": {"state": "archived", "stages": {"finished": True, "archived": True}, "missing": []},
         "raw_sporty": archived.get("raw_sporty"),

@@ -12,7 +12,7 @@ from app.season_stage import detect_season_stage
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_event_detail, fetch_live_events, is_terminal_event, is_usable_event_for_mode
 from app.sportradar_client import fetch_match_intelligence
 from app.time_context import match_time_context
-from app.web_context import search_match_context
+from app.web_context import search_league_sentiment, search_match_context
 
 
 class MatchEnrichmentError(Exception):
@@ -86,6 +86,18 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
     except Exception:
         pass
 
+    # Fetch league-level sentiment for broader context
+    league_sentiment = {}
+    try:
+        from app.config import get_settings
+
+        settings = get_settings()
+        if settings.web_search_league_sentiment_enabled:
+            league_name = sporty.get("tournament") or ""
+            league_sentiment = search_league_sentiment(league_name)
+    except Exception:
+        pass
+
     sportradar_detail = fetch_match_intelligence(sporty.get("id") or sportybet_id)
 
     now = datetime.now(timezone.utc).isoformat()
@@ -119,6 +131,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "sofascore_no_match_at": None if sofa else now,
         "minimum_enrichment_status": "full_provider_match" if sofa else "sporty_only",
         "web_context": web_context,
+        "league_sentiment": league_sentiment,
         "match_score": round(score, 3),
         "match_source": source,
         "manual_match": bool(doc.get("sofascore_id")),

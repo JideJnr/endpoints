@@ -45,6 +45,8 @@ class Settings:
     web_scrape_max_chars: int
     web_search_timeout_seconds: int
     web_scrape_timeout_seconds: int
+    web_search_league_sentiment_enabled: bool
+    web_search_grok_sentiment_enabled: bool
     local_storage_only: bool
     disable_pruning: bool
     mongodb_uri: str
@@ -98,6 +100,8 @@ def get_settings() -> Settings:
         web_scrape_max_chars=_int_env("PREDICTX_WEB_SCRAPE_MAX_CHARS", 1500),
         web_search_timeout_seconds=_int_env("PREDICTX_WEB_SEARCH_TIMEOUT_SECONDS", 4),
         web_scrape_timeout_seconds=_int_env("PREDICTX_WEB_SCRAPE_TIMEOUT_SECONDS", 6),
+        web_search_league_sentiment_enabled=_bool_env("PREDICTX_WEB_SEARCH_LEAGUE_SENTIMENT_ENABLED", True),
+        web_search_grok_sentiment_enabled=_bool_env("PREDICTX_WEB_SEARCH_GROK_SENTIMENT_ENABLED", True),
         local_storage_only=_bool_env("PREDICTX_LOCAL_STORAGE_ONLY", False),
         disable_pruning=_bool_env("PREDICTX_DISABLE_PRUNING", False),
         mongodb_uri=os.getenv("MONGODB_URI", ""),
@@ -143,6 +147,8 @@ def public_settings() -> dict[str, object]:
             "scrape_max_chars": settings.web_scrape_max_chars,
             "search_timeout_seconds": settings.web_search_timeout_seconds,
             "scrape_timeout_seconds": settings.web_scrape_timeout_seconds,
+            "league_sentiment_enabled": settings.web_search_league_sentiment_enabled,
+            "grok_sentiment_enabled": settings.web_search_grok_sentiment_enabled,
         },
         "storage": {
             "local_only": settings.local_storage_only,

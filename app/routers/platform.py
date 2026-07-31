@@ -38,7 +38,7 @@ from app.prediction_agent import predict_sofascore_event
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_team_history
 from app.sos import compare_schedules, analyse_schedule
 from app.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post
-from app.web_context import context_for_match, search_match_context
+from app.web_context import context_for_match, search_league_sentiment, search_match_context
 
 router = APIRouter(tags=["platform"])
 
@@ -785,6 +785,11 @@ def get_schedule_model(home_team_id: int, away_team_id: int):
 @router.get("/models/web-context")
 def get_web_context(home: str, away: str, tournament: str = ""):
     return {"status": "success", "web_context": search_match_context(home, away, tournament)}
+
+
+@router.get("/models/league-sentiment")
+def get_league_sentiment(league: str, tournament: str = ""):
+    return {"status": "success", "league_sentiment": search_league_sentiment(league, tournament)}
 
 
 def _predictions_for_date(date: Optional[str], limit: int, include_history: bool) -> list[dict[str, Any]]:

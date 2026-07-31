@@ -19,7 +19,7 @@ from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail,
 from app.sportradar_client import fetch_match_intelligence
 from app.sportybet_client import fetch_live_and_upcoming_matches_post
 from app.time_context import match_time_context
-from app.web_context import search_match_context
+from app.web_context import search_league_sentiment, search_match_context
 
 
 FUZZY_THRESHOLD = 0.75
@@ -162,6 +162,29 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
 
     print(f"[enrichment] web context fetched: {len(web_contexts)}/{len(needs_web)}")
 
+    # ── Step 3b: league sentiment in parallel ──────────────────────────
+    league_sentiments: dict[int, dict] = {}
+
+    def _fetch_league_sentiment(idx: int, sporty: dict) -> tuple[int, dict]:
+        try:
+            from app.config import get_settings
+
+            settings = get_settings()
+            if not settings.web_search_league_sentiment_enabled:
+                return idx, {}
+            league_name = sporty.get("tournament") or ""
+            return idx, search_league_sentiment(league_name)
+        except Exception:
+            return idx, {}
+
+    with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
+        futures = {pool.submit(_fetch_league_sentiment, i, sporty): i for i, (sporty, _, _) in enumerate(matched_pairs)}
+        for future in as_completed(futures):
+            idx, ctx = future.result()
+            league_sentiments[idx] = ctx
+
+    print(f"[enrichment] league sentiment fetched: {len(league_sentiments)}/{len(matched_pairs)}")
+
     def _fetch_sportradar(idx: int, sporty: dict) -> tuple[int, dict]:
         return idx, fetch_match_intelligence(sporty.get("id"))
 
@@ -214,6 +237,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "sofascore_no_match_at": None if sofa else now,
             "minimum_enrichment_status": "full_provider_match" if sofa else "sporty_only",
             "web_context": web_context,
+            "league_sentiment": league_sentiments.get(i, {}),
             "match_score": round(score, 3),
             "raw_sporty": sporty,
             "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,

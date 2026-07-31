@@ -175,6 +175,26 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
     web_str = str((snippets[0].get("snippet") if snippets else None) or "none")[:150]
     grok_web = web.get("grok_analysis") or {}
     grok_web_str = str(grok_web.get("summary") or "none")[:600]
+    # Include sentiment and probability signals from Grok research
+    grok_sentiment = grok_web.get("sentiment") or {}
+    sentiment_str = "none"
+    if isinstance(grok_sentiment, dict) and grok_sentiment.get("home_sentiment"):
+        sentiment_str = (
+            f"home={grok_sentiment.get('home_sentiment')} "
+            f"away={grok_sentiment.get('away_sentiment')} "
+            f"overall={grok_sentiment.get('overall_sentiment')} "
+            f"conf={grok_sentiment.get('confidence')}%"
+        )[:300]
+    grok_probability = grok_web.get("probability") or {}
+    probability_str = "none"
+    if isinstance(grok_probability, dict):
+        parts = []
+        for key in ("implied_home_win", "implied_draw", "implied_away_win"):
+            val = grok_probability.get(key)
+            if val is not None:
+                parts.append(f"{key}={val}%")
+        if parts:
+            probability_str = " | ".join(parts)[:300]
 
     return (
         f"{doc.get('sportybet_name') or doc.get('name')} | "
@@ -192,6 +212,8 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         f"ODDS: {odds_str}\n"
         f"WEB: {web_str}\n"
         f"GROK_WEB_RESEARCH: {grok_web_str}\n"
+        f"GROK_SENTIMENT: {sentiment_str}\n"
+        f"GROK_PROBABILITY: {probability_str}\n"
         f"\nOutput prediction as JSON."
     )
 

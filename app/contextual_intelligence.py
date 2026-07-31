@@ -647,6 +647,21 @@ def _web_text(doc: dict[str, Any]) -> str:
         for item in grok.get("evidence") or []:
             if isinstance(item, dict):
                 values.append(str(item.get("claim") or ""))
+        sentiment = grok.get("sentiment") or {}
+        if isinstance(sentiment, dict):
+            for key in ("home_sentiment", "away_sentiment", "overall_sentiment"):
+                val = sentiment.get(key)
+                if val:
+                    values.append(f"{key}: {val}")
+            conf = sentiment.get("confidence")
+            if conf is not None:
+                values.append(f"sentiment_confidence: {conf}")
+        probability = grok.get("probability") or {}
+        if isinstance(probability, dict):
+            for key in ("implied_home_win", "implied_draw", "implied_away_win"):
+                val = probability.get(key)
+                if val is not None:
+                    values.append(f"{key}: {val}%")
     return " ".join(values)
 
 

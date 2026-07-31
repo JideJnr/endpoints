@@ -653,6 +653,9 @@ def _decision_signals_for_row(row: sqlite3.Row) -> list[dict[str, Any]]:
 
 _BACKGROUND_SIGNAL_NAMES = {
     "web_context",
+    "web_sentiment",
+    "web_probability",
+    "league_sentiment",
     "sportybet_detail_available",
     "sportybet_markets_available",
     "sofascore_detail_available",

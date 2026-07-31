@@ -278,6 +278,7 @@ def _compact_prediction(
         "sportybet_detail": (detail or {}).get("sportybet_detail"),
         "h2h": (detail or {}).get("h2h"),
         "web_context": (detail or {}).get("web_context") or prediction.get("web_context"),
+        "league_sentiment": (detail or {}).get("league_sentiment") or prediction.get("league_sentiment"),
         "poisson": prediction.get("poisson"),
         "strength_of_schedule": prediction.get("strength_of_schedule"),
     }
@@ -300,6 +301,13 @@ def _review_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "win rate historically, trust it more. If a signal has <40% win rate, flag it as a risk. "
                 "If CLV is positive, the system is beating the market — be less conservative. "
                 "Use the supplied rule-engine signals only. Do not invent team news, injuries, or odds. "
+                "If web_context.grok_analysis contains sentiment data, consider it: "
+                "positive home sentiment boosts home confidence, negative sentiment reduces it. "
+                "If web_context.grok_analysis contains probability data (implied_home_win, etc.), "
+                "use it as a supporting signal but do not override model outputs. "
+                "If league_sentiment is present, use it as broad context: "
+                "negative league sentiment means more upsets are likely, "
+                "positive sentiment reinforces form-based predictions. "
                 "Return only compact JSON with keys: status, verdict, confidence_adjustment, risks, reasons. "
                 "confidence_adjustment must be an integer from -8 to 8."
             ),
