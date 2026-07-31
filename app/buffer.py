@@ -36,6 +36,7 @@ from app.league_memory import _init_db
 from app.market import snapshot_odds
 from app.match_state import classify_match_state
 from app.normalise import normalise
+from app.season_stage import detect_season_stage
 
 # How many SofaScore detail calls to run in parallel
 ENRICH_WORKERS = 8
@@ -1318,6 +1319,7 @@ def run_enrichment_worker(
             "away_last_matches": (detail or {}).get("away_last_matches") or [],
             "standings":         (detail or {}).get("standings") or [],
             "league_table":      (detail or {}).get("standings") or [],
+            "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
             "web_context":       web_context,
             "match_score":       round(score, 3),
             "sofascore_match_status": match_status,
@@ -1614,6 +1616,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             "away_last_matches": (detail or {}).get("away_last_matches") or [],
             "standings":         (detail or {}).get("standings") or [],
             "league_table":      (detail or {}).get("standings") or [],
+            "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
             "web_context":       web_context,
             "match_score":       round(score, 3),
             "match_source":      source,

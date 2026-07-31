@@ -18,6 +18,7 @@ from datetime import date as dt, datetime, timezone
 from typing import Any
 
 from app.league_memory import record_prediction
+from app.season_stage import detect_season_stage
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -142,6 +143,17 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
             home_pos = f"#{row.get('position','?')} {row.get('points','?')}pts"
         if away_name and away_name.lower() in tn.lower():
             away_pos = f"#{row.get('position','?')} {row.get('points','?')}pts"
+
+    # Season stage awareness: when the season hasn't started or is just
+    # beginning, standings are unreliable.  Add a note to the prompt.
+    season_stage = doc.get("season_stage") or detect_season_stage(standings)
+    season_note = ""
+    if season_stage:
+        stage = season_stage.get("stage")
+        if stage == "not_started":
+            season_note = " | SEASON_NOT_STARTED: standings are 0 points for all teams — ignore table positions"
+        elif stage == "beginning":
+            season_note = f" | SEASON_BEGINNING: avg {season_stage.get('avg_matches_played', 0)} matches played — standings not yet reliable"
 
     # 1x2 odds
     markets = doc.get("sportybet_markets") or doc.get("markets") or []

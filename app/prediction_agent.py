@@ -4,6 +4,11 @@ from statistics import mean
 from typing import Any
 
 from app.match_state import classify_match_state
+from app.season_stage import (
+    classify_table_size,
+    detect_season_stage,
+    season_aware_table_weight,
+)
 
 from app.league_memory import late_goal_memory_signal
 from app.league_strength import league_strength_edge
@@ -109,7 +114,7 @@ def predict_sofascore_event(
     form_edge = _form_edge(event, home_form, away_form, signals)
     league_edge = _league_strength_edge(event, home_history, away_history, signals)
     h2h_edge = _h2h_edge(event, signals)
-    table_edge = _table_edge(event, signals)
+    table_edge = _table_edge(event, signals, event.get("standings") or event.get("league_table") or [])
     odds_edge = _odds_edge(event, signals)
     common_opp_edge = _common_opponent_edge(
         home.get("name") or "",
@@ -395,6 +400,11 @@ def _common_opponent_edge(
             table_by_id[str(team_id)] = entry
         table_by_name[_norm(name)] = entry
 
+    # Detect season stage so we don't treat 0-point / bottom-of-table
+    # standings as meaningful when the season hasn't started or is just beginning.
+    season_stage = detect_season_stage(standings)
+    table_size_info = classify_table_size(standings)
+
     def _opponent_table(event: dict[str, Any], opponent: str) -> dict[str, Any] | None:
         home_team = event.get("home_team") or event.get("homeTeam") or {}
         away_team = event.get("away_team") or event.get("awayTeam") or {}
@@ -409,10 +419,15 @@ def _common_opponent_edge(
         # 1.0 when table data is unavailable; 1.45 for the leaders down to
         # 0.75 at the foot of a normal table.  The cap keeps a single result
         # from overpowering form, odds and H2H.
+        #
+        # When the season hasn't started or is just beginning, standings are
+        # unreliable — all teams have 0 points and the table is meaningless.
+        # We reduce the weight accordingly so table position doesn't dominate
+        # the common-opponent comparison.
         if not entry or not entry.get("position") or table_size < 2:
             return 1.0
-        strength = (table_size - int(entry["position"])) / (table_size - 1)
-        return round(0.75 + max(0.0, min(1.0, strength)) * 0.70, 2)
+        position = int(entry["position"])
+        return season_aware_table_weight(position, table_size, season_stage)
 
     # Build lookup: normalised opponent name → best result for each team
     home_opp: dict[str, dict] = {}
@@ -496,6 +511,12 @@ def _common_opponent_edge(
                 "away_goal_diff": away_gd,
                 "home_rating": round(home_rating, 2),
                 "away_rating": round(away_rating, 2),
+                "season_stage": season_stage.get("stage"),
+                "season_not_started": season_stage.get("season_not_started"),
+                "season_beginning": season_stage.get("season_beginning"),
+                "standings_meaningful": season_stage.get("standings_meaningful"),
+                "table_size": table_size,
+                "table_category": table_size_info.get("category"),
                 "comparisons": [
                     {
                         "opponent": c["opponent"],
@@ -598,8 +619,21 @@ def form_trajectory_signal(
         if tname:
             pos_by_name[tname] = pos
 
+    # Detect season stage so opponent-quality weighting is reduced when
+    # standings are unreliable (season not started / just beginning).
+    season_stage = detect_season_stage(standings or [])
+    table_size_info = classify_table_size(standings or [])
+    # When standings are unreliable, flatten opponent weights toward 1.0
+    # so form trajectory is driven by results, not meaningless table positions.
+    opp_weight_scale = 1.0 if season_stage.get("standings_meaningful") else 0.3
+
     def _opp_weight(match: dict[str, Any]) -> float:
-        """1.5 for top-quarter opponents, 0.6 for bottom-quarter, 1.0 otherwise."""
+        """1.5 for top-quarter opponents, 0.6 for bottom-quarter, 1.0 otherwise.
+
+        When the season hasn't started or is just beginning, standings are
+        unreliable so we scale weights toward 1.0.  Small leagues also get
+        adjusted thresholds because bottom positions are less significant.
+        """
         if not table_size:
             return 1.0
         is_home = str((match.get("homeTeam") or match.get("home_team") or {}).get("id") or "") == str(team_id)
@@ -612,11 +646,22 @@ def form_trajectory_signal(
         if not pos:
             return 1.0
         percentile = pos / table_size
-        if percentile <= 0.25:
-            return 1.5   # top quarter — harder opponent
-        if percentile >= 0.75:
-            return 0.6   # bottom quarter — weaker opponent
-        return 1.0
+        # Adjust thresholds for small leagues: in a 4-team league,
+        # the bottom team is still 25% of the table, not 75%.
+        if table_size_info.get("is_small_league"):
+            top_threshold = 0.30
+            bottom_threshold = 0.70
+        else:
+            top_threshold = 0.25
+            bottom_threshold = 0.75
+        if percentile <= top_threshold:
+            weight = 1.5   # top quarter — harder opponent
+        elif percentile >= bottom_threshold:
+            weight = 0.6   # bottom quarter — weaker opponent
+        else:
+            weight = 1.0
+        # Scale toward 1.0 when standings are unreliable
+        return 1.0 + (weight - 1.0) * opp_weight_scale
 
     def _match_pts(match: dict[str, Any]) -> int:
         score = match.get("score") or {}
@@ -723,14 +768,43 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
     return edge
 
 
-def _table_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
+def _table_edge(
+    event: dict[str, Any],
+    signals: list[dict[str, Any]],
+    standings: list[dict[str, Any]] | None = None,
+) -> float:
     pregame = event.get("pregame_form") or {}
     home_position = _to_int((pregame.get("home_team") or {}).get("position"), 0)
     away_position = _to_int((pregame.get("away_team") or {}).get("position"), 0)
     if not home_position or not away_position:
         return 0.0
-    edge = max(min((away_position - home_position) * 1.5, 15), -15)
-    signals.append({"name": "league_position_edge", "value": edge, "impact": edge})
+
+    # When the season hasn't started or is just beginning, table positions
+    # are unreliable (all teams have 0 points).  Scale the edge down so
+    # meaningless standings don't dominate the prediction.
+    standings = standings or []
+    season_stage = detect_season_stage(standings)
+    stage = season_stage.get("stage", "in_progress")
+    if stage == "not_started":
+        weight = 0.1
+    elif stage == "beginning":
+        weight = 0.3
+    else:
+        weight = 1.0
+
+    edge = max(min((away_position - home_position) * 1.5 * weight, 15), -15)
+    signals.append({
+        "name": "league_position_edge",
+        "value": {
+            "home_position": home_position,
+            "away_position": away_position,
+            "season_stage": stage,
+            "standings_meaningful": season_stage.get("standings_meaningful"),
+            "table_size": len(standings),
+            "edge": round(edge, 2),
+        },
+        "impact": round(edge, 2),
+    })
     return edge
 
 

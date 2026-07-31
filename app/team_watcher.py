@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.db import DB_PATH
-from app.league_memory import _ensure_column, _init_db
+from app.db import _ensure_column, _init_db
 from app.db import db_conn
 from app.match_state import classify_match_state
 from app.time_context import match_time_context
@@ -175,6 +175,7 @@ def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
 
 def inspect_sporty_team_ids(limit: int = 20) -> dict[str, Any]:
     _init_db()
+    examples: list[dict[str, Any]] = []
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
@@ -188,6 +189,8 @@ def inspect_sporty_team_ids(limit: int = 20) -> dict[str, Any]:
                 continue
             for row in rows:
                 sporty = _loads(row["raw_sporty"], {})
+                if not isinstance(sporty, dict):
+                    continue
                 team_ids = sporty.get("team_ids") if isinstance(sporty.get("team_ids"), dict) else {}
                 examples.append({
                     "table": table,

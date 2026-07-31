@@ -9,6 +9,11 @@ from app.db import DB_PATH
 from app.league_memory import _init_db
 from app.db import db_conn
 from app.match_state import classify_match_state
+from app.season_stage import (
+    classify_table_size,
+    detect_season_stage,
+    season_aware_table_weight,
+)
 
 
 DEFAULT_WORLD_CUP = {
@@ -1223,8 +1228,14 @@ def _competition_intelligence_context(
     standings = detail.get("standings") or doc.get("standings") or []
     home = event.get("home_team") or {}
     away = event.get("away_team") or {}
-    home_table = _team_standing_context(standings, home)
-    away_table = _team_standing_context(standings, away)
+
+    # Detect season stage and table size so we don't treat 0-point / bottom-of-table
+    # standings as meaningful when the season hasn't started or is just beginning.
+    season_stage = detect_season_stage(standings)
+    table_size_info = classify_table_size(standings)
+
+    home_table = _team_standing_context(standings, home, season_stage)
+    away_table = _team_standing_context(standings, away, season_stage)
     home_strength = _recent_play_strength(detail.get("home_last_matches") or [], home)
     away_strength = _recent_play_strength(detail.get("away_last_matches") or [], away)
     home_watcher = _team_watcher_context(key, home)
@@ -1235,7 +1246,13 @@ def _competition_intelligence_context(
         ai_team_watchers = team_watchers_for_match(doc)
     except Exception as exc:
         ai_team_watchers = {"available": False, "error": str(exc)}
+
+    # When standings are unreliable (season not started / beginning),
+    # reduce the table edge so it doesn't dominate the prediction.
     table_edge = _safe_num((home_table or {}).get("points_per_game")) - _safe_num((away_table or {}).get("points_per_game"))
+    if not season_stage.get("standings_meaningful"):
+        table_edge *= 0.25  # heavily discount table PPG edge when standings are unreliable
+
     strength_edge = _safe_num(home_strength.get("strength_score")) - _safe_num(away_strength.get("strength_score"))
     watcher_edge = _safe_num((home_watcher.get("profile") or {}).get("team_score")) - _safe_num((away_watcher.get("profile") or {}).get("team_score"))
     return {
@@ -1246,6 +1263,12 @@ def _competition_intelligence_context(
             "away": away_table,
             "edge_ppg": round(table_edge, 3),
             "leader": "home" if table_edge > 0.15 else "away" if table_edge < -0.15 else "even",
+            "season_stage": season_stage.get("stage"),
+            "season_not_started": season_stage.get("season_not_started"),
+            "season_beginning": season_stage.get("season_beginning"),
+            "standings_meaningful": season_stage.get("standings_meaningful"),
+            "table_size": table_size_info.get("table_size"),
+            "table_category": table_size_info.get("category"),
         },
         "team_strength": {
             "home": home_strength,
@@ -1263,27 +1286,36 @@ def _competition_intelligence_context(
             "basis": "long_term_competition_team_ai_profiles",
         },
         "ai_team_watchers": ai_team_watchers,
-        "readiness_notes": _competition_readiness_notes(home_table, away_table, home_strength, away_strength),
+        "readiness_notes": _competition_readiness_notes(home_table, away_table, home_strength, away_strength, season_stage),
     }
 
 
-def _team_standing_context(standings: list[dict[str, Any]], team: dict[str, Any]) -> dict[str, Any] | None:
+def _team_standing_context(
+    standings: list[dict[str, Any]],
+    team: dict[str, Any],
+    season_stage: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     team_id = str(team.get("id") or "")
     team_name = str(team.get("name") or "").lower()
     for row in standings or []:
         row_team = row.get("team") or {}
         if team_id and str(row_team.get("id") or "") == team_id:
-            return _standing_summary(row)
+            return _standing_summary(row, season_stage)
         if team_name and str(row_team.get("name") or "").lower() == team_name:
-            return _standing_summary(row)
+            return _standing_summary(row, season_stage)
     return None
 
 
-def _standing_summary(row: dict[str, Any]) -> dict[str, Any]:
+def _standing_summary(
+    row: dict[str, Any],
+    season_stage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     played = int(_safe_num(row.get("played")) or 0)
     points = int(_safe_num(row.get("points")) or 0)
     gf = int(_safe_num(row.get("goals_for")) or 0)
     ga = int(_safe_num(row.get("goals_against")) or 0)
+    stage = (season_stage or {}).get("stage", "in_progress")
+    standings_meaningful = (season_stage or {}).get("standings_meaningful", True)
     return {
         "position": row.get("position"),
         "team": row.get("team"),
@@ -1292,6 +1324,11 @@ def _standing_summary(row: dict[str, Any]) -> dict[str, Any]:
         "points_per_game": round(points / played, 3) if played else 0,
         "goal_difference": _goal_diff(row.get("goal_diff"), gf - ga),
         "promotion": row.get("promotion"),
+        "season_stage": stage,
+        "standings_meaningful": standings_meaningful,
+        # When standings are unreliable, PPG is not a reliable signal.
+        # We still report it but flag it as unreliable.
+        "ppg_reliable": standings_meaningful and played >= 3,
     }
 
 
@@ -1347,6 +1384,7 @@ def _competition_readiness_notes(
     away_table: dict[str, Any] | None,
     home_strength: dict[str, Any],
     away_strength: dict[str, Any],
+    season_stage: dict[str, Any] | None = None,
 ) -> list[str]:
     notes: list[str] = []
     if not home_table or not away_table:
@@ -1355,6 +1393,14 @@ def _competition_readiness_notes(
         notes.append("recent_play_sample_low")
     if abs(float(home_strength.get("strength_score") or 0) - float(away_strength.get("strength_score") or 0)) >= 12:
         notes.append("team_strength_gap_detected")
+    # Season stage awareness: when the season hasn't started or is just
+    # beginning, standings are unreliable and should be flagged.
+    if season_stage:
+        stage = season_stage.get("stage")
+        if stage == "not_started":
+            notes.append("season_not_started_standings_unreliable")
+        elif stage == "beginning":
+            notes.append("season_beginning_standings_unreliable")
     return notes
 
 

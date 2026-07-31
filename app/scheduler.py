@@ -34,6 +34,7 @@ from app.buffer import (
 from app.activity_log import record_activity
 from app.ai_prediction_pipeline import job_ai_prediction_queue
 from app.competition_analyser import job_competition_analysis
+from app.season_stage import detect_season_stage
 
 
 _scheduler = None
@@ -761,6 +762,7 @@ def job_unified_upcoming() -> dict[str, Any]:
             "away_last_matches": (detail or {}).get("away_last_matches") or [],
             "standings":         (detail or {}).get("standings") or [],
             "league_table":      (detail or {}).get("standings") or [],
+            "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
             "match_score":       round(score, 3),
             "sofascore_match_status": "matched" if sofa else "no_match",
             "sofascore_retry_after_ts": None if sofa else retry_after_ts,
@@ -943,6 +945,7 @@ def job_unified_live() -> dict[str, Any]:
             "home_last_matches": (detail or existing.get("sofascore_detail") or {}).get("home_last_matches") or [],
             "away_last_matches": (detail or existing.get("sofascore_detail") or {}).get("away_last_matches") or [],
             "standings":         (detail or existing.get("sofascore_detail") or {}).get("standings") or [],
+            "season_stage":      detect_season_stage((detail or existing.get("sofascore_detail") or {}).get("standings") or []),
             "sofascore_match_status": "matched" if sofa_id else existing.get("sofascore_match_status", "no_match"),
             "raw_sporty":        sporty,
             "time_context":      time_ctx,

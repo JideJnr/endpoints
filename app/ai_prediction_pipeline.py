@@ -16,6 +16,7 @@ from typing import Any
 from app.db import db_conn
 from app.db import DB_PATH
 from app.league_memory import _init_db
+from app.season_stage import detect_season_stage
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +401,13 @@ def _step_form(doc: dict, model: str, timeout: int = 20) -> str:
         home, away = _teams(doc)
         if not home or not away: return FORM_FALLBACK
 
+        # Detect season stage so we don't treat 0-point / bottom-of-table
+        # standings as meaningful when the season hasn't started or is just beginning.
+        season_stage = detect_season_stage(standings)
+        if season_stage.get("season_not_started"):
+            # Standings are completely meaningless — all teams have 0 points.
+            return FORM_FALLBACK
+
         # Filter standings to only include the two teams of interest to prevent
         # the LLM from hallucinating or discussing the wrong teams.
         def _team_in_standings(team_name: str, standings_data: list) -> dict | None:
@@ -414,11 +422,20 @@ def _step_form(doc: dict, model: str, timeout: int = 20) -> str:
         home_row = _team_in_standings(home, standings)
         away_row = _team_in_standings(away, standings)
 
+        # Build season context note for the LLM
+        season_note = ""
+        if season_stage.get("season_beginning"):
+            season_note = (
+                f"\nNOTE: The season is just beginning (avg {season_stage.get('avg_matches_played', 0)} matches played). "
+                f"League positions are not yet reliable — treat standings as indicative only.\n"
+            )
+
         if home_row and away_row:
             evidence = (
                 f"League standings for the match {home} vs {away}:\n"
                 f"{home}: position {home_row.get('position')}, points {home_row.get('points')}\n"
                 f"{away}: position {away_row.get('position')}, points {away_row.get('points')}\n"
+                f"{season_note}"
             )
         elif home_row or away_row:
             team = home if home_row else away
@@ -426,12 +443,14 @@ def _step_form(doc: dict, model: str, timeout: int = 20) -> str:
             evidence = (
                 f"League standings for the match {home} vs {away}:\n"
                 f"{team}: position {row.get('position')}, points {row.get('points')}\n"
+                f"{season_note}"
             )
         else:
             # Neither team found in standings - provide truncated standings but emphasize teams
             evidence = (
                 f"League standings for the match {home} vs {away}:\n"
                 f"{str(standings)[:380]}\n"
+                f"{season_note}"
             )
 
         prompt = (

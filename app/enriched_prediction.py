@@ -18,6 +18,7 @@ from app.match_state import classify_match_state
 from app.poisson import run_poisson
 from app.prediction_agent import predict_sofascore_event, predict_sporty_match
 from app.risk_manager import apply_risk_controls
+from app.season_stage import detect_season_stage
 from app.time_context import match_time_context
 from app.config import get_settings
 
@@ -458,6 +459,27 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     signals.extend(_source_quality_signals(doc, readiness))
     if _provider_state(doc) == "sofascore" and not (doc.get("sportybet_markets") or doc.get("markets")):
         signals.append({"name": "no_odds_data", "value": True, "impact": -2})
+
+    # Season stage awareness: when the season hasn't started or is just
+    # beginning, standings are unreliable.  Add a signal so the prediction
+    # engine and contextual intelligence can adjust confidence accordingly.
+    standings = detail.get("standings") or doc.get("standings") or []
+    season_stage = doc.get("season_stage") or detect_season_stage(standings)
+    if season_stage:
+        stage = season_stage.get("stage")
+        if stage == "not_started":
+            signals.append({
+                "name": "season_not_started",
+                "value": season_stage,
+                "impact": -4,
+            })
+        elif stage == "beginning":
+            signals.append({
+                "name": "season_beginning",
+                "value": season_stage,
+                "impact": -2,
+            })
+
     signals.extend(_model_signals(poisson, dixon, elo, ensemble, doc))
     finished_memory: dict[str, Any] = {}
     close_strength_context: dict[str, Any] = {}
@@ -953,13 +975,16 @@ def _fallback_market_prediction(
             record_health_event("enriched_prediction", "fallback_market_movement_failed", exc)
     live_picks = _live_inplay_picks(doc, detail, rules, {}, {}, odds_movement) if is_live else []
     picks.extend(live_picks)
-    if not is_live and _provider_state(doc) != "sportybet":
+    # Allow prematch market-favorite picks when markets are available,
+    # even with sofascore/both provider state. Markets alone provide
+    # a valid degraded signal for prematch when history is thin.
+    if not is_live and _provider_state(doc) != "sportybet" and not (doc.get("sportybet_markets") or doc.get("markets")):
         picks = [
             _pick(
                 "no_bet",
                 "No strong bet",
                 50,
-                "Thin history fallback is not allowed to publish prematch market-favorite picks",
+                "Thin history fallback is not allowed to publish prematch market-favorite picks without market data",
             )
         ]
     contextual_intelligence = build_contextual_intelligence(

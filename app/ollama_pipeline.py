@@ -13,6 +13,7 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError
 
 from app.config import get_settings
+from app.season_stage import detect_season_stage
 
 logger = logging.getLogger(__name__)
 
@@ -288,10 +289,17 @@ def _extract_standings_data(doc: dict[str, Any]) -> dict[str, Any]:
             home_pos, home_pts = row.get("position", "?"), row.get("points", "?")
         if away_name and away_name.lower() in tn.lower():
             away_pos, away_pts = row.get("position", "?"), row.get("points", "?")
+    # Detect season stage so the standings specialist knows whether
+    # standings are reliable or just beginning.
+    season_stage = doc.get("season_stage") or detect_season_stage(standings)
     return {
         "home_pos": home_pos, "home_pts": home_pts,
         "away_pos": away_pos, "away_pts": away_pts,
         "available": home_pos != "?" and away_pos != "?",
+        "season_stage": season_stage.get("stage") if season_stage else "in_progress",
+        "season_not_started": season_stage.get("season_not_started", False) if season_stage else False,
+        "season_beginning": season_stage.get("season_beginning", False) if season_stage else False,
+        "standings_meaningful": season_stage.get("standings_meaningful", True) if season_stage else True,
     }
 
 
@@ -345,7 +353,18 @@ def run_standings_specialist(doc: dict[str, Any]) -> dict[str, Any]:
     data = _extract_standings_data(doc)
     if not data["available"]:
         return {"status": "skipped", "reason": "No standings data"}
-    r = _run_specialist(_STANDINGS_PROMPT.format(**data), _TIMEOUT_SPECIALIST)
+    # When the season hasn't started, standings are meaningless — skip.
+    if data.get("season_not_started"):
+        return {"status": "skipped", "reason": "Season not started — standings unreliable"}
+    # When the season is just beginning, add a caution note to the prompt.
+    season_note = ""
+    if data.get("season_beginning"):
+        season_note = (
+            "\nNOTE: The season is just beginning. League positions are not yet "
+            "reliable — treat standings as indicative only.\n"
+        )
+    prompt = _STANDINGS_PROMPT.format(**data) + season_note
+    r = _run_specialist(prompt, _TIMEOUT_SPECIALIST)
     return {**r, "specialist": "standings"} if r.get("status") == "success" else r
 
 

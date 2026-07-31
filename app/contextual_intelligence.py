@@ -10,6 +10,7 @@ from app.db import DB_PATH
 from app.league_memory import _init_db
 from app.market_intent import classify_market_intent
 from app.match_state import classify_match_state
+from app.season_stage import detect_season_stage
 from app.time_context import match_time_context
 
 
@@ -158,6 +159,21 @@ def _match_context(doc: dict[str, Any], time_context: dict[str, Any]) -> dict[st
     if minutes is not None and 0 <= minutes <= 90 and not doc.get("lineups") and not (doc.get("sofascore_detail") or {}).get("lineups"):
         tags.append("lineup_window")
         adjustment -= 2
+
+    # Season stage awareness: when the season hasn't started or is just
+    # beginning, standings are unreliable.  Reduce confidence and flag it.
+    standings = doc.get("standings") or doc.get("league_table") or []
+    season_stage = doc.get("season_stage") or detect_season_stage(standings)
+    if season_stage:
+        stage = season_stage.get("stage")
+        if stage == "not_started":
+            tags.append("season_not_started")
+            confidence_reliability = "reduced"
+            adjustment -= 5
+        elif stage == "beginning":
+            tags.append("season_beginning")
+            confidence_reliability = "reduced"
+            adjustment -= 3
 
     return {
         "tags": tags or ["standard_fixture"],

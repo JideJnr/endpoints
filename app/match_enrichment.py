@@ -8,6 +8,7 @@ from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enr
 from app.enrichment import FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD, _fuzzy_match, _is_junk, _llm_match
 from app.market import snapshot_odds
 from app.match_state import classify_match_state
+from app.season_stage import detect_season_stage
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_event_detail, fetch_live_events, is_terminal_event, is_usable_event_for_mode
 from app.sportradar_client import fetch_match_intelligence
 from app.time_context import match_time_context
@@ -112,6 +113,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         "away_last_matches": (detail or {}).get("away_last_matches") or [],
         "standings": (detail or {}).get("standings") or [],
         "league_table": (detail or {}).get("standings") or [],
+        "season_stage": detect_season_stage((detail or {}).get("standings") or []),
         "sofascore_match_status": match_status,
         "sofascore_best_score": round(score, 3),
         "sofascore_no_match_at": None if sofa else now,

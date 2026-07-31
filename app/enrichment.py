@@ -14,6 +14,7 @@ from app.league_memory import store_enriched_matches
 from app.market import snapshot_odds
 from app.normalise import normalise
 from app.match_state import classify_match_state
+from app.season_stage import detect_season_stage
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, is_usable_event_for_mode
 from app.sportradar_client import fetch_match_intelligence
 from app.sportybet_client import fetch_live_and_upcoming_matches_post
@@ -208,6 +209,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             "away_last_matches": (detail or {}).get("away_last_matches") or [],
             "standings": (detail or {}).get("standings") or [],
             "league_table": (detail or {}).get("standings") or [],
+            "season_stage": detect_season_stage((detail or {}).get("standings") or []),
             "sofascore_match_status": match_status,
             "sofascore_no_match_at": None if sofa else now,
             "minimum_enrichment_status": "full_provider_match" if sofa else "sporty_only",

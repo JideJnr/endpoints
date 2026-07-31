@@ -43,6 +43,7 @@ from app.db import db_conn
 from app.db import DB_PATH
 from app.league_memory import _init_db, normalize_league
 from app.match_state import classify_match_state
+from app.season_stage import detect_season_stage
 from app.sofascore_client import (
     fetch_all_scheduled_events,
     fetch_event_detail,
@@ -435,6 +436,7 @@ def enrich_sofa_pipeline(
                 "away_last_matches": (detail or {}).get("away_last_matches") or [],
                 "standings": (detail or {}).get("standings") or [],
                 "league_table": (detail or {}).get("standings") or [],
+                "season_stage": detect_season_stage((detail or {}).get("standings") or []),
                 "sofascore_match_status": "matched",
                 "minimum_enrichment_status": "full_provider_match" if detail else "sofascore_only",
                 "sportybet_markets": [],
