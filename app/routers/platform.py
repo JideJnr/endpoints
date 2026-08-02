@@ -552,6 +552,7 @@ def get_betbuilder_test_book(sportybet_id: str, stake: int = 100):
 
 
 
+@router.get("/betbuilder/history")
 def get_betbuilder_history(limit: int = Query(default=100, ge=1, le=1000), auto_grade: bool = True):
     return {"status": "success", **list_betbuilder_history(limit=limit, auto_grade=auto_grade)}
 
@@ -583,10 +584,10 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
     try:
         from app.ai_betbuilder import synthesize_sure_picks
         target_odds = max(1.01, _to_float(payload.get("target_odds")) or 5.0)
-        max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 1.35)
+        max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 3.0)
 
         return synthesize_sure_picks(
-            analyses[:20],
+            analyses[:100],
             target_odds=target_odds,
             max_total_odds=max_total_odds,
         )
@@ -731,6 +732,106 @@ def post_maintenance_memory(
     odds_retention_days: int = Query(default=60, ge=1, le=365),
 ):
     return run_memory_maintenance(raw_retention_days=raw_retention_days, odds_retention_days=odds_retention_days)
+
+
+@router.post("/maintenance/reset-predictions")
+def post_reset_predictions(
+    clear_history: bool = Query(default=False, description="Also delete today's prediction_history rows"),
+    match_id: Optional[str] = Query(default=None, description="Reset a single match only"),
+):
+    """Strip cached predictions from the buffer so every active match is re-predicted from scratch.
+
+    - Removes the 'prediction', 'manual_prediction_state', 'ai_prediction_state',
+      'ai_analysis', and 'ai_prediction_queue_pending' keys from raw_enriched.
+    - Leaves enrichment data (sofascore_detail, standings, odds, etc.) intact so
+      re-prediction is fast.
+    - Optionally purges today's prediction_history rows so the history view is also clean.
+    """
+    import json as _json
+    import sqlite3
+    from app.db import db_conn
+
+    _PREDICTION_KEYS = {
+        "prediction",
+        "manual_prediction_state",
+        "ai_prediction_state",
+        "ai_analysis",
+        "ai_analysis_ollama",
+        "ai_prediction_queue_pending",
+        "prediction_error",
+    }
+
+    buffer_reset = 0
+    history_deleted = 0
+    errors: list[str] = []
+
+    with db_conn(timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+
+        # Fetch active (unfinished) buffer rows to strip
+        if match_id:
+            rows = conn.execute(
+                "select match_id, raw_enriched from match_buffer where match_id = ? and is_finished = 0",
+                (match_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "select match_id, raw_enriched from match_buffer where is_finished = 0 and raw_enriched is not null",
+            ).fetchall()
+
+        for row in rows:
+            try:
+                doc = _json.loads(row["raw_enriched"] or "{}")
+                had_prediction = any(k in doc for k in _PREDICTION_KEYS)
+                if not had_prediction:
+                    continue
+                for key in _PREDICTION_KEYS:
+                    doc.pop(key, None)
+                conn.execute(
+                    "update match_buffer set raw_enriched = ? where match_id = ?",
+                    (_json.dumps(doc), row["match_id"]),
+                )
+                buffer_reset += 1
+            except Exception as exc:
+                errors.append(f"{row['match_id']}: {exc}")
+
+        # Also clear the in-memory analysis cache in ai_betbuilder
+        try:
+            from app.ai_betbuilder import _ANALYSIS_CACHE
+            if match_id:
+                _ANALYSIS_CACHE.pop(match_id, None)
+            else:
+                _ANALYSIS_CACHE.clear()
+        except Exception:
+            pass
+
+        if clear_history:
+            from datetime import date as _date
+            today = _date.today().isoformat()
+            if match_id:
+                history_deleted = conn.execute(
+                    "delete from prediction_history where match_id = ? and date(created_at) >= ?",
+                    (match_id, today),
+                ).rowcount
+            else:
+                history_deleted = conn.execute(
+                    "delete from prediction_history where date(created_at) >= ?",
+                    (today,),
+                ).rowcount
+
+        conn.commit()
+
+    return {
+        "status": "success",
+        "buffer_matches_reset": buffer_reset,
+        "prediction_history_deleted": history_deleted,
+        "errors": errors,
+        "message": (
+            f"Reset {buffer_reset} buffer match(es). "
+            + (f"Deleted {history_deleted} prediction_history row(s). " if clear_history else "")
+            + "Matches will be re-predicted automatically by the next pipeline cycle or via /run/predict."
+        ),
+    }
 
 
 @router.get("/odds/movement/{match_id}")

@@ -1577,6 +1577,31 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
             )
             conn.commit()
         _store_signal_outcome_for_row(row, result)
+
+        # Record outcome for the probability learner
+        try:
+            from app.probability_learner import learn_probabilities
+            from app.signal_aggregator import normalize_signal
+
+            signals_json = row.get("signals_json") or "[]"
+            signals = json.loads(signals_json) if signals_json else []
+            normalized_signals = []
+            for sig in signals:
+                name = sig.get("name") or sig.get("signal_name") or ""
+                value = sig.get("value") or sig.get("signal_value") or 0
+                normalized = normalize_signal(name, value)
+                normalized_signals.append(normalized)
+
+            learn_probabilities(
+                signals=normalized_signals,
+                result=result,
+                pick_type=row.get("pick_type") or "match_result",
+                league_key="__global__",
+                confidence=float(row.get("confidence") or 0.5),
+            )
+        except Exception:
+            pass
+
         graded += 1
 
     primary_ids = {str(row["match_id"]) for row in rows}

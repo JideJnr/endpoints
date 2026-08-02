@@ -1,7 +1,15 @@
+from __future__ import annotations
+
 from app.db import db_conn
+import json
+import logging
 import random
+import sqlite3
 import time
+from datetime import date as _date_cls, datetime, timezone
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from curl_cffi import requests
 
@@ -63,6 +71,92 @@ _LIST_CACHE_TTL_SCHEDULED = 60   # seconds
 _LIST_CACHE_TTL_LIVE = 20        # seconds
 _list_cache: Dict[str, Tuple[float, list]] = {}  # key → (fetched_at, data)
 _category_cache: Optional[Tuple[float, list[int]]] = None
+
+# ── DB-backed event-list cache TTL constants ──────────────────────────────────
+# Controls how long a `sofa_event_list_cache` row is considered fresh.
+# Today's fixtures change more often; past dates are effectively immutable.
+DB_CACHE_TTL_TODAY_SECONDS   = 600       # 10 minutes
+DB_CACHE_TTL_FUTURE_SECONDS  = 3600      # 1 hour
+DB_CACHE_TTL_PAST_SECONDS    = 86400     # 24 hours
+
+
+def _ttl_for_date(date: str) -> int:
+    """Return the DB cache TTL (in seconds) appropriate for *date*.
+
+    Args:
+        date: ISO-8601 date string, e.g. ``"2025-07-15"``.
+
+    Returns:
+        * ``DB_CACHE_TTL_TODAY_SECONDS``  when *date* equals today's UTC date.
+        * ``DB_CACHE_TTL_FUTURE_SECONDS`` when *date* is strictly after today.
+        * ``DB_CACHE_TTL_PAST_SECONDS``   when *date* is strictly before today.
+    """
+    today = _date_cls.today().isoformat()
+    if date == today:
+        return DB_CACHE_TTL_TODAY_SECONDS
+    if date > today:
+        return DB_CACHE_TTL_FUTURE_SECONDS
+    return DB_CACHE_TTL_PAST_SECONDS
+
+
+def _db_cache_get(date: str) -> list[dict] | None:
+    """Return cached events if the DB row exists and is within TTL.
+
+    On any SQLite exception the function logs a warning and returns ``None``
+    so the caller falls back to a fresh network fetch.  A corrupt or
+    unparseable ``fetched_at`` value is likewise treated as an expired row.
+
+    Args:
+        date: ISO-8601 date string, e.g. ``"2025-07-15"``.
+
+    Returns:
+        The cached ``list[dict]`` of parsed events when the row exists and
+        is within TTL, or ``None`` otherwise.
+    """
+    try:
+        ttl = _ttl_for_date(date)
+        with db_conn(timeout=5) as conn:
+            row = conn.execute(
+                "SELECT fetched_at, events_json FROM sofa_event_list_cache WHERE date = ?",
+                (date,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            fetched_at = datetime.fromisoformat(row["fetched_at"])
+        except (ValueError, TypeError):
+            # Corrupt fetched_at — treat as expired
+            return None
+        age_seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        if age_seconds < ttl:
+            return json.loads(row["events_json"])
+        return None
+    except sqlite3.Error as exc:
+        logger.warning("_db_cache_get(%r) failed — falling back to network fetch: %s", date, exc)
+        return None
+
+
+def _db_cache_set(date: str, events: list[dict]) -> None:
+    """Persist *events* for *date* in the DB cache.
+
+    On any SQLite exception the error is logged and suppressed so that write
+    failures never propagate to callers.  The caller already has the event list
+    in hand; the failed write merely means the next call will re-fetch.
+
+    Args:
+        date:   ISO-8601 date string, e.g. ``"2025-07-15"``.
+        events: Parsed event list to serialise and store.
+    """
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        with db_conn(timeout=5) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sofa_event_list_cache (date, fetched_at, events_json) VALUES (?, ?, ?)",
+                (date, now, json.dumps(events)),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        logger.error("_db_cache_set(%r) failed — cache write suppressed: %s", date, exc)
 
 
 def _list_cache_get(key: str, ttl: float) -> Optional[list]:
@@ -315,16 +409,24 @@ def _scheduled_category_ids() -> list[int]:
     return ids
 
 
-def fetch_all_scheduled_events(date: str) -> list[dict]:
+def fetch_all_scheduled_events(date: str, *, force: bool = False) -> list[dict]:
     """Fetch scheduled events by tournament ID (global endpoint is dead).
     Merges core league IDs + auto-learned IDs from matched buffer matches.
     Fetches all in parallel, deduplicates by event ID.
-    """
-    cache_key = f"scheduled:{date}"
-    cached = _list_cache_get(cache_key, _LIST_CACHE_TTL_SCHEDULED)
-    if cached is not None:
-        return cached
 
+    When *force* is ``False`` (default), the DB-backed cache is consulted
+    first; a cache hit within TTL is returned immediately without any network
+    request.  When *force* is ``True``, the DB cache is bypassed and a fresh
+    network fetch is always performed, after which the cache row is
+    overwritten.
+    """
+    # ── DB cache read (skipped when force=True) ───────────────────────────
+    if not force:
+        cached = _db_cache_get(date)
+        if cached is not None:
+            return cached
+
+    # ── Network fetch ─────────────────────────────────────────────────────
     # Try global endpoint first — works on some dates/regions
     try:
         url = SOFASCORE_ALL_URL.format(date=date)
@@ -332,7 +434,7 @@ def fetch_all_scheduled_events(date: str) -> list[dict]:
         if resp.status_code == 200:
             events = [_parse_event(e) for e in _events_from_response(resp.json()) if isinstance(e, dict)]
             if events:
-                _list_cache_set(cache_key, events)
+                _db_cache_set(date, events)
                 return events
     except Exception:
         pass
@@ -372,7 +474,7 @@ def fetch_all_scheduled_events(date: str) -> list[dict]:
                         seen.add(eid)
                         events.append(ev)
 
-    _list_cache_set(cache_key, events)
+    _db_cache_set(date, events)
     return events
 
 

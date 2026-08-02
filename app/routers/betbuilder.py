@@ -22,6 +22,7 @@ class AutoPlaceRequest(BaseModel):
 @router.get("/auto-suggestions")
 def auto_suggestions(max_picks: int = 5, min_confidence: float = 65.0) -> dict[str, Any]:
     """Get auto-bet suggestions based on predictions and user behavior."""
+    max_picks = max(1, min(max_picks, 100))  # support up to 100 picks
     try:
         _init_db()
         import sqlite3

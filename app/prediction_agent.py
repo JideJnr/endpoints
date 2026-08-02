@@ -156,7 +156,39 @@ def predict_sofascore_event(
         picks.append(_pick("match_result", f"{side} Win", 55 + min(abs(home_power), 25), "stronger side has a decisive edge"))
     elif abs(home_power) >= 4:
         side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
-        picks.append(_pick("double_chance", f"{side} double chance", 52 + min(abs(home_power), 20), "small edge, safer market"))
+        # Try signal aggregator for directional pick with high odds + proven history.
+        # If no directional pick qualifies, return no_bet — the logic is strong
+        # enough to make a pick or no pick, no double chance fallback needed.
+        try:
+            from app.signal_aggregator import SignalAggregator
+            from app.fallback_logic import FallbackHandler
+
+            aggregator = SignalAggregator()
+            aggregator.add_signal("home_form", 0.6 if home_power > 0 else 0.4, source="rules")
+            aggregator.add_signal("away_form", 0.4 if home_power > 0 else 0.6, source="rules")
+            aggregator.add_signal("h2h_home", 0.5 + abs(home_power) / 100, source="rules")
+            aggregator.add_signal("h2h_away", 0.5 - abs(home_power) / 100, source="rules")
+            aggregator.add_signal("home_odds", 50 + abs(home_power) * 5, source="rules")
+            aggregator.add_signal("away_odds", 50 - abs(home_power) * 5, source="rules")
+
+            sig_probs = aggregator.calculate_probabilities()
+            handler = FallbackHandler()
+            fallback = handler.get_fallback_pick(
+                signals=aggregator.signals,
+                odds={"home": 1.8, "draw": 3.2, "away": 4.5},
+                prob_result=sig_probs,
+            )
+            if fallback and fallback.get("type") != "no_bet" and fallback.get("confidence", 0) >= 40:
+                picks.append(_pick(
+                    "match_result",
+                    fallback.get("selection", f"{side} Win"),
+                    max(52, int(fallback.get("confidence", 52))),
+                    f"signal aggregator directional: {fallback.get('selection')} (odds {fallback.get('odds', 0):.2f})",
+                ))
+            else:
+                picks.append(_pick("no_bet", "No strong bet", 50, "signal aggregator could not produce a directional pick with sufficient confidence"))
+        except Exception:
+            picks.append(_pick("no_bet", "No strong bet", 50, "signal aggregator failed — no directional pick available"))
 
     goal_pressure = _goal_pressure(home_form, away_form, event, signals)
     live_chase_pressure = _live_chase_pressure(event, home_power, goal_pressure, signals)

@@ -70,10 +70,13 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
 
 def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
     target_odds = max(1.01, _to_float(payload.get("target_odds")) or 5.0)
-    max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 1.35)
-    # This endpoint is user-facing. Keep the specialist pass bounded so it can
-    # return a useful slip instead of serially analysing an entire fixture list.
-    candidate_limit = max(4, min(_to_int(payload.get("candidate_limit"), 6), 8))
+    # Allow a generous ceiling so the selector has room to reach high target odds.
+    # Default to 3x the target so there's enough headroom without being unbounded.
+    max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 3.0)
+    # Scale the candidate pool with the target: higher odds need more matches.
+    # Cap at 100 which is the available match pool.
+    default_limit = min(100, max(6, int(target_odds / 2)))
+    candidate_limit = max(4, min(_to_int(payload.get("candidate_limit"), default_limit), 100))
     candidates = upcoming_prediction_candidates(limit=candidate_limit)
     analyses: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -92,10 +95,10 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
             return candidate, {"status": "skipped", "message": "Candidate has no match id"}
         return candidate, enriched_match_analysis(match_id)
 
-    # A few independent specialist reviews can happen together, but keep this
-    # deliberately small: it shares the API process and must not monopolise it.
+    # Run analyses concurrently. Scale workers with candidate count but stay
+    # reasonable to avoid saturating the Groq API rate limit.
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
+    with ThreadPoolExecutor(max_workers=min(10, len(candidates))) as pool:
         futures = [pool.submit(_analyse_candidate, candidate) for candidate in candidates]
         for future in as_completed(futures):
             candidate, analysis = future.result()
@@ -120,6 +123,36 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     synthesis = synthesize_sure_picks(analyses, target_odds=target_odds, max_total_odds=max_total_odds)
+
+    # Use signal aggregator to calculate learned probabilities for each analysis
+    # and boost conviction for picks with proven win history
+    for analysis in analyses:
+        try:
+            from app.probability_learner import get_learned_probabilities
+            from app.signal_aggregator import normalize_signal
+
+            analysis_signals = []
+            if analysis.get("key_factors"):
+                for factor in analysis.get("key_factors", []):
+                    analysis_signals.append({"name": str(factor), "value": 0.7, "source": "groq"})
+            if analysis.get("market_signal"):
+                analysis_signals.append({"name": str(analysis["market_signal"]), "value": 0.6, "source": "groq"})
+            if analysis.get("btts") is not None:
+                analysis_signals.append({"name": "btts", "value": 0.8 if analysis["btts"] else 0.2, "source": "groq"})
+            if analysis.get("over_2_5") is not None:
+                analysis_signals.append({"name": "over_2_5", "value": 0.8 if analysis["over_2_5"] else 0.2, "source": "groq"})
+
+            normalized_signals = [normalize_signal(s.get("name", ""), s.get("value", 0)) for s in analysis_signals]
+            learned = get_learned_probabilities(
+                normalized_signals,
+                pick_type="match_result",
+                league_key=analysis.get("league_name") or "__global__",
+                min_samples=5,
+            )
+            analysis["learned_probabilities"] = learned
+        except Exception:
+            pass
+
     return {
         "status": "success",
         "groq_powered": True,
@@ -154,7 +187,7 @@ def synthesize_sure_picks(
         raise ValueError("At least two completed enriched analyses are required")
 
     ranked = []
-    for item in clean[:20]:
+    for item in clean[:100]:  # support up to 100 match pool
         groq_conf = _to_int(item.get("groq_confidence") or item.get("confidence"), 0)
         similar_used = _to_int(item.get("similar_matches_used"), 0)
         engine_pick = item.get("prediction_engine_pick") or {}
@@ -171,7 +204,73 @@ def synthesize_sure_picks(
             )
         except Exception:
             learning = {"samples": 0, "win_rate": None, "adjustment": 0}
-        conviction = round(groq_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0), 2)
+
+        # Use signal aggregator to calculate learned probabilities
+        learned_prob = None
+        try:
+            from app.probability_learner import get_learned_probabilities
+            from app.signal_aggregator import normalize_signal
+
+            # Build signals from the analysis
+            analysis_signals = []
+            if item.get("key_factors"):
+                for factor in item.get("key_factors", []):
+                    analysis_signals.append({"name": str(factor), "value": 0.7, "source": "groq"})
+            if item.get("market_signal"):
+                analysis_signals.append({"name": str(item["market_signal"]), "value": 0.6, "source": "groq"})
+            if item.get("btts") is not None:
+                analysis_signals.append({"name": "btts", "value": 0.8 if item["btts"] else 0.2, "source": "groq"})
+            if item.get("over_2_5") is not None:
+                analysis_signals.append({"name": "over_2_5", "value": 0.8 if item["over_2_5"] else 0.2, "source": "groq"})
+
+            # Add signal from the engine pick
+            if engine_pick.get("selection"):
+                analysis_signals.append({
+                    "name": str(engine_pick["selection"]),
+                    "value": engine_pick.get("confidence", 50) / 100,
+                    "source": "engine",
+                })
+
+            # Normalize signals
+            normalized_signals = []
+            for sig in analysis_signals:
+                norm = normalize_signal(sig.get("name", ""), sig.get("value", 0))
+                normalized_signals.append(norm)
+
+            learned_prob = get_learned_probabilities(
+                normalized_signals,
+                pick_type=engine_pick.get("type") or item.get("pick_type") or "match_result",
+                league_key=item.get("league_name") or "__global__",
+                min_samples=5,
+            )
+        except Exception:
+            learned_prob = None
+
+        # Calculate conviction score with learned probability boost
+        base_conviction = groq_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0)
+
+        # Apply learned probability boost
+        learned_boost = 0.0
+        if learned_prob and learned_prob.get("samples", 0) >= 5:
+            # Boost based on how well the learned distribution matches the Groq confidence
+            learned_away = learned_prob.get("away_prob", 0.25)
+            learned_home = learned_prob.get("home_prob", 0.45)
+            learned_draw = learned_prob.get("draw_prob", 0.30)
+            groq_selection = (item.get("groq_recommendation") or engine_pick.get("selection") or "").lower()
+
+            if "away" in groq_selection or "2" == groq_selection:
+                learned_boost = (learned_away - 0.25) * 20  # boost up to +5
+            elif "home" in groq_selection or "1" == groq_selection:
+                learned_boost = (learned_home - 0.45) * 20  # boost up to +5
+            elif "draw" in groq_selection or "x" == groq_selection:
+                learned_boost = (learned_draw - 0.30) * 20  # boost up to +5
+
+            # Extra boost for proven away wins (54% baseline)
+            if learned_prob.get("away_prob", 0) >= 0.54 and "away" in groq_selection:
+                learned_boost += 3.0
+
+        conviction = round(base_conviction + learned_boost, 2)
+
         ranked.append({
             "match_id": item.get("match_id") or item.get("sportybet_id"),
             "match": item.get("match_name") or item.get("match"),
@@ -186,6 +285,7 @@ def synthesize_sure_picks(
             "estimated_odds": odds,
             "conviction_score": conviction,
             "learning": learning,
+            "learned_probabilities": learned_prob,
             "confirmed": confirmed,
             "similar_matches_used": similar_used,
             "source": "groq",
@@ -302,7 +402,7 @@ def _run_groq_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_to
         "Prefer confirmed picks where the prediction engine and Groq agree. Rank by conviction_score. "
         f"Select enough picks to reach target odds {target_odds} without exceeding max odds {max_total_odds}. "
         "If target cannot be reached, return the best available picks.\n\n"
-        + json.dumps(ranked[:20], ensure_ascii=False)
+        + json.dumps(ranked[:100], ensure_ascii=False)
     )
     response = get_llm().invoke([
         {"role": "system", "content": "Return only valid JSON."},

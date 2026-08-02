@@ -366,16 +366,16 @@ def run_learning_cycle() -> dict[str, Any]:
 
         conn.commit()
 
-    # ── 5. AI analysis feedback loop ────────────────────────────────
-    ai_updates = _incorporate_ai_analysis(conn, rows)
+        # ── 5. AI analysis feedback loop ────────────────────────────────
+        ai_updates = _incorporate_ai_analysis(conn, rows)
 
-    # ── 6. Incorporate user behavior for self-learning ────────────
-    behavior_updates = _incorporate_user_behavior(conn, rows)
+        # ── 6. Incorporate user behavior for self-learning ────────────
+        behavior_updates = _incorporate_user_behavior(conn, rows)
 
-    # ── 7. Grade specialist contributions ─────────────────────────
-    specialist_updates = _grade_specialists_from_history(rows)
+        # ── 7. Grade specialist contributions ─────────────────────────
+        specialist_updates = _grade_specialists_from_history(rows)
 
-    conn.commit()
+        conn.commit()
 
     print(
         f"[self_learner] cycle complete: "

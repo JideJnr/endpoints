@@ -1881,6 +1881,35 @@ def _combined_picks(
                 }
                 break
     if not picks:
+        # Try signal aggregator for directional picks before falling back to no_bet
+        try:
+            from app.signal_aggregator import SignalAggregator
+            from app.fallback_logic import FallbackHandler
+
+            aggregator = SignalAggregator()
+            probs = ensemble.get("probabilities") or {}
+            aggregator.add_signal("home_odds", probs.get("home_win", 33), source="ensemble")
+            aggregator.add_signal("away_odds", probs.get("away_win", 33), source="ensemble")
+            aggregator.add_signal("draw_odds", probs.get("draw", 33), source="ensemble")
+
+            sig_probs = aggregator.calculate_probabilities()
+            handler = FallbackHandler()
+            fallback = handler.get_fallback_pick(
+                signals=aggregator.signals,
+                odds={"home": 1.0, "draw": 1.0, "away": 1.0},
+                prob_result=sig_probs,
+            )
+            if fallback and fallback.get("type") != "no_bet" and fallback.get("confidence", 0) >= 35:
+                picks.append(_selector_pick(
+                    fallback.get("type", "match_result"),
+                    fallback.get("selection", "Home Win"),
+                    max(50, int(fallback.get("confidence", 50))),
+                    f"signal aggregator fallback: {fallback.get('selection')}",
+                ))
+        except Exception:
+            pass
+
+    if not picks:
         picks.append({
             "type": "no_bet",
             "selection": "No strong bet",
@@ -3689,6 +3718,45 @@ def _market_selector_picks(
     if side_conf >= 55 and side_conf - second_side >= 12 and samples >= 8:
         picks.append(_selector_pick("match_result", best_side, side_conf, "1X2 model and local finished-score memory agree with separation"))
 
+    # When 1X2 lacks clear separation, use the signal aggregator to find
+    # directional picks with high odds and proven win history instead of
+    # defaulting to double chance.
+    if side_conf - second_side < 12 or samples < 8:
+        try:
+            from app.signal_aggregator import SignalAggregator
+            from app.fallback_logic import FallbackHandler
+
+            # Build signals from the current model probabilities
+            aggregator = SignalAggregator()
+            aggregator.add_signal("home_odds", home, source="ensemble")
+            aggregator.add_signal("away_odds", away, source="ensemble")
+            aggregator.add_signal("draw_odds", draw, source="ensemble")
+            if home > draw and home > away:
+                aggregator.add_signal("home_form", 0.7, source="ensemble")
+            elif away > draw and away > home:
+                aggregator.add_signal("away_form", 0.7, source="ensemble")
+            else:
+                aggregator.add_signal("home_form", 0.5, source="ensemble")
+                aggregator.add_signal("away_form", 0.5, source="ensemble")
+
+            sig_probs = aggregator.calculate_probabilities()
+            handler = FallbackHandler()
+            fallback = handler.get_fallback_pick(
+                signals=aggregator.signals,
+                odds={"home": 1 / (home / 100) if home > 0 else 1.0, "draw": 1 / (draw / 100) if draw > 0 else 1.0, "away": 1 / (away / 100) if away > 0 else 1.0},
+                prob_result=sig_probs,
+            )
+            if fallback and fallback.get("type") != "no_bet" and fallback.get("confidence", 0) >= 40:
+                picks.append(_selector_pick(
+                    fallback.get("type", "match_result"),
+                    fallback.get("selection", "Home Win"),
+                    max(55, int(fallback.get("confidence", 55))),
+                    f"signal aggregator directional pick: {fallback.get('selection')} (odds {fallback.get('odds', 0):.2f})",
+                ))
+        except Exception:
+            pass
+
+    # Double chance as last resort — only when directional picks are unavailable
     dc_options = [
         ("Home or Draw", home + draw, away, "home avoids defeat profile"),
         ("Away or Draw", away + draw, home, "away avoids defeat profile"),

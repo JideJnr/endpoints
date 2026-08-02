@@ -881,10 +881,17 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
             from match_buffer
             where raw_enriched is not null
               and is_finished = 0
+              and json_extract(raw_enriched, '$.sofascore_match_status') != 'srl_skip'
               and (
                     json_extract(raw_enriched, '$.manual_prediction_state') is not null
                  or json_extract(raw_enriched, '$.prediction') is not null
                  or json_extract(raw_enriched, '$.ai_prediction_queue_pending') = 1
+                 or (
+                      -- Pick up any enriched match that has no prediction yet
+                      json_extract(raw_enriched, '$.enriched_at') is not null
+                      and json_extract(raw_enriched, '$.prediction') is null
+                      and json_extract(raw_enriched, '$.prediction_error') is null
+                    )
               )
               and json_extract(raw_enriched, '$.ai_prediction_state') is null
             """,

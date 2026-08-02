@@ -24,12 +24,15 @@ Staleness rules:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from app.db import DB_PATH, _conn
 from app.league_memory import _init_db
@@ -114,6 +117,13 @@ def _init_buffer_table(conn: sqlite3.Connection) -> None:
     _ensure_buffer_column(conn, "match_buffer", "sportybet_id", "text")
     _ensure_buffer_column(conn, "future_match_buffer", "data_source", "text not null default 'sportybet'")
     _ensure_buffer_column(conn, "future_match_buffer", "sportybet_id", "text")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sofa_event_list_cache (
+            date        TEXT PRIMARY KEY,
+            fetched_at  TEXT NOT NULL,
+            events_json TEXT NOT NULL
+        )
+    """)
 
 
 def _ensure_buffer_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -221,7 +231,60 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             if not exists:
                 count += 1
         conn.commit()
+
+    # Register every new match with team watcher using SportyBet ID.
+    # This ensures the watcher knows about every match from ingest, even
+    # before SofaScore enrichment runs. SofaScore team IDs are appended
+    # later in _register_sofa_team_ids_with_watcher() after enrichment.
+    _register_ingest_with_team_watcher(matches)
     return count
+
+
+def _register_ingest_with_team_watcher(matches: list[dict[str, Any]]) -> None:
+    """Register ingested SportyBet matches with team watcher on first ingest."""
+    try:
+        from app.team_watcher import observe_match as _tw_observe
+        for m in matches:
+            match_id = str(m.get("id") or "")
+            if not match_id:
+                continue
+            state = classify_match_state(m)
+            if state.get("is_finished"):
+                continue
+            # Build a minimal doc the team watcher can parse for team identity
+            doc = {
+                "sportybet_id": match_id,
+                "match_id": match_id,
+                "name": m.get("name") or "",
+                "sportybet_name": m.get("name") or "",
+                "tournament": m.get("tournament") or "",
+                "category": m.get("category") or "",
+                "match_date": m.get("match_date") or "",
+                "start_time": m.get("start_time"),
+                "home_team": m.get("home_team") or _parse_home_team(m.get("name") or ""),
+                "away_team": m.get("away_team") or _parse_away_team(m.get("name") or ""),
+                "data_source": "sportybet",
+            }
+            try:
+                _tw_observe(doc)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _parse_home_team(name: str) -> dict[str, Any]:
+    """Extract home team name from 'Home v Away' format."""
+    import re as _re
+    parts = _re.split(r"\s+v(?:s)?\.?\s+", name, flags=_re.I)
+    return {"name": parts[0].strip()} if len(parts) == 2 else {"name": name}
+
+
+def _parse_away_team(name: str) -> dict[str, Any]:
+    """Extract away team name from 'Home v Away' format."""
+    import re as _re
+    parts = _re.split(r"\s+v(?:s)?\.?\s+", name, flags=_re.I)
+    return {"name": parts[1].strip()} if len(parts) == 2 else {"name": ""}
 
 
 def patch_live_scores(matches: list[dict[str, Any]]) -> int:
@@ -378,7 +441,7 @@ def get_unenriched_batch(
         retry_clause = "1 = 1" if force_live_retry else """
               (
                 json_extract(raw_enriched, '$.sofascore_match_status') is null
-                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
+                or json_extract(raw_enriched, '$.sofascore_match_status') not in ('no_match', 'srl_skip')
                 or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= ?
               )
         """
@@ -492,6 +555,21 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
             ),
         )
         conn.commit()
+
+    # When a SofaScore ID is newly resolved, push the full enriched doc to team
+    # watcher so it gets sofa team IDs, standings, and last matches appended.
+    sofa_id = str(doc.get("sofascore_id") or "")
+    if sofa_id:
+        _update_team_watcher_sofa_ids(match_id, doc)
+
+
+def _update_team_watcher_sofa_ids(match_id: str, doc: dict[str, Any]) -> None:
+    """After SofaScore enrichment resolves team IDs, update team watcher with full context."""
+    try:
+        from app.team_watcher import observe_match as _tw_observe
+        _tw_observe(doc)
+    except Exception:
+        pass
 
 
 # ── Read API ──────────────────────────────────────────────────────────────────
@@ -1134,6 +1212,35 @@ def run_enrichment_worker(
             matched += 1
             continue
 
+        # ── Prematch guard: raw_sporty must be present ────────────────────────
+        # Static fields (home_team, away_team, tournament, etc.) are read
+        # directly from raw_sporty for prematch items. If raw_sporty is absent
+        # (edge case from legacy ingest), skip and wait for the next cycle.
+        # Never call refresh_sporty_match_state for prematch items.
+        if not item.get("is_live") and not sporty:
+            logger.warning(
+                "Skipping prematch match %s: raw_sporty absent",
+                item.get("match_id"),
+            )
+            continue
+
+        # ── SRL / simulated match guard ───────────────────────────────────────
+        # SportyBet carries SRL (Simulated Reality League) virtual fixtures that
+        # have no real SofaScore counterpart.  Skip the matching attempt entirely
+        # so we don't waste API calls and don't leave the row stuck with
+        # repeated "no_match" retries.
+        if _is_junk(match_name or ""):
+            srl_doc = {**(existing or {}), "sofascore_match_status": "srl_skip", "data_source": "sportybet"}
+            store_enriched(item["match_id"], srl_doc)
+            record_activity(
+                f"SRL/virtual match skipped: {match_name}",
+                job="enrich_worker",
+                status="skipped",
+                match_id=str(item.get("match_id") or ""),
+                match_name=match_name,
+            )
+            continue
+
         record_activity(
             f"Matching SofaScore for {match_name}",
             job="enrich_worker",
@@ -1274,6 +1381,21 @@ def run_enrichment_worker(
     now = datetime.now(timezone.utc).isoformat()
     stored = 0
     predicted = 0
+
+    # league_sentiment is the same for all matches in a single worker cycle.
+    # It is intentionally fetched once per cycle rather than per match to limit
+    # web-search API usage.  Default to empty dict so the assembly below never
+    # raises NameError when the tournament name is absent or when the feature
+    # flag is disabled.
+    league_sentiment: dict[str, Any] = {}
+    try:
+        from app.config import get_settings as _get_settings
+        _cfg = _get_settings()
+        if getattr(_cfg, "web_search_league_sentiment_enabled", False) and pairs:
+            _first_sporty = pairs[0][0]["sporty"]
+            league_sentiment = search_league_sentiment(_first_sporty.get("tournament") or "")
+    except Exception:
+        pass
 
     for i, (item, sofa, score) in enumerate(pairs):
         sporty = item["sporty"]
@@ -1490,6 +1612,20 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         sporty = item["sporty"]
         existing = item.get("existing") or {}
         match_name = sporty.get("name") or item.get("match_id")
+
+        # ── SRL / simulated match guard ───────────────────────────────────────
+        if _is_junk(match_name or ""):
+            srl_doc = {**(existing or {}), "sofascore_match_status": "srl_skip", "data_source": "sportybet"}
+            store_enriched(item["match_id"], srl_doc)
+            record_activity(
+                f"SRL/virtual match skipped: {match_name}",
+                job="date_aware_enrichment",
+                status="skipped",
+                match_id=str(item.get("match_id") or ""),
+                match_name=match_name,
+            )
+            continue
+
         record_activity(
             f"Matching SofaScore for {match_name}",
             job="date_aware_enrichment",

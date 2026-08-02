@@ -673,6 +673,16 @@ def job_unified_upcoming() -> dict[str, Any]:
         sporty = item["sporty"]
         existing = item.get("existing") or {}
 
+        # ── SRL / simulated match guard ───────────────────────────────────────
+        # Skip SofaScore matching entirely for SRL/virtual fixtures.
+        match_name = sporty.get("name") or item.get("match_id") or ""
+        if _is_junk(match_name):
+            from app.buffer import store_enriched as _store_enriched
+            srl_doc = {**(existing or {}), "sofascore_match_status": "srl_skip", "data_source": "sportybet"}
+            _store_enriched(item["match_id"], srl_doc)
+            unmatched_count += 1
+            continue
+
         # Already matched — reuse saved sofascore_id
         saved_sofa_id = existing.get("sofascore_id")
         if saved_sofa_id:
@@ -777,16 +787,18 @@ def job_unified_upcoming() -> dict[str, Any]:
         store_enriched(item["match_id"], doc)
         stored_count += 1
 
-        if sofa:
-            try:
-                fresh = get_buffered_match(item["match_id"]) or doc
-                result = apply_prediction_state(fresh, match_id=str(item["match_id"]))
-                if result.get("status") == "predicted":
-                    predicted_count += 1
-                elif result.get("status") == "deferred":
-                    deferred_count += 1
-            except Exception as exc:
-                _logger.debug("unified_upcoming: prediction failed for %s: %s", item["match_id"], exc)
+        # Predict for ALL stored matches, not just SofaScore-matched ones.
+        # Matches with SportyBet markets but no SofaScore ID can still get
+        # a degraded market-signal prediction.
+        try:
+            fresh = get_buffered_match(item["match_id"]) or doc
+            result = apply_prediction_state(fresh, match_id=str(item["match_id"]))
+            if result.get("status") == "predicted":
+                predicted_count += 1
+            elif result.get("status") == "deferred":
+                deferred_count += 1
+        except Exception as exc:
+            _logger.debug("unified_upcoming: prediction failed for %s: %s", item["match_id"], exc)
 
     record_activity(
         f"Unified upcoming done: {len(matches)} fetched, {ingested_new} new, "
