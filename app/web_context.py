@@ -11,7 +11,7 @@ from app.config import get_settings
 
 
 def search_match_context(home: str, away: str, tournament: str = "") -> dict[str, Any]:
-    """Search, read the first result pages, then optionally extract evidence with Grok."""
+    """Search, read the first result pages, then optionally extract evidence with Open Router."""
     query = f"{home} vs {away} prediction preview {tournament}".strip()
     settings = get_settings()
 
@@ -35,21 +35,21 @@ def search_match_context(home: str, away: str, tournament: str = "") -> dict[str
 
     # scrape pages in parallel with a hard wall-clock timeout
     scraped = _scrape_parallel(urls_to_scrape, settings.web_scrape_timeout_seconds)
-    grok_analysis = _analyse_pages_with_ai(query, scraped, home, away)
+    open_router_analysis = _analyse_pages_with_ai(query, scraped, home, away)
 
     search_error = next((item.get("error") for item in reversed(attempts) if item.get("status") == "error"), None)
     return {
         "query": query,
         "snippets": snippets,
         "scraped": scraped,
-        "grok_analysis": grok_analysis,
+        "open_router_analysis": open_router_analysis,
         "error": search_error if not results else None,
         "diagnostics": {
             **_diagnostics(settings),
             "attempts": attempts,
             "results": len(results),
             "scraped": len(scraped),
-            "grok": grok_analysis.get("status"),
+            "open_router": open_router_analysis.get("status"),
         },
     }
 
@@ -81,20 +81,20 @@ def search_team_context(team: str, league: str = "", position: str | int | None 
             urls_to_scrape.append(url)
 
     scraped = _scrape_parallel(urls_to_scrape, settings.web_scrape_timeout_seconds)
-    grok_analysis = _analyse_pages_with_ai(query, scraped, team, league or team)
+    open_router_analysis = _analyse_pages_with_ai(query, scraped, team, league or team)
     search_error = next((item.get("error") for item in reversed(attempts) if item.get("status") == "error"), None)
     return {
         "query": query,
         "snippets": snippets,
         "scraped": scraped,
-        "grok_analysis": grok_analysis,
+        "open_router_analysis": open_router_analysis,
         "error": search_error if not results else None,
         "diagnostics": {
             **_diagnostics(settings),
             "attempts": attempts,
             "results": len(results),
             "scraped": len(scraped),
-            "grok": grok_analysis.get("status"),
+            "open_router": open_router_analysis.get("status"),
         },
     }
 

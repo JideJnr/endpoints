@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +12,15 @@ from app.db import db_conn
 from app.match_state import classify_match_state
 from app.time_context import match_time_context
 from app.web_context import search_team_context
+from app.competition_registry import (
+    init_competition_registry_tables,
+    ensure_competition,
+    ensure_team_competition,
+    update_team_competition_stats,
+    add_performance_note,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
@@ -164,12 +174,83 @@ def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
             """,
             (resolved_key, limit),
         ).fetchall()
+
+        # Import engine tables and query prediction accuracy
+        weekly_analysis = None
+        prediction_accuracy = {
+            "accuracy_known": False,
+            "samples": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": None,
+        }
+        try:
+            from app.team_watcher_engine import init_tw_tables  # noqa: PLC0415
+            init_tw_tables(conn)
+
+            # Parse weekly_analysis_json from the watcher row
+            if row is not None:
+                raw_wa = None
+                try:
+                    raw_wa = row["weekly_analysis_json"]
+                except (IndexError, KeyError):
+                    raw_wa = None
+                if raw_wa:
+                    try:
+                        weekly_analysis = json.loads(raw_wa) if isinstance(raw_wa, str) else raw_wa
+                    except (ValueError, TypeError):
+                        weekly_analysis = None
+
+            # Query graded prediction stats
+            acc_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS samples,
+                    SUM(CASE WHEN result = 'win'  THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) AS losses
+                FROM team_watcher_predictions
+                WHERE team_key = ? AND graded_at IS NOT NULL
+                """,
+                (resolved_key,),
+            ).fetchone()
+
+            if acc_row:
+                samples = int(acc_row["samples"] or 0)
+                wins = int(acc_row["wins"] or 0)
+                losses = int(acc_row["losses"] or 0)
+                win_rate = round(wins / samples, 3) if samples > 0 else None
+                accuracy_known = samples >= 5
+                prediction_accuracy = {
+                    "accuracy_known": accuracy_known,
+                    "samples": samples,
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": win_rate,
+                }
+        except Exception:
+            pass  # Engine unavailable — return defaults
+
     if row is None:
         return {"status": "not_found", "team_key": team_key}
+
+    # Rebuild profile on-the-fly if it was never computed (stored as '{}')
+    watcher_data = _watcher_row(row)
+    if not _loads(row["profile_json"], {}) and matches:
+        try:
+            with db_conn() as conn2:
+                conn2.row_factory = sqlite3.Row
+                rebuilt = _build_profile(conn2, row["team_key"])
+            watcher_data["profile"] = rebuilt
+            watcher_data["venue_split"] = rebuilt.get("venue_split") or {}
+        except Exception:
+            pass
+
     return {
         "status": "success",
-        "watcher": _watcher_row(row),
+        "watcher": watcher_data,
         "matches": [_match_row(match) for match in matches],
+        "weekly_analysis": weekly_analysis,
+        "prediction_accuracy": prediction_accuracy,
     }
 
 
@@ -221,6 +302,18 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
+        init_competition_registry_tables(conn)
+
+        # ── Auto-verify / auto-create the competition ────────────────────────
+        competition_name = _league_name_for_doc(match_doc)
+        competition_entry = ensure_competition(
+            conn,
+            name=competition_name,
+            category=str(match_doc.get("category") or ""),
+            country=str(match_doc.get("country_name") or ""),
+        )
+        competition_key = competition_entry.get("key", "") if competition_entry else ""
+
         for team in teams:
             resolved_key = _resolve_watcher_key(conn, team)
             _upsert_watcher(conn, team, resolved_key=resolved_key)
@@ -315,8 +408,67 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                     resolved_key,
                 ),
             )
+
+            # ── Update team-competition stats ────────────────────────────────
+            if competition_key:
+                try:
+                    update_team_competition_stats(
+                        conn,
+                        team_key=resolved_key,
+                        competition_key=competition_key,
+                        goals_for=observation.get("goals_for"),
+                        goals_against=observation.get("goals_against"),
+                        result=observation.get("result"),
+                        match_date=str(observation.get("match_date") or ""),
+                    )
+                except Exception as _exc:
+                    logger.debug("update_team_competition_stats failed: %s", _exc)
+
             updated.append({"team_key": resolved_key, "team_name": team["team_name"], "profile": profile})
-        conn.commit()
+        conn.commit()  # commit match inserts + profile updates before competition registry calls
+
+    # Grade any open TW_Signal predictions for this match and trigger weekly analysis
+    # Both calls are wrapped in their own try/except so engine errors never abort observe_match.
+    try:
+        from app.team_watcher_engine import grade_tw_predictions  # noqa: PLC0415
+        # Extract home/away scores from match_doc so grade_tw_predictions can
+        # determine the actual outcome.  The score dict uses "home"/"away" keys
+        # (same convention used by _observation_for_team above).
+        _score_doc = match_doc.get("score") if isinstance(match_doc.get("score"), dict) else {}
+        _raw_sporty_doc = match_doc.get("raw_sporty") if isinstance(match_doc.get("raw_sporty"), dict) else {}
+        _raw_score = _raw_sporty_doc.get("score") if isinstance(_raw_sporty_doc.get("score"), dict) else {}
+        _home_score = _score_doc.get("home") if _score_doc.get("home") is not None else _raw_score.get("home")
+        _away_score = _score_doc.get("away") if _score_doc.get("away") is not None else _raw_score.get("away")
+        result_for_match = {
+            "match_id": match_id,
+            "updated": updated,
+            "home_score": _home_score,
+            "away_score": _away_score,
+        }
+        grade_tw_predictions(match_id, result_for_match)
+    except Exception as _exc:
+        logger.warning("grade_tw_predictions failed for match_id=%s: %s", match_id, _exc)
+
+    try:
+        from app.team_watcher_engine import _maybe_generate_weekly_analysis  # noqa: PLC0415
+        for team_update in updated:
+            _maybe_generate_weekly_analysis(team_update["team_key"])
+    except Exception as _exc:
+        pass
+
+    # ── Post-match AI monitoring: generate context-rich performance notes ──
+    try:
+        from app.team_watcher_engine import monitor_team_performance  # noqa: PLC0415
+        for team_update in updated:
+            monitor_team_performance(
+                team_key=team_update["team_key"],
+                match_id=match_id,
+                match_doc=match_doc,
+                tw_signal=match_doc.get("tw_signal"),
+            )
+    except Exception as _exc:
+        logger.debug("monitor_team_performance skipped for match_id=%s: %s", match_id, _exc)
+
     return {"status": "success", "match_id": match_id, "updated": updated}
 
 
@@ -325,6 +477,54 @@ def observe_finished_match_by_id(match_id: str, analysis: dict[str, Any] | None 
     if not doc:
         return {"status": "not_found", "match_id": match_id}
     return observe_match(doc, analysis=analysis)
+
+
+def rebuild_all_profiles(limit: int = 5000) -> dict[str, Any]:
+    """Rebuild profile_json for all watchers where it is still stored as '{}'."""
+    _init_db()
+    rebuilt = skipped = errors = 0
+    with db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        init_team_watcher_tables(conn)
+        keys = [
+            row["team_key"]
+            for row in conn.execute(
+                "select team_key from ai_team_watchers where profile_json = '{}' or profile_json is null limit ?",
+                (limit,),
+            ).fetchall()
+        ]
+    for team_key in keys:
+        try:
+            with db_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                profile = _build_profile(conn, team_key)
+                conn.execute(
+                    """
+                    update ai_team_watchers
+                    set profile_json = ?, league_name = coalesce(league_name, ?),
+                        position = coalesce(position, ?), match_count = ?,
+                        overview_json = ?, updated_at = ?
+                    where team_key = ?
+                    """,
+                    (
+                        json.dumps(profile),
+                        profile.get("league_name"),
+                        profile.get("position"),
+                        int(profile.get("sample_size") or 0),
+                        json.dumps(profile.get("overview") or {}),
+                        datetime.now(timezone.utc).isoformat(),
+                        team_key,
+                    ),
+                )
+                conn.commit()
+            rebuilt += 1
+        except Exception as exc:
+            logger.debug("rebuild_all_profiles failed for %s: %s", team_key, exc)
+            errors += 1
+        else:
+            if profile.get("sample_size", 0) == 0:
+                skipped += 1
+    return {"status": "success", "total": len(keys), "rebuilt": rebuilt, "skipped": skipped, "errors": errors}
 
 
 def backfill_from_finished(limit: int = 200) -> dict[str, Any]:
@@ -380,6 +580,109 @@ def _list_finished_matches_local_or_mongo(limit: int) -> list[dict[str, Any]]:
         return docs
     except Exception:
         return []
+
+
+def backfill_team_watcher_ids(limit: int = 5000) -> dict[str, Any]:
+    """Backfill missing sporty_team_id and sofascore_team_id on existing ai_team_watchers rows.
+
+    Strategy:
+    1. Find all team watcher rows with a missing sporty or sofa team ID.
+    2. Scan the match buffer (enriched docs) and finished_matches for any match
+       involving those teams — enriched docs carry raw_sporty.team_ids and
+       sofascore_detail/sofascore_event with the correct IDs.
+    3. Re-run observe_match on each found doc so _teams_for_doc extracts the
+       IDs and _upsert_watcher persists them via COALESCE (won't overwrite
+       existing good data).
+
+    Returns counts of watchers inspected, updated, and still missing.
+    """
+    _init_db()
+
+    # Step 1 — find watchers missing at least one ID
+    with db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        init_team_watcher_tables(conn)
+        missing_rows = conn.execute(
+            """
+            SELECT team_key, team_name, sporty_team_id, sofascore_team_id
+            FROM ai_team_watchers
+            WHERE (sporty_team_id IS NULL OR sporty_team_id = '')
+               OR (sofascore_team_id IS NULL OR sofascore_team_id = '')
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    if not missing_rows:
+        return {"status": "ok", "inspected": 0, "updated": 0, "still_missing": 0}
+
+    missing_keys = {row["team_name"].lower().strip() for row in missing_rows}
+    inspected = len(missing_rows)
+
+    # Step 2 — collect enriched docs from buffer + finished_matches
+    docs: list[dict[str, Any]] = []
+    try:
+        from app.buffer import get_buffered_matches
+        buf = get_buffered_matches(limit=2000)
+        docs.extend(buf)
+    except Exception:
+        pass
+    try:
+        finished = _list_finished_matches_local_or_mongo(limit=2000)
+        docs.extend(finished)
+    except Exception:
+        pass
+
+    # Deduplicate by match_id
+    seen_ids: set[str] = set()
+    unique_docs: list[dict[str, Any]] = []
+    for doc in docs:
+        mid = str(doc.get("sportybet_id") or doc.get("match_id") or doc.get("_id") or "")
+        if mid and mid not in seen_ids:
+            seen_ids.add(mid)
+            unique_docs.append(doc)
+
+    # Step 3 — re-observe docs that involve a team with missing IDs
+    processed_matches: set[str] = set()
+    for doc in unique_docs:
+        raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+        home_name = _team_name(raw_sporty.get("home_team") or doc.get("home_team") or "").lower().strip()
+        away_name = _team_name(raw_sporty.get("away_team") or doc.get("away_team") or "").lower().strip()
+        if not (home_name in missing_keys or away_name in missing_keys):
+            continue
+        mid = str(doc.get("sportybet_id") or doc.get("match_id") or doc.get("_id") or "")
+        if mid in processed_matches:
+            continue
+        processed_matches.add(mid)
+        try:
+            observe_match(doc)
+        except Exception:
+            pass
+
+    # Step 4 — count how many still have missing IDs
+    with db_conn() as conn:
+        still_missing = conn.execute(
+            """
+            SELECT COUNT(*) FROM ai_team_watchers
+            WHERE (sporty_team_id IS NULL OR sporty_team_id = '')
+               OR (sofascore_team_id IS NULL OR sofascore_team_id = '')
+            """,
+        ).fetchone()[0]
+
+    updated = max(0, inspected - still_missing)
+
+    logger.info(
+        "backfill_team_watcher_ids: inspected=%d docs_scanned=%d matches_processed=%d updated=%d still_missing=%d",
+        inspected, len(unique_docs), len(processed_matches), updated, still_missing,
+    )
+    return {
+        "status": "ok",
+        "inspected": inspected,
+        "docs_scanned": len(unique_docs),
+        "matches_processed": len(processed_matches),
+        "updated": updated,
+        "still_missing": still_missing,
+    }
 
 
 def team_context_for_match(match_doc: dict[str, Any]) -> dict[str, Any]:
@@ -470,9 +773,23 @@ def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key
 def _teams_for_doc(doc: dict[str, Any]) -> list[dict[str, Any]]:
     raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
     sporty_ids = raw_sporty.get("team_ids") if isinstance(raw_sporty.get("team_ids"), dict) else {}
+
+    # sofascore_detail is the primary source for SofaScore team IDs.
+    # sofascore_event is the parsed scheduled-event row — also has home_team/away_team.
+    # Fall back through both so IDs are captured as early as enrichment writes
+    # sofascore_event (before the heavier sofascore_detail fetch completes).
     sofa_detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else {}
-    sofa_home = sofa_detail.get("home_team") or sofa_detail.get("homeTeam") or {}
-    sofa_away = sofa_detail.get("away_team") or sofa_detail.get("awayTeam") or {}
+    sofa_event = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else {}
+
+    def _sofa_team(detail_key: str, event_key: str) -> dict[str, Any]:
+        # Try detail first (most complete), then event
+        t = sofa_detail.get(detail_key) or sofa_detail.get(event_key) or {}
+        if not t:
+            t = sofa_event.get(detail_key) or sofa_event.get(event_key) or {}
+        return t if isinstance(t, dict) else {}
+
+    sofa_home = _sofa_team("home_team", "homeTeam")
+    sofa_away = _sofa_team("away_team", "awayTeam")
     league_name = _league_name_for_doc(doc)
     table_map = _table_lookup(doc)
     sides = [
@@ -557,6 +874,8 @@ def _observation_for_team(doc: dict[str, Any], team: dict[str, Any], analysis: d
             "away_team": raw_sporty.get("away_team") or doc.get("away_team"),
             "home_team_id": (raw_sporty.get("team_ids") or {}).get("home") if isinstance(raw_sporty.get("team_ids"), dict) else None,
             "away_team_id": (raw_sporty.get("team_ids") or {}).get("away") if isinstance(raw_sporty.get("team_ids"), dict) else None,
+            "home_sofascore_team_id": str((doc.get("sofascore_detail") or doc.get("sofascore_event") or {}).get("home_team", {}).get("id") or "") or None,
+            "away_sofascore_team_id": str((doc.get("sofascore_detail") or doc.get("sofascore_event") or {}).get("away_team", {}).get("id") or "") or None,
             "team_side": side,
             "data_sources": doc.get("data_sources") or {},
             "time_context": time_context,
@@ -778,6 +1097,23 @@ def _watcher_row(row: sqlite3.Row | None) -> dict[str, Any]:
     if not row:
         return {}
     profile = _loads(row["profile_json"], {})
+    # If profile was never built (stored as {}), synthesise it from top-level columns
+    # so the frontend always gets usable data.
+    if not profile:
+        profile = {
+            "analyst_score": 0,
+            "trend": "stable",
+            "record": {"wins": 0, "draws": 0, "losses": 0, "form": ""},
+            "goals": {"for_avg": 0, "against_avg": 0, "over_2_5_rate": 0, "btts_rate": 0, "clean_sheet_rate": 0, "blank_rate": 0},
+            "preferred_markets": [],
+            "strengths": [],
+            "risks": [],
+            "venue_split": {"home": {}, "away": {}},
+            "prediction_context": {"usable": False, "confidence": "low", "market_focus": []},
+            "league_name": row["league_name"],
+            "position": row["position"],
+            "recent_briefs": [],
+        }
     return {
         "team_key": row["team_key"],
         "team_name": row["team_name"],
@@ -1099,9 +1435,9 @@ def _build_overview(team_name: str, league_name: str | None, position: Any, prof
     if sample_size == 0:
         summary = f"{team_name} is a new watch entry in {league_name or 'their league'} and still building a meaningful history."
     web_summary = ""
-    grok = web_context.get("grok_analysis") if isinstance(web_context, dict) else {}
-    if isinstance(grok, dict):
-        web_summary = str(grok.get("summary") or grok.get("analysis") or grok.get("result") or "").strip()
+    open_router = web_context.get("open_router_analysis") if isinstance(web_context, dict) else {}
+    if isinstance(open_router, dict):
+        web_summary = str(open_router.get("summary") or open_router.get("analysis") or open_router.get("result") or "").strip()
     if web_summary:
         summary = f"{summary} Online context: {web_summary[:280]}"
     return {

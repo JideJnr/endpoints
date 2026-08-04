@@ -1082,6 +1082,14 @@ def job_grade_predictions() -> dict[str, Any]:
         overdue_result = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
         total_graded += int(overdue_result.get("graded") or 0)
         total_skipped += int(overdue_result.get("skipped") or 0)
+
+        # Grade orphaned predictions (matches removed from buffer before grading)
+        try:
+            from app.league_memory import grade_orphaned_predictions
+            orphaned_result = grade_orphaned_predictions(limit=1000)
+            total_graded += int(orphaned_result.get("graded") or 0)
+        except Exception as _oe:
+            orphaned_result = {"status": "error", "reason": str(_oe), "graded": 0}
         betbuilder_result = grade_betbuilder_history(limit=500)
         metrics = get_grading_metrics()
 
@@ -1094,8 +1102,11 @@ def job_grade_predictions() -> dict[str, Any]:
 
         # Run self-learning cycle and optimise ensemble weights.
         try:
+            from app.self_learner import run_learning_cycle
             from app.weight_optimiser import optimise_ensemble_weights
+            self_learn_result = run_learning_cycle()
             learn_result = optimise_ensemble_weights()
+            learn_result["self_learner"] = self_learn_result
         except Exception as exc:
             learn_result = {"error": str(exc)}
 
@@ -1123,8 +1134,9 @@ def job_grade_predictions() -> dict[str, Any]:
             f"[scheduler] grade_predictions: graded={total_graded} skipped={total_skipped} "
             f"elo_updated={elo_updated} win_rate={metrics.get('win_percent')}% "
             f"calibration_bands={cal_result.get('bands_updated', 0)} "
-            f"signals_learned={(learn_result.get('learning') or {}).get('signal_updates', 0)} "
-            f"model_weights={(learn_result.get('learning') or {}).get('model_weight_updates', 0)} "
+            f"signals_learned={(learn_result.get('self_learner') or {}).get('signal_updates', learn_result.get('signal_updates', 0))} "
+            f"model_weights={(learn_result.get('self_learner') or {}).get('model_weight_updates', 0)} "
+            f"league_profiles={(learn_result.get('self_learner') or {}).get('league_updates', 0)} "
             f"overdue={overdue_result.get('graded', 0)} "
             f"cleanup_finished={cleanup_result.get('deleted_finished')}"
         )
@@ -1141,23 +1153,36 @@ def job_grade_predictions() -> dict[str, Any]:
 def job_grade_overdue_predictions() -> dict[str, Any]:
     """Frequent safety-net grader using SportyBet results first, SofaScore fallback second."""
     try:
-        from app.league_memory import grade_betbuilder_history, grade_overdue_predictions
+        from app.league_memory import grade_betbuilder_history, grade_orphaned_predictions, grade_overdue_predictions
 
         record_activity("Checking overdue match results", job="grade_overdue", status="running")
         result = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
+
+        # Also grade orphaned predictions on every run
+        try:
+            orphaned = grade_orphaned_predictions(limit=500)
+            result["orphaned"] = orphaned
+            result["graded"] = int(result.get("graded") or 0) + int(orphaned.get("graded") or 0)
+        except Exception as _oe:
+            result["orphaned"] = {"status": "error", "reason": str(_oe)}
+
         graded = int(result.get("graded") or 0) + int(result.get("candidate_graded") or 0)
         if graded:
             try:
                 from app.confidence_calibrator import rebuild_calibration
+                from app.self_learner import run_learning_cycle
                 from app.weight_optimiser import optimise_ensemble_weights
 
                 result["calibration"] = rebuild_calibration()
-                result["learning"] = optimise_ensemble_weights()
+                # Rebuild signal weights from fresh graded data
+                learn_cycle = run_learning_cycle()
+                opt_result = optimise_ensemble_weights()
+                result["learning"] = {**opt_result, "self_learner": learn_cycle}
             except Exception as exc:
                 result["learning_error"] = str(exc)
         result["betbuilder"] = grade_betbuilder_history(limit=300)
         record_activity(
-            f"Overdue grading finished: {result.get('graded', 0)} primary, {result.get('candidate_graded', 0)} candidates",
+            f"Overdue grading finished: {result.get('graded', 0)} primary, {result.get('candidate_graded', 0)} candidates, {int((result.get('orphaned') or {}).get('graded') or 0)} orphaned",
             job="grade_overdue",
             status="ok",
             details=result,
@@ -1165,6 +1190,7 @@ def job_grade_overdue_predictions() -> dict[str, Any]:
         print(
             f"[scheduler] grade_overdue: checked={result.get('checked')} "
             f"graded={result.get('graded')} candidates={result.get('candidate_graded')} "
+            f"orphaned={int((result.get('orphaned') or {}).get('graded') or 0)} "
             f"live={result.get('still_live')} not_found={result.get('not_found')}"
         )
         return result
@@ -1598,6 +1624,7 @@ def stop_scheduler(wait: bool = False) -> bool:
     _shutting_down = True
     _watchdog_stop.set()
     scheduler = _scheduler
+    _scheduler = None  # clear reference before shutdown so new process doesn't inherit it
     if not scheduler:
         return False
     try:
@@ -1606,12 +1633,11 @@ def stop_scheduler(wait: bool = False) -> bool:
                 scheduler.remove_all_jobs()
             except Exception:
                 pass
-            scheduler.shutdown(wait=False)
+            scheduler.shutdown(wait=wait)
     except Exception as exc:
         message = str(exc).lower()
         if "not running" not in message and "shutdown" not in message:
             print(f"[scheduler] shutdown warning: {exc}")
-    _scheduler = None
     return True
 
 

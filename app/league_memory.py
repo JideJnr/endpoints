@@ -11,6 +11,7 @@ from typing import Any
 from app.db import (DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db, _init_db, _init_db_unlocked, _ensure_column, _is_sqlite_lock, _DB_SCHEMA_READY, _DB_SCHEMA_LOCK, _run_schema_migrations, _run_legacy_backfills, _existing_schema_can_be_trusted, _ensure_prediction_history_columns)
 from app.market_intent import classify_market_intent, grade_market_intent
 from app.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
+from app.competition_registry import init_competition_registry_tables, ensure_competition
 
 
 
@@ -42,6 +43,18 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
         is_live = True
 
     with _conn(timeout=15) as conn:
+        init_competition_registry_tables(conn)
+        # ── Auto-verify / auto-create the competition ────────────────────────
+        try:
+            ensure_competition(
+                conn,
+                name=league,
+                category=str(match.get("category") or ""),
+                country=str(match.get("country_name") or ""),
+            )
+        except Exception as _exc:
+            logger.debug("ensure_competition failed for league=%s: %s", league, _exc)
+
         duplicate_info = _detect_duplicate_or_replay(conn, source, match_id, league, match, home_goals, away_goals, minute, is_finished)
         _upsert_match(conn, source, match_id, league, match, home_goals, away_goals, is_finished)
         timeline_snapshot_recorded = False
@@ -4226,3 +4239,137 @@ def get_behavior_weighted_picks(match_id: str) -> list[dict[str, Any]]:
             "created_at": row["created_at"],
         })
     return picks
+
+
+def grade_orphaned_predictions(limit: int = 1000) -> dict[str, Any]:
+    """Grade ``prediction_history`` rows that have no match_buffer entry.
+
+    These are predictions whose match was removed from the buffer after being
+    archived (finished).  The standard ``grade_overdue_predictions`` grader
+    skips them because it relies on the buffer for ``start_time``.
+
+    This function:
+    1. Finds all ungraded rows that are absent from both ``match_buffer`` and
+       ``future_match_buffer``.
+    2. Groups them by the date derived from ``created_at`` (best proxy available
+       when no buffer row exists).
+    3. Fetches SofaScore finished events for each distinct date.
+    4. Grades each row via the stored ``sofascore_id`` or SportyBet match id.
+
+    Returns::
+
+        {
+            "status": "ok",
+            "inspected": <total orphaned rows>,
+            "graded": <rows successfully graded>,
+            "candidate_graded": <candidate rows graded>,
+            "not_found": <rows where no SofaScore result was found>,
+            "errors": [...]
+        }
+    """
+    _init_db()
+    from collections import defaultdict
+
+    # ── 1. Fetch all orphaned ungraded rows ──────────────────────────────────
+    with _conn() as conn:
+        _ensure_buffer_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT ph.*
+            FROM prediction_history ph
+            WHERE ph.graded_at IS NULL
+              AND ph.pick_type != 'no_bet'
+              AND ph.match_id NOT IN (SELECT match_id FROM match_buffer)
+              AND ph.match_id NOT IN (SELECT match_id FROM future_match_buffer)
+            ORDER BY ph.created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    if not rows:
+        return {
+            "status": "ok",
+            "inspected": 0,
+            "graded": 0,
+            "candidate_graded": 0,
+            "not_found": 0,
+            "errors": [],
+        }
+
+    # ── 2. Group by date (use created_at date as proxy for match date) ───────
+    by_date: dict[str, list] = defaultdict(list)
+    for row in rows:
+        date_key = str(row["created_at"] or "")[:10]
+        if date_key:
+            by_date[date_key].append(row)
+
+    graded = candidate_graded = not_found = 0
+    errors: list[str] = []
+
+    # ── 3. For each date, fetch SofaScore events and grade matching rows ──────
+    try:
+        from app.sofascore_client import fetch_all_scheduled_events, fetch_event
+    except Exception as exc:
+        return {"status": "error", "reason": f"sofascore import failed: {exc}"}
+
+    for match_date, date_rows in by_date.items():
+        try:
+            events = fetch_all_scheduled_events(match_date)
+        except Exception as exc:
+            errors.append(f"sofascore {match_date}: {exc}")
+            not_found += len(date_rows)
+            continue
+
+        event_by_id = {str(e.get("id")): e for e in events}
+        finished = {eid: e for eid, e in event_by_id.items()
+                    if str(((e.get("status") or {}).get("type")) or "").lower() == "finished"}
+
+        for row in date_rows:
+            match_id = str(row["match_id"])
+            # Collect all known SofaScore ids for this row
+            sofa_ids: list[str] = []
+            if row["sofascore_id"]:
+                sofa_ids.append(str(row["sofascore_id"]))
+
+            # Try to find a matching finished event
+            event = finished.get(match_id)
+            if not event:
+                event = next((finished.get(sid) for sid in sofa_ids if finished.get(sid)), None)
+
+            # Direct fetch fallback for each sofa_id
+            if not event and sofa_ids:
+                for sid in sofa_ids:
+                    try:
+                        direct = fetch_event(sid)
+                        if direct and str(((direct.get("status") or {}).get("type")) or "").lower() == "finished":
+                            event = direct
+                            break
+                    except Exception:
+                        pass
+
+            if not event:
+                not_found += 1
+                continue
+
+            score = event.get("score") or {}
+            final_home = _to_int(score.get("home"), 0)
+            final_away = _to_int(score.get("away"), 0)
+
+            counts = _grade_match_predictions_by_ids(
+                match_id=match_id,
+                linked_ids=sofa_ids,
+                final_home=final_home,
+                final_away=final_away,
+            )
+            graded += counts["primary"]
+            candidate_graded += counts["candidate"]
+
+    return {
+        "status": "ok",
+        "inspected": len(rows),
+        "graded": graded,
+        "candidate_graded": candidate_graded,
+        "not_found": not_found,
+        "errors": errors[:10],
+    }

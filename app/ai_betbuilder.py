@@ -73,10 +73,14 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
     # Allow a generous ceiling so the selector has room to reach high target odds.
     # Default to 3x the target so there's enough headroom without being unbounded.
     max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 3.0)
-    # Scale the candidate pool with the target: higher odds need more matches.
-    # Cap at 100 which is the available match pool.
-    default_limit = min(100, max(6, int(target_odds / 2)))
-    candidate_limit = max(4, min(_to_int(payload.get("candidate_limit"), default_limit), 100))
+    # Scale the candidate pool with the target odds.
+    # For 300 odds (≈ 9 legs at 1.9 each) we need a much larger pool to find
+    # enough qualifying matches.  Formula: need ≈ log(target) / log(avg_leg_odds)
+    # where avg_leg_odds ≈ 1.65.  We fetch 3× that estimate, capped at 200.
+    import math as _math
+    estimated_legs = max(6, int(_math.log(max(target_odds, 2)) / _math.log(1.65)) + 2)
+    default_limit = min(200, estimated_legs * 3)
+    candidate_limit = max(10, min(_to_int(payload.get("candidate_limit"), default_limit), 200))
     candidates = upcoming_prediction_candidates(limit=candidate_limit)
     analyses: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -269,7 +273,33 @@ def synthesize_sure_picks(
             if learned_prob.get("away_prob", 0) >= 0.54 and "away" in groq_selection:
                 learned_boost += 3.0
 
-        conviction = round(base_conviction + learned_boost, 2)
+        # Apply league accuracy adjustment — boost leagues where we consistently
+        # win, penalise leagues where we consistently lose.  This feeds graded
+        # prediction history directly into Maya's selection ranking so she
+        # naturally surfaces picks from high-accuracy leagues and deprioritises
+        # picks from leagues the engine doesn't understand well.
+        league_acc_boost = 0.0
+        try:
+            from app.self_learner import get_league_accuracy
+            _lacc = get_league_accuracy(item.get("league_name") or "")
+            if _lacc.get("known"):
+                for _lt in (_lacc.get("by_pick_type") or []):
+                    _pt = engine_pick.get("type") or item.get("pick_type") or "match_result"
+                    if _lt.get("pick_type") in (_pt, "__all__"):
+                        _samples = int(_lt.get("samples") or 0)
+                        _wr = float(_lt.get("win_rate") or 0)  # in %
+                        if _samples >= 8:
+                            if _wr > 65.0:
+                                # Outperforming league — boost conviction
+                                league_acc_boost = min(8.0, (_wr - 65.0) / 5.0)
+                            elif _wr < 50.0:
+                                # Underperforming league — suppress conviction
+                                league_acc_boost = max(-10.0, -((50.0 - _wr) / 5.0))
+                        break
+        except Exception:
+            pass
+
+        conviction = round(base_conviction + learned_boost + league_acc_boost, 2)
 
         ranked.append({
             "match_id": item.get("match_id") or item.get("sportybet_id"),
@@ -286,6 +316,7 @@ def synthesize_sure_picks(
             "conviction_score": conviction,
             "learning": learning,
             "learned_probabilities": learned_prob,
+            "league_accuracy_boost": round(league_acc_boost, 2),
             "confirmed": confirmed,
             "similar_matches_used": similar_used,
             "source": "groq",
@@ -337,16 +368,63 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
     today = date.today()
     tomorrow = today + timedelta(days=1)
     allowed_dates = {today.isoformat(), tomorrow.isoformat()}
+    now_ts = time.time()
     candidates = []
     for row in rows:
+        # Skip finished, cancelled or already-started matches
         if row.get("is_finished") or str(row.get("result") or "").lower() in {"cancelled", "finished"}:
             continue
         match_date = str(row.get("match_date") or "")[:10]
         if match_date and match_date not in allowed_dates:
             continue
+        # Skip matches that have already kicked off (start_time in the past)
+        start_time = row.get("start_time")
+        if start_time:
+            try:
+                kick_ts = float(start_time)
+                if kick_ts > 1e12:
+                    kick_ts /= 1000  # ms → seconds
+                if kick_ts < now_ts:
+                    continue  # already started
+            except (TypeError, ValueError):
+                pass
+        # Skip if match is currently live
+        if row.get("is_live") or str(row.get("period") or "").lower() in {"h1", "h2", "et", "live", "ht"}:
+            continue
         pick = row.get("best_pick") or _best_pick(row.get("picks") or [])
         if not pick:
             continue
+        # Enforce minimum odds of 1.30 per leg — sub-1.30 picks don't contribute
+        # meaningful value to an accumulator
+        pick_odds = _pick_decimal_odds(pick)
+        if pick_odds < 1.30:
+            continue
+        # ── SportyBet availability check ──────────────────────────────────────
+        # Verify the match is still in the active buffer with live markets before
+        # including it as a Maya candidate.  Matches that were archived or had
+        # their markets pulled will fail here and be silently skipped.
+        match_id = str(row.get("match_id") or row.get("sportybet_id") or "")
+        if match_id:
+            try:
+                from app.buffer import get_buffered_match, refresh_sporty_match_state
+                # Refresh buffer state inline (non-blocking — uses cached data if recent)
+                try:
+                    refresh_sporty_match_state(match_id)
+                except Exception:
+                    pass
+                buf_doc = get_buffered_match(match_id)
+                if not buf_doc:
+                    continue  # not in buffer — skip
+                # Must have live SportyBet markets
+                markets = buf_doc.get("sportybet_markets") or buf_doc.get("markets") or []
+                if not markets:
+                    continue  # no markets available — skip
+                # Must not be finished or live
+                if buf_doc.get("is_finished") or buf_doc.get("is_live"):
+                    continue
+            except Exception:
+                # If buffer check fails, allow through — don't block on infra errors
+                pass
         candidates.append({**row, "best_pick": pick})
     candidates.sort(key=lambda item: int((item.get("best_pick") or {}).get("confidence") or 0), reverse=True)
     return candidates[:limit]
@@ -400,6 +478,9 @@ def _run_groq_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_to
         "You are an expert football betting slip analyst. Read these completed Groq enriched analyses. "
         "Return strict JSON with selected_picks (array of objects with match_id) and synthesis_reasoning. "
         "Prefer confirmed picks where the prediction engine and Groq agree. Rank by conviction_score. "
+        "IMPORTANT: Each pick has a league_accuracy_boost field — positive means the system historically "
+        "wins in that league, negative means it loses. Strongly prefer picks with positive league_accuracy_boost. "
+        "Avoid picks with league_accuracy_boost below -5 unless no alternatives exist. "
         f"Select enough picks to reach target odds {target_odds} without exceeding max odds {max_total_odds}. "
         "If target cannot be reached, return the best available picks.\n\n"
         + json.dumps(ranked[:100], ensure_ascii=False)
@@ -477,13 +558,16 @@ def _pick_decimal_odds(pick: dict[str, Any] | None) -> float:
     return round(1 / confidence, 3)
 
 
-def _select_by_odds(candidates: list[dict[str, Any]], target_odds: float, max_total_odds: float) -> list[dict[str, Any]]:
+def _select_by_odds(candidates: list[dict[str, Any]], target_odds: float, max_total_odds: float, min_leg_odds: float = 1.30) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     used: set[str] = set()
     combined = 1.0
     for item in candidates:
         match_id = str(item.get("match_id") or "")
-        odds = float(item.get("odds") or 1)
+        odds = float(item.get("odds") or item.get("estimated_odds") or 1)
+        # Skip legs below the minimum odds threshold
+        if odds < min_leg_odds:
+            continue
         if match_id in used or combined * odds > max_total_odds:
             continue
         selected.append(item)

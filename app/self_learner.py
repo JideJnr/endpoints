@@ -209,7 +209,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "rules":       {"goal_pressure", "h2h_edge", "league_position_edge",
                         "recent_history_edge", "common_opponent_edge",
                         "avg_rating_edge", "market_steam", "odds_edge"},
-        "deepseek":    {"deepseek_agent", "ai_brain_review"},
+        "openrouter":  {"openrouter_agent", "ai_brain_review"},
     }
     model_stats: dict[str, dict] = {m: {"samples": 0, "wins": 0} for m in model_signal_map}
 
@@ -333,7 +333,7 @@ def run_learning_cycle() -> dict[str, Any]:
         # fall back to signal-based heuristics when models_json is empty.
         base_weights = {
             "dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15,
-            "rules": 0.20, "deepseek": 0.10,
+            "rules": 0.20, "openrouter": 0.10,
         }
         for model in base_weights:
             direct = direct_model_stats.get(model, {"samples": 0, "wins": 0})
@@ -666,6 +666,13 @@ _BACKGROUND_SIGNAL_NAMES = {
     "source_blend_sportybet_prematch_minimum",
     "source_blend_sportybet_market_signal",
     "data_depth",
+    # Meta/modifier signals — these reflect the learner's own adjustments, not
+    # match evidence.  Including them in signal stats creates a feedback loop
+    # where the learner measures its own impact rather than match predictors.
+    "learned_signal_adjustment",
+    "calibration_gap_severe",
+    "calibration_gap_moderate",
+    "sportradar_widget_unavailable",
 }
 
 

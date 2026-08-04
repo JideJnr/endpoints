@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\db.py
+# hypothesis_version: 6.141.1
+
+[30000, '1', 'audit_json', 'betbuilder_history', 'conn', 'country_name', 'data_source', 'database is locked', 'final_away', 'final_home', 'graded_at', 'grading_reason_json', 'integer', 'learning_json', 'leg_results_json', 'match_fingerprint', 'matches', 'models_json', 'on', 'prediction_history', 'prediction_mode', 'request_json', 'result', 'sofascore_id', 'sportybet_id', 'start_time', 'text', 'true', 'yes']

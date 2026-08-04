@@ -251,7 +251,10 @@ def _register_ingest_with_team_watcher(matches: list[dict[str, Any]]) -> None:
             state = classify_match_state(m)
             if state.get("is_finished"):
                 continue
-            # Build a minimal doc the team watcher can parse for team identity
+            # Build a minimal doc the team watcher can parse for team identity.
+            # Include raw_sporty so _teams_for_doc() can extract team_ids
+            # (sporty competitor IDs) on first ingest — before SofaScore
+            # enrichment runs and appends sofascore_team_id.
             doc = {
                 "sportybet_id": match_id,
                 "match_id": match_id,
@@ -264,6 +267,8 @@ def _register_ingest_with_team_watcher(matches: list[dict[str, Any]]) -> None:
                 "home_team": m.get("home_team") or _parse_home_team(m.get("name") or ""),
                 "away_team": m.get("away_team") or _parse_away_team(m.get("name") or ""),
                 "data_source": "sportybet",
+                # Pass the full sporty dict as raw_sporty so team_ids is accessible
+                "raw_sporty": m,
             }
             try:
                 _tw_observe(doc)

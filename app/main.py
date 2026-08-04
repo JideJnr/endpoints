@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
         await _close_live_websockets()
         stop_keep_alive()
         from app.scheduler import stop_scheduler
-        stop_scheduler(wait=True)
+        stop_scheduler(wait=False)
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

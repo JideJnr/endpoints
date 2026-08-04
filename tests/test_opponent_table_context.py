@@ -1,6 +1,6 @@
 import unittest
 
-from app.deepseek_agent import _analyse_pages_with_deepseek
+from app.web_context import _analyse_pages_with_ai
 
 
 def _match(home, away, home_goals, away_goals):
@@ -34,16 +34,16 @@ class OpponentTableContextTests(unittest.TestCase):
         self.assertEqual(comparison["opponent_table"]["position"], 1)
         self.assertGreater(comparison["table_weight"], 1.0)
 
-    def test_deepseek_reader_is_explicitly_unavailable_without_key(self):
-        # No network call is attempted unless a DEEPSEEK_API_KEY is configured.
+    def test_openrouter_reader_is_explicitly_unavailable_without_key(self):
+        # No network call is attempted unless an OPENROUTER_API_KEY is configured.
         import os
 
-        old_key = os.environ.pop("DEEPSEEK_API_KEY", None)
+        old_key = os.environ.pop("OPENROUTER_API_KEY", None)
         try:
-            result = _analyse_pages_with_deepseek("Home vs Away", [{"url": "https://example.test", "text": "Preview"}], "Home", "Away")
+            result = _analyse_pages_with_ai("Home vs Away", [{"url": "https://example.test", "text": "Preview"}], "Home", "Away")
         finally:
             if old_key is not None:
-                os.environ["DEEPSEEK_API_KEY"] = old_key
+                os.environ["OPENROUTER_API_KEY"] = old_key
         self.assertEqual(result["status"], "unavailable")
 
 

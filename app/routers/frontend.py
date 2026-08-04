@@ -1049,11 +1049,131 @@ def backfill_ai_team_watchers(limit: int = Query(default=200, ge=1, le=1000)):
     return backfill_from_finished(limit=limit)
 
 
+@router.post("/team-watchers/backfill-ids")
+def backfill_team_watcher_team_ids(limit: int = Query(default=5000, ge=1, le=10000)):
+    """Backfill missing sporty_team_id and sofascore_team_id on existing team watcher rows.
+    Scans the match buffer and finished match archive to re-observe matches involving
+    teams with missing IDs. Safe to call multiple times — COALESCE logic never
+    overwrites good data with nulls."""
+    from app.team_watcher import backfill_team_watcher_ids
+
+    return backfill_team_watcher_ids(limit=limit)
+
+
+@router.post("/team-watchers/rebuild-profiles")
+def rebuild_ai_team_watcher_profiles(limit: int = Query(default=5000, ge=1, le=20000)):
+    """Rebuild profile_json for all watchers where it is still stored as '{}'."""
+    from app.team_watcher import rebuild_all_profiles
+
+    return rebuild_all_profiles(limit=limit)
+
+
+@router.post("/team-watchers/regrade-void")
+def regrade_void_tw_predictions(limit: int = Query(default=2000, ge=1, le=10000)):
+    """Regrade all TW predictions that were incorrectly stored as 'void' due
+    to a bug in observe_match that omitted scores from the grading result dict.
+    Safe to call multiple times — rows already corrected to win/loss are not touched."""
+    from app.team_watcher_engine import regrade_void_predictions
+
+    return regrade_void_predictions(limit=limit)
+
+
 @router.post("/team-watchers/observe-match/{match_id:path}")
 def observe_match_for_ai_team_watchers(match_id: str):
     from app.team_watcher import observe_finished_match_by_id
 
     return observe_finished_match_by_id(match_id)
+
+
+# ── Competition Registry endpoints ────────────────────────────────────────────
+
+@router.get("/competition-registry/competitions")
+def list_competition_registry(tier: Optional[int] = Query(default=None), enabled: Optional[bool] = Query(default=None)):
+    """List all tracked competitions with optional filtering."""
+    from app.competition_registry import list_competitions
+    from app.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        competitions = list_competitions(conn, tier=tier, enabled=enabled)
+    return {"status": "success", "count": len(competitions), "competitions": competitions}
+
+
+@router.get("/competition-registry/competitions/{competition_key}")
+def get_competition_registry_entry(competition_key: str):
+    """Get a single competition entry by its normalized key."""
+    from app.competition_registry import get_competition
+    from app.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        entry = get_competition(conn, competition_key)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Competition not found: {competition_key}")
+    return {"status": "success", "competition": entry}
+
+
+@router.get("/competition-registry/teams/{team_key}/competitions")
+def get_team_competitions(team_key: str, limit: int = Query(default=20, ge=1, le=100)):
+    """Get all competitions a team participates in, with per-competition stats."""
+    from app.competition_registry import get_team_competition_stats, get_team_performance_notes
+    from app.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        rows = conn.execute(
+            "select * from team_competitions where team_key = ? order by matches_played desc limit ?",
+            (team_key, limit),
+        ).fetchall()
+        stats = [dict(r) for r in rows]
+        for stat in stats:
+            notes = get_team_performance_notes(conn, team_key, stat["competition_key"], limit=10)
+            stat["recent_notes"] = notes
+
+    return {"status": "success", "team_key": team_key, "count": len(stats), "competitions": stats}
+
+
+@router.get("/competition-registry/teams/{team_key}/competitions/{competition_key}")
+def get_team_competition_detail(team_key: str, competition_key: str):
+    """Get detailed team-competition stats and recent performance notes."""
+    from app.competition_registry import get_team_competition_stats, get_team_performance_notes, get_team_competition_history
+    from app.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        stats = get_team_competition_stats(conn, team_key, competition_key)
+        if not stats:
+            raise HTTPException(status_code=404, detail="Team-competition relationship not found")
+        notes = get_team_performance_notes(conn, team_key, competition_key, limit=20)
+        history = get_team_competition_history(conn, team_key, competition_key, limit=30)
+
+    return {
+        "status": "success",
+        "team_key": team_key,
+        "competition_key": competition_key,
+        "stats": stats,
+        "recent_notes": notes,
+        "match_history": history,
+    }
+
+
+@router.get("/competition-registry/teams/{team_key}/notes")
+def get_team_performance_notes_endpoint(
+    team_key: str,
+    competition_key: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Get performance notes for a team, optionally filtered by competition."""
+    from app.competition_registry import get_team_performance_notes
+    from app.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        if competition_key:
+            notes = get_team_performance_notes(conn, team_key, competition_key, limit=limit)
+        else:
+            rows = conn.execute(
+                "select * from team_performance_notes where team_key = ? order by created_at desc limit ?",
+                (team_key, limit),
+            ).fetchall()
+            notes = [dict(r) for r in rows]
+
+    return {"status": "success", "team_key": team_key, "count": len(notes), "notes": notes}
 
 
 @router.get("/competition-special/{competition_key}/analysis/latest")
@@ -1473,7 +1593,7 @@ def grade_results(hours_back: int = 24):
         conn.row_factory = sqlite3.Row
         pending = conn.execute(
             "select id, match_id, match_name, league_name, country_name, pick_type, selection, "
-            "confidence, signals_json, audit_json, "
+            "confidence, signals_json, audit_json, result, "
             "(select match_date from match_buffer where match_id=ph.match_id limit 1) as match_date "
             "from prediction_history ph "
             "where graded_at is null and pick_type != 'no_bet'"
@@ -1577,6 +1697,13 @@ def grade_results(hours_back: int = 24):
 
     overdue = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
 
+    # Grade orphaned predictions (no buffer entry — matches archived before grading)
+    try:
+        from app.league_memory import grade_orphaned_predictions
+        orphaned = grade_orphaned_predictions(limit=1000)
+    except Exception as _exc:
+        orphaned = {"status": "error", "reason": str(_exc), "graded": 0}
+
     # AI analysis for graded matches
     ai_analysis_count = 0
     for row in pending:
@@ -1601,9 +1728,10 @@ def grade_results(hours_back: int = 24):
         "sofascore_predictions_skipped": sofascore["skipped"],
         "sofascore": sofascore,
         "overdue": overdue,
+        "orphaned": orphaned,
         "matches_archived": archived,
         "ai_analysis_triggered": ai_analysis_count,
-        "signal_stats": _grade_signal_stats(graded + sofascore["graded"] + int(overdue.get("graded") or 0)),
+        "signal_stats": _grade_signal_stats(graded + sofascore["graded"] + int(overdue.get("graded") or 0) + int(orphaned.get("graded") or 0)),
     }
 
 
@@ -1613,6 +1741,15 @@ def grade_overdue_results(hours_after_kickoff: float = 2.0, limit: int = 500):
     from app.league_memory import grade_overdue_predictions
 
     return grade_overdue_predictions(hours_after_kickoff=hours_after_kickoff, limit=limit)
+
+
+@router.post("/results/grade-orphaned")
+def grade_orphaned_results(limit: int = Query(default=1000, ge=1, le=5000)):
+    """Grade prediction_history rows that have no match_buffer entry (orphaned after archiving).
+    Fetches SofaScore results per date for each distinct match date in the backlog."""
+    from app.league_memory import grade_orphaned_predictions
+
+    return grade_orphaned_predictions(limit=limit)
 
 
 @router.post("/results/grade-match/{match_id:path}")
@@ -2619,7 +2756,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
             "query": web.get("query"),
             "snippets": web.get("snippets", []),
             "articles": web.get("scraped", []) or web.get("articles", []),
-            "grok_analysis": web.get("grok_analysis") or {},
+            "open_router_analysis": web.get("open_router_analysis") or {},
             "error": web.get("error"),
             "disabled": web.get("disabled"),
             "diagnostics": web.get("diagnostics"),

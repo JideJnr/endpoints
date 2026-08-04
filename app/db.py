@@ -561,6 +561,81 @@ def _init_db_unlocked() -> None:
                 cached_at  text not null
             )
         """)
+        # ── Competition registry tables ──────────────────────────────────────
+        conn.execute("""
+            create table if not exists competitions (
+                id                   integer primary key autoincrement,
+                key                  text    not null unique,
+                name                 text    not null,
+                category             text,
+                country              text,
+                tier                 integer not null default 4,
+                unique_tournament_id integer,
+                sofascore_id         text,
+                sportybet_id         text,
+                enabled              integer not null default 1,
+                metadata_json        text    not null default '{}',
+                created_at           text    not null default current_timestamp,
+                updated_at           text    not null default current_timestamp
+            )
+        """)
+        conn.execute("""
+            create table if not exists team_competitions (
+                id                    integer primary key autoincrement,
+                team_key              text    not null,
+                competition_key       text    not null,
+                team_name             text    not null,
+                competition_name      text    not null,
+                matches_played        integer not null default 0,
+                wins                  integer not null default 0,
+                draws                 integer not null default 0,
+                losses                integer not null default 0,
+                goals_for             integer not null default 0,
+                goals_against         integer not null default 0,
+                clean_sheets          integer not null default 0,
+                failed_to_score       integer not null default 0,
+                btts_count            integer not null default 0,
+                over_25_count         integer not null default 0,
+                prediction_correct    integer not null default 0,
+                prediction_total      integer not null default 0,
+                last_match_date       text,
+                form_json             text    not null default '[]',
+                performance_notes_json text   not null default '[]',
+                created_at            text    not null default current_timestamp,
+                updated_at            text    not null default current_timestamp,
+                unique (team_key, competition_key)
+            )
+        """)
+        conn.execute("""
+            create table if not exists team_performance_notes (
+                id              integer primary key autoincrement,
+                team_key        text    not null,
+                competition_key text    not null,
+                match_id        text    not null,
+                note_type       text    not null,
+                title           text    not null,
+                description     text    not null,
+                context_json    text    not null default '{}',
+                severity        text    not null default 'info',
+                created_at      text    not null default current_timestamp
+            )
+        """)
+        conn.execute("create index if not exists idx_competitions_key   on competitions(key)")
+        conn.execute("create index if not exists idx_competitions_tier  on competitions(tier)")
+        conn.execute(
+            "create index if not exists idx_team_competitions_team  on team_competitions(team_key)"
+        )
+        conn.execute(
+            "create index if not exists idx_team_competitions_comp  on team_competitions(competition_key)"
+        )
+        conn.execute(
+            "create index if not exists idx_team_comp_notes_team "
+            "on team_performance_notes(team_key, competition_key)"
+        )
+        conn.execute(
+            "create index if not exists idx_team_comp_notes_match "
+            "on team_performance_notes(match_id)"
+        )
         conn.commit()
 
 

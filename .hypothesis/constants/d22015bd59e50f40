@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\elo.py
+# hypothesis_version: 6.141.1
+
+[0.0, 0.5, 1.0, 1500.0, 100, 400, 'already_recorded', 'away', 'away_elo', 'away_team', 'away_win_probability', 'elo', 'elo_diff', 'home', 'home_elo', 'home_team', 'home_win_probability', 'id', 'match_id', 'model', 'name', 'new_elo', 'old_elo', 'reason', 'score', 'updated']

@@ -582,6 +582,26 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         from app.health_counters import record_health_event
         record_health_event("enriched_prediction", "market_movement_failed", exc)
 
+    # ── Team Watcher Engine signal ────────────────────────────────────────────
+    tw_signal = None
+    has_tw_pick = False
+    try:
+        from app.team_watcher_engine import team_watcher_signal, record_tw_prediction
+        tw_signal = team_watcher_signal(doc)
+        signals.append(tw_signal)
+        has_tw_pick = tw_signal.get("pick_type") not in (None, "no_bet")
+        if has_tw_pick:
+            match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
+            raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+            home_name_raw = raw_sporty.get("home_team") or doc.get("home_team") or ""
+            home_key = "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in str(home_name_raw)).split())
+            record_tw_prediction(home_key, match_id_str, tw_signal)
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "team_watcher_engine_error", exc)
+        tw_signal = None
+        has_tw_pick = False
+
     # ── SofaScore grade signal ────────────────────────────────────────────────
     longshot_signal = _consensus_longshot_value_signal(doc, ensemble, poisson, dixon, elo, rules, odds_movement)
     if longshot_signal:
@@ -730,6 +750,50 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             # Apply regime tier penalty (Tier 4 gets -5)
             tier_penalty = {1: 0, 2: 0, 3: 0, 4: -5}.get(regime.tier, 0)
             cal_conf = min(99, max(1, cal_conf + tier_penalty))
+            # Apply league accuracy adjustment — penalise leagues where the
+            # system underperforms (win_rate < 50%), boost leagues where it
+            # consistently outperforms (win_rate > 65%).  Requires at least 8
+            # graded samples to trust the rate.  The team watcher and league
+            # memory already carry this signal; this makes it explicit and
+            # bidirectional at pick confidence level.
+            #
+            #  win_rate < 50%  →  penalty:  -(50 - wr) / 5   (max -10)
+            #  win_rate > 65%  →  boost:    +(wr - 65) / 5   (max +8)
+            #  50% ≤ wr ≤ 65%  →  no adjustment (neutral band)
+            try:
+                from app.self_learner import get_league_accuracy
+                _league_key = doc.get("tournament") or doc.get("category") or ""
+                if isinstance(_league_key, dict):
+                    _league_key = _league_key.get("name") or ""
+                _lacc = get_league_accuracy(str(_league_key))
+                if _lacc.get("known"):
+                    for _lt in (_lacc.get("by_pick_type") or []):
+                        if _lt.get("pick_type") in (pick.get("type"), "__all__"):
+                            _samples = int(_lt.get("samples") or 0)
+                            _wr = float(_lt.get("win_rate") or 0)  # already in %
+                            _league_adj = 0
+                            if _samples >= 8:
+                                if _wr < 50.0:
+                                    # Underperforming league — reduce confidence
+                                    _league_adj = -round((50.0 - _wr) / 5)
+                                    _league_adj = max(-10, _league_adj)
+                                elif _wr > 65.0:
+                                    # Outperforming league — boost confidence
+                                    _league_adj = round((_wr - 65.0) / 5)
+                                    _league_adj = min(8, _league_adj)
+                            if _league_adj != 0:
+                                cal_conf = min(99, max(1, cal_conf + _league_adj))
+                                pick.setdefault("calibration", {})
+                                pick["calibration"]["league_accuracy_adj"] = _league_adj
+                                pick["calibration"]["league_win_rate"] = _wr
+                                pick["calibration"]["league_samples"] = _samples
+                            break
+            except Exception:
+                pass
+            # Apply TW_Signal confidence impact (bounded ±8)
+            if tw_signal and has_tw_pick:
+                tw_impact = max(-8, min(8, tw_signal.get("confidence_impact", 0)))
+                cal_conf = max(1, min(99, cal_conf + tw_impact))
             pick["confidence"] = cal_conf
 
             raw_stake = stake_multiplier(pick.get("type") or "match_result", raw_conf)
@@ -750,6 +814,10 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "memory_weighting":   memory,
                 "learned_signal_adjustment": pick_learned_adj,
                 "confidence_floor_applied": bool(pick.get("confidence_floor_applied")),
+                # Preserve league accuracy adj computed above (may have been set before this dict)
+                "league_accuracy_adj": (pick.get("calibration") or {}).get("league_accuracy_adj"),
+                "league_win_rate":     (pick.get("calibration") or {}).get("league_win_rate"),
+                "league_samples":      (pick.get("calibration") or {}).get("league_samples"),
             }
             # ── Calibration gap monitoring ─────────────────────────────────────
             try:
@@ -897,6 +965,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             "live_stats_available": live_stats_available,
             "live_data_sources": live_data_sources,
         },
+        "has_team_watcher_pick": has_tw_pick,
+        **({
+            "team_watcher_pick": {
+                "selection": tw_signal.get("selection"),
+                "confidence": tw_signal.get("confidence"),
+                "models_agree": tw_signal.get("models_agree", False),
+            },
+        } if has_tw_pick and tw_signal else {}),
     }
     _finalize_prediction_output(prediction, ensemble)
     return prediction
@@ -4245,7 +4321,7 @@ def _model_signals(
     web = doc.get("web_context") or {}
     snippets = web.get("snippets") or []
     scraped = web.get("scraped") or []
-    grok = web.get("grok_analysis") or {}
+    open_router = web.get("open_router_analysis") or {}
     attempts = web.get("attempts") or []
     web_impact = 0
     if web.get("error") or web.get("disabled"):
@@ -4259,8 +4335,8 @@ def _model_signals(
                 "query": web.get("query"),
                 "snippets": len(snippets),
                 "scraped": len(scraped),
-                "grok_status": grok.get("status"),
-                "grok_evidence": len(grok.get("evidence") or []),
+                "open_router_status": open_router.get("status"),
+                "open_router_evidence": len(open_router.get("evidence") or []),
                 "attempts": attempts,
                 "source_titles": [
                     item.get("title")
@@ -4273,8 +4349,8 @@ def _model_signals(
             "impact": web_impact,
         }
     )
-    # Add sentiment signal from Grok analysis when available
-    sentiment = grok.get("sentiment") or {}
+    # Add sentiment signal from Open Router analysis when available
+    sentiment = open_router.get("sentiment") or {}
     if isinstance(sentiment, dict) and sentiment.get("home_sentiment"):
         sentiment_conf = sentiment.get("confidence", 50)
         home_sent = sentiment.get("home_sentiment", "neutral")
@@ -4299,8 +4375,8 @@ def _model_signals(
                 "role": "supporting_evidence",
             }
         )
-    # Add probability signal from Grok analysis when available
-    probability = grok.get("probability") or {}
+    # Add probability signal from Open Router analysis when available
+    probability = open_router.get("probability") or {}
     if isinstance(probability, dict) and any(
         probability.get(k) is not None for k in ("implied_home_win", "implied_draw", "implied_away_win")
     ):

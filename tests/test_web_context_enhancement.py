@@ -221,13 +221,13 @@ class SearchLeagueSentimentTests(unittest.TestCase):
 class WebContextSignalIntegrationTests(unittest.TestCase):
     """Test that sentiment and probability signals are correctly built in enriched_prediction."""
 
-    def _make_doc(self, grok_analysis):
+    def _make_doc(self, open_router_analysis):
         return {
             "web_context": {
                 "query": "test query",
                 "snippets": [{"title": "Source", "snippet": "Snippet text", "url": "http://x"}],
                 "scraped": [{"url": "http://x", "text": "Content"}],
-                "grok_analysis": grok_analysis,
+                "open_router_analysis": open_router_analysis,
             }
         }
 
@@ -275,7 +275,7 @@ class WebContextSignalIntegrationTests(unittest.TestCase):
         # negative home - positive away = net negative direction
         self.assertLess(sentiment_signals[0]["impact"], 0)
 
-    def test_no_sentiment_when_grok_failed(self):
+    def test_no_sentiment_when_open_router_failed(self):
         from app.enriched_prediction import _model_signals
 
         doc = self._make_doc(
@@ -333,7 +333,7 @@ class WebTextExtractionTests(unittest.TestCase):
 
         doc = {
             "web_context": {
-                "grok_analysis": {
+                "open_router_analysis": {
                     "status": "ok",
                     "summary": "Test summary",
                     "evidence": [],
@@ -364,7 +364,7 @@ class WebTextExtractionTests(unittest.TestCase):
 
         doc = {
             "web_context": {
-                "grok_analysis": {
+                "open_router_analysis": {
                     "status": "ok",
                     "summary": "Test summary",
                     "evidence": [],

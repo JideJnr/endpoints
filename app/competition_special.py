@@ -66,7 +66,7 @@ _CATALOGUE_BY_KEY = {entry["key"]: entry for entry in TOP_30_COMPETITIONS}
 def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
     """Attach competition-special intelligence to any ordinary match document.
 
-    This keeps manual match matching and Grok analysis on the same known-league
+    This keeps manual match matching and Open Router analysis on the same known-league
     footing as fixtures that entered through the dedicated competition lane.
     """
     event = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else {}

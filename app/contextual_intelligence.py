@@ -641,13 +641,13 @@ def _web_text(doc: dict[str, Any]) -> str:
             values.append(str(item.get("text") or item.get("snippet") or ""))
         else:
             values.append(str(item))
-    grok = web.get("grok_analysis") or {}
-    if grok.get("status") == "ok":
-        values.append(str(grok.get("summary") or ""))
-        for item in grok.get("evidence") or []:
+    open_router = web.get("open_router_analysis") or {}
+    if open_router.get("status") == "ok":
+        values.append(str(open_router.get("summary") or ""))
+        for item in open_router.get("evidence") or []:
             if isinstance(item, dict):
                 values.append(str(item.get("claim") or ""))
-        sentiment = grok.get("sentiment") or {}
+        sentiment = open_router.get("sentiment") or {}
         if isinstance(sentiment, dict):
             for key in ("home_sentiment", "away_sentiment", "overall_sentiment"):
                 val = sentiment.get(key)
@@ -656,7 +656,7 @@ def _web_text(doc: dict[str, Any]) -> str:
             conf = sentiment.get("confidence")
             if conf is not None:
                 values.append(f"sentiment_confidence: {conf}")
-        probability = grok.get("probability") or {}
+        probability = open_router.get("probability") or {}
         if isinstance(probability, dict):
             for key in ("implied_home_win", "implied_draw", "implied_away_win"):
                 val = probability.get(key)
