@@ -2480,7 +2480,7 @@ def analyze_match_with_ai(sportybet_id: str):
 @router.get("/matches/{sportybet_id}/ai-analysis-all")
 def get_all_ai_analyses(sportybet_id: str):
     """
-    Return all stored AI analyses for a match: Groq + Ollama (qwen3:8b + deepseek-r1:8b).
+    Return all stored AI analyses for a match: Groq + Ollama (qwen3:8b + openrouter).
     Runs nothing — only returns what has already been computed and persisted.
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)

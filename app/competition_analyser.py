@@ -499,7 +499,7 @@ def run_competition_analysis(
 
     # Model priority
     model = next(
-        (name for name in ("qwen3:1.7b", "deepseek-r1:1.5b") if is_ollama_available(name)),
+        (name for name in ("qwen3:1.7b", "openrouter") if is_ollama_available(name)),
         None,
     )
     if not model:

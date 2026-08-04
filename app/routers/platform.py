@@ -475,7 +475,7 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
                 try:
                     from app.ai_betbuilder import enriched_match_analysis
                     analysis = enriched_match_analysis(match_id, force_refresh=True)
-                    rec = analysis.get("deepseek_recommendation") or analysis.get("recommendation")
+                    rec = analysis.get("openrouter_recommendation") or analysis.get("recommendation")
                     pick_type = (analysis.get("prediction_engine_pick") or {}).get("type") or "match_result"
                     if rec and analysis.get("status") == "success":
                         maya_pick = {**bad, "selection": rec, "type": pick_type}

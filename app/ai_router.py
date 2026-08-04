@@ -62,8 +62,8 @@ OPENROUTER_MODELS: list[dict[str, Any]] = [
     },
 ]
 
-# Call types that prefer deepseek as primary
-_DEEPSEEK_PRIMARY_TASKS = {"reasoning", "h2h", "form", "evidence", "step"}
+# Call types that prefer openrouter as primary
+_OPENROUTER_PRIMARY_TASKS = {"reasoning", "h2h", "form", "evidence", "step"}
 
 
 class AIRouter:
@@ -331,10 +331,10 @@ class AIRouter:
 def parse_json_response(raw: str) -> dict[str, Any]:
     """
     Extract a JSON object from a model response.
-    Strips </think>...</think> blocks (DeepSeek-R1) and markdown fences.
+    Strips </think>...</think> blocks (OpenRouter) and markdown fences.
     Raises json.JSONDecodeError if no valid JSON found.
     """
-    # Strip DeepSeek-R1 chain-of-thought blocks
+    # Strip OpenRouter chain-of-thought blocks
     text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     # Strip markdown fences
     if "```" in text:

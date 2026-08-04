@@ -14,7 +14,7 @@ DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     AI supervisor with memory-aware reasoning.
-    Routes through AIRouter (qwen3 → deepseek → groq) then falls back to
+    Routes through AIRouter (qwen3 → openrouter → groq) then falls back to
     deterministic rules when no model is available.
     """
     safe_detail = detail if isinstance(detail, dict) else {}
@@ -159,7 +159,7 @@ def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] |
 
 
 def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Use AIRouter for supervisor review: qwen3 → deepseek → groq."""
+    """Use AIRouter for supervisor review: qwen3 → openrouter → groq."""
     from app.ai_router import get_router, parse_json_safe
     try:
         messages = _review_messages(payload)

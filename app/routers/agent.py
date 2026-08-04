@@ -430,7 +430,7 @@ def get_groq_status():
 # ── Ollama local LLM endpoints ────────────────────────────────────────────────
 # Requires Ollama running locally. Pull models:
 #   ollama pull qwen3:8b
-#   ollama pull deepseek-r1:8b
+#   ollama pull openrouter
 
 @router.post("/ollama/predict")
 def post_ollama_predictions(
@@ -440,7 +440,7 @@ def post_ollama_predictions(
 ):
     """
     Run Ollama local LLM predictions over today's enriched matches.
-    Supported models: qwen3:8b (Best Overall), deepseek-r1:8b (Best Reasoning).
+    Supported models: qwen3:8b (Best Overall), openrouter (Best Reasoning).
     Requires Ollama running locally.
     """
     try:
