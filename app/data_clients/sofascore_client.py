@@ -26,6 +26,7 @@ SOFASCORE_STANDINGS_URL = "https://www.sofascore.com/api/v1/tournament/{tourname
 SOFASCORE_H2H_URL = "https://www.sofascore.com/api/v1/event/{event_id}/h2h"
 SOFASCORE_STATISTICS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/statistics"
 SOFASCORE_INCIDENTS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/incidents"
+SOFASCORE_GRAPH_URL = "https://www.sofascore.com/api/v1/event/{event_id}/graph"
 SOFASCORE_LINEUPS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/lineups"
 SOFASCORE_PREGAME_FORM_URL = "https://www.sofascore.com/api/v1/event/{event_id}/pregame-form"
 SOFASCORE_MANAGERS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/managers"
@@ -577,6 +578,7 @@ def fetch_event_detail(event: dict) -> dict:
         "h2h":                   (fetch_h2h, event_id),
         "statistics":            (fetch_event_statistics, event_id),
         "incidents":             (fetch_event_incidents, event_id),
+        "graph":                 (fetch_event_graph, event_id),
         "lineups":               (fetch_event_lineups, event_id),
         "pregame_form":          (fetch_pregame_form, event_id),
         "managers":              (fetch_managers, event_id),
@@ -603,6 +605,7 @@ def fetch_event_detail_live_refresh(event_id: int, existing_detail: dict) -> dic
     Only fetches the three endpoints that change during a live match:
       - statistics  (possession, shots, xG, corners, attacks)
       - incidents   (goals, cards, substitutions)
+      - graph       (attack/goal momentum, when SofaScore returns it)
       - lineups     (current XI + substitutions made)
 
     All static data (H2H, managers, team history, featured players, standings,
@@ -622,6 +625,7 @@ def fetch_event_detail_live_refresh(event_id: int, existing_detail: dict) -> dic
 
     live_stats = safe(fetch_event_statistics, event_id)
     live_incidents = safe(fetch_event_incidents, event_id)
+    live_graph = safe(fetch_event_graph, event_id)
     live_lineups = safe(fetch_event_lineups, event_id)
 
     # Merge: start from existing detail, overlay only the live-changing fields
@@ -630,6 +634,8 @@ def fetch_event_detail_live_refresh(event_id: int, existing_detail: dict) -> dic
         updated["statistics"] = live_stats
     if live_incidents is not None:
         updated["incidents"] = live_incidents
+    if live_graph is not None:
+        updated["graph"] = live_graph
     if live_lineups is not None:
         updated["lineups"] = live_lineups
 
@@ -703,6 +709,11 @@ def fetch_event_statistics(event_id: int) -> list[dict]:
 def fetch_event_incidents(event_id: int) -> list[dict]:
     url = SOFASCORE_INCIDENTS_URL.format(event_id=event_id)
     return _get(url).json().get("incidents", [])
+
+
+def fetch_event_graph(event_id: int) -> dict:
+    url = SOFASCORE_GRAPH_URL.format(event_id=event_id)
+    return _get(url).json()
 
 
 def fetch_event_lineups(event_id: int) -> dict:

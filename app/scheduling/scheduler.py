@@ -121,7 +121,7 @@ logging.getLogger("apscheduler.scheduler").addFilter(_ApschedulerShutdownNoiseFi
 
 def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
     """Fast: fetch upcoming matches from SportyBet and dump into buffer."""
-    from app.market import snapshot_odds
+    from app.market.market import snapshot_odds
     from app.buffer import purge_ghost_matches
 
     if is_shutting_down():
@@ -165,7 +165,7 @@ def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
 def job_ingest_live(limit: int = 200) -> dict[str, Any]:
     """Fast: fetch live matches, add new ones to buffer, patch scores on existing ones."""
     from app.league_memory import observe_matches
-    from app.market import snapshot_odds
+    from app.market.market import snapshot_odds
 
     if is_shutting_down():
         return {"status": "shutdown", "job": "ingest_live"}
@@ -574,10 +574,10 @@ def job_unified_upcoming() -> dict[str, Any]:
     from app.sportybet_client import fetch_upcoming_matches_post
     from app.sofascore_client import fetch_all_scheduled_events, is_usable_event_for_mode, search_events
     from app.buffer import ingest_matches, get_unenriched_batch, store_enriched, get_buffered_match
-    from app.buffer import _extract_1x2
+    from app.storage.buffer import _extract_1x2
     from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
     from app.sofascore_client import fetch_event_detail
-    from app.market import snapshot_odds
+    from app.market.market import snapshot_odds
     from app.time_context import match_time_context
     from app.match_state import classify_match_state
     from app.prediction_flow import apply_prediction_state
@@ -868,12 +868,13 @@ def job_unified_live() -> dict[str, Any]:
     from app.sportybet_client import fetch_live_matches_post
     from app.buffer import (
         ingest_matches, patch_live_scores, get_unenriched_batch,
-        store_enriched, get_buffered_match, _extract_1x2,
+        store_enriched, get_buffered_match,
     )
+    from app.storage.buffer import _extract_1x2
     from app.sofascore_client import fetch_live_events, fetch_event_detail, fetch_event_detail_live_refresh
     from app.enrichment import _fuzzy_match, _is_junk, FUZZY_THRESHOLD
     from app.league_memory import observe_matches
-    from app.market import snapshot_odds
+    from app.market.market import snapshot_odds
     from app.match_state import classify_match_state
     from app.time_context import match_time_context
     from app.prediction_flow import apply_prediction_state

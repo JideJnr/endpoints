@@ -116,11 +116,11 @@ def _existing_schema_can_be_trusted() -> bool:
                 select count(*)
                 from sqlite_master
                 where type = 'table'
-                  and name in ('prediction_history', 'match_buffer', 'job_runs', 'team_behaviour_profiles', 'user_behavior')
+                  and name in ('prediction_history', 'match_buffer', 'job_runs', 'team_behaviour_profiles', 'user_behavior', 'matches')
                 """
             ).fetchone()
         # Require ALL core tables to exist, not just 3
-        return int(row[0] if row else 0) >= 5
+        return int(row[0] if row else 0) >= 6
     except sqlite3.OperationalError as exc:
         if _is_sqlite_lock(exc):
             return True
@@ -141,6 +141,18 @@ def _ensure_prediction_history_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "prediction_history", "audit_json", "text not null default '{}'")
     _ensure_column(conn, "prediction_history", "grading_reason_json", "text not null default '{}'")
     _ensure_column(conn, "prediction_history", "models_json", "text not null default '{}'")
+
+
+def _ensure_match_fact_columns(conn: sqlite3.Connection) -> None:
+    table = conn.execute("select 1 from sqlite_master where type = 'table' and name = 'matches'").fetchone()
+    if not table:
+        return
+    _ensure_column(conn, "matches", "half_time_home_goals", "integer")
+    _ensure_column(conn, "matches", "half_time_away_goals", "integer")
+    _ensure_column(conn, "matches", "goal_times_json", "text not null default '[]'")
+    _ensure_column(conn, "matches", "average_goal_interval_minutes", "real")
+    _ensure_column(conn, "matches", "live_statistics_json", "text not null default '{}'")
+    _ensure_column(conn, "matches", "provider_capabilities_json", "text not null default '{}'")
 
 
 def _init_db_unlocked() -> None:
@@ -502,12 +514,7 @@ def _init_db_unlocked() -> None:
         )
         _ensure_column(conn, "matches", "match_fingerprint", "text")
         _ensure_column(conn, "matches", "start_time", "text")
-        _ensure_column(conn, "matches", "half_time_home_goals", "integer")
-        _ensure_column(conn, "matches", "half_time_away_goals", "integer")
-        _ensure_column(conn, "matches", "goal_times_json", "text not null default '[]'")
-        _ensure_column(conn, "matches", "average_goal_interval_minutes", "real")
-        _ensure_column(conn, "matches", "live_statistics_json", "text not null default '{}'")
-        _ensure_column(conn, "matches", "provider_capabilities_json", "text not null default '{}'")
+        _ensure_match_fact_columns(conn)
         conn.execute("create index if not exists idx_matches_league on matches(league_key)")
         conn.execute("create index if not exists idx_matches_last_seen on matches(last_seen_at)")
         conn.execute("create index if not exists idx_matches_fingerprint on matches(match_fingerprint)")
@@ -664,6 +671,7 @@ def _init_db() -> None:
             with db_conn(timeout=30) as conn:
                 conn.execute("pragma busy_timeout = 30000")
                 _ensure_prediction_history_columns(conn)
+                _ensure_match_fact_columns(conn)
             _DB_SCHEMA_READY = True
             return
         try:
@@ -676,4 +684,3 @@ def _init_db() -> None:
                 # next call if this process has not completed initialization yet.
                 return
             raise
-

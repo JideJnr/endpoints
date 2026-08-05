@@ -38,7 +38,7 @@ from typing import Any
 from app.db import db_conn
 from app.db import DB_PATH
 from app.league_memory import _init_db
-from app.storage.league_memory import _get_passed_models
+from app.storage.league_memory._helpers import _get_passed_models
 
 UNIQUE_GRADED_HISTORY = """
     select *

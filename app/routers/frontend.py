@@ -255,7 +255,7 @@ def post_sportradar_enrich_all(limit: int = Query(default=500, ge=1, le=2000)):
 @router.get("/matches/{sportybet_id}/sofascore-candidates")
 def get_sofascore_candidates(sportybet_id: str):
     """Return the full SofaScore pool for this SportyBet match state."""
-    from app.buffer import _is_ghost_match, _sofascore_date_candidates
+    from app.storage.buffer import _is_ghost_match, _sofascore_date_candidates
     from app.sofascore_client import fetch_all_scheduled_events, fetch_live_events, is_usable_event_for_mode
 
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
@@ -283,7 +283,7 @@ def get_sofascore_candidates(sportybet_id: str):
     if not live:
         sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
         scan_dates = _sofascore_date_candidates(sporty, target_date)
-        from app.buffer import _with_search_fallback_candidates
+        from app.storage.buffer import _with_search_fallback_candidates
 
         search_filtered = _with_search_fallback_candidates(sporty, [], live=False)
         search_pool = sorted(
@@ -335,7 +335,7 @@ def get_sofascore_candidates(sportybet_id: str):
             continue
         filtered.append(event)
     if not live:
-        from app.buffer import _with_search_fallback_candidates
+        from app.storage.buffer import _with_search_fallback_candidates
 
         sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
         filtered = _with_search_fallback_candidates(sporty, filtered, live=False)

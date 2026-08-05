@@ -1086,6 +1086,7 @@ def _sofa_live_data(detail: dict[str, Any] | None) -> dict[str, Any]:
         "statistics": statistics,
         "normalized_statistics": normalize_live_statistics(statistics),
         "incidents": incidents,
+        "graph": detail.get("graph") or detail.get("momentum") or {},
         "score": detail.get("score") or detail.get("homeScore") or {},
         "status": detail.get("status"),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
