@@ -35,7 +35,7 @@ GET  /matches/upcoming-enriched-predicted — upcoming with enrichment + predict
 GET  /matches/{id}/similar             — similar historical matches (cached 5 min)
 POST /matches/{id}/enrich              — trigger enrichment for one match
 POST /matches/{id}/predict             — trigger prediction for one match
-POST /matches/{id}/ai-analysis         — run DeepSeek AI analysis for one match
+POST /matches/{id}/ai-analysis         — run OpenRouter AI analysis for one match
 POST /matches/{id}/sofascore-match     — manually attach a SofaScore event
 GET  /matches/{id}/sofascore-candidates — SofaScore candidate events for matching
 ```

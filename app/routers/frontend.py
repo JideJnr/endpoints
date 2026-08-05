@@ -17,7 +17,7 @@ from app.buffer import (
     store_enriched,
 )
 from app.league_memory import list_prediction_history
-from app.market import get_movement
+from app.market.market import get_movement
 from app.match_state import classify_match_state
 from app.scheduler import scheduler_status
 

@@ -32,7 +32,7 @@ from app.dixon_coles import run_dixon_coles
 from app.elo import elo_prediction
 from app.ensemble import ensemble_prediction
 from app.kelly import kelly_fraction
-from app.market import get_all_movements, get_movement
+from app.market.market import get_all_movements, get_movement
 from app.poisson import run_poisson
 from app.prediction_agent import predict_sofascore_event
 from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_team_history

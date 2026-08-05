@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from app.prediction_agent import _common_opponent_edge
 from app.web_context import _analyse_pages_with_ai
 
 
@@ -36,14 +38,10 @@ class OpponentTableContextTests(unittest.TestCase):
 
     def test_openrouter_reader_is_explicitly_unavailable_without_key(self):
         # No network call is attempted unless an OPENROUTER_API_KEY is configured.
-        import os
-
-        old_key = os.environ.pop("OPENROUTER_API_KEY", None)
-        try:
+        mock_settings = unittest.mock.Mock()
+        mock_settings.openrouter_api_key = ""
+        with patch("app.web_context.get_settings", return_value=mock_settings):
             result = _analyse_pages_with_ai("Home vs Away", [{"url": "https://example.test", "text": "Preview"}], "Home", "Away")
-        finally:
-            if old_key is not None:
-                os.environ["OPENROUTER_API_KEY"] = old_key
         self.assertEqual(result["status"], "unavailable")
 
 
