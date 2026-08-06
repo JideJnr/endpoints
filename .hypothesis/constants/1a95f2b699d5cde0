@@ -1,4 +1,0 @@
-# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\confidence_calibrator.py
-# hypothesis_version: 6.141.1
-
-[0.4, 0.5, 0.65, 0.75, 1.0, 1.5, 2.0, 100, '80%+', 'adjusted_confidence', 'alert', 'band', 'band_low', 'bands_updated', 'calibrated', 'caution', 'double_down', 'expected_confidence', 'gap', 'gap_severity', 'gaps', 'historical_win_rate', 'last_updated', 'losses', 'match_result', 'moderate', 'moderate_gaps', 'none', 'ok', 'pick_type', 'probability_source', 'proceed', 'raw_confidence', 'recommendation', 'reduce_confidence', 'samples', 'severe', 'severe_gaps', 'severity', 'status', 'total_bands', 'win_rate', 'wins']

@@ -1,4 +1,0 @@
-# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\competition_registry.py
-# hypothesis_version: 6.141.1
-
-[' and enabled = ?', ' and tier = ?', ' order by name asc', ', ', 'category', 'competition_key', 'competition_name', 'country', 'draw', 'draws', 'goals_against', 'goals_for', 'info', 'key', 'last_match_date = ?', 'loss', 'losses', 'matches_played', 'name', 'sofascore_id', 'sportybet_id', 'team_key', 'team_name', 'tier', 'unique_tournament_id', 'updated_at = ?', 'win', 'wins']

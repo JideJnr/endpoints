@@ -18,6 +18,7 @@ from app.match_state import classify_match_state
 from app.poisson import run_poisson
 from app.prediction_agent import predict_sofascore_event, predict_sporty_match
 from app.risk_manager import apply_risk_controls
+from app.research.research_filter import evaluate_pick
 from app.season_stage import detect_season_stage
 from app.time_context import match_time_context
 from app.config import get_settings
@@ -3281,6 +3282,21 @@ def _curate_picks(
         adjusted_confidence = min(adjusted_confidence, int(signal_policy.get("confidence_cap") or adjusted_confidence))
         if adjusted_confidence < 55:
             continue
+
+        # ── Research trust boost (ranking-only, does not modify published confidence) ──
+        research_trust_boost = 0
+        try:
+            research_result = evaluate_pick(pick)
+            if not research_result.get("blocked"):
+                research_trust_boost = int(research_result.get("trust_boost") or 0)
+                if research_trust_boost > 0:
+                    evidence.setdefault("research_boosted", True)
+                    evidence["research_trust_boosts"] = research_result.get("evidence", {}).get("research_trust_boosts", [])
+        except Exception:
+            pass
+
+        ranking_confidence = min(88, adjusted_confidence + research_trust_boost)
+
         evidence = pick.get("evidence") if isinstance(pick.get("evidence"), dict) else {}
         evidence["score_result_memory"] = score_memory
         evidence["signal_policy"] = signal_policy
@@ -3295,7 +3311,7 @@ def _curate_picks(
             "role_learning": role_memory,
             "score_result_memory": score_memory,
             "signal_policy": signal_policy,
-            "ranking_confidence": adjusted_confidence,
+            "ranking_confidence": ranking_confidence,
         })
 
     if not candidates and no_bet:

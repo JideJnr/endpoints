@@ -1,0 +1,27 @@
+"""Research-driven predictor filter — data-driven rule engine."""
+
+from app.research.research_filter import (
+    BLOCK_LEAGUE_LOSS_RATE,
+    BLOCK_COUNTRY_LOSS_RATE,
+    CAUTION_COUNTRY_LOSS_RATE,
+    CAUTION_LEAGUE_LOSS_RATE,
+    TRUST_COUNTRY_WIN_RATE,
+    MIN_LEAGUE_SAMPLES,
+    MIN_COUNTRY_SAMPLES,
+    MIN_PICK_TYPE_SAMPLES,
+    MIN_SELECTION_SAMPLES,
+    MIN_CONFIDENCE_BAND_SAMPLES,
+    MIN_SOURCE_SAMPLES,
+    MIN_ODDS_BUCKET_SAMPLES,
+    MIN_FAVORITE_SIDE_SAMPLES,
+    CAUTION_THRESHOLD,
+    TRUST_BOOST_CAP,
+    PUBLISHED_CONFIDENCE_CAP,
+    DYNAMIC_CACHE_TTL,
+    evaluate_pick,
+    _research_filter_candidate,
+    get_research_context_for_prompt,
+    _load_dynamic_rules,
+    _get_dynamic_rules,
+    _normalise_league_key,
+)

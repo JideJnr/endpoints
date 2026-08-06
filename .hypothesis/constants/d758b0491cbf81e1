@@ -1,4 +1,0 @@
-# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\validation_gate.py
-# hypothesis_version: 6.141.1
-
-[0.0, 0.6, 12.0, 100, 'allowed', 'and league_name = ?', 'avg_clv', 'avg_clv_percent', 'away_win', 'band_low', 'blocked', 'bootstrap', 'bootstrap_mode', 'bootstrap_reasons', 'both_teams_to_score', 'btts', 'calibration', 'clv', 'clv_entries', 'competition', 'confidence', 'draw', 'drawdown', 'empty', 'error', 'gg', 'goal', 'goals', 'home_win', 'league', 'league_name', 'loss', 'loss_streak', 'market', 'match_result', 'metrics', 'missing_table', 'name', 'negative_or_flat_clv', 'no_bet', 'not_applicable', 'over', 'passed', 'pick_type', 'positive_clv_rate', 'positive_rate', 'prediction_history', 'reasons', 'recent_loss_rate', 'result', 'samples', 'source', 'status', 'tournament', 'type', 'under', 'win_rate']

@@ -1,4 +1,0 @@
-# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\config.py
-# hypothesis_version: 6.141.1
-
-[120, 1500, '"', '#', "'", ',', '.env', '0.01', '1', '12', '35', '36', '=', 'HF_TOKEN', 'MONGODB_DB', 'MONGODB_URI', 'OPENROUTER_API_KEY', 'OPENROUTER_BASE_URL', 'OPENROUTER_MODEL', 'PREDICTX_AI_MODEL', 'PREDICTX_AI_PROVIDER', 'PREDICTX_APP_NAME', 'PREDICTX_DB_PATH', 'PREDICTX_ENV', 'PREDICTX_HF_MODEL', 'PREDICTX_HF_URL', 'PREDICTX_OLLAMA_URL', 'ai', 'app_name', 'backends', 'configured', 'cors_origins', 'data', 'database', 'database_path', 'development', 'duckduckgo', 'enabled', 'environment', 'hf_model', 'hf_token_present', 'lean', 'llama3.2:3b', 'local_only', 'max_results', 'mongodb', 'ollama_model', 'ollama_url', 'on', 'openrouter', 'openrouter/free', 'pipeline_enabled', 'predictx', 'provider', 'pruning_disabled', 'scrape_max_chars', 'storage', 'timeout_seconds', 'true', 'utf-8', 'web_search', 'yes']

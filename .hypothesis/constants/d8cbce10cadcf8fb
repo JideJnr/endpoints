@@ -1,4 +1,0 @@
-# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\ensemble.py
-# hypothesis_version: 6.141.1
-
-[0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 1.0, 1.5, 33.3, 33.4, 100, 'Draw', '_', 'away', 'away_win', 'away_win_probability', 'confidence', 'default', 'diversity_score', 'dixon_coles', 'draw', 'elo', 'ensemble', 'entropy', 'groq', 'home', 'home_win', 'home_win_probability', 'learned', 'limited_signal', 'majority_outcome', 'model', 'models_used', 'none', 'opposing_models', 'outcome_std', 'partial', 'poisson', 'prediction', 'probabilities', 'rules', 'rules_only', 'supporting_models', 'weights_source', 'weights_used']

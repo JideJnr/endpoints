@@ -19,6 +19,7 @@ from typing import Any
 
 from app.league_memory import record_prediction
 from app.season_stage import detect_season_stage
+from app.research.research_filter import get_research_context_for_prompt
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -196,6 +197,15 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         if parts:
             probability_str = " | ".join(parts)[:300]
 
+    # Inject research context
+    research_section = ""
+    try:
+        research_block = get_research_context_for_prompt()
+        if research_block:
+            research_section = f"\n## RESEARCH_STATS (live empirical patterns)\n{research_block}\n"
+    except Exception:
+        pass
+
     return (
         f"{doc.get('sportybet_name') or doc.get('name')} | "
         f"{doc.get('tournament')} ({doc.get('category')}) | "
@@ -213,8 +223,10 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         f"WEB: {web_str}\n"
         f"OPEN_ROUTER_WEB_RESEARCH: {open_router_web_str}\n"
         f"OPEN_ROUTER_SENTIMENT: {sentiment_str}\n"
-        f"OPEN_ROUTER_PROBABILITY: {probability_str}\n"
+        f"OPEN_ROUTER_PROBABILITY: {probability_str}"
+        f"{research_section}"
         f"\nOutput prediction as JSON."
+    )
     )
 
 

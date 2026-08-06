@@ -57,6 +57,7 @@ SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "live_priority_toggle": {"label": "Live priority lane", "default": 60, "min": 30, "max": 300, "pipeline_id": "live_priority_mode"},
     "unified_upcoming": {"label": "Unified upcoming pipeline", "default": 300, "min": 60, "max": 600, "pipeline_id": "unified_upcoming"},
     "unified_live": {"label": "Unified live pipeline", "default": 60, "min": 30, "max": 300, "pipeline_id": "unified_live"},
+    "regenerate_research_stats": {"label": "Research stats regeneration", "default": 86400, "min": 3600, "max": 86400 * 7, "pipeline_id": None},
 }
 _DB_WRITE_JOB_IDS = {
     "ai_prediction_queue",
@@ -78,6 +79,7 @@ _DB_WRITE_JOB_IDS = {
     "sofa_pipeline",
     "unified_upcoming",
     "unified_live",
+    "regenerate_research_stats",
 }
 _JOB_STALE_SECONDS = {
     "ai_prediction_queue": 600,
@@ -1178,6 +1180,111 @@ def job_grade_predictions() -> dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
+def job_regenerate_research_stats() -> dict[str, Any]:
+    """Regenerate research_stats table from prediction_history.
+
+    Aggregates win/loss data across multiple dimensions and writes
+    summary rows with minimum sample gates.  Guarded by a total
+    wins+losses threshold of 50.
+    """
+    import time as _time
+
+    from app.research.research_filter import (
+        MIN_LEAGUE_SAMPLES,
+        MIN_COUNTRY_SAMPLES,
+        MIN_PICK_TYPE_SAMPLES,
+    )
+
+    start = _time.time()
+    try:
+        from app.db import db_conn
+
+        with db_conn() as conn:
+            total = conn.execute(
+                "SELECT count(*) as cnt FROM prediction_history WHERE result IN ('win', 'loss')"
+            ).fetchone()
+            total_graded = int(total[0]) if total else 0
+
+        if total_graded < 50:
+            print(f"[scheduler] research_stats_job:insufficient_data total_graded={total_graded}")
+            return {"status": "skipped", "reason": "insufficient_data", "total_graded": total_graded}
+
+        dimensions = [
+            "pick_type",
+            "selection",
+            "confidence_band",
+            "country",
+            "league",
+            "source",
+            "odds_bucket_home",
+            "odds_bucket_draw",
+            "odds_bucket_away",
+            "odds_bucket_fav",
+            "favorite_side",
+        ]
+
+        rows_written = 0
+        rows_skipped = 0
+
+        with db_conn() as conn:
+            for dim in dimensions:
+                min_samples = MIN_LEAGUE_SAMPLES if dim == "league" else MIN_COUNTRY_SAMPLES if dim == "country" else MIN_PICK_TYPE_SAMPLES
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        {dim} as key,
+                        sum(case when result = 'win' then 1 else 0 end) as wins,
+                        sum(case when result = 'loss' then 1 else 0 end) as losses,
+                        count(*) as total
+                    FROM prediction_history
+                    WHERE result IN ('win', 'loss')
+                      AND {dim} IS NOT NULL
+                      AND {dim} != ''
+                    GROUP BY {dim}
+                    HAVING count(*) >= ?
+                    """,
+                    (min_samples,),
+                ).fetchall()
+
+                for row in rows:
+                    key = str(row["key"] or "")
+                    wins = int(row["wins"] or 0)
+                    losses = int(row["losses"] or 0)
+                    total = int(row["total"] or 0)
+                    win_rate = wins / total if total > 0 else 0.0
+                    loss_rate = losses / total if total > 0 else 0.0
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO research_stats
+                            (dimension, key, wins, losses, total, win_rate, loss_rate, min_samples, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                        """,
+                        (dim, key, wins, losses, total, round(win_rate, 6), round(loss_rate, 6), min_samples),
+                    )
+                    rows_written += 1
+
+                rows_skipped += len([r for r in rows if int(r["total"]) < min_samples])
+
+            conn.commit()
+
+        elapsed = round(_time.time() - start, 3)
+        print(
+            f"[scheduler] regenerate_research_stats: rows_written={rows_written} "
+            f"rows_skipped={rows_skipped} duration={elapsed}s"
+        )
+        return {
+            "status": "ok",
+            "job": "regenerate_research_stats",
+            "rows_written": rows_written,
+            "rows_skipped": rows_skipped,
+            "total_graded": total_graded,
+            "duration_seconds": elapsed,
+        }
+    except Exception as exc:
+        print(f"[scheduler] regenerate_research_stats failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+
 def job_grade_overdue_predictions() -> dict[str, Any]:
     """Frequent safety-net grader using SportyBet results first, SofaScore fallback second."""
     try:
@@ -1599,6 +1706,18 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=900,
+    )
+
+    # regenerate research_stats — daily at 03:00 server time
+    scheduler.add_job(
+        _safe(job_regenerate_research_stats),
+        IntervalTrigger(days=1),
+        id="regenerate_research_stats",
+        name="Research stats regeneration",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
 
     # prune old MongoDB finished matches — weekly

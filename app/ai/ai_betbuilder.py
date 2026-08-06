@@ -9,6 +9,7 @@ from typing import Any
 
 from app.buffer import get_buffered_match
 from app.league_memory import list_prediction_history
+from app.research.research_filter import _research_filter_candidate, _normalise_league_key, _get_dynamic_rules
 
 
 _ANALYSIS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -301,6 +302,47 @@ def synthesize_sure_picks(
 
         conviction = round(base_conviction + learned_boost + league_acc_boost, 2)
 
+        # ── Research conviction adjustment ──────────────────────────
+        research_conviction_adj = 0
+        selection = item.get("groq_recommendation") or engine_pick.get("selection") or ""
+        sel_lower = str(selection).lower()
+        country_name = str(item.get("country_name") or "").lower().strip()
+        source = str(item.get("source") or "")
+
+        # Home or Away selection → +4
+        if "home or away" in sel_lower or sel_lower == "home_or_away":
+            research_conviction_adj += 4
+        # Away or Draw with groq_conf >= 72 → -3
+        if "away or draw" in sel_lower or sel_lower == "away_or_draw":
+            if groq_conf >= 72:
+                research_conviction_adj -= 3
+        # Country in dynamic trust countries → +3
+        if country_name in _get_dynamic_rules()["trust_countries"]:
+            research_conviction_adj += 3
+        # Source sportybet_market_signal → +5
+        if source == "sportybet_market_signal":
+            research_conviction_adj += 5
+
+        # ── Optimal profile score (0-6) ─────────────────────────────
+        optimal_profile_score = 0
+        if "home or away" in sel_lower or sel_lower == "home_or_away":
+            optimal_profile_score += 1
+        if groq_conf >= 72:
+            optimal_profile_score += 1
+        if 1.50 <= odds <= 1.99:
+            optimal_profile_score += 1
+        if country_name in _get_dynamic_rules()["trust_countries"]:
+            optimal_profile_score += 1
+        if source == "sportybet_market_signal":
+            optimal_profile_score += 1
+        if "home or away" in sel_lower or sel_lower == "home_or_away":
+            optimal_profile_score += 1  # second point for home-away being strongest
+
+        # Cap optimal_profile_score at 6
+        optimal_profile_score = min(optimal_profile_score, 6)
+
+        adjusted_conviction = round(conviction + research_conviction_adj, 2)
+
         ranked.append({
             "match_id": item.get("match_id") or item.get("sportybet_id"),
             "match": item.get("match_name") or item.get("match"),
@@ -313,7 +355,10 @@ def synthesize_sure_picks(
             "confidence": groq_conf,
             "odds": odds,
             "estimated_odds": odds,
-            "conviction_score": conviction,
+            "conviction_score": adjusted_conviction,
+            "research_conviction_adj": research_conviction_adj,
+            "optimal_profile_score": optimal_profile_score,
+            "optimal_profile": optimal_profile_score >= 4,
             "learning": learning,
             "learned_probabilities": learned_prob,
             "league_accuracy_boost": round(league_acc_boost, 2),
@@ -322,7 +367,7 @@ def synthesize_sure_picks(
             "source": "groq",
             "synthesis_reasoning": "",
         })
-    ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"], item["groq_confidence"]), reverse=True)
+    ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"] + item.get("optimal_profile_score", 0) * 0.5, item["groq_confidence"]), reverse=True)
 
     try:
         model_plan = _run_groq_synthesis(ranked, target_odds, max_total_odds)
@@ -399,6 +444,17 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
         pick_odds = _pick_decimal_odds(pick)
         if pick_odds < 1.30:
             continue
+        # ── Research filter candidate check ──────────────────────────────────
+        try:
+            country = str(row.get("country_name") or row.get("category") or "").lower().strip()
+            league_key = str(row.get("league_name") or "").lower().strip()
+            if not league_key and row.get("tournament"):
+                league_key = _normalise_league_key(str(row["tournament"]))
+            odds_profile = _extract_betbuilder_odds_profile(row)
+            if not _research_filter_candidate(pick, odds_profile, country, league_key):
+                continue
+        except Exception:
+            pass
         # ── SportyBet availability check ──────────────────────────────────────
         # Verify the match is still in the active buffer with live markets before
         # including it as a Maya candidate.  Matches that were archived or had
@@ -665,3 +721,36 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(round(float(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _extract_betbuilder_odds_profile(row: dict[str, Any]) -> dict[str, float]:
+    """Extract a normalized odds profile from a betbuilder buffer doc or prediction row."""
+    odds: dict[str, float] = {}
+    # Try signals_json first (contains odds_profile)
+    signals_json = row.get("signals_json") or row.get("signals") or "[]"
+    if isinstance(signals_json, str):
+        try:
+            signals = json.loads(signals_json)
+        except (json.JSONDecodeError, TypeError):
+            signals = []
+    else:
+        signals = signals_json or []
+    for sig in signals:
+        if isinstance(sig, dict) and sig.get("name") == "odds_profile":
+            profile = sig.get("value") or {}
+            if isinstance(profile, dict):
+                odds.update(profile)
+                break
+    # Fallback: try odds_profile directly on the row
+    if not odds:
+        direct = row.get("odds_profile") or {}
+        if isinstance(direct, dict):
+            odds.update(direct)
+    # Normalize keys
+    normalized: dict[str, float] = {}
+    for k, v in odds.items():
+        try:
+            normalized[k] = float(v)
+        except (TypeError, ValueError):
+            pass
+    return normalized
