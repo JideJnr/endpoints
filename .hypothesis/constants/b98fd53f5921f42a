@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\data_clients\sofascore_grades.py
+# hypothesis_version: 6.141.1
+
+[-0.3, 0.0, 0.3, 0.5, 1.0, 6.5, 10.0, 'Unknown', 'available', 'avg_rating', 'away', 'awayTeam', 'away_avg_rating', 'away_team', 'away_top_player', 'away_trend', 'away_weak_link', 'declining', 'delta', 'grades', 'home', 'homeTeam', 'home_avg_rating', 'home_team', 'home_top_player', 'home_trend', 'home_weak_link', 'id', 'impact', 'improving', 'known', 'lineups', 'name', 'player', 'players', 'players_rated', 'position', 'pregame_form', 'rating', 'rating_diff', 'ratings', 'samples', 'shortName', 'sofascoreRating', 'sofascore_grade', 'sofascore_rating', 'source', 'stable', 'statistics', 'stored', 'team_id', 'team_name', 'top_performer', 'top_rating', 'trend', 'value', 'weak_link', 'weak_rating']

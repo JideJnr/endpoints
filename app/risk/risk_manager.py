@@ -8,7 +8,6 @@ from app.config import get_settings
 from app.market_intent import classify_market_intent
 from app.risk_learner import get_learned_risk_controls, get_learned_risk_controls_for_pick, LearnedRiskControls
 from app.validation_gate import evaluate_promotion_gate
-from app.research.research_filter import evaluate_pick
 
 
 # ── Static Fallbacks (used when learned data is insufficient) ──────────────────
@@ -78,37 +77,6 @@ def apply_risk_controls(
                 })
         except Exception:
             pass  # Fall back to static rules if learner fails
-
-    # ── Research filter block ──────────────────────────────────────────
-    try:
-        research_results = []
-        for idx, pick in enumerate(picks):
-            if pick.get("type") == "no_bet":
-                continue
-            try:
-                result = evaluate_pick(pick)
-                if result.get("blocked"):
-                    pick["type"] = "no_bet"
-                    pick["selection"] = "Avoid game"
-                    pick["reason"] = result.get("reason") or "research_filter_blocked"
-                    pick["confidence"] = 50
-                    report["actions"].append({
-                        "type": "research_filter_block",
-                        "pick_index": idx,
-                        "selection": pick.get("selection"),
-                        "reason": result.get("reason"),
-                    })
-                else:
-                    existing_evidence = pick.get("evidence") if isinstance(pick.get("evidence"), dict) else {}
-                    if result.get("evidence"):
-                        existing_evidence.update(result["evidence"])
-                        pick["evidence"] = existing_evidence
-                research_results.append(result)
-            except Exception:
-                pass
-        report["research_filter"] = research_results
-    except Exception:
-        pass
 
     for idx, pick in enumerate(picks):
         if pick.get("type") == "no_bet":

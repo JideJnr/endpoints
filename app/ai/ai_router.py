@@ -8,9 +8,7 @@ Priority chain
   1. OpenRouter Pipeline — small-context multi-stage pipeline (form, H2H, odds,
                            standings, models specialists → final synthesis)
   2. OpenRouter free model — primary for match analysis, general reasoning, JSON output
-  3. Groq                 — cloud fallback when OpenRouter is unavailable
-                       (rate-limited; used only as last resort)
-  4. Rules engine         — deterministic fallback, never fails
+  3. Rules engine         — deterministic fallback, never fails
 
 Each call type declares which model is its *primary* so the router dispatches
 to the right strength first, then cascades down the chain automatically.
@@ -86,7 +84,7 @@ class AIRouter:
     def call_analysis(self, prompt: str) -> str:
         """
         Full match analysis → JSON prediction.
-        Primary: OpenRouter Pipeline  →  OpenRouter free model  →  Groq
+        Primary: OpenRouter Pipeline  →  OpenRouter free model
         """
         # Try pipeline first if we have a doc context (passed via prompt prefix)
         pipeline_result = self._try_pipeline_from_prompt(prompt)
@@ -97,14 +95,14 @@ class AIRouter:
     def call_reasoning(self, prompt: str) -> str:
         """
         Step-by-step evidence reasoning (H2H, form, odds, similar matches).
-        Primary: OpenRouter free model  →  Groq
+        Primary: OpenRouter free model
         """
         return self._dispatch(prompt, task="reasoning", timeout=self._timeout_reasoning)
 
     def call_review(self, messages: list[dict[str, str]]) -> str:
         """
         Supervisor / brain review using a messages list (system + user).
-        Primary: OpenRouter free model  →  Groq
+        Primary: OpenRouter free model
         """
         return self._dispatch_messages(messages, task="review", timeout=self._timeout_review)
 

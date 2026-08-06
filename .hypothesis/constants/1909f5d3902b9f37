@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\market\season_stage.py
+# hypothesis_version: 6.141.1
+
+[0.0, 0.2, 0.25, 0.5, 0.7, 0.75, 0.8, 0.85, 1.0, 1.1, 1.5, 'all_zero_played', 'all_zero_points', 'avg_matches_played', 'beginning', 'bottom_zone_cutoff', 'category', 'confidence', 'high', 'in_progress', 'is_large_league', 'is_medium_league', 'is_small_league', 'large', 'low', 'low_played_count', 'medium', 'most_teams_unplayed', 'no_data', 'no_standings_data', 'not_started', 'played', 'points', 'position', 'reason', 'season_beginning', 'season_early', 'season_in_progress', 'season_not_started', 'season_started', 'small', 'stage', 'standings_meaningful', 'table_context', 'table_size', 'title_race_cutoff', 'zero_played_count', 'zero_points_count']
