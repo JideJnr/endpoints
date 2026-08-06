@@ -7,7 +7,7 @@ as the Ollama model manager but does nothing, so callers don't break.
 """
 from __future__ import annotations
 
-from app.config import get_settings
+from app.config.config import get_settings
 
 
 def preload_model(model: str) -> bool:

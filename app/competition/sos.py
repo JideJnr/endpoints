@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.sofascore_client import fetch_standings, fetch_team_history
+from app.data_clients.sofascore_client import fetch_standings, fetch_team_history
 
 
 LEAGUE_TIERS = {

@@ -18,12 +18,12 @@ See docs/migration_checklist.md for full migration history.
 
 Import ordering note: enrichment.py is imported first because match_enrichment.py
 imports its symbols (FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD, _fuzzy_match, etc.)
-via `from app.enrichment import ...`. By populating this namespace from enrichment.py
+via `from app.enrichment.enrichment import ...`. By populating this namespace from enrichment.py
 before match_enrichment is loaded, we avoid a circular-import deadlock.
 """
 # noqa: F401  # DEPRECATED shim — see migration_checklist.md
 
-# ---- Must be first: match_enrichment.py imports these from app.enrichment ----
+# ---- Must be first: match_enrichment.py imports these from app.enrichment.enrichment ----
 from app.enrichment.enrichment import (  # noqa: F401
     FUZZY_THRESHOLD,
     LLM_FALLBACK_THRESHOLD,
@@ -81,7 +81,7 @@ from app.enrichment.match_intelligence import (  # noqa: F401
     build_match_intelligence,
 )
 
-# ---- match_enrichment imports from app.enrichment — must come after enrichment.py symbols ----
+# ---- match_enrichment imports from app.enrichment.enrichment — must come after enrichment.py symbols ----
 from app.enrichment.match_enrichment import (  # noqa: F401
     MatchEnrichmentError,
     enrich_buffered_match,
@@ -150,3 +150,4 @@ __all__ = [
     # similar_matches
     "find_similar_matches",
 ]
+

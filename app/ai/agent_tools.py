@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from langchain.tools import tool
 
-from app.poisson import run_poisson
+from app.models.poisson import run_poisson
 from app.market.market import get_movement, get_all_movements
-from app.sos import compare_schedules, analyse_schedule
-from app.sofascore_client import (
+from app.competition.sos import compare_schedules, analyse_schedule
+from app.data_clients.sofascore_client import (
     fetch_all_scheduled_events,
     fetch_event_detail,
     fetch_team_history,
@@ -23,7 +23,7 @@ from app.sofascore_client import (
     fetch_odds,
     fetch_odds_featured,
 )
-from app.sportybet_client import (
+from app.data_clients.sportybet_client import (
     fetch_live_matches_post,
     fetch_live_and_upcoming_matches_post,
 )
@@ -191,3 +191,4 @@ ALL_TOOLS = [
     get_all_odds_movements,
     strength_of_schedule,
 ]
+

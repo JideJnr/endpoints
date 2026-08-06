@@ -25,7 +25,7 @@ def _get_weights() -> dict[str, float]:
     _cache_hits += 1
     if _cached_weights is None or _cache_hits % _CACHE_REFRESH_EVERY == 0:
         try:
-            from app.self_learner import get_learned_weights
+            from app.monitoring.self_learner import get_learned_weights
             learned = get_learned_weights()
             if learned:
                 _cached_weights = learned

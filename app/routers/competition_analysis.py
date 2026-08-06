@@ -11,10 +11,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.db import db_conn
-from app.competition_special import DEFAULT_WORLD_CUP, TOP_30_COMPETITIONS
-from app.db import DB_PATH
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.competition.competition_special import DEFAULT_WORLD_CUP, TOP_30_COMPETITIONS
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
 
 router = APIRouter(prefix="/competition", tags=["competition_analysis"])
 
@@ -29,7 +29,7 @@ def _guard_key(competition_key: str) -> None:
 @router.get("/{competition_key}/analysis/latest")
 def get_latest_analysis_endpoint(competition_key: str) -> dict[str, Any]:
     _guard_key(competition_key)
-    from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
+    from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -56,7 +56,7 @@ def get_analysis_history_endpoint(
     limit: int = Query(default=10, ge=1, le=100),
 ) -> dict[str, Any]:
     _guard_key(competition_key)
-    from app.competition_analyser import get_analysis_history, init_competition_analysis_table
+    from app.competition.competition_analyser import get_analysis_history, init_competition_analysis_table
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -69,7 +69,7 @@ def get_analysis_history_endpoint(
 @router.post("/{competition_key}/analysis/trigger")
 def trigger_analysis_endpoint(competition_key: str) -> dict[str, Any]:
     _guard_key(competition_key)
-    from app.competition_analyser import run_competition_analysis
+    from app.competition.competition_analyser import run_competition_analysis
 
     result = run_competition_analysis(competition_key)
     return result

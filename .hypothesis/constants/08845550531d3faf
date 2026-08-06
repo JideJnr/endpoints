@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\scheduling\loop_authority.py
+# hypothesis_version: 6.135.26
+
+[300, 'acquired_at', 'active', 'begin immediate', 'expires_at', 'expires_in_seconds', 'heartbeat_at', 'owner', 'reason', 'run_count', 'scope', 'source']

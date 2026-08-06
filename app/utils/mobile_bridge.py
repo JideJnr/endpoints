@@ -6,8 +6,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import connect_db, db_conn
-from app.league_memory import _init_db
+from app.storage.db import connect_db, db_conn
+from app.storage.league_memory import _init_db
 
 
 def init_mobile_bridge_db(conn: sqlite3.Connection | None = None) -> None:
@@ -214,8 +214,8 @@ def acknowledge_packets(packet_ids: list[str]) -> dict[str, Any]:
 
 
 def _ingest_sportybet_response(response: dict[str, Any], scope: str | None) -> dict[str, Any]:
-    from app.buffer import ingest_matches
-    from app.sportybet_client import parse_events_response
+    from app.storage.buffer import ingest_matches
+    from app.data_clients.sportybet_client import parse_events_response
 
     matches = parse_events_response(response)
     by_date: dict[str, list[dict[str, Any]]] = {}

@@ -22,7 +22,7 @@ For each combination, it computes:
   - recommended_stake_cap: the stake percentage that maximizes risk-adjusted return
 
 Usage:
-    from app.risk_learner import get_learned_risk_controls, record_risk_outcome
+    from app.risk.risk_learner import get_learned_risk_controls, record_risk_outcome
 
     # At prediction time — get dynamic caps
     controls = get_learned_risk_controls(
@@ -51,9 +51,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH, _conn
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH, _conn
+from app.storage.league_memory import _init_db
 
 
 # ── Data Structures ────────────────────────────────────────────────────────────
@@ -522,7 +522,7 @@ def _odds_range(decimal_odds: float) -> str:
 
 def _estimate_league_tier(league_name: str | None, country_name: str | None) -> int:
     """Estimate league tier from name. Falls back to tier 3."""
-    from app.regime import get_regime
+    from app.market.regime import get_regime
     regime = get_regime(league_name, country_name)
     return regime.tier
 
@@ -659,3 +659,4 @@ def get_learned_risk_controls_for_pick(
         league_tier=league_tier,
         decimal_odds=decimal_odds,
     )
+

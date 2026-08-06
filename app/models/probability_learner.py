@@ -19,7 +19,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import db_conn, DB_PATH, _conn, _init_db
+from app.storage.db import db_conn, DB_PATH, _conn, _init_db
 
 
 # ── Signal pattern key builder ──────────────────────────────

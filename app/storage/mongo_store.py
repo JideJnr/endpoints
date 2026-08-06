@@ -10,8 +10,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency on local-only installs
     MongoClient = None
 
-from app.db import db_conn
-from app.config import get_settings
+from app.storage.db import db_conn
+from app.config.config import get_settings
 from app.match_facts import enrich_match_facts
 
 _client = None
@@ -71,8 +71,8 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
     if not is_configured():
         return False
 
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
     from app.market.market import get_movement
 
     _init_db()
@@ -357,8 +357,8 @@ def flush_buffer_to_mongo(match_date: str | None = None) -> dict[str, Any]:
     return {"status": "skipped", "reason": "only finished matches are stored in mongo"}
 
 def cleanup_buffer() -> dict[str, Any]:
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
     from datetime import datetime, timezone
     settings = _get_settings()
     _init_db()
@@ -383,10 +383,10 @@ def cleanup_buffer() -> dict[str, Any]:
                 try:
                     archive_finished_match_from_buffer(str(row["match_id"]))
                 except Exception:
-                    from app.buffer import _archive_finished_locally
+                    from app.storage.buffer import _archive_finished_locally
                     _archive_finished_locally(str(row["match_id"]))
             else:
-                from app.buffer import _archive_finished_locally
+                from app.storage.buffer import _archive_finished_locally
                 _archive_finished_locally(str(row["match_id"]))
         except Exception:
             pass
@@ -517,8 +517,8 @@ def _to_int(value: Any) -> int | None:
 
 def _latest_prediction(match_id: str) -> dict[str, Any] | None:
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         _init_db()
         with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
@@ -624,3 +624,5 @@ def _score_value(score: Any, side: str, *, fallback: Any = None) -> int | None:
         if parsed is not None:
             return parsed
     return _to_int(fallback)
+
+

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.db import db_conn
+from app.storage.db import db_conn
 import json
 import logging
 import random
@@ -323,8 +323,8 @@ _CORE_TOURNAMENT_IDS: Dict[int, str] = {
 def _get_learned_tournament_ids() -> Dict[int, str]:
     """Load auto-learned tournament IDs from SQLite."""
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         import sqlite3 as _sqlite3
         _init_db()
         with db_conn(timeout=10) as conn:
@@ -346,8 +346,8 @@ def learn_tournament_id(tournament_id: int, name: str) -> None:
     if not tournament_id:
         return
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         import sqlite3 as _sqlite3
         _init_db()
         with db_conn(timeout=10) as conn:
@@ -526,7 +526,7 @@ def fetch_team_history(team_id: int, page: int = 0) -> dict:
     # ── Fix 1: serve from cache on page 0, bypass cache for page 1+ ────────────────────────
     if page == 0:
         try:
-            from app.league_memory import get_cached_team_history, store_team_history
+            from app.storage.league_memory import get_cached_team_history, store_team_history
             cached = get_cached_team_history(team_id)
             if cached is not None:
                 return {"has_next_page": True, "events": cached}
@@ -537,7 +537,7 @@ def fetch_team_history(team_id: int, page: int = 0) -> dict:
     events = [_parse_event(e) for e in data.get("events", [])]
     if page == 0 and events:
         try:
-            from app.league_memory import store_team_history
+            from app.storage.league_memory import store_team_history
             store_team_history(team_id, events)
         except Exception:
             pass

@@ -5,7 +5,7 @@ Statistical and ML scoring models — Poisson, Dixon-Coles, ELO, ensemble scorin
 odds-only predictor, SportyBet-only predictor, probability learner, weight optimiser.
 
 Note: Eager re-exports are intentionally omitted here to prevent circular imports.
-dixon_coles imports from app.poisson (shim), which would create a circular loading
+dixon_coles imports from app.models.poisson (shim), which would create a circular loading
 cycle if this __init__.py eagerly imported both. Import sub-modules directly:
 
     from app.models.poisson import run_poisson, MAX_GOALS, HOME_ADVANTAGE

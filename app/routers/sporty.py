@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from app.sportybet_client import (
+from app.data_clients.sportybet_client import (
     fetch_match_info,
     fetch_live_and_upcoming_matches_post,
     fetch_live_matches_post,

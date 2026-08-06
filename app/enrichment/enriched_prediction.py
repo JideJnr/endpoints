@@ -5,22 +5,22 @@ import sqlite3
 from collections import Counter
 from typing import Any
 
-from app.db import DB_PATH, _conn
-from app.league_memory import _init_db
+from app.storage.db import DB_PATH, _conn
+from app.storage.league_memory import _init_db
 
-from app.dixon_coles import run_dixon_coles
-from app.contextual_intelligence import apply_contextual_adjustment, build_contextual_intelligence
-from app.elo import elo_prediction
-from app.ensemble import ensemble_prediction
-from app.kelly import kelly_fraction
-from app.market_intent import classify_market_intent, selection_key as market_selection_key
-from app.match_state import classify_match_state
-from app.poisson import run_poisson
-from app.prediction_agent import predict_sofascore_event, predict_sporty_match
-from app.risk_manager import apply_risk_controls
-from app.season_stage import detect_season_stage
-from app.time_context import match_time_context
-from app.config import get_settings
+from app.models.dixon_coles import run_dixon_coles
+from app.enrichment.contextual_intelligence import apply_contextual_adjustment, build_contextual_intelligence
+from app.models.elo import elo_prediction
+from app.models.ensemble import ensemble_prediction
+from app.risk.kelly import kelly_fraction
+from app.market.market_intent import classify_market_intent, selection_key as market_selection_key
+from app.utils.match_state import classify_match_state
+from app.models.poisson import run_poisson
+from app.ai.prediction_agent import predict_sofascore_event, predict_sporty_match
+from app.risk.risk_manager import apply_risk_controls
+from app.market.season_stage import detect_season_stage
+from app.utils.time_context import match_time_context
+from app.config.config import get_settings
 
 # ── Imports from extracted sub-modules ───────────────────────────────────────
 from app.enrichment.signal_aggregator import (  # noqa: F401
@@ -318,7 +318,7 @@ def _hydrate_live_data_if_possible(doc: dict[str, Any], detail: dict[str, Any]) 
     errors: list[dict[str, str]] = list(doc.get("live_fetch_errors") or [])
     if sofa_id and not _live_match_statistics(detail).get("has_stats"):
         try:
-            from app.sofascore_client import fetch_event_incidents, fetch_event_lineups, fetch_event_statistics
+            from app.data_clients.sofascore_client import fetch_event_incidents, fetch_event_lineups, fetch_event_statistics
 
             statistics = fetch_event_statistics(int(sofa_id))
             incidents = fetch_event_incidents(int(sofa_id))
@@ -339,7 +339,7 @@ def _hydrate_live_data_if_possible(doc: dict[str, Any], detail: dict[str, Any]) 
     sporty_id = str(doc.get("sportybet_id") or doc.get("id") or "")
     if sporty_id and not doc.get("live_data_sportybet"):
         try:
-            from app.sportybet_client import fetch_live_matches_post
+            from app.data_clients.sportybet_client import fetch_live_matches_post
 
             for match in fetch_live_matches_post() or []:
                 if str(match.get("id") or match.get("eventId") or match.get("match_id") or "") == sporty_id:
@@ -496,7 +496,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     close_strength_context: dict[str, Any] = {}
     database_adj = 0
     try:
-        from app.league_memory import close_match_strength_context, weighted_finished_match_memory
+        from app.storage.league_memory import close_match_strength_context, weighted_finished_match_memory
 
         finished_memory = weighted_finished_match_memory(doc)
         close_strength_context = close_match_strength_context(doc)
@@ -512,14 +512,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             "impact": _close_strength_adjustment(ensemble, close_strength_context),
         })
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "finished_memory_failed", exc)
 
     # ── User pick signal ──────────────────────────────────────────────────────
     # If the user has submitted a pick for this match, inject it as a signal
     # that nudges confidence toward their selection.
     try:
-        from app.league_memory import get_behavior_weighted_picks
+        from app.storage.league_memory import get_behavior_weighted_picks
         match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
         if match_id_str:
             user_picks = [p for p in get_behavior_weighted_picks(match_id_str) if p.get("user_action") == "user_pick"]
@@ -551,7 +551,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     "role": "decision_driver" if agrees else "risk_signal",
                 })
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "user_pick_signal_failed", exc)
 
     # ── Odds pattern signal ───────────────────────────────────────────────────
@@ -560,7 +560,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     odds_movement: dict[str, Any] = {}
     market_adj = 0
     try:
-        from app.odds_pattern import pattern_signal
+        from app.market.odds_pattern import pattern_signal
         match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
         if match_id_str:
             odds_pattern_signal = pattern_signal(match_id_str)
@@ -571,7 +571,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "impact": pattern_adj,
             })
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "odds_pattern_failed", exc)
 
     try:
@@ -590,14 +590,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "impact": market_adj,
             })
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "market_movement_failed", exc)
 
     # ── Team Watcher Engine signal ────────────────────────────────────────────
     tw_signal = None
     has_tw_pick = False
     try:
-        from app.team_watcher_engine import team_watcher_signal, record_tw_prediction
+        from app.team_watcher.team_watcher_engine import team_watcher_signal, record_tw_prediction
         tw_signal = team_watcher_signal(doc)
         signals.append(tw_signal)
         has_tw_pick = tw_signal.get("pick_type") not in (None, "no_bet")
@@ -608,29 +608,29 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             home_key = "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in str(home_name_raw)).split())
             record_tw_prediction(home_key, match_id_str, tw_signal)
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "team_watcher_engine_error", exc)
         tw_signal = None
         has_tw_pick = False
 
     # ── Team Watch signal (opponent tier, goal timing, signal combo history) ──
     try:
-        from app.team_watcher import team_watch_signal as _tw_watch_signal
+        from app.team_watcher.team_watcher import team_watch_signal as _tw_watch_signal
         tw_watch = _tw_watch_signal(doc)
         if tw_watch and (tw_watch.get("value") or {}).get("available"):
             signals.append(tw_watch)
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "team_watch_signal_error", exc)
 
     # ── Team Watch signal (opponent tier, goal timing, signal combo history) ──
     try:
-        from app.team_watcher import team_watch_signal as _tw_watch_signal
+        from app.team_watcher.team_watcher import team_watch_signal as _tw_watch_signal
         tw_watch = _tw_watch_signal(doc)
         if tw_watch and tw_watch.get("value", {}).get("available"):
             signals.append(tw_watch)
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "team_watch_signal_error", exc)
 
     # ── SofaScore grade signal ────────────────────────────────────────────────
@@ -640,7 +640,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
 
     grade_adj = 0
     try:
-        from app.sofascore_grades import grade_signal_for_match
+        from app.data_clients.sofascore_grades import grade_signal_for_match
         match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
         match_date_str = doc.get("match_date")
         grade_sig = grade_signal_for_match(detail, match_id=match_id_str, match_date=match_date_str)
@@ -655,7 +655,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     # suppress signals that historically mislead — per league.
     learned_signal_adj = 0
     try:
-        from app.self_learner import get_signal_weights
+        from app.monitoring.self_learner import get_signal_weights
         league = doc.get("tournament") or doc.get("category") or ""
         if isinstance(league, dict):
             league = league.get("name") or ""
@@ -680,7 +680,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     "impact": learned_signal_adj,
                 })
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "learned_signal_weights_failed", exc)
 
     # Time-decay for live matches
@@ -759,14 +759,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             _fi_league = _fi_league.get("name") or ""
         _apply_feature_importance(signals, str(_fi_league))
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("feature_importance_error", str(exc))
 
     # ── Calibration: adjust confidence based on historical win rates ──────────
     try:
-        from app.confidence_calibrator import calibrate_confidence, stake_multiplier
-        from app.league_memory import weighted_prediction_memory
-        from app.regime import get_regime_for_doc, apply_regime_stake_cap
+        from app.enrichment.confidence_calibrator import calibrate_confidence, stake_multiplier
+        from app.storage.league_memory import weighted_prediction_memory
+        from app.market.regime import get_regime_for_doc, apply_regime_stake_cap
 
         regime = get_regime_for_doc(doc)
 
@@ -792,7 +792,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             #  win_rate > 65%  →  boost:    +(wr - 65) / 5   (max +8)
             #  50% ≤ wr ≤ 65%  →  no adjustment (neutral band)
             try:
-                from app.self_learner import get_league_accuracy
+                from app.monitoring.self_learner import get_league_accuracy
                 _league_key = doc.get("tournament") or doc.get("category") or ""
                 if isinstance(_league_key, dict):
                     _league_key = _league_key.get("name") or ""
@@ -852,7 +852,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             }
             # ── Calibration gap monitoring ─────────────────────────────────────
             try:
-                from app.confidence_calibrator import compute_calibration_gap
+                from app.enrichment.confidence_calibrator import compute_calibration_gap
                 gap_info = compute_calibration_gap(pick.get("type") or "match_result", raw_conf)
                 pick["calibration"]["gap"] = gap_info
                 if gap_info.get("gap_severity") == "severe":
@@ -870,7 +870,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                         "reason": f"Confidence {raw_conf}% exceeds historical win rate by {gap_info['gap']} points",
                     })
             except Exception as exc:
-                from app.health_counters import record_health_event
+                from app.utils.health_counters import record_health_event
                 record_health_event("calibration_gap_error", str(exc))
             if memory.get("blended_win_rate") is not None:
                 signals.append({
@@ -880,7 +880,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 })
             # Prefer CLV-based stake sizing if enough data exists
             try:
-                from app.clv import clv_stake_multiplier
+                from app.risk.clv import clv_stake_multiplier
                 clv_mult = clv_stake_multiplier(pick.get("type") or "match_result", raw_conf)
                 if clv_mult != 1.0:
                     capped_clv = apply_regime_stake_cap(clv_mult, doc.get("tournament"), doc.get("category"))
@@ -889,10 +889,10 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 else:
                     pick["calibration"]["stake_source"] = "win_rate"
             except Exception as exc:
-                from app.health_counters import record_health_event
+                from app.utils.health_counters import record_health_event
                 record_health_event("enriched_prediction", "clv_stake_multiplier_failed", exc)
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "calibration_block_failed", exc)
 
     contextual_intelligence = build_contextual_intelligence(
@@ -1027,7 +1027,7 @@ def _rules_prediction(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, 
                 rules_detail.get("away_last_matches") or [],
             )
         except Exception as exc:
-            from app.health_counters import record_health_event
+            from app.utils.health_counters import record_health_event
             record_health_event("enriched_prediction", "rules_prediction_failed", exc)
     sporty_doc = {
         **doc,
@@ -1078,7 +1078,7 @@ def _fallback_market_prediction(
             match_id_str = str(doc.get("sportybet_id") or doc.get("id") or "")
             odds_movement = get_movement(match_id_str) if match_id_str else {}
         except Exception as exc:
-            from app.health_counters import record_health_event
+            from app.utils.health_counters import record_health_event
             record_health_event("enriched_prediction", "fallback_market_movement_failed", exc)
     live_picks = _live_inplay_picks(doc, detail, rules, {}, {}, odds_movement) if is_live else []
     picks.extend(live_picks)
@@ -1307,11 +1307,11 @@ def _ensemble_agrees_with_value(selection_name: str, ensemble: dict[str, Any] | 
 
 def _candidate_memory(doc: dict[str, Any], pick_type: str, selection: str | None = None) -> dict[str, Any]:
     try:
-        from app.league_memory import weighted_candidate_memory
+        from app.storage.league_memory import weighted_candidate_memory
 
         return weighted_candidate_memory(doc, pick_type, selection)
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "candidate_memory_failed", exc)
         return {"allow": True, "blended_win_rate": None, "scopes": {}}
 
@@ -1577,7 +1577,7 @@ def _longshot_quality_context(
     home_history = detail.get("home_last_matches") or []
     away_history = detail.get("away_last_matches") or []
     try:
-        from app.league_strength import history_league_strength, league_strength_score
+        from app.competition.league_strength import history_league_strength, league_strength_score
 
         home_strength = history_league_strength(home_history)
         away_strength = history_league_strength(away_history)
@@ -1585,7 +1585,7 @@ def _longshot_quality_context(
         tournament_name = tournament.get("name") if isinstance(tournament, dict) else str(tournament or "")
         match_strength = league_strength_score(tournament_name)
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "league_strength_failed", exc)
         home_strength = {"sample_size": 0, "avg_score": 55}
         away_strength = {"sample_size": 0, "avg_score": 55}
@@ -1990,8 +1990,8 @@ def _combined_picks(
     if not picks:
         # Try signal aggregator for directional picks before falling back to no_bet
         try:
-            from app.signal_aggregator import SignalAggregator
-            from app.fallback_logic import FallbackHandler
+            from app.enrichment.signal_aggregator import SignalAggregator
+            from app.risk.fallback_logic import FallbackHandler
 
             aggregator = SignalAggregator()
             probs = ensemble.get("probabilities") or {}
@@ -2304,7 +2304,7 @@ def _learned_signal_adjustment_for_pick(
 ) -> int:
     """Apply self-learner feedback scoped by league and market type."""
     try:
-        from app.self_learner import get_signal_weights
+        from app.monitoring.self_learner import get_signal_weights
 
         league = doc.get("tournament") or doc.get("category") or ""
         if isinstance(league, dict):
@@ -2319,7 +2319,7 @@ def _learned_signal_adjustment_for_pick(
                 adjustment += round(float(weight_adj) * 3 * direction)
         return max(-8, min(8, adjustment))
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "learned_signal_adjustment_failed", exc)
         return 0
 
@@ -2653,9 +2653,9 @@ def _pick_family(pick: dict[str, Any]) -> str:
 def _candidate_role_memory(doc: dict[str, Any], pick_type: str, selection: str) -> dict[str, Any]:
     """Learn whether this market works better as primary or secondary in similar context."""
     try:
-        from app.db import DB_PATH
-        from app.db import _conn
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.db import _conn
+        from app.storage.league_memory import _init_db
 
         league = str(doc.get("tournament") or doc.get("league_name") or "")
         country = str(doc.get("category") or doc.get("country") or "")
@@ -2760,7 +2760,7 @@ def _candidate_role_memory(doc: dict[str, Any], pick_type: str, selection: str) 
             "context_quality": _role_context_quality(primary_samples + secondary_samples, bool(odds_profile), bool(movement_signature)),
         }
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "candidate_role_memory_failed", exc)
         return {"primary_adjustment": 0}
 
@@ -2868,7 +2868,7 @@ def _current_movement_signature(doc: dict[str, Any]) -> dict[str, str] | None:
         if selection in {"home", "draw", "away"} and direction in {"backed", "faded"}:
             return {"selection": selection, "direction": direction}
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "current_movement_signature_failed", exc)
         return None
     return None
@@ -3056,9 +3056,9 @@ def _pick_signal_stats(pick_type: str, selection: str, signal_name: str) -> dict
     if not pick_type or not selection or not signal_name:
         return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
     try:
-        from app.db import DB_PATH
-        from app.db import _conn
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.db import _conn
+        from app.storage.league_memory import _init_db
 
         _init_db()
         with _conn(timeout=5) as conn:
@@ -3076,7 +3076,7 @@ def _pick_signal_stats(pick_type: str, selection: str, signal_name: str) -> dict
                 (pick_type, selection, signal_name),
             ).fetchone()
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "global_signal_stats_failed", exc)
         return {"samples": 0, "wins": 0, "losses": 0, "win_rate": None}
     samples = int((row or [0])[0] or 0)
@@ -3428,9 +3428,9 @@ def _selection_score_memory(pick_type: str, selection: str) -> dict[str, Any]:
     if not pick_type or not selection:
         return {"available": False, "reason": "missing_pick"}
     try:
-        from app.db import DB_PATH
-        from app.db import _conn
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.db import _conn
+        from app.storage.league_memory import _init_db
 
         _init_db()
         with _conn(timeout=5) as conn:
@@ -3730,8 +3730,8 @@ def _market_selector_picks(
     # defaulting to double chance.
     if side_conf - second_side < 12 or samples < 8:
         try:
-            from app.signal_aggregator import SignalAggregator
-            from app.fallback_logic import FallbackHandler
+            from app.enrichment.signal_aggregator import SignalAggregator
+            from app.risk.fallback_logic import FallbackHandler
 
             # Build signals from the current model probabilities
             aggregator = SignalAggregator()
@@ -4458,7 +4458,7 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 def _regime_info(doc: dict[str, Any]) -> dict[str, Any]:
     try:
-        from app.regime import get_regime_for_doc
+        from app.market.regime import get_regime_for_doc
         r = get_regime_for_doc(doc)
         return {
             "tier":           r.tier,
@@ -4518,3 +4518,8 @@ class EnrichedPrediction:
             ValueError: when the document is not yet ready (missing data fields).
         """
         return predict_enriched_match(self._doc)
+
+
+
+
+

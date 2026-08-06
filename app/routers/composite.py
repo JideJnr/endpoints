@@ -139,7 +139,7 @@ def get_competition_special_dashboard(
     failures are captured in the `errors` array so the page still renders
     with partial data.
     """
-    from app.competition_special import list_all_competition_summaries
+    from app.competition.competition_special import list_all_competition_summaries
 
     try:
         result = list_all_competition_summaries(

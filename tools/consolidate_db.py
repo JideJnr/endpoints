@@ -97,7 +97,7 @@ for key in ("init_db", "init_db_unlocked", "ensure_column", "is_sqlite_lock"):
 
 # Replace the top import line to add db primitives
 new_import = (
-    "from app.db import ("
+    "from app.storage.db import ("
     "DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db, "
     "_init_db, _init_db_unlocked, _ensure_column, _is_sqlite_lock, "
     "_DB_SCHEMA_READY, _DB_SCHEMA_LOCK"
@@ -129,7 +129,7 @@ print(f"league_memory.py: patched ({len(lm_lines)} -> {len(new_lm_lines)} lines)
 # ── 4. Update league_memory/db.py re-exports ─────────────────────────────────
 lm_db_new = """from __future__ import annotations
 
-from app.db import (
+from app.storage.db import (
     DB_PATH,
     _conn,
     close_db,
@@ -174,8 +174,8 @@ with open(TW_PATH, encoding="utf-8") as f:
     tw_txt = f.read()
 
 tw_new = tw_txt.replace(
-    "from app.league_memory import _ensure_column, _init_db",
-    "from app.db import _ensure_column, _init_db",
+    "from app.storage.league_memory import _ensure_column, _init_db",
+    "from app.storage.db import _ensure_column, _init_db",
 )
 if tw_new != tw_txt:
     with open(TW_PATH, "w", encoding="utf-8") as f:
@@ -184,4 +184,4 @@ if tw_new != tw_txt:
 else:
     print("team_watcher.py: no change needed")
 
-print("\nDone. Verify with: python -c \"from app.db import _init_db, _ensure_column; print('ok')\"")
+print("\nDone. Verify with: python -c \"from app.storage.db import _init_db, _ensure_column; print('ok')\"")

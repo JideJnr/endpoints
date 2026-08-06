@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\scheduling\job_state.py
+# hypothesis_version: 6.135.26
+
+[300, 900, '+00:00', ',', '?', 'Z', 'begin immediate', 'commit', 'error', 'fail_count', 'finished_at', 'heartbeat_at', 'job_id', 'jobs', 'last_error', 'last_result', 'last_result_json', 'owner', 'recovered', 'rollback', 'run_count', 'running', 'started_at', 'status', '{}']

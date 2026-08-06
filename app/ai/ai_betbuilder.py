@@ -7,8 +7,8 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from app.buffer import get_buffered_match
-from app.league_memory import list_prediction_history
+from app.storage.buffer import get_buffered_match
+from app.storage.league_memory import list_prediction_history
 from app.research.research_filter import _research_filter_candidate, _normalise_league_key, _get_dynamic_rules
 
 
@@ -36,8 +36,8 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
 
     gated = similarity_gate(doc, _similar_matches(doc, limit=10))[:5]
     groq_input = _analysis_doc(doc, engine_pick, gated)
-    analysis = _run_groq_enriched(groq_input)
-    if analysis.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+    analysis = _run_openrouter_enriched(groq_input)
+    if analysis.get("status") in {"openrouter_unavailable", "agent_build_failed", "error"}:
         return analysis
 
     groq_selection = analysis.get("recommendation") or analysis.get("groq_recommendation")
@@ -133,8 +133,8 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
     # and boost conviction for picks with proven win history
     for analysis in analyses:
         try:
-            from app.probability_learner import get_learned_probabilities
-            from app.signal_aggregator import normalize_signal
+            from app.models.probability_learner import get_learned_probabilities
+            from app.enrichment.signal_aggregator import normalize_signal
 
             analysis_signals = []
             if analysis.get("key_factors"):
@@ -186,6 +186,7 @@ def synthesize_sure_picks(
     *,
     target_odds: float,
     max_total_odds: float,
+    deterministic: bool = False,
 ) -> dict[str, Any]:
     clean = [item for item in analyses if item.get("status") == "success" or item.get("groq_recommendation")]
     if len(clean) < 2:
@@ -199,7 +200,7 @@ def synthesize_sure_picks(
         confirmed = bool(item.get("confirmed")) or _same_outcome(engine_pick.get("selection"), item.get("groq_recommendation"))
         odds = round(_to_float(item.get("estimated_odds")) or _pick_decimal_odds(engine_pick), 3)
         try:
-            from app.league_memory import betbuilder_pick_memory
+            from app.storage.league_memory import betbuilder_pick_memory
             learning = betbuilder_pick_memory(
                 engine_pick.get("type") or item.get("pick_type"),
                 item.get("groq_recommendation") or engine_pick.get("selection"),
@@ -213,8 +214,8 @@ def synthesize_sure_picks(
         # Use signal aggregator to calculate learned probabilities
         learned_prob = None
         try:
-            from app.probability_learner import get_learned_probabilities
-            from app.signal_aggregator import normalize_signal
+            from app.models.probability_learner import get_learned_probabilities
+            from app.enrichment.signal_aggregator import normalize_signal
 
             # Build signals from the analysis
             analysis_signals = []
@@ -281,7 +282,7 @@ def synthesize_sure_picks(
         # picks from leagues the engine doesn't understand well.
         league_acc_boost = 0.0
         try:
-            from app.self_learner import get_league_accuracy
+            from app.monitoring.self_learner import get_league_accuracy
             _lacc = get_league_accuracy(item.get("league_name") or "")
             if _lacc.get("known"):
                 for _lt in (_lacc.get("by_pick_type") or []):
@@ -370,6 +371,8 @@ def synthesize_sure_picks(
     ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"] + item.get("optimal_profile_score", 0) * 0.5, item["groq_confidence"]), reverse=True)
 
     try:
+        if deterministic:
+            raise RuntimeError("deterministic mode requested — skipping LLM synthesis")
         model_plan = _run_groq_synthesis(ranked, target_odds, max_total_odds)
         selected_ids = [str(item.get("match_id") or "") for item in model_plan.get("selected_picks") or []]
         selected = [item for item in ranked if str(item.get("match_id") or "") in selected_ids] if selected_ids else []
@@ -405,7 +408,7 @@ def synthesize_sure_picks(
 
 def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
     try:
-        from app.current_predictions import list_recent_dashboard_predictions
+        from app.utils.current_predictions import list_recent_dashboard_predictions
 
         rows = list_recent_dashboard_predictions(hours=72, limit=max(limit, 200))
     except Exception:
@@ -462,7 +465,7 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
         match_id = str(row.get("match_id") or row.get("sportybet_id") or "")
         if match_id:
             try:
-                from app.buffer import get_buffered_match, refresh_sporty_match_state
+                from app.storage.buffer import get_buffered_match, refresh_sporty_match_state
                 # Refresh buffer state inline (non-blocking — uses cached data if recent)
                 try:
                     refresh_sporty_match_state(match_id)
@@ -487,7 +490,7 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def similarity_gate(doc: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    from app.similar_matches import _extract_target_odds_implied
+    from app.enrichment.similar_matches import _extract_target_odds_implied
 
     target_implied = _extract_target_odds_implied(doc)
     team_terms = [term for term in (_team_name(doc, "home"), _team_name(doc, "away")) if len(term) >= 4]
@@ -521,14 +524,14 @@ def similarity_gate(doc: dict[str, Any], candidates: list[dict[str, Any]]) -> li
     return passing
 
 
-def _run_groq_enriched(doc: dict[str, Any]) -> dict[str, Any]:
-    from app.groq_agent import run_groq_match_analysis
+def _run_openrouter_enriched(doc: dict[str, Any]) -> dict[str, Any]:
+    from app.ai.groq_agent import run_groq_match_analysis
 
     return run_groq_match_analysis(doc)
 
 
-def _run_groq_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_total_odds: float) -> dict[str, Any]:
-    from app.llm import get_llm
+def _run_openrouter_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_total_odds: float) -> dict[str, Any]:
+    from app.ai.llm import get_llm
 
     prompt = (
         "You are an expert football betting slip analyst. Read these completed Groq enriched analyses. "
@@ -571,7 +574,7 @@ def _analysis_doc(doc: dict[str, Any], engine_pick: dict[str, Any], similar: lis
 
 
 def _similar_matches(doc: dict[str, Any], limit: int) -> list[dict[str, Any]]:
-    from app.similar_matches import find_similar_matches
+    from app.enrichment.similar_matches import find_similar_matches
 
     return find_similar_matches(doc, limit=limit)
 
@@ -754,3 +757,4 @@ def _extract_betbuilder_odds_profile(row: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             pass
     return normalized
+

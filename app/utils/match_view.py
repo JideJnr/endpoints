@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.match_state import classify_match_state
+from app.utils.match_state import classify_match_state
 
 
 def match_summary(doc: dict[str, Any]) -> dict[str, Any]:

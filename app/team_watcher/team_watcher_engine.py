@@ -20,7 +20,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import _ensure_column, _init_db, db_conn
+from app.storage.db import _ensure_column, _init_db, db_conn
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +324,7 @@ def _ai_model(
     ``ai_model_available: False``.
     """
     try:
-        from app.ai_router import get_router, parse_json_response  # noqa: PLC0415
+        from app.ai.ai_router import get_router, parse_json_response  # noqa: PLC0415
 
         home_name = match_doc.get("home_team") or "Home"
         away_name = match_doc.get("away_team") or "Away"
@@ -1356,7 +1356,7 @@ def monitor_team_performance(
                     notes.append(trend_note)
 
             # ── 4. Persist notes via competition registry ────────────────────
-            from app.competition_registry import (
+            from app.competition.competition_registry import (
                 add_performance_note as _add_note,
                 ensure_team_competition,
                 update_team_competition_stats,
@@ -1408,7 +1408,7 @@ def monitor_team_performance(
 
 def _normalize_league_name(name: str) -> str:
     """Normalize a league name to a stable key."""
-    from app.league_memory import normalize_league
+    from app.storage.league_memory import normalize_league
     return normalize_league(name)
 
 

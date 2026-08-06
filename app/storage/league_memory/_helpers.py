@@ -717,7 +717,7 @@ def _odds_band(odds: float | None) -> str:
 def _infer_betbuilder_pick_type(selection: str) -> str:
     """Infer a pick_type for betbuilder selections that omitted it."""
     try:
-        from app.market_intent import classify_market_intent
+        from app.market.market_intent import classify_market_intent
     except Exception:
         classify_market_intent = None
     text = str(selection or "")
@@ -793,3 +793,4 @@ def _betbuilder_learning_summary(legs: list[dict[str, Any]], slip_result: str) -
             for leg in losses
         ],
     }
+

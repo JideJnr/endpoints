@@ -17,7 +17,7 @@ What we extract:
   - grade_signal        : composite signal for the prediction engine
 
 Usage:
-    from app.sofascore_grades import extract_team_grades, grade_signal_for_match
+    from app.data_clients.sofascore_grades import extract_team_grades, grade_signal_for_match
 
     # From a SofaScore detail document
     grades = extract_team_grades(sofascore_detail)
@@ -29,9 +29,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
 
 
 # ── Table ─────────────────────────────────────────────────────────────────────

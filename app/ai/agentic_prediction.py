@@ -8,12 +8,12 @@ import os
 from typing import Any, Callable
 from urllib import request as urllib_request
 
-from app.activity_log import record_activity
-from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
-from app.enriched_prediction import prediction_readiness
-from app.match_intelligence import build_match_intelligence
-from app.match_state import classify_match_state
-from app.prediction_flow import apply_prediction_state
+from app.utils.activity_log import record_activity
+from app.storage.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
+from app.enrichment.enriched_prediction import prediction_readiness
+from app.enrichment.match_intelligence import build_match_intelligence
+from app.utils.match_state import classify_match_state
+from app.utils.prediction_flow import apply_prediction_state
 
 
 MAX_AGENT_ITERATIONS = 10
@@ -348,7 +348,7 @@ def _action_initialize_match_state(state: dict[str, Any]) -> dict[str, Any]:
     doc = get_buffered_match(state["match_id"])
     if not doc:
         raise AgentExecutionError(f"Match {state['match_id']} not found in buffer", {"status": "not_found"})
-    from app.competition_special import apply_known_competition_context
+    from app.competition.competition_special import apply_known_competition_context
     apply_known_competition_context(doc)
     state["doc"] = doc
     intelligence = build_match_intelligence(doc)
@@ -431,7 +431,7 @@ def _action_refresh_live_context(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _action_reconcile_sofascore(state: dict[str, Any]) -> dict[str, Any]:
-    from app.match_enrichment import enrich_buffered_match
+    from app.enrichment.match_enrichment import enrich_buffered_match
 
     before = state.get("doc") if isinstance(state.get("doc"), dict) else {}
     result = enrich_buffered_match(state["match_id"], auto_predict=False)
@@ -463,7 +463,7 @@ def _action_evaluate_readiness(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _action_enrich_context(state: dict[str, Any]) -> dict[str, Any]:
-    from app.match_enrichment import enrich_buffered_match
+    from app.enrichment.match_enrichment import enrich_buffered_match
 
     result = enrich_buffered_match(state["match_id"], auto_predict=False)
     doc = get_buffered_match(state["match_id"])
@@ -499,7 +499,7 @@ def _action_local_llm_reasoning(state: dict[str, Any]) -> dict[str, Any]:
 
 def _action_run_prediction(state: dict[str, Any]) -> dict[str, Any]:
     doc = state.get("doc") if isinstance(state.get("doc"), dict) else {}
-    from app.competition_special import apply_known_competition_context
+    from app.competition.competition_special import apply_known_competition_context
     apply_known_competition_context(doc)
     result = apply_prediction_state(
         doc,
@@ -891,3 +891,5 @@ def _deterministic_context_summary(compact: dict[str, Any]) -> dict[str, Any]:
         "historical_patterns": historical.get("patterns") or [],
         "next_action_hint": "predict_if_ready_else_defer",
     }
+
+

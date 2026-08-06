@@ -16,8 +16,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from app.signal_aggregator import SignalAggregator, calculate_win_probabilities, score_pick_direction
-from app.probability_learner import ProbabilityLearner, get_learned_probabilities
+from app.enrichment.signal_aggregator import SignalAggregator, calculate_win_probabilities, score_pick_direction
+from app.models.probability_learner import ProbabilityLearner, get_learned_probabilities
 
 
 # ── Confidence thresholds ──────────────────────────────────

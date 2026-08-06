@@ -6,13 +6,13 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import DB_PATH
-from app.db import _ensure_column, _init_db
-from app.db import db_conn
-from app.match_state import classify_match_state
-from app.time_context import match_time_context
-from app.web_context import search_team_context
-from app.competition_registry import (
+from app.storage.db import DB_PATH
+from app.storage.db import _ensure_column, _init_db
+from app.storage.db import db_conn
+from app.utils.match_state import classify_match_state
+from app.utils.time_context import match_time_context
+from app.enrichment.web_context import search_team_context
+from app.competition.competition_registry import (
     init_competition_registry_tables,
     ensure_competition,
     ensure_team_competition,
@@ -187,7 +187,7 @@ def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
             "win_rate": None,
         }
         try:
-            from app.team_watcher_engine import init_tw_tables  # noqa: PLC0415
+            from app.team_watcher.team_watcher_engine import init_tw_tables  # noqa: PLC0415
             init_tw_tables(conn)
 
             # Parse weekly_analysis_json from the watcher row
@@ -433,7 +433,7 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
     # Grade any open TW_Signal predictions for this match and trigger weekly analysis
     # Both calls are wrapped in their own try/except so engine errors never abort observe_match.
     try:
-        from app.team_watcher_engine import grade_tw_predictions  # noqa: PLC0415
+        from app.team_watcher.team_watcher_engine import grade_tw_predictions  # noqa: PLC0415
         # Extract home/away scores from match_doc so grade_tw_predictions can
         # determine the actual outcome.  The score dict uses "home"/"away" keys
         # (same convention used by _observation_for_team above).
@@ -453,7 +453,7 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
         logger.warning("grade_tw_predictions failed for match_id=%s: %s", match_id, _exc)
 
     try:
-        from app.team_watcher_engine import _maybe_generate_weekly_analysis  # noqa: PLC0415
+        from app.team_watcher.team_watcher_engine import _maybe_generate_weekly_analysis  # noqa: PLC0415
         for team_update in updated:
             _maybe_generate_weekly_analysis(team_update["team_key"])
     except Exception as _exc:
@@ -461,7 +461,7 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
 
     # ── Post-match AI monitoring: generate context-rich performance notes ──
     try:
-        from app.team_watcher_engine import monitor_team_performance  # noqa: PLC0415
+        from app.team_watcher.team_watcher_engine import monitor_team_performance  # noqa: PLC0415
         for team_update in updated:
             monitor_team_performance(
                 team_key=team_update["team_key"],
@@ -545,7 +545,7 @@ def backfill_from_finished(limit: int = 200) -> dict[str, Any]:
 
 def _mongo_configured() -> bool:
     try:
-        from app.mongo_store import is_configured
+        from app.storage.mongo_store import is_configured
         return is_configured()
     except Exception:
         return False
@@ -554,16 +554,16 @@ def _mongo_configured() -> bool:
 def _list_finished_matches_local_or_mongo(limit: int) -> list[dict[str, Any]]:
     if _mongo_configured():
         try:
-            from app.mongo_store import list_finished_matches
+            from app.storage.mongo_store import list_finished_matches
             return list_finished_matches(limit=limit)
         except Exception:
             pass
     # Local SQLite fallback (used when PREDICTX_LOCAL_STORAGE_ONLY=true)
     try:
         import json as _json
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
-        from app.db import db_conn
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
+        from app.storage.db import db_conn
         _init_db()
         with db_conn() as conn:
             conn.row_factory = sqlite3.Row
@@ -625,7 +625,7 @@ def backfill_team_watcher_ids(limit: int = 5000) -> dict[str, Any]:
     # Step 2 — collect enriched docs from buffer + finished_matches
     docs: list[dict[str, Any]] = []
     try:
-        from app.buffer import get_buffered_matches
+        from app.storage.buffer import get_buffered_matches
         buf = get_buffered_matches(limit=2000)
         docs.extend(buf)
     except Exception:
@@ -1279,14 +1279,14 @@ def _match_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _get_finished_or_buffered_match(match_id: str) -> dict[str, Any] | None:
     try:
-        from app.mongo_store import get_finished_match
+        from app.storage.mongo_store import get_finished_match
         doc = get_finished_match(match_id)
         if doc:
             return doc
     except Exception:
         pass
     try:
-        from app.buffer import get_buffered_match
+        from app.storage.buffer import get_buffered_match
         return get_buffered_match(match_id)
     except Exception:
         return None
@@ -2032,3 +2032,5 @@ def _active_signal_names(match_doc: dict[str, Any]) -> set[str]:
         return set()
     signals = prediction.get("signals") or []
     return {str(s.get("name") or "") for s in signals if isinstance(s, dict) and s.get("name")}
+
+

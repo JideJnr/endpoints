@@ -14,7 +14,7 @@ from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError
 
-from app.config import get_settings
+from app.config.config import get_settings
 
 OPENROUTER_MODELS = {
     "openrouter/free": {
@@ -155,13 +155,13 @@ def run_ollama_match_analysis(
         }
 
     try:
-        from app.competition_special import apply_known_competition_context
+        from app.competition.competition_special import apply_known_competition_context
         apply_known_competition_context(doc)
     except Exception:
         pass
 
     try:
-        from app.groq_agent import _summarise_doc
+        from app.ai.groq_agent import _summarise_doc
         summary = _summarise_doc(doc)
     except Exception as exc:
         return {"status": "error", "message": f"Failed to summarise doc: {exc}", "model": model}
@@ -262,7 +262,7 @@ def run_ollama_predictions(
     target_date = match_date or dt.today().isoformat()
 
     if docs is None:
-        from app.league_memory import get_enriched_matches
+        from app.storage.league_memory import get_enriched_matches
         docs = get_enriched_matches(target_date, limit=limit)
 
     if not docs:

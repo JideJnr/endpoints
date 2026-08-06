@@ -25,7 +25,7 @@ router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 @router.get("")
 def list_pipelines():
     """Return the full pipeline state list with live engine states and job-run data."""
-    from app.pipeline_registry import get_all_pipeline_states
+    from app.scheduling.pipeline_registry import get_all_pipeline_states
     try:
         pipelines = get_all_pipeline_states()
         return {
@@ -43,9 +43,9 @@ def list_pipelines():
 @router.post("/{engine_id}/enable")
 def enable_pipeline(engine_id: str):
     """Enable a toggleable pipeline by engine_id and trigger an immediate run if applicable."""
-    from app.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP, PRESETS
-    from app.league_memory import set_engine_status
-    from app.activity_log import record_activity
+    from app.scheduling.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP, PRESETS
+    from app.storage.league_memory import set_engine_status
+    from app.utils.activity_log import record_activity
     import threading
 
     if engine_id not in TOGGLEABLE_IDS:
@@ -106,9 +106,9 @@ def enable_pipeline(engine_id: str):
 @router.post("/{engine_id}/disable")
 def disable_pipeline(engine_id: str):
     """Disable a toggleable pipeline by engine_id."""
-    from app.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP
-    from app.league_memory import set_engine_status
-    from app.activity_log import record_activity
+    from app.scheduling.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP
+    from app.storage.league_memory import set_engine_status
+    from app.utils.activity_log import record_activity
 
     if engine_id not in TOGGLEABLE_IDS:
         raise HTTPException(
@@ -143,9 +143,9 @@ def apply_preset(preset_name: str):
     - **local** — enable all toggleable pipelines
     - **off**   — disable all toggleable pipelines
     """
-    from app.pipeline_registry import PRESETS, PIPELINE_MAP
-    from app.league_memory import set_engine_status
-    from app.activity_log import record_activity
+    from app.scheduling.pipeline_registry import PRESETS, PIPELINE_MAP
+    from app.storage.league_memory import set_engine_status
+    from app.utils.activity_log import record_activity
 
     if preset_name not in PRESETS:
         raise HTTPException(

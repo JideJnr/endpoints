@@ -21,7 +21,7 @@ Dropped picks are flagged with correlated=True so the frontend can show them
 as dimmed/filtered rather than hiding them entirely.
 
 Usage:
-    from app.portfolio import filter_correlated
+    from app.utils.portfolio import filter_correlated
 
     filtered = filter_correlated(predictions)
     # Each prediction now has:

@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.mobile_bridge import (
+from app.utils.mobile_bridge import (
     acknowledge_packets,
     list_provider_packets,
     mobile_bridge_status,

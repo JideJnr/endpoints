@@ -8,18 +8,18 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.db import db_conn
-from app.buffer import (
+from app.storage.db import db_conn
+from app.storage.buffer import (
     get_buffered_matches,
     get_buffered_match,
     get_live_buffered_matches,
     get_buffer_stats,
     store_enriched,
 )
-from app.league_memory import list_prediction_history
+from app.storage.league_memory import list_prediction_history
 from app.market.market import get_movement
-from app.match_state import classify_match_state
-from app.scheduler import scheduler_status
+from app.utils.match_state import classify_match_state
+from app.scheduling.scheduler import scheduler_status
 
 try:
     from cachetools import TTLCache
@@ -89,7 +89,7 @@ def get_similar_matches(
 
     Results are cached for 5 minutes per sportybet_id.
     """
-    from app.similar_matches import find_similar_matches
+    from app.enrichment.similar_matches import find_similar_matches
 
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     cache_key = (sportybet_id, limit)
@@ -105,7 +105,7 @@ def get_similar_matches(
 
     # ── Compute similarity ────────────────────────────────────────────────────
     try:
-        from app.similar_matches import find_similar_matches, _extract_target_odds_implied
+        from app.enrichment.similar_matches import find_similar_matches, _extract_target_odds_implied
         target_implied = _extract_target_odds_implied(doc)
         target_odds_context = None
         if target_implied:
@@ -148,7 +148,7 @@ def get_match_by_sofascore_id(sofascore_id: str):
     Look up a finished match by SofaScore ID.
     Used as fallback when the SportyBet ID is not available.
     """
-    from app.mongo_store import get_finished_match_by_sofascore_id
+    from app.storage.mongo_store import get_finished_match_by_sofascore_id
 
     doc = get_finished_match_by_sofascore_id(sofascore_id)
     if not doc:
@@ -159,8 +159,8 @@ def get_match_by_sofascore_id(sofascore_id: str):
 @router.get("/matches/{sportybet_id}/sporty-info")
 def get_match_sporty_info(sportybet_id: str):
     """Fetch fresh SportyBet endpoint data for one match and merge it into buffer."""
-    from app.buffer import refresh_sporty_match_state
-    from app.sportybet_client import fetch_match_info
+    from app.storage.buffer import refresh_sporty_match_state
+    from app.data_clients.sportybet_client import fetch_match_info
 
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     try:
@@ -190,8 +190,8 @@ def get_match_sporty_info(sportybet_id: str):
 @router.get("/matches/{sportybet_id}/sportradar-info")
 def get_match_sportradar_info(sportybet_id: str):
     """Fetch fresh Sportradar/SIR widget stats for one buffered SportyBet match."""
-    from app.buffer import _data_sources, store_enriched
-    from app.sportradar_client import fetch_match_intelligence
+    from app.storage.buffer import _data_sources, store_enriched
+    from app.data_clients.sportradar_client import fetch_match_intelligence
 
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
@@ -218,8 +218,8 @@ def get_match_sportradar_info(sportybet_id: str):
 @router.post("/matches/sportradar-enrich")
 def post_sportradar_enrich_all(limit: int = Query(default=500, ge=1, le=2000)):
     """Backfill Sportradar/SIR widget stats for buffered matches without running full prediction."""
-    from app.buffer import _data_sources, store_enriched
-    from app.sportradar_client import fetch_match_intelligence
+    from app.storage.buffer import _data_sources, store_enriched
+    from app.data_clients.sportradar_client import fetch_match_intelligence
 
     docs = get_buffered_matches(limit=limit)
     processed = available = stored = 0
@@ -256,7 +256,7 @@ def post_sportradar_enrich_all(limit: int = Query(default=500, ge=1, le=2000)):
 def get_sofascore_candidates(sportybet_id: str):
     """Return the full SofaScore pool for this SportyBet match state."""
     from app.storage.buffer import _is_ghost_match, _sofascore_date_candidates
-    from app.sofascore_client import fetch_all_scheduled_events, fetch_live_events, is_usable_event_for_mode
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_live_events, is_usable_event_for_mode
 
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
     doc = get_buffered_match(sportybet_id)
@@ -377,8 +377,8 @@ def match_sofascore_candidate(
     payload: dict[str, Any] = Body(...),
 ):
     """Manually attach a SofaScore event and persist the correction."""
-    from app.buffer import store_enriched
-    from app.sofascore_client import fetch_all_scheduled_events, fetch_live_events, is_usable_event_for_mode
+    from app.storage.buffer import store_enriched
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_live_events, is_usable_event_for_mode
 
     sofa_id = payload.get("sofascore_id")
     if sofa_id is None:
@@ -460,9 +460,9 @@ def refresh_predictions_today():
     engine actually said at the time.
     """
     from datetime import date
-    from app.league_memory import _init_db
-    from app.buffer import get_buffered_matches, refresh_sporty_buffer_scope
-    from app.agentic_prediction import AgentExecutionError, run_agentic_match_prediction
+    from app.storage.league_memory import _init_db
+    from app.storage.buffer import get_buffered_matches, refresh_sporty_buffer_scope
+    from app.ai.agentic_prediction import AgentExecutionError, run_agentic_match_prediction
 
     today = date.today().isoformat()
     _init_db()
@@ -545,9 +545,9 @@ def refresh_predictions_today():
 def get_predictions_today():
     """Return today's latest predictions per match, sorted by confidence desc. Excludes no_bet."""
     from datetime import date
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
-    from app.buffer import _init_buffer_table
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
+    from app.storage.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     today = date.today().isoformat()
@@ -616,7 +616,7 @@ def get_predictions_today():
 
         # Attach regime info + filter picks that don't meet regime threshold
         try:
-            from app.regime import get_regime, passes_regime_gate
+            from app.market.regime import get_regime, passes_regime_gate
             tournament = p.get("league_name") or p.get("tournament") or ""
             regime = get_regime(tournament)
             p["regime"] = {"tier": regime.tier, "name": regime.name}
@@ -642,7 +642,7 @@ def get_predictions_today():
 
     # ── Portfolio correlation filter ──────────────────────────────────────────
     try:
-        from app.portfolio import filter_correlated, portfolio_summary
+        from app.utils.portfolio import filter_correlated, portfolio_summary
         sorted_preds = filter_correlated(sorted_preds)
         summary = portfolio_summary(sorted_preds)
     except Exception:
@@ -659,7 +659,7 @@ def get_predictions_today():
 
 def _list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list[dict[str, Any]]:
     """Compatibility wrapper for older local imports."""
-    from app.current_predictions import list_recent_dashboard_predictions
+    from app.utils.current_predictions import list_recent_dashboard_predictions
 
     return list_recent_dashboard_predictions(hours=hours, limit=limit)
 
@@ -668,9 +668,9 @@ def _list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> lis
 def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=1000)):
     """Upcoming buffered matches with enrichment and latest prediction status."""
     from datetime import date
-    from app.buffer import get_buffered_matches, refresh_sporty_buffer_scope
-    from app.league_memory import list_prediction_history
-    from app.enriched_prediction import prediction_readiness
+    from app.storage.buffer import get_buffered_matches, refresh_sporty_buffer_scope
+    from app.storage.league_memory import list_prediction_history
+    from app.enrichment.enriched_prediction import prediction_readiness
 
     today = date.today().isoformat()
     docs = get_buffered_matches(limit=limit)
@@ -744,8 +744,8 @@ def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=100
 @router.post("/matches/purge-ghosts")
 def purge_ghost_matches_endpoint():
     """Delete stale not-started matches from the buffer whose kick-off has passed."""
-    from app.buffer import purge_ghost_matches
-    from app.mongo_store import cleanup_buffer
+    from app.storage.buffer import purge_ghost_matches
+    from app.storage.mongo_store import cleanup_buffer
     purged = purge_ghost_matches()
     cleanup = cleanup_buffer()
     return {
@@ -760,10 +760,10 @@ def purge_ghost_matches_endpoint():
 @router.post("/matches/cleanup")
 def cleanup_finished_matches():
     """Immediately remove all finished, 90+, and ghost matches from the buffer."""
-    from app.mongo_store import cleanup_buffer
-    from app.buffer import purge_ghost_matches
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.mongo_store import cleanup_buffer
+    from app.storage.buffer import purge_ghost_matches
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
     import sqlite3 as _sqlite3
 
     # First pass: archive any is_finished=1 rows that weren't cleaned up
@@ -775,7 +775,7 @@ def cleanup_finished_matches():
         ).fetchall()
     for (match_id,) in rows:
         try:
-            from app.buffer import _archive_finished_locally
+            from app.storage.buffer import _archive_finished_locally
             _archive_finished_locally(match_id)
             archived += 1
         except Exception:
@@ -798,7 +798,7 @@ def cleanup_finished_matches():
 @router.get("/buffer/status")
 def get_buffer_status():
     """Scheduler health + buffer counts. Use to verify background jobs are running."""
-    from app.activity_log import get_activity
+    from app.utils.activity_log import get_activity
 
     return {
         "status": "success",
@@ -811,7 +811,7 @@ def get_buffer_status():
 @router.get("/system/activity")
 def get_system_activity(limit: int = Query(default=30, ge=1, le=120)):
     """Small live activity log for the Settings page."""
-    from app.activity_log import get_activity
+    from app.utils.activity_log import get_activity
 
     return {"status": "success", **get_activity(limit=limit)}
 
@@ -819,7 +819,7 @@ def get_system_activity(limit: int = Query(default=30, ge=1, le=120)):
 @router.get("/system/audit")
 def get_system_audit(limit: int = Query(default=200, ge=20, le=1000)):
     """Operational contract audit for ingest, enrichment, prediction, grading, and jobs."""
-    from app.system_audit import prediction_system_audit
+    from app.monitoring.system_audit import prediction_system_audit
 
     return prediction_system_audit(limit=limit)
 
@@ -827,7 +827,7 @@ def get_system_audit(limit: int = Query(default=200, ge=20, le=1000)):
 @router.get("/system/authority")
 def get_system_authority():
     """Current correction authority leases across self-healing loops."""
-    from app.loop_authority import authority_snapshot
+    from app.scheduling.loop_authority import authority_snapshot
 
     return {
         "status": "success",
@@ -844,7 +844,7 @@ def get_system_authority():
 @router.post("/system/supervisor")
 def run_system_supervisor(auto_correct: bool = True, deep_audit: bool = False):
     """Run the safe operational supervisor once."""
-    from app.system_supervisor import run_system_supervisor as _run_system_supervisor
+    from app.monitoring.system_supervisor import run_system_supervisor as _run_system_supervisor
 
     return _run_system_supervisor(auto_correct=auto_correct, deep_audit=deep_audit)
 
@@ -852,7 +852,7 @@ def run_system_supervisor(auto_correct: bool = True, deep_audit: bool = False):
 @router.get("/system/supervisor")
 def get_system_supervisor_snapshots(limit: int = Query(default=50, ge=1, le=300)):
     """Recent supervisor observations, actions, and recurring operational issues."""
-    from app.system_supervisor import latest_supervisor_snapshots
+    from app.monitoring.system_supervisor import latest_supervisor_snapshots
 
     return latest_supervisor_snapshots(limit=limit)
 
@@ -860,7 +860,7 @@ def get_system_supervisor_snapshots(limit: int = Query(default=50, ge=1, le=300)
 @router.post("/system/prediction-monitor")
 def run_prediction_monitor(auto_correct: bool = True):
     """Run the hourly prediction-quality monitor once."""
-    from app.prediction_monitor import run_prediction_monitor as _run_prediction_monitor
+    from app.monitoring.prediction_monitor import run_prediction_monitor as _run_prediction_monitor
 
     return _run_prediction_monitor(auto_correct=auto_correct)
 
@@ -868,7 +868,7 @@ def run_prediction_monitor(auto_correct: bool = True):
 @router.get("/system/prediction-monitor")
 def get_prediction_monitor_snapshots(limit: int = Query(default=50, ge=1, le=300)):
     """Recent prediction-quality snapshots, mismatch patterns, and accuracy trends."""
-    from app.prediction_monitor import latest_prediction_monitor_snapshots
+    from app.monitoring.prediction_monitor import latest_prediction_monitor_snapshots
 
     return latest_prediction_monitor_snapshots(limit=limit)
 
@@ -876,7 +876,7 @@ def get_prediction_monitor_snapshots(limit: int = Query(default=50, ge=1, le=300
 @router.get("/system/desk")
 def get_desk_observability(limit: int = Query(default=200, ge=20, le=1000)):
     """Trading-desk style operational view: breaks, stale work, decision/risk log."""
-    from app.desk_analytics import desk_observability
+    from app.utils.desk_analytics import desk_observability
 
     return desk_observability(limit=limit)
 
@@ -884,7 +884,7 @@ def get_desk_observability(limit: int = Query(default=200, ge=20, le=1000)):
 @router.get("/competition-special/world-cup/settings")
 def get_world_cup_special_settings():
     """Settings-tab contract for the dedicated World Cup competition mode."""
-    from app.competition_special import get_competition_settings
+    from app.competition.competition_special import get_competition_settings
 
     return {"status": "success", "settings": get_competition_settings("world-cup-2026")}
 
@@ -892,7 +892,7 @@ def get_world_cup_special_settings():
 @router.post("/competition-special/world-cup/settings")
 def post_world_cup_special_settings(payload: dict[str, Any] = Body(...)):
     """Enable/disable the World Cup special lane and adjust tournament ids/dates."""
-    from app.competition_special import update_competition_settings
+    from app.competition.competition_special import update_competition_settings
 
     return {"status": "success", "settings": update_competition_settings("world-cup-2026", payload)}
 
@@ -904,7 +904,7 @@ def post_world_cup_special_sync(
     limit_days: int = Query(default=60, ge=1, le=90),
 ):
     """Pull the World Cup fixture list into the dedicated competition buffer."""
-    from app.competition_special import sync_competition_fixtures
+    from app.competition.competition_special import sync_competition_fixtures
 
     return sync_competition_fixtures(
         "world-cup-2026",
@@ -920,7 +920,7 @@ def post_world_cup_special_enrich_predict(
     allow_repeat: bool = False,
 ):
     """Enrich World Cup rows from SofaScore and run the special prediction path."""
-    from app.competition_special import enrich_predict_competition
+    from app.competition.competition_special import enrich_predict_competition
 
     return enrich_predict_competition("world-cup-2026", limit=limit, allow_repeat=allow_repeat)
 
@@ -928,7 +928,7 @@ def post_world_cup_special_enrich_predict(
 @router.get("/competition-special/world-cup/buffer")
 def get_world_cup_special_buffer(limit: int = Query(default=200, ge=1, le=500)):
     """Dedicated World Cup buffer: fixtures, groups, match state, enrichment, predictions."""
-    from app.competition_special import list_competition_buffer
+    from app.competition.competition_special import list_competition_buffer
 
     return list_competition_buffer("world-cup-2026", limit=limit)
 
@@ -936,7 +936,7 @@ def get_world_cup_special_buffer(limit: int = Query(default=200, ge=1, le=500)):
 @router.get("/competition-special/world-cup/status")
 def get_world_cup_special_status():
     """Small health summary for the Settings tab and World Cup page."""
-    from app.competition_special import competition_status
+    from app.competition.competition_special import competition_status
 
     return competition_status("world-cup-2026")
 
@@ -944,7 +944,7 @@ def get_world_cup_special_status():
 @router.get("/competition-special/competitions")
 def get_top_competition_catalogue():
     """All 30 SofaScore competitions and their individual lane settings."""
-    from app.competition_special import list_top_competitions
+    from app.competition.competition_special import list_top_competitions
 
     competitions = list_top_competitions()
     return {"status": "success", "provider": "sofascore", "count": len(competitions), "competitions": competitions}
@@ -952,14 +952,14 @@ def get_top_competition_catalogue():
 
 @router.get("/competition-special/{competition_key}/settings")
 def get_competition_special_settings(competition_key: str):
-    from app.competition_special import get_competition_settings
+    from app.competition.competition_special import get_competition_settings
 
     return {"status": "success", "settings": get_competition_settings(competition_key)}
 
 
 @router.post("/competition-special/{competition_key}/settings")
 def post_competition_special_settings(competition_key: str, payload: dict[str, Any] = Body(...)):
-    from app.competition_special import update_competition_settings
+    from app.competition.competition_special import update_competition_settings
 
     return {"status": "success", "settings": update_competition_settings(competition_key, payload)}
 
@@ -971,7 +971,7 @@ def post_competition_special_sync(
     end_date: Optional[str] = None,
     limit_days: int = Query(default=7, ge=1, le=90),
 ):
-    from app.competition_special import sync_competition_fixtures
+    from app.competition.competition_special import sync_competition_fixtures
 
     return sync_competition_fixtures(competition_key, start_date=start_date, end_date=end_date, limit_days=limit_days)
 
@@ -982,21 +982,21 @@ def post_competition_special_enrich_predict(
     limit: int = Query(default=12, ge=1, le=80),
     allow_repeat: bool = False,
 ):
-    from app.competition_special import enrich_predict_competition
+    from app.competition.competition_special import enrich_predict_competition
 
     return enrich_predict_competition(competition_key, limit=limit, allow_repeat=allow_repeat)
 
 
 @router.get("/competition-special/{competition_key}/buffer")
 def get_competition_special_buffer(competition_key: str, limit: int = Query(default=200, ge=1, le=500)):
-    from app.competition_special import list_competition_buffer
+    from app.competition.competition_special import list_competition_buffer
 
     return list_competition_buffer(competition_key, limit=limit)
 
 
 @router.get("/competition-special/{competition_key}/status")
 def get_competition_special_status(competition_key: str):
-    from app.competition_special import competition_status
+    from app.competition.competition_special import competition_status
 
     return competition_status(competition_key)
 
@@ -1006,14 +1006,14 @@ def get_competition_team_watchers(
     competition_key: str,
     limit: int = Query(default=80, ge=1, le=200),
 ):
-    from app.competition_special import list_team_watchers
+    from app.competition.competition_special import list_team_watchers
 
     return list_team_watchers(competition_key, limit=limit)
 
 
 @router.get("/competition-special/{competition_key}/team-watchers/{team_id}")
 def get_competition_team_watcher(competition_key: str, team_id: str):
-    from app.competition_special import get_team_watcher
+    from app.competition.competition_special import get_team_watcher
 
     return get_team_watcher(competition_key, team_id)
 
@@ -1023,28 +1023,28 @@ def get_ai_team_watchers(
     limit: int = Query(default=100, ge=1, le=300),
     league_name: Optional[str] = None,
 ):
-    from app.team_watcher import list_watchers
+    from app.team_watcher.team_watcher import list_watchers
 
     return list_watchers(limit=limit, league_name=league_name)
 
 
 @router.get("/team-watchers/inspect-sporty")
 def inspect_sporty_team_watcher_ids(limit: int = Query(default=20, ge=1, le=100)):
-    from app.team_watcher import inspect_sporty_team_ids
+    from app.team_watcher.team_watcher import inspect_sporty_team_ids
 
     return inspect_sporty_team_ids(limit=limit)
 
 
 @router.get("/team-watchers/{team_key:path}")
 def get_ai_team_watcher(team_key: str, limit: int = Query(default=30, ge=1, le=100)):
-    from app.team_watcher import get_watcher
+    from app.team_watcher.team_watcher import get_watcher
 
     return get_watcher(team_key, limit=limit)
 
 
 @router.post("/team-watchers/backfill")
 def backfill_ai_team_watchers(limit: int = Query(default=200, ge=1, le=1000)):
-    from app.team_watcher import backfill_from_finished
+    from app.team_watcher.team_watcher import backfill_from_finished
 
     return backfill_from_finished(limit=limit)
 
@@ -1055,7 +1055,7 @@ def backfill_team_watcher_team_ids(limit: int = Query(default=5000, ge=1, le=100
     Scans the match buffer and finished match archive to re-observe matches involving
     teams with missing IDs. Safe to call multiple times — COALESCE logic never
     overwrites good data with nulls."""
-    from app.team_watcher import backfill_team_watcher_ids
+    from app.team_watcher.team_watcher import backfill_team_watcher_ids
 
     return backfill_team_watcher_ids(limit=limit)
 
@@ -1063,7 +1063,7 @@ def backfill_team_watcher_team_ids(limit: int = Query(default=5000, ge=1, le=100
 @router.post("/team-watchers/rebuild-profiles")
 def rebuild_ai_team_watcher_profiles(limit: int = Query(default=5000, ge=1, le=20000)):
     """Rebuild profile_json for all watchers where it is still stored as '{}'."""
-    from app.team_watcher import rebuild_all_profiles
+    from app.team_watcher.team_watcher import rebuild_all_profiles
 
     return rebuild_all_profiles(limit=limit)
 
@@ -1073,14 +1073,14 @@ def regrade_void_tw_predictions(limit: int = Query(default=2000, ge=1, le=10000)
     """Regrade all TW predictions that were incorrectly stored as 'void' due
     to a bug in observe_match that omitted scores from the grading result dict.
     Safe to call multiple times — rows already corrected to win/loss are not touched."""
-    from app.team_watcher_engine import regrade_void_predictions
+    from app.team_watcher.team_watcher_engine import regrade_void_predictions
 
     return regrade_void_predictions(limit=limit)
 
 
 @router.post("/team-watchers/observe-match/{match_id:path}")
 def observe_match_for_ai_team_watchers(match_id: str):
-    from app.team_watcher import observe_finished_match_by_id
+    from app.team_watcher.team_watcher import observe_finished_match_by_id
 
     return observe_finished_match_by_id(match_id)
 
@@ -1090,8 +1090,8 @@ def observe_match_for_ai_team_watchers(match_id: str):
 @router.get("/competition-registry/competitions")
 def list_competition_registry(tier: Optional[int] = Query(default=None), enabled: Optional[bool] = Query(default=None)):
     """List all tracked competitions with optional filtering."""
-    from app.competition_registry import list_competitions
-    from app.db import db_conn
+    from app.competition.competition_registry import list_competitions
+    from app.storage.db import db_conn
 
     with db_conn(timeout=15) as conn:
         competitions = list_competitions(conn, tier=tier, enabled=enabled)
@@ -1101,8 +1101,8 @@ def list_competition_registry(tier: Optional[int] = Query(default=None), enabled
 @router.get("/competition-registry/competitions/{competition_key}")
 def get_competition_registry_entry(competition_key: str):
     """Get a single competition entry by its normalized key."""
-    from app.competition_registry import get_competition
-    from app.db import db_conn
+    from app.competition.competition_registry import get_competition
+    from app.storage.db import db_conn
 
     with db_conn(timeout=15) as conn:
         entry = get_competition(conn, competition_key)
@@ -1114,8 +1114,8 @@ def get_competition_registry_entry(competition_key: str):
 @router.get("/competition-registry/teams/{team_key}/competitions")
 def get_team_competitions(team_key: str, limit: int = Query(default=20, ge=1, le=100)):
     """Get all competitions a team participates in, with per-competition stats."""
-    from app.competition_registry import get_team_competition_stats, get_team_performance_notes
-    from app.db import db_conn
+    from app.competition.competition_registry import get_team_competition_stats, get_team_performance_notes
+    from app.storage.db import db_conn
 
     with db_conn(timeout=15) as conn:
         rows = conn.execute(
@@ -1133,8 +1133,8 @@ def get_team_competitions(team_key: str, limit: int = Query(default=20, ge=1, le
 @router.get("/competition-registry/teams/{team_key}/competitions/{competition_key}")
 def get_team_competition_detail(team_key: str, competition_key: str):
     """Get detailed team-competition stats and recent performance notes."""
-    from app.competition_registry import get_team_competition_stats, get_team_performance_notes, get_team_competition_history
-    from app.db import db_conn
+    from app.competition.competition_registry import get_team_competition_stats, get_team_performance_notes, get_team_competition_history
+    from app.storage.db import db_conn
 
     with db_conn(timeout=15) as conn:
         stats = get_team_competition_stats(conn, team_key, competition_key)
@@ -1160,8 +1160,8 @@ def get_team_performance_notes_endpoint(
     limit: int = Query(default=20, ge=1, le=100),
 ):
     """Get performance notes for a team, optionally filtered by competition."""
-    from app.competition_registry import get_team_performance_notes
-    from app.db import db_conn
+    from app.competition.competition_registry import get_team_performance_notes
+    from app.storage.db import db_conn
 
     with db_conn(timeout=15) as conn:
         if competition_key:
@@ -1180,9 +1180,9 @@ def get_team_performance_notes_endpoint(
 def get_competition_analysis_latest(competition_key: str):
     """Most recent post-matchday Ollama analysis for a competition."""
     import sqlite3
-    from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -1210,9 +1210,9 @@ def get_competition_analysis_history(
 ):
     """Paginated post-matchday analysis history for a competition."""
     import sqlite3
-    from app.competition_analyser import get_analysis_history, init_competition_analysis_table
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.competition.competition_analyser import get_analysis_history, init_competition_analysis_table
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -1225,7 +1225,7 @@ def get_competition_analysis_history(
 @router.post("/competition-special/{competition_key}/analysis/trigger")
 def trigger_competition_analysis(competition_key: str):
     """Manually trigger post-matchday Ollama analysis for a competition."""
-    from app.competition_analyser import run_competition_analysis
+    from app.competition.competition_analyser import run_competition_analysis
 
     return run_competition_analysis(competition_key)
 
@@ -1238,10 +1238,10 @@ def get_competition_page(
 ):
     """Single-call competition page: settings + buffer + status + latest analysis + history."""
     import sqlite3
-    from app.competition_special import competition_status, get_competition_settings, list_competition_buffer, list_team_watchers
-    from app.competition_analyser import get_analysis_history, get_latest_analysis, init_competition_analysis_table
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.competition.competition_special import competition_status, get_competition_settings, list_competition_buffer, list_team_watchers
+    from app.competition.competition_analyser import get_analysis_history, get_latest_analysis, init_competition_analysis_table
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     buffer = list_competition_buffer(competition_key, limit=buffer_limit)
     status = competition_status(competition_key)
@@ -1273,7 +1273,7 @@ def get_clv_analytics(days: int = Query(default=30, ge=1, le=365)):
     Closing Line Value analytics.
     avg_clv > 0 means you're consistently beating the closing price = real edge.
     """
-    from app.clv import get_clv_summary
+    from app.risk.clv import get_clv_summary
     return {"status": "success", **get_clv_summary(days=days)}
 
 
@@ -1281,7 +1281,7 @@ def get_clv_analytics(days: int = Query(default=30, ge=1, le=365)):
 def compute_clv_now(match_date: Optional[str] = None):
     """Force-compute CLV for a specific date (defaults to today)."""
     from datetime import date
-    from app.clv import compute_clv_for_date
+    from app.risk.clv import compute_clv_for_date
     target = match_date or date.today().isoformat()
     result = compute_clv_for_date(target)
     return {"status": "success", **result}
@@ -1290,14 +1290,14 @@ def compute_clv_now(match_date: Optional[str] = None):
 @router.get("/analytics/calibration")
 def get_calibration():
     """Historical win rate per pick_type × confidence band. Used to size stakes."""
-    from app.confidence_calibrator import get_calibration_table
+    from app.enrichment.confidence_calibrator import get_calibration_table
     return {"status": "success", "calibration": get_calibration_table()}
 
 
 @router.get("/analytics/backtest-gate")
 def get_backtest_gate(limit: int = Query(default=1000, ge=50, le=10000), min_samples: int = Query(default=50, ge=10, le=1000)):
     """Stored-decision replay gate used before trusting model/rule changes."""
-    from app.desk_analytics import backtest_gate
+    from app.utils.desk_analytics import backtest_gate
 
     return backtest_gate(limit=limit, min_samples=min_samples)
 
@@ -1305,7 +1305,7 @@ def get_backtest_gate(limit: int = Query(default=1000, ge=50, le=10000), min_sam
 @router.get("/analytics/signal-attribution")
 def get_signal_attribution(min_samples: int = Query(default=5, ge=1, le=100), limit: int = Query(default=5000, ge=100, le=20000)):
     """Signal attribution from graded primary and candidate prediction rows."""
-    from app.desk_analytics import signal_attribution_report
+    from app.utils.desk_analytics import signal_attribution_report
 
     return signal_attribution_report(min_samples=min_samples, limit=limit)
 
@@ -1405,8 +1405,8 @@ def _engine_row_matches(engine: dict[str, Any], pick_type: str, selection: str, 
 
 
 def _engine_work_rows(limit: int = 3000) -> list[dict[str, Any]]:
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
     import json
     import sqlite3
 
@@ -1502,7 +1502,7 @@ def get_engine_work(engine_id: str, limit: int = Query(default=3000, ge=100, le=
 @router.post("/analytics/calibration/rebuild")
 def rebuild_calibration_endpoint():
     """Force-rebuild the calibration table from all graded predictions."""
-    from app.confidence_calibrator import rebuild_calibration
+    from app.enrichment.confidence_calibrator import rebuild_calibration
     result = rebuild_calibration()
     return {"status": "success", **result}
 
@@ -1510,14 +1510,14 @@ def rebuild_calibration_endpoint():
 @router.get("/analytics/odds-patterns")
 def get_odds_pattern_stats():
     """Aggregate stats on odds movement patterns and their historical win rates."""
-    from app.odds_pattern import pattern_stats
+    from app.market.odds_pattern import pattern_stats
     return {"status": "success", **pattern_stats()}
 
 
 @router.get("/analytics/odds-patterns/{match_id}")
 def get_match_pattern_signal(match_id: str):
     """Get the odds pattern signal for a specific match."""
-    from app.odds_pattern import pattern_signal
+    from app.market.odds_pattern import pattern_signal
     from urllib.parse import unquote
     signal = pattern_signal(unquote(match_id))
     return {"status": "success", "match_id": match_id, "signal": signal}
@@ -1526,7 +1526,7 @@ def get_match_pattern_signal(match_id: str):
 @router.get("/analytics/regime")
 def get_regime_info(tournament: str = Query(default=""), category: str = Query(default="")):
     """Look up the liquidity regime for a tournament name."""
-    from app.regime import get_regime, TIER_1, TIER_2, TIER_3, TIER_4
+    from app.market.regime import get_regime, TIER_1, TIER_2, TIER_3, TIER_4
     regime = get_regime(tournament, category)
     return {
         "status":    "success",
@@ -1543,7 +1543,7 @@ def get_regime_info(tournament: str = Query(default=""), category: str = Query(d
 @router.get("/analytics/regime/tiers")
 def get_all_tiers():
     """Return all regime tier definitions."""
-    from app.regime import TIER_1, TIER_2, TIER_3, TIER_4
+    from app.market.regime import TIER_1, TIER_2, TIER_3, TIER_4
     return {
         "status": "success",
         "tiers": [
@@ -1563,13 +1563,13 @@ def grade_results(hours_back: int = 24):
     import time as _time
     import json
     from datetime import date as _date, timedelta as _timedelta
-    from app.sportybet_client import fetch_results
-    from app.db import DB_PATH
-    from app.league_memory import _init_db, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
+    from app.data_clients.sportybet_client import fetch_results
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
     from app.storage.league_memory._helpers import _grade_pick_for_match
-    from app.prediction_audit import grading_reason
-    from app.mongo_store import archive_finished_match_from_buffer
-    from app.sofascore_client import fetch_all_scheduled_events
+    from app.monitoring.prediction_audit import grading_reason
+    from app.storage.mongo_store import archive_finished_match_from_buffer
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events
     import sqlite3
 
     now_ms   = int(_time.time() * 1000)
@@ -1626,7 +1626,7 @@ def grade_results(hours_back: int = 24):
             conn.commit()
         # Store decision-signal outcomes in local device memory; Mongo is only an optional mirror.
         try:
-            from app.self_learner import _decision_signals_for_row
+            from app.monitoring.self_learner import _decision_signals_for_row
 
             signals = _decision_signals_for_row(row)
         except Exception:
@@ -1647,7 +1647,7 @@ def grade_results(hours_back: int = 24):
                 confidence=row["confidence"],
             )
             try:
-                from app.mongo_store import store_signal_outcomes, is_configured
+                from app.storage.mongo_store import store_signal_outcomes, is_configured
                 if is_configured():
                     store_signal_outcomes(
                         match_id=str(row["match_id"]),
@@ -1717,7 +1717,7 @@ def grade_results(hours_back: int = 24):
 
     # Grade orphaned predictions (no buffer entry — matches archived before grading)
     try:
-        from app.league_memory import grade_orphaned_predictions
+        from app.storage.league_memory import grade_orphaned_predictions
         orphaned = grade_orphaned_predictions(limit=1000)
     except Exception as _exc:
         orphaned = {"status": "error", "reason": str(_exc), "graded": 0}
@@ -1728,7 +1728,7 @@ def grade_results(hours_back: int = 24):
         if row["result"] not in ("win", "loss"):
             continue
         try:
-            from app.mongo_store import get_finished_match
+            from app.storage.mongo_store import get_finished_match
             finished = get_finished_match(str(row["match_id"]))
             if not finished:
                 continue
@@ -1756,7 +1756,7 @@ def grade_results(hours_back: int = 24):
 @router.post("/results/grade-overdue")
 def grade_overdue_results(hours_after_kickoff: float = 2.0, limit: int = 500):
     """Grade all pending matches that are past kickoff+N hours, skipping true live matches."""
-    from app.league_memory import grade_overdue_predictions
+    from app.storage.league_memory import grade_overdue_predictions
 
     return grade_overdue_predictions(hours_after_kickoff=hours_after_kickoff, limit=limit)
 
@@ -1765,7 +1765,7 @@ def grade_overdue_results(hours_after_kickoff: float = 2.0, limit: int = 500):
 def grade_orphaned_results(limit: int = Query(default=1000, ge=1, le=5000)):
     """Grade prediction_history rows that have no match_buffer entry (orphaned after archiving).
     Fetches SofaScore results per date for each distinct match date in the backlog."""
-    from app.league_memory import grade_orphaned_predictions
+    from app.storage.league_memory import grade_orphaned_predictions
 
     return grade_orphaned_predictions(limit=limit)
 
@@ -1773,7 +1773,7 @@ def grade_orphaned_results(limit: int = Query(default=1000, ge=1, le=5000)):
 @router.post("/results/grade-match/{match_id:path}")
 def grade_one_match_result(match_id: str, hours_back: int = 72):
     """Check SportyBet/SofaScore for one match result and grade its prediction rows."""
-    from app.league_memory import check_and_grade_match_result
+    from app.storage.league_memory import check_and_grade_match_result
 
     return check_and_grade_match_result(match_id, hours_back=hours_back)
 
@@ -1785,7 +1785,7 @@ def get_odds_only_predictions():
     Runs on every buffered match that has odds, including unenriched ones.
     Useful as a baseline when enrichment hasn't run yet.
     """
-    from app.odds_predictor import odds_only_prediction
+    from app.models.odds_predictor import odds_only_prediction
     from datetime import date
 
     today = date.today().isoformat()
@@ -1818,7 +1818,7 @@ def get_signal_analytics(
     Signal win rate analytics.
     Scope: whole DB (default), filtered by country, or filtered by tournament.
     """
-    from app.league_memory import get_local_signal_stats
+    from app.storage.league_memory import get_local_signal_stats
     return {
         "status": "success",
         **get_local_signal_stats(
@@ -1838,8 +1838,8 @@ def get_signal_matches(
     """List matches carrying a specific learned signal, with grading summary."""
     import json
     import sqlite3
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     signal_name = str(signal_name or "consensus_longshot_value")
     result = result if isinstance(result, str) else ""
@@ -1956,9 +1956,9 @@ def get_model_explorer(
     """Prediction history grouped by pick/model so the UI can rank by accuracy."""
     import json
     import sqlite3
-    from app.market_intent import classify_market_intent
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.market.market_intent import classify_market_intent
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     def _pick_family(pick_type: str, selection: str, market_intent: dict[str, Any] | None = None) -> str:
         intent = market_intent or classify_market_intent(pick_type, selection)
@@ -2303,7 +2303,7 @@ def get_model_explorer(
 def enrich_match_endpoint(sportybet_id: str):
     """Force-enrich a single match using saved manual SofaScore match when present."""
     try:
-        from app.match_enrichment import MatchEnrichmentError, enrich_buffered_match
+        from app.enrichment.match_enrichment import MatchEnrichmentError, enrich_buffered_match
 
         sportybet_id = _resolve_buffer_match_id(sportybet_id)
         return enrich_buffered_match(sportybet_id)
@@ -2319,8 +2319,8 @@ def predict_single_match(
     dry_run: bool = False,
 ):
     """Run the deterministic/manual prediction pipeline without the AI agent."""
-    from app.match_enrichment import MatchEnrichmentError, enrich_buffered_match
-    from app.prediction_flow import apply_prediction_state
+    from app.enrichment.match_enrichment import MatchEnrichmentError, enrich_buffered_match
+    from app.utils.prediction_flow import apply_prediction_state
 
     try:
         sportybet_id = _resolve_buffer_match_id(sportybet_id)
@@ -2468,7 +2468,7 @@ def analyze_match_with_ai(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in the buffer")
 
-    from app.ai_prediction_pipeline import run_ai_prediction_with_fallback
+    from app.ai.ai_prediction_pipeline import run_ai_prediction_with_fallback
 
     state = run_ai_prediction_with_fallback(
         doc,
@@ -2557,13 +2557,13 @@ def analyze_match_snapshot(sportybet_id: str):
     # Try buffer first, then finished matches
     doc = get_buffered_match(sportybet_id)
     if not doc:
-        from app.mongo_store import get_finished_match
+        from app.storage.mongo_store import get_finished_match
         doc = get_finished_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in buffer or archive")
 
-    from app.groq_agent import run_groq_match_analysis
-    from app.ollama_agent import run_ollama_all_models
+    from app.ai.groq_agent import run_groq_match_analysis
+    from app.ai.ollama_agent import run_ollama_all_models
 
     # Run the router-backed AI analysis first
     analysis = run_groq_match_analysis(doc)
@@ -2595,13 +2595,13 @@ def analyze_graded_match(sportybet_id: str):
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
 
-    from app.mongo_store import get_finished_match
+    from app.storage.mongo_store import get_finished_match
     doc = get_finished_match(sportybet_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Finished match not found")
 
-    from app.groq_agent import run_groq_match_analysis
-    from app.ollama_agent import run_ollama_all_models
+    from app.ai.groq_agent import run_groq_match_analysis
+    from app.ai.ollama_agent import run_ollama_all_models
 
     # Add grading result context to the document
     prediction = doc.get("prediction")
@@ -2642,8 +2642,8 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
     Run AI analysis on a graded match to see what happened and if the prediction was correct.
     Tries the router-backed OpenRouter path first, then falls back if needed.
     """
-    from app.groq_agent import run_groq_match_analysis
-    from app.ollama_agent import run_ollama_all_models
+    from app.ai.groq_agent import run_groq_match_analysis
+    from app.ai.ollama_agent import run_ollama_all_models
 
     prediction = doc.get("prediction")
     if prediction:
@@ -2678,15 +2678,15 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
 
 def _observe_team_watchers_after_analysis(doc: dict[str, Any], analysis: dict[str, Any]) -> None:
     try:
-        from app.team_watcher import observe_match
+        from app.team_watcher.team_watcher import observe_match
         observe_match(doc, analysis=analysis)
     except Exception as exc:
         _logger.debug("Team watcher update failed for %s: %s", doc.get("_id") or doc.get("sportybet_id"), exc)
 
 
 def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
-    from app.enriched_prediction import prediction_readiness
-    from app.match_intelligence import build_match_intelligence
+    from app.enrichment.enriched_prediction import prediction_readiness
+    from app.enrichment.match_intelligence import build_match_intelligence
 
     detail = doc.get("sofascore_detail") or {}
     managers = detail.get("managers") or {}
@@ -2802,7 +2802,7 @@ def _archived_match_detail(match_id: str) -> dict[str, Any] | None:
     """Read a finished match that has already left the hot SQL buffer."""
     archived: dict[str, Any] | None = None
     try:
-        from app.mongo_store import get_finished_match
+        from app.storage.mongo_store import get_finished_match
         archived = get_finished_match(match_id)
     except Exception:
         archived = None
@@ -2853,8 +2853,8 @@ def _local_finished_match(match_id: str) -> dict[str, Any] | None:
     try:
         import json
         import sqlite3
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
 
         _init_db()
         with db_conn(timeout=30) as conn:
@@ -2878,8 +2878,8 @@ def _history_match_detail(match_id: str) -> dict[str, Any] | None:
     try:
         import json
         import sqlite3
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
 
         _init_db()
         with db_conn(timeout=30) as conn:
@@ -2958,7 +2958,7 @@ def _find_sofascore_event(
     fetch_live_events,
     fetch_all_scheduled_events,
 ) -> dict[str, Any] | None:
-    from app.sofascore_client import is_usable_event_for_mode
+    from app.data_clients.sofascore_client import is_usable_event_for_mode
 
     if live:
         try:
@@ -3003,13 +3003,13 @@ def _candidate_summary(event: dict[str, Any], doc: dict[str, Any], match_date: s
 
 
 def _learned_best_pick(picks: list[dict[str, Any]]) -> dict[str, Any]:
-    from app.pick_roles import learned_best_pick
+    from app.risk.pick_roles import learned_best_pick
 
     return learned_best_pick(picks)
 
 
 def _load_role_memory_rows() -> dict[tuple[str, str], list[dict[str, Any]]]:
-    from app.pick_roles import load_role_memory_rows
+    from app.risk.pick_roles import load_role_memory_rows
 
     return load_role_memory_rows()
 
@@ -3020,7 +3020,7 @@ def _backfill_role_learning(
     match_id: str,
     role_rows: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
 ) -> None:
-    from app.pick_roles import backfill_role_learning
+    from app.risk.pick_roles import backfill_role_learning
 
     backfill_role_learning(prediction, picks, match_id, role_rows)
 
@@ -3032,20 +3032,20 @@ def _fast_role_memory(
     selection: str,
     role_rows: dict[tuple[str, str], list[dict[str, Any]]],
 ) -> dict[str, Any]:
-    from app.pick_roles import fast_role_memory
+    from app.risk.pick_roles import fast_role_memory
 
     return fast_role_memory(league, country, pick_type, selection, role_rows)
 
 
 def _attach_fast_learned_decision(picks: list[dict[str, Any]]) -> None:
-    from app.pick_roles import attach_fast_learned_decision
+    from app.risk.pick_roles import attach_fast_learned_decision
 
     attach_fast_learned_decision(picks)
 
 
 def _candidate_score(event: dict[str, Any], doc: dict[str, Any]) -> float:
     try:
-        from app.enrichment import _event_score
+        from app.enrichment.enrichment import _event_score
         sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
         return _event_score(
             {
@@ -3094,31 +3094,31 @@ def _sort_start(value: Any) -> int:
 
 
 def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
-    from app.match_view import match_summary
+    from app.utils.match_view import match_summary
 
     return match_summary(doc)
 
 
 def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    from app.match_view import extract_1x2
+    from app.utils.match_view import extract_1x2
 
     return extract_1x2(markets)
 
 
 def _home_team(doc: dict[str, Any]) -> str:
-    from app.match_view import home_team
+    from app.utils.match_view import home_team
 
     return home_team(doc)
 
 
 def _away_team(doc: dict[str, Any]) -> str:
-    from app.match_view import away_team
+    from app.utils.match_view import away_team
 
     return away_team(doc)
 
 
 def _team_from_name(doc: dict[str, Any], index: int) -> str:
-    from app.match_view import team_from_name
+    from app.utils.match_view import team_from_name
 
     return team_from_name(doc, index)
 
@@ -3165,7 +3165,7 @@ def _grade_signal_stats(graded: int) -> dict[str, Any]:
     if graded == 0:
         return {}
     try:
-        from app.league_memory import get_local_signal_stats
+        from app.storage.league_memory import get_local_signal_stats
         stats = get_local_signal_stats(min_samples=3)
         top = stats.get("signals", [])[:5]
         return {"top_signals": top, "scope": "device"}
@@ -3182,7 +3182,7 @@ def get_specialist_performance(league: str = Query(default=""), pick_type: str =
     Shows win rate, sample count, and learned weight (0.3–2.0).
     Weight > 1.0 = specialist is trusted more; < 1.0 = suppressed.
     """
-    from app.ai_prediction_pipeline import get_specialist_summary, get_specialist_weights
+    from app.ai.ai_prediction_pipeline import get_specialist_summary, get_specialist_weights
     summary = get_specialist_summary()
     weights = get_specialist_weights(
         league=league or None,
@@ -3207,7 +3207,7 @@ def get_brain_summary():
     Shows signal win rates, league accuracy, auto-tuned model weights, and CLV trend.
     This is the 'consciousness' view — what the system knows about itself.
     """
-    from app.self_learner import get_learning_summary
+    from app.monitoring.self_learner import get_learning_summary
     summary = get_learning_summary()
     return {"status": "success", **summary}
 
@@ -3219,7 +3219,7 @@ def trigger_learning_cycle():
     Normally runs automatically after every grading cycle (every 6 hours).
     Use this to force an immediate update after manual grading.
     """
-    from app.self_learner import run_learning_cycle
+    from app.monitoring.self_learner import run_learning_cycle
     result = run_learning_cycle()
     return {"status": "success", **result}
 
@@ -3239,7 +3239,7 @@ def get_brain_signal_weights(league: str = Query(default="")):
     Return learned signal weights — which signals are hot/cold.
     Optionally filter by league to get league-specific weights.
     """
-    from app.self_learner import get_top_signals, get_signal_weights
+    from app.monitoring.self_learner import get_top_signals, get_signal_weights
     top = get_top_signals(limit=30)
     league_weights = get_signal_weights(league) if league else {}
     return {
@@ -3257,7 +3257,7 @@ def get_brain_league_profile(league_name: str):
     Shows win rate per pick type, calibration gap, and whether the system
     is over/under-confident in this league.
     """
-    from app.self_learner import get_league_accuracy
+    from app.monitoring.self_learner import get_league_accuracy
     from urllib.parse import unquote
     result = get_league_accuracy(unquote(league_name))
     return {"status": "success", **result}
@@ -3270,7 +3270,7 @@ def get_brain_model_weights():
     Shows how much each model (Poisson, Dixon-Coles, ELO, Rules, Groq)
     has been adjusted based on historical accuracy.
     """
-    from app.self_learner import get_learned_weights
+    from app.monitoring.self_learner import get_learned_weights
     weights = get_learned_weights()
     return {
         "status": "success",
@@ -3286,7 +3286,7 @@ def get_team_sofascore_grades(team_id: str, last_n: int = Query(default=5, ge=1,
     Return SofaScore rating trend for a team.
     Shows whether the team is improving or declining based on player ratings.
     """
-    from app.sofascore_grades import get_team_rating_trend
+    from app.data_clients.sofascore_grades import get_team_rating_trend
     result = get_team_rating_trend(team_id, last_n=last_n)
     return {"status": "success", **result}
 
@@ -3297,9 +3297,9 @@ def get_brain_health():
     Full brain health check — shows all learning systems and their status.
     Use this to verify the self-learning pipeline is working end-to-end.
     """
-    from app.self_learner import get_learning_summary, get_learned_weights
-    from app.clv import get_clv_summary
-    from app.confidence_calibrator import get_calibration_table
+    from app.monitoring.self_learner import get_learning_summary, get_learned_weights
+    from app.risk.clv import get_clv_summary
+    from app.enrichment.confidence_calibrator import get_calibration_table
 
     health: dict[str, Any] = {"status": "success"}
 
@@ -3351,3 +3351,7 @@ def get_brain_health():
     health["brain_score"] = f"{ok_count}/{total} systems healthy"
 
     return health
+
+
+
+

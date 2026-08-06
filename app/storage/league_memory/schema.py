@@ -18,7 +18,7 @@ import sqlite3
 
 # Re-export the primary DB initialiser so callers within the package
 # (and external shims) can import it from here.
-from app.db import _init_db as _init_db  # noqa: F401, PLC0414
+from app.storage.db import _init_db as _init_db  # noqa: F401, PLC0414
 
 
 def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
@@ -51,7 +51,7 @@ def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
 def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:
     """Ensure buffer-related tables exist by delegating to ``app.buffer``."""
     try:
-        from app.buffer import _init_buffer_table
+        from app.storage.buffer import _init_buffer_table
 
         _init_buffer_table(conn)
     except Exception:

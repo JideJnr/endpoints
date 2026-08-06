@@ -213,7 +213,7 @@ def ensure_default_states() -> dict[str, str]:
     On first boot, write default engine states for any pipeline that has no row
     yet.  Existing rows are NEVER overwritten.
     """
-    from app.league_memory import get_engine_states, set_engine_status
+    from app.storage.league_memory import get_engine_states, set_engine_status
 
     existing = get_engine_states()
     initialised: dict[str, str] = {}
@@ -228,7 +228,7 @@ def ensure_default_states() -> dict[str, str]:
 
 def is_pipeline_enabled(engine_id: str) -> bool:
     """Return True if the pipeline engine state is 'active'."""
-    from app.league_memory import get_engine_states
+    from app.storage.league_memory import get_engine_states
     states = get_engine_states()
     return states.get(engine_id, "paused") == "active"
 
@@ -254,8 +254,8 @@ def get_all_pipeline_states() -> list[dict]:
     Return the full pipeline state list for the API response.
     Merges static pipeline definitions with live engine states and job_run data.
     """
-    from app.league_memory import get_engine_states
-    from app.job_state import list_job_states
+    from app.storage.league_memory import get_engine_states
+    from app.scheduling.job_state import list_job_states
 
     engine_states = get_engine_states()
     job_run_map = {row["job_id"]: row for row in list_job_states()}

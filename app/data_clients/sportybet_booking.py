@@ -10,8 +10,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from app.buffer import get_buffered_match, refresh_sporty_match_state
-from app.market_intent import classify_market_intent
+from app.storage.buffer import get_buffered_match, refresh_sporty_match_state
+from app.market.market_intent import classify_market_intent
 from app.data_clients.sportybet_client import _browser_headers, _get_session
 
 
@@ -181,3 +181,4 @@ def _provider_error(body: Any, status: int) -> str:
     if isinstance(body, dict):
         return str(body.get("message") or body.get("error") or body.get("detail") or f"SportyBet returned HTTP {status}")
     return f"SportyBet returned HTTP {status}"
+

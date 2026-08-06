@@ -4,7 +4,7 @@ import json
 from typing import Any
 from urllib import error, request
 
-from app.config import get_settings
+from app.config.config import get_settings
 
 
 DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
@@ -22,7 +22,7 @@ def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None
     memory_context = _build_memory_context(prediction)
     prompt_payload = _compact_prediction(prediction, safe_detail, memory_context, match_context)
     # Try AIRouter first (covers ollama + groq in one call)
-    from app.ai_router import get_router
+    from app.ai.ai_router import get_router
     if get_router().any_available():
         ai = _router_review(prompt_payload)
         if ai:
@@ -48,7 +48,7 @@ def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | No
         match_doc.update(prediction)
 
     try:
-        from app.competition_special import apply_known_competition_context
+        from app.competition.competition_special import apply_known_competition_context
         apply_known_competition_context(match_doc)
         context["known_competition"] = match_doc.get("known_competition")
         context["competition_special"] = match_doc.get("competition_special")
@@ -57,7 +57,7 @@ def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | No
         pass
 
     try:
-        from app.team_watcher import team_context_for_match
+        from app.team_watcher.team_watcher import team_context_for_match
         team_watchers = team_context_for_match(match_doc)
         context["team_watchers"] = team_watchers
     except Exception:
@@ -83,7 +83,7 @@ def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
     context: dict[str, Any] = {}
 
     try:
-        from app.self_learner import get_signal_weights, get_league_accuracy, get_top_signals, get_learned_weights, get_learning_summary
+        from app.monitoring.self_learner import get_signal_weights, get_league_accuracy, get_top_signals, get_learned_weights, get_learning_summary
         league = prediction.get("league_name") or prediction.get("tournament") or ""
         if isinstance(league, dict):
             league = league.get("name") or ""
@@ -121,7 +121,7 @@ def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
         pass
 
     try:
-        from app.clv import get_clv_summary
+        from app.risk.clv import get_clv_summary
         clv = get_clv_summary(days=14)
         avg_clv = clv.get("avg_clv_percent")
         if avg_clv is not None:
@@ -134,7 +134,7 @@ def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
         pass
 
     try:
-        from app.confidence_calibrator import get_calibration_table
+        from app.enrichment.confidence_calibrator import get_calibration_table
         cal = get_calibration_table()
         if cal:
             context["calibration"] = [
@@ -160,7 +160,7 @@ def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] |
 
 def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Use AIRouter for supervisor review: qwen3 → openrouter → groq."""
-    from app.ai_router import get_router, parse_json_safe
+    from app.ai.ai_router import get_router, parse_json_safe
     try:
         messages = _review_messages(payload)
         raw = get_router().call_review(messages)
@@ -376,3 +376,6 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+

@@ -13,10 +13,10 @@ import sqlite3
 import time
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db
-from app.season_stage import detect_season_stage
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
+from app.market.season_stage import detect_season_stage
 
 logger = logging.getLogger(__name__)
 
@@ -321,20 +321,20 @@ def _build_h2h_statement(h2h_matches: list[dict], team_duel: dict | None = None)
 
 def _ollama_model() -> str | None:
     """Return the first available local model via the router."""
-    from app.ai_router import get_router
+    from app.ai.ai_router import get_router
     return get_router().best_available()
 
 
 def _call_provider(model: str, prompt: str, timeout: int) -> str:
     """Route through AIRouter — Ollama primary, Groq final fallback."""
-    from app.ai_router import get_router
+    from app.ai.ai_router import get_router
     task = "reasoning" if model not in ("groq",) else "analysis"
     return get_router().call_auto(prompt, task=task)
 
 
 # Kept as an internal compatibility alias for existing step tests/call sites.
 def _ollama(model: str, prompt: str, timeout: int) -> str:
-    from app.ai_router import get_router
+    from app.ai.ai_router import get_router
     # Step functions pass the model name as a hint for task routing
     task = "reasoning"
     return get_router().call_auto(prompt, task=task)
@@ -355,7 +355,7 @@ def _step_h2h(doc: dict, model: str, timeout: int = 20) -> str:
             team_duel = None
         event_id = doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id"))
         if not matches and not team_duel and event_id:
-            from app.sofascore_client import fetch_h2h
+            from app.data_clients.sofascore_client import fetch_h2h
             fetched = fetch_h2h(int(event_id)) or {}
             if isinstance(fetched, dict):
                 matches = list(fetched.get("events") or [])
@@ -473,7 +473,7 @@ def _step_odds(doc: dict, model: str, timeout: int = 20) -> str:
     try:
         match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
         if not match_id: return ODDS_FALLBACK
-        from app.agent_tools import get_odds_movement
+        from app.ai.agent_tools import get_odds_movement
         data = get_odds_movement(match_id) or {}
         if not data: return ODDS_FALLBACK
         evidence = f"Odds movement: {json.dumps(data, default=str)[:350]}"
@@ -489,7 +489,7 @@ def apply_tier_filter(candidates: list[dict], target_tier: int) -> list[dict]:
 
 def _step_similar_matches(doc: dict, model: str, timeout: int = 20) -> str:
     try:
-        from app.similar_matches import find_similar_matches
+        from app.enrichment.similar_matches import find_similar_matches
         raw = find_similar_matches(doc) or {}
         candidates = raw.get("matches", raw.get("similar_matches", [])) if isinstance(raw, dict) else raw
         candidates = apply_tier_filter(list(candidates or []), classify_tournament_tier(_tournament(doc)))
@@ -679,7 +679,7 @@ def _get_competition_context(doc: dict, conn) -> str | None:
         )
         if not key:
             return None
-        from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
+        from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
         init_competition_analysis_table(conn)
         row = get_latest_analysis(key, conn)
         if not row:
@@ -699,7 +699,7 @@ def _get_competition_context(doc: dict, conn) -> str | None:
 
 
 def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None, specialist_weights: dict[str, float] | None = None) -> dict:
-    from app.ai_router import get_router, parse_json_response
+    from app.ai.ai_router import get_router, parse_json_response
     context_block = f"Competition context: {competition_context} | " if competition_context else ""
     unavailable = [
         label for label, statement in zip(
@@ -744,7 +744,7 @@ def _convert_confidence(raw: float) -> int:
 
 
 def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
-    from app.prediction_flow import apply_prediction_state
+    from app.utils.prediction_flow import apply_prediction_state
     logger.warning("Rules-engine fallback invoked: %s", reason)
     kwargs["use_ollama_pipeline"] = False
     result = apply_prediction_state(doc, **kwargs)
@@ -763,9 +763,9 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         use_ollama_pipeline=True if use_ollama_pipeline is None else use_ollama_pipeline,
     )
     try:
-        from app.ai_router import get_router
+        from app.ai.ai_router import get_router
         router = get_router()
-        model = router.best_available() or ("groq" if router.is_groq_available() else None)
+        model = router.best_available()
         if not model:
             result = _rules_fallback(doc, "unavailable", **kwargs)
             result["competition_analysis_used"] = False
@@ -814,7 +814,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
         specialist_weights = get_specialist_weights(league=_tournament(doc))
         decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context, specialist_weights=specialist_weights)
-        from app.prediction_flow import apply_prediction_state
+        from app.utils.prediction_flow import apply_prediction_state
 
         result = apply_prediction_state(doc, **kwargs)
         if result.get("status") != "predicted": return result
@@ -866,9 +866,9 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
 
 
 def job_ai_prediction_queue(batch_size: int = 10) -> dict:
-    from app.activity_log import record_activity
-    from app.pipeline_registry import is_pipeline_enabled
-    from app.buffer import get_buffered_match as _get_buffered_match, store_enriched as _store
+    from app.utils.activity_log import record_activity
+    from app.scheduling.pipeline_registry import is_pipeline_enabled
+    from app.storage.buffer import get_buffered_match as _get_buffered_match, store_enriched as _store
     if not is_pipeline_enabled("ai_prediction_queue"):
         return {"status": "skipped", "reason": "pipeline_disabled"}
     record_activity("AI prediction queue started", job="ai_prediction_queue", status="running")
@@ -907,7 +907,7 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
     def _process_one(doc: dict) -> dict:
         if not doc.get("prediction_readiness") or not doc.get("sofascore_detail"):
             try:
-                from app.match_enrichment import enrich_buffered_match
+                from app.enrichment.match_enrichment import enrich_buffered_match
                 enrich_buffered_match(str(doc.get("match_id") or ""), auto_predict=False)
                 refreshed = _get_buffered_match(str(doc.get("match_id") or ""))
                 if refreshed:
@@ -936,3 +936,5 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
                 summary["errors"] += 1
     record_activity("AI prediction queue completed", job="ai_prediction_queue", status="ok" if not summary["errors"] else "error", details=summary)
     return summary
+
+

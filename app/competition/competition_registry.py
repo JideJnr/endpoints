@@ -21,7 +21,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import _ensure_column, _init_db, db_conn
+from app.storage.db import _ensure_column, _init_db, db_conn
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ def ensure_competition(
 
     Returns the competition row as a dict (empty dict if name is blank).
     """
-    from app.league_memory import normalize_league  # local import breaks circular dependency
+    from app.storage.league_memory import normalize_league  # local import breaks circular dependency
     key = normalize_league(name)
     if not key:
         return {}

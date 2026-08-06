@@ -8,7 +8,7 @@ This is an OPTIONAL enhancement on top of the existing rules-based prediction_ag
 Falls back gracefully if GROQ_API_KEY is not set.
 
 Usage:
-    from app.groq_agent import run_groq_predictions
+    from app.ai.groq_agent import run_groq_predictions
     results = run_groq_predictions(match_date="2026-05-16", docs=enriched_docs)
 """
 from __future__ import annotations
@@ -17,8 +17,8 @@ import json
 from datetime import date as dt, datetime, timezone
 from typing import Any
 
-from app.league_memory import record_prediction
-from app.season_stage import detect_season_stage
+from app.storage.league_memory import record_prediction
+from app.market.season_stage import detect_season_stage
 from app.research.research_filter import get_research_context_for_prompt
 
 
@@ -59,8 +59,8 @@ _SYSTEM_PROMPT_LANGCHAIN = SYSTEM_PROMPT.replace("{", "{{").replace("}", "}}")
 def _build_agent():
     from langchain.agents import create_tool_calling_agent, AgentExecutor
     from langchain_core.prompts import ChatPromptTemplate
-    from app.llm import get_llm
-    from app.agent_tools import ALL_TOOLS
+    from app.ai.llm import get_llm
+    from app.ai.agent_tools import ALL_TOOLS
     from datetime import datetime, timezone
 
     @__import__("langchain.tools", fromlist=["tool"]).tool
@@ -231,7 +231,7 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
 
 
 def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
-    from app.competition_special import apply_known_competition_context
+    from app.competition.competition_special import apply_known_competition_context
     apply_known_competition_context(doc)
     match_input = _summarise_doc(doc)
 
@@ -264,7 +264,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     Run a match analysis for one enriched document.
     Routes through AIRouter with OpenRouter first, then Groq as fallback.
     """
-    from app.ai_router import get_router, parse_json_response
+    from app.ai.ai_router import get_router, parse_json_response
 
     router = get_router()
     if not router.any_available():
@@ -273,7 +273,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     # Try small-context pipeline first if available
     if router.is_pipeline_available():
         try:
-            from app.ollama_pipeline import run_ollama_pipeline
+            from app.ai.ollama_pipeline import run_ollama_pipeline
             pipeline_result = run_ollama_pipeline(doc, attach_brain=False)
             if pipeline_result.get("status") == "predicted":
                 return pipeline_result
@@ -281,7 +281,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
             logger.warning("groq_agent: pipeline failed, falling back to single-call: %s", exc)
 
     try:
-        from app.competition_special import apply_known_competition_context
+        from app.competition.competition_special import apply_known_competition_context
         apply_known_competition_context(doc)
         summary = _summarise_doc(doc)
         prompt = f"{SYSTEM_PROMPT}\n\n{summary}"
@@ -338,14 +338,14 @@ def run_groq_predictions(
     Returns:
         summary dict with predictions list
     """
-    from app.ai_router import get_router
+    from app.ai.ai_router import get_router
     if not get_router().any_available():
         return {"status": "ai_unavailable", "message": "No AI provider available. Set OPENROUTER_API_KEY or enable a fallback provider."}
 
     target_date = match_date or dt.today().isoformat()
 
     if docs is None:
-        from app.league_memory import get_enriched_matches
+        from app.storage.league_memory import get_enriched_matches
         docs = get_enriched_matches(target_date, limit=limit)
 
     if not docs:
@@ -394,3 +394,4 @@ def run_groq_predictions(
         "value_bets": value_bets,
         "predictions": predictions,
     }
+

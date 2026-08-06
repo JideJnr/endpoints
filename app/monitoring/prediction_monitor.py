@@ -5,10 +5,10 @@ import sqlite3
 import time
 from typing import Any
 
-from app.db import db_conn
-from app.activity_log import record_activity
-from app.db import DB_PATH
-from app.league_memory import _init_db, get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions
+from app.storage.db import db_conn
+from app.utils.activity_log import record_activity
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db, get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions
 
 
 SNAPSHOT_KEEP_ROWS = 1000
@@ -39,7 +39,7 @@ def run_prediction_monitor(*, auto_correct: bool = True) -> dict[str, Any]:
 
     graded_now = int((grading or {}).get("graded") or 0) + int((grading or {}).get("candidate_graded") or 0)
     if auto_correct:
-        from app.loop_authority import CorrectionAuthorityBusy, correction_authority
+        from app.scheduling.loop_authority import CorrectionAuthorityBusy, correction_authority
 
         try:
             with correction_authority("prediction_monitor", "learning", reason="grading-driven calibration and weight refresh") as lease:
@@ -370,19 +370,19 @@ def _trend_is_degrading(trend: Any) -> bool:
 
 
 def _rebuild_calibration() -> dict[str, Any]:
-    from app.confidence_calibrator import rebuild_calibration
+    from app.enrichment.confidence_calibrator import rebuild_calibration
 
     return rebuild_calibration()
 
 
 def _optimise_weights() -> dict[str, Any]:
-    from app.weight_optimiser import optimise_ensemble_weights
+    from app.models.weight_optimiser import optimise_ensemble_weights
 
     return optimise_ensemble_weights()
 
 
 def _memory_maintenance() -> dict[str, Any]:
-    from app.league_memory import run_memory_maintenance
+    from app.storage.league_memory import run_memory_maintenance
 
     return run_memory_maintenance(raw_retention_days=30, odds_retention_days=60)
 
@@ -522,3 +522,4 @@ def _record_monitor_activity(result: dict[str, Any]) -> None:
         )
     except Exception:
         pass
+

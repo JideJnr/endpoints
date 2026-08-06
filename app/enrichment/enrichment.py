@@ -10,16 +10,16 @@ from difflib import SequenceMatcher
 from typing import Any
 from urllib import error, request
 
-from app.league_memory import store_enriched_matches
+from app.storage.league_memory import store_enriched_matches
 from app.market.market import snapshot_odds
-from app.normalise import normalise
-from app.match_state import classify_match_state
-from app.season_stage import detect_season_stage
-from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, is_usable_event_for_mode
-from app.sportradar_client import fetch_match_intelligence
-from app.sportybet_client import fetch_live_and_upcoming_matches_post
-from app.time_context import match_time_context
-from app.web_context import search_league_sentiment, search_match_context
+from app.utils.normalise import normalise
+from app.utils.match_state import classify_match_state
+from app.market.season_stage import detect_season_stage
+from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, is_usable_event_for_mode
+from app.data_clients.sportradar_client import fetch_match_intelligence
+from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post
+from app.utils.time_context import match_time_context
+from app.enrichment.web_context import search_league_sentiment, search_match_context
 
 
 FUZZY_THRESHOLD = 0.75
@@ -46,7 +46,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     sporty_matches = fetch_live_and_upcoming_matches_post()[:limit]
     # Existing links are stable for a fixture.  Do not download the complete
     # candidate schedule again just to rediscover an already stored ID.
-    from app.league_memory import get_enriched_match
+    from app.storage.league_memory import get_enriched_match
 
     existing_by_index: dict[int, dict[str, Any]] = {}
     for index, sporty in enumerate(sporty_matches):
@@ -76,7 +76,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
             sofa = saved_event if isinstance(saved_event, dict) else None
             if not sofa:
                 try:
-                    from app.sofascore_client import fetch_event
+                    from app.data_clients.sofascore_client import fetch_event
 
                     sofa = fetch_event(int(existing["sofascore_id"]))
                 except Exception:
@@ -167,7 +167,7 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
 
     def _fetch_league_sentiment(idx: int, sporty: dict) -> tuple[int, dict]:
         try:
-            from app.config import get_settings
+            from app.config.config import get_settings
 
             settings = get_settings()
             if not settings.web_search_league_sentiment_enabled:
@@ -336,7 +336,7 @@ def _llm_match(sporty: dict[str, Any], sofa_events: list[dict[str, Any]]) -> dic
     if not token:
         return None
 
-    from app.config import get_settings
+    from app.config.config import get_settings
     settings = get_settings()
 
     candidates = [{"id": e["id"], "name": e.get("name", "")} for e in sofa_events[:60]]
@@ -559,3 +559,6 @@ def _token_score(a: str, b: str) -> float:
 def _is_junk(name: str) -> bool:
     text = f" {normalise(name)} "
     return any(marker in text for marker in JUNK_MARKERS)
+
+
+

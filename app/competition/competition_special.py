@@ -5,11 +5,11 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from app.db import DB_PATH
-from app.league_memory import _init_db
-from app.db import db_conn
-from app.match_state import classify_match_state
-from app.season_stage import (
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
+from app.storage.db import db_conn
+from app.utils.match_state import classify_match_state
+from app.market.season_stage import (
     classify_table_size,
     detect_season_stage,
     season_aware_table_weight,
@@ -307,7 +307,7 @@ def sync_competition_fixtures(
     end_date: str | None = None,
     limit_days: int = 60,
 ) -> dict[str, Any]:
-    from app.sofascore_client import fetch_scheduled_events
+    from app.data_clients.sofascore_client import fetch_scheduled_events
 
     settings = get_competition_settings(key)
     tournament_id = int(settings.get("unique_tournament_id") or _catalogue_default(key)["unique_tournament_id"])
@@ -486,9 +486,9 @@ def get_team_watcher(key: str, team_id: str) -> dict[str, Any]:
 
 
 def enrich_predict_competition(key: str = "world-cup-2026", limit: int = 12, allow_repeat: bool = False) -> dict[str, Any]:
-    from app.enriched_prediction import prediction_readiness
-    from app.prediction_flow import apply_prediction_state
-    from app.sofascore_client import fetch_event_detail, fetch_event
+    from app.enrichment.enriched_prediction import prediction_readiness
+    from app.utils.prediction_flow import apply_prediction_state
+    from app.data_clients.sofascore_client import fetch_event_detail, fetch_event
 
     _init_db()
     mirrored = ensure_competition_main_buffer(key)
@@ -635,7 +635,7 @@ def run_enabled_competition_cycles(limit: int = 31) -> dict[str, Any]:
 
 def refresh_competition_context(key: str = "world-cup-2026", limit: int = 12) -> dict[str, Any]:
     """Continuously refresh table/team-strength/odds context for competition rows."""
-    from app.sofascore_client import fetch_event, fetch_event_detail
+    from app.data_clients.sofascore_client import fetch_event, fetch_event_detail
 
     _init_db()
     refreshed = errors = 0
@@ -864,7 +864,7 @@ def _save_competition_detail(
     doc["team_strength_context"] = intelligence.get("team_strength")
     doc["table_context"] = intelligence.get("table")
     try:
-        from app.market import snapshot_odds, get_movement
+        from app.market.market import snapshot_odds, get_movement
         snapshot_odds(doc)
         doc["odds_movement"] = get_movement(doc.get("sportybet_id"))
         intelligence["odds_movement"] = doc["odds_movement"]
@@ -1165,7 +1165,7 @@ def _mirror_competition_event_to_main_buffer(
     *,
     enriched_doc: dict[str, Any] | None = None,
 ) -> None:
-    from app.buffer import _buffer_table_for, _init_buffer_table
+    from app.storage.buffer import _buffer_table_for, _init_buffer_table
 
     _init_buffer_table(conn)
     status = event.get("status") or {}
@@ -1451,7 +1451,7 @@ def _competition_intelligence_context(
     home_watcher = _team_watcher_context(key, home)
     away_watcher = _team_watcher_context(key, away)
     try:
-        from app.team_watcher import team_watchers_for_match
+        from app.team_watcher.team_watcher import team_watchers_for_match
 
         ai_team_watchers = team_watchers_for_match(doc)
     except Exception as exc:
@@ -2057,7 +2057,7 @@ def list_all_competition_summaries(
 
             with db_conn(timeout=30) as conn:
                 init_competition_tables(conn)
-                from app.competition_analyser import get_latest_analysis, init_competition_analysis_table
+                from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
                 init_competition_analysis_table(conn)
                 latest_analysis = get_latest_analysis(key, conn)
 
@@ -2106,3 +2106,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
     columns = {row[1] for row in conn.execute(f"pragma table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"alter table {table} add column {column} {ddl}")
+
+
+
+

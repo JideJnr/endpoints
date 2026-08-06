@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from app.db import db_conn
+from app.storage.db import db_conn
 
 BASE = "https://widgets.fn.sportradar.com/common/en/Etc:UTC/gismo"
 HEADERS = {
@@ -43,8 +43,8 @@ _SEASON_CACHE_TTL = 300  # 5 minutes
 def _get_token() -> Optional[str]:
     """Return cached token if still valid, else fetch a fresh one."""
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         _init_db()
         with db_conn(timeout=10) as conn:
             conn.execute("""
@@ -102,8 +102,8 @@ def _fetch_fresh_token() -> Optional[str]:
 
         # Persist to SQLite
         try:
-            from app.db import DB_PATH
-            from app.league_memory import _init_db
+            from app.storage.db import DB_PATH
+            from app.storage.league_memory import _init_db
             _init_db()
             with db_conn(timeout=10) as conn:
                 conn.execute("""
@@ -133,8 +133,8 @@ def store_token(token: str) -> None:
     try:
         exp_match = re.search(r'exp=(\d+)', token)
         exp = int(exp_match.group(1)) if exp_match else int(time.time()) + 86400
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         _init_db()
         with db_conn(timeout=10) as conn:
             conn.execute("""

@@ -15,7 +15,7 @@ import logging
 from datetime import date as dt
 from typing import Any, Optional
 
-from app.db import db_conn
+from app.storage.db import db_conn
 from fastapi import APIRouter, Body, HTTPException, Query
 
 _logger = logging.getLogger(__name__)
@@ -27,10 +27,10 @@ router = APIRouter(prefix="/sofa-pipeline", tags=["sofa-pipeline"])
 @router.get("/status")
 def get_sofa_pipeline_status():
     """Return toggle state + count of SofaScore-source matches in the buffer."""
-    from app.sofa_pipeline import get_sofa_pipeline_mode
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
-    from app.buffer import _init_buffer_table
+    from app.data_clients.sofa_pipeline import get_sofa_pipeline_mode
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
+    from app.storage.buffer import _init_buffer_table
     import sqlite3
 
     mode = get_sofa_pipeline_mode()
@@ -78,7 +78,7 @@ def toggle_sofa_pipeline(payload: dict[str, Any] = Body(...)):
 
     Body: `{"enabled": true}` or `{"enabled": false}`
     """
-    from app.sofa_pipeline import set_sofa_pipeline_mode
+    from app.data_clients.sofa_pipeline import set_sofa_pipeline_mode
 
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
@@ -109,7 +109,7 @@ def run_sofa_pipeline(
     - `enrich_batch`: max matches to enrich+predict per enrichment pass
     - `include_live`: also fetch live events
     """
-    from app.sofa_pipeline import run_sofa_pipeline_cycle
+    from app.data_clients.sofa_pipeline import run_sofa_pipeline_cycle
 
     target_date = date or dt.today().isoformat()
     try:
@@ -134,7 +134,7 @@ def ingest_sofa(
     include_live: bool = Query(default=True),
 ):
     """Stage 1: Fetch SofaScore events and write into match_buffer."""
-    from app.sofa_pipeline import ingest_from_sofascore
+    from app.data_clients.sofa_pipeline import ingest_from_sofascore
 
     target_date = date or dt.today().isoformat()
     try:
@@ -157,7 +157,7 @@ def enrich_sofa(
     live_only: bool = Query(default=False),
 ):
     """Stage 2+3: Enrich buffered SofaScore matches and run predictions."""
-    from app.sofa_pipeline import enrich_sofa_pipeline
+    from app.data_clients.sofa_pipeline import enrich_sofa_pipeline
 
     target_date = date or dt.today().isoformat()
     try:

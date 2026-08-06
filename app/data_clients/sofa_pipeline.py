@@ -39,11 +39,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db, normalize_league
-from app.match_state import classify_match_state
-from app.season_stage import detect_season_stage
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db, normalize_league
+from app.utils.match_state import classify_match_state
+from app.market.season_stage import detect_season_stage
 from app.data_clients.sofascore_client import (
     fetch_all_scheduled_events,
     fetch_event_detail,
@@ -51,7 +51,7 @@ from app.data_clients.sofascore_client import (
     is_usable_event_for_mode,
     is_terminal_event,
 )
-from app.time_context import match_time_context
+from app.utils.time_context import match_time_context
 from app.storage.buffer import _init_buffer_table, store_enriched, get_buffered_match, _sofa_live_data
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ ENGINE_STATE_ID = "sofa_pipeline_mode"
 def get_sofa_pipeline_mode() -> dict[str, Any]:
     """Return current toggle state from the engine_states table."""
     try:
-        from app.league_memory import get_engine_states
+        from app.storage.league_memory import get_engine_states
         enabled = get_engine_states().get(ENGINE_STATE_ID) == "active"
     except Exception:
         enabled = False
@@ -80,8 +80,8 @@ def get_sofa_pipeline_mode() -> dict[str, Any]:
 
 def set_sofa_pipeline_mode(enabled: bool) -> dict[str, Any]:
     """Persist toggle state."""
-    from app.league_memory import set_engine_status
-    from app.activity_log import record_activity
+    from app.storage.league_memory import set_engine_status
+    from app.utils.activity_log import record_activity
 
     status = "active" if enabled else "paused"
     set_engine_status(ENGINE_STATE_ID, status)
@@ -503,7 +503,7 @@ def enrich_sofa_pipeline(
             errors += 1
 
     # ── Stage 3: Predict after all enrichment writes are done (decoupled) ─────
-    from app.prediction_flow import apply_prediction_state
+    from app.utils.prediction_flow import apply_prediction_state
     for match_id, doc in enriched_docs:
         try:
             fresh_doc = get_buffered_match(match_id) or doc
@@ -535,7 +535,7 @@ def run_sofa_pipeline_cycle(
     enrich_batch: int = 20,
     include_live: bool = True,
 ) -> dict[str, Any]:
-    from app.activity_log import record_activity
+    from app.utils.activity_log import record_activity
 
     target_date = match_date or date_cls.today().isoformat()
     record_activity(
@@ -578,3 +578,4 @@ def run_sofa_pipeline_cycle(
         "enrich": enrich_result,
         "live_enrich": live_result,
     }
+

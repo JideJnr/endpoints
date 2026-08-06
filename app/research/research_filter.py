@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any
 
-from app.db import db_conn
+from app.storage.db import db_conn
 
 logger = logging.getLogger(__name__)
 

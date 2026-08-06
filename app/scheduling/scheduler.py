@@ -22,19 +22,19 @@ import threading
 from datetime import date as dt, datetime, timedelta, timezone
 from typing import Any
 
-from app.db import db_conn
-from app.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
-from app.buffer import (
+from app.storage.db import db_conn
+from app.data_clients.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
+from app.storage.buffer import (
     ingest_matches,
     patch_live_scores,
     run_enrichment_worker,
     get_buffer_stats,
     purge_ghost_matches,
 )
-from app.activity_log import record_activity
-from app.ai_prediction_pipeline import job_ai_prediction_queue
-from app.competition_analyser import job_competition_analysis
-from app.season_stage import detect_season_stage
+from app.utils.activity_log import record_activity
+from app.ai.ai_prediction_pipeline import job_ai_prediction_queue
+from app.competition.competition_analyser import job_competition_analysis
+from app.market.season_stage import detect_season_stage
 
 
 _scheduler = None
@@ -124,13 +124,13 @@ logging.getLogger("apscheduler.scheduler").addFilter(_ApschedulerShutdownNoiseFi
 def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
     """Fast: fetch upcoming matches from SportyBet and dump into buffer."""
     from app.market.market import snapshot_odds
-    from app.buffer import purge_ghost_matches
+    from app.storage.buffer import purge_ghost_matches
 
     if is_shutting_down():
         return {"status": "shutdown", "job": "ingest_upcoming"}
     # ── Pipeline toggle check ──────────────────────────────────────────────────
     try:
-        from app.pipeline_registry import is_pipeline_enabled
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("sportybet_ingest_upcoming"):
             return {"status": "skipped", "job": "ingest_upcoming", "reason": "pipeline_disabled"}
     except Exception:
@@ -166,14 +166,14 @@ def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
 
 def job_ingest_live(limit: int = 200) -> dict[str, Any]:
     """Fast: fetch live matches, add new ones to buffer, patch scores on existing ones."""
-    from app.league_memory import observe_matches
+    from app.storage.league_memory import observe_matches
     from app.market.market import snapshot_odds
 
     if is_shutting_down():
         return {"status": "shutdown", "job": "ingest_live"}
     # ── Pipeline toggle check ──────────────────────────────────────────────────
     try:
-        from app.pipeline_registry import is_pipeline_enabled
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("sportybet_ingest_live"):
             return {"status": "skipped", "job": "ingest_live", "reason": "pipeline_disabled"}
     except Exception:
@@ -233,7 +233,7 @@ def job_enrich_worker() -> dict[str, Any]:
     # ── Pipeline toggle check ──────────────────────────────────────────────────
     # Determine which sub-modes are enabled from the registry
     try:
-        from app.pipeline_registry import get_enrich_worker_mode
+        from app.scheduling.pipeline_registry import get_enrich_worker_mode
         enrich_mode = get_enrich_worker_mode()
     except Exception:
         enrich_mode = {"disabled": False, "live_only": False, "exclude_live": False, "both": True}
@@ -243,7 +243,7 @@ def job_enrich_worker() -> dict[str, Any]:
 
     record_activity("Looking for the next match to enrich", job="enrich_worker", status="running")
     try:
-        from app.live_retry_queue import active_pending_count, expire_stale_entries
+        from app.utils.live_retry_queue import active_pending_count, expire_stale_entries
 
         expired = expire_stale_entries()
         pending_retries = active_pending_count()
@@ -336,7 +336,7 @@ def job_live_priority(count: int = 30, limit: int = 500) -> dict[str, Any]:
 def get_live_priority_mode() -> dict[str, Any]:
     """Persistent setting used by the Settings toggle and scheduler."""
     try:
-        from app.league_memory import get_engine_states
+        from app.storage.league_memory import get_engine_states
         enabled = get_engine_states().get(LIVE_PRIORITY_ENGINE_ID) == "active"
     except Exception:
         enabled = False
@@ -349,7 +349,7 @@ def get_live_priority_mode() -> dict[str, Any]:
 
 
 def set_live_priority_mode(enabled: bool) -> dict[str, Any]:
-    from app.league_memory import set_engine_status
+    from app.storage.league_memory import set_engine_status
 
     status = "active" if enabled else "paused"
     set_engine_status(LIVE_PRIORITY_ENGINE_ID, status)
@@ -392,8 +392,8 @@ def _scheduler_interval(job_id: str) -> int:
     if not meta:
         return 60
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         _init_db()
         with db_conn(timeout=10) as conn:
             _ensure_scheduler_interval_table(conn)
@@ -407,7 +407,7 @@ def _scheduler_interval(job_id: str) -> int:
 
 
 def scheduler_intervals(active_only: bool = True) -> dict[str, Any]:
-    from app.pipeline_registry import is_pipeline_enabled
+    from app.scheduling.pipeline_registry import is_pipeline_enabled
 
     status = scheduler_status()
     jobs_by_id = {job.get("id"): job for job in status.get("jobs") or []}
@@ -441,8 +441,8 @@ def scheduler_intervals(active_only: bool = True) -> dict[str, Any]:
 
 def patch_scheduler_intervals(intervals: dict[str, int]) -> dict[str, Any]:
     from apscheduler.triggers.interval import IntervalTrigger
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     _init_db()
     applied: list[dict[str, Any]] = []
@@ -484,7 +484,7 @@ def job_sofa_pipeline() -> dict[str, Any]:
     if is_shutting_down():
         return {"status": "shutdown", "job": "sofa_pipeline"}
     try:
-        from app.sofa_pipeline import get_sofa_pipeline_mode, run_sofa_pipeline_cycle
+        from app.data_clients.sofa_pipeline import get_sofa_pipeline_mode, run_sofa_pipeline_cycle
         mode = get_sofa_pipeline_mode()
         if not mode.get("enabled"):
             return {"status": "idle", "job": "sofa_pipeline", "enabled": False}
@@ -515,9 +515,9 @@ def job_enrich_future() -> dict[str, Any]:
     """
     if is_shutting_down():
         return {"status": "shutdown", "job": "enrich_future"}
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
-    from app.buffer import _init_buffer_table
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
+    from app.storage.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     _init_db()
@@ -567,22 +567,22 @@ def job_unified_upcoming() -> dict[str, Any]:
     if is_shutting_down():
         return {"status": "shutdown", "job": "unified_upcoming"}
     try:
-        from app.pipeline_registry import is_pipeline_enabled
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("unified_upcoming"):
             return {"status": "skipped", "job": "unified_upcoming", "reason": "pipeline_disabled"}
     except Exception:
         pass
 
-    from app.sportybet_client import fetch_upcoming_matches_post
-    from app.sofascore_client import fetch_all_scheduled_events, is_usable_event_for_mode, search_events
-    from app.buffer import ingest_matches, get_unenriched_batch, store_enriched, get_buffered_match
+    from app.data_clients.sportybet_client import fetch_upcoming_matches_post
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events, is_usable_event_for_mode, search_events
+    from app.storage.buffer import ingest_matches, get_unenriched_batch, store_enriched, get_buffered_match
     from app.storage.buffer import _extract_1x2
-    from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
-    from app.sofascore_client import fetch_event_detail
+    from app.enrichment.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
+    from app.data_clients.sofascore_client import fetch_event_detail
     from app.market.market import snapshot_odds
-    from app.time_context import match_time_context
-    from app.match_state import classify_match_state
-    from app.prediction_flow import apply_prediction_state
+    from app.utils.time_context import match_time_context
+    from app.utils.match_state import classify_match_state
+    from app.utils.prediction_flow import apply_prediction_state
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import date as date_cls, timedelta, datetime, timezone
 
@@ -679,7 +679,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         # Skip SofaScore matching entirely for SRL/virtual fixtures.
         match_name = sporty.get("name") or item.get("match_id") or ""
         if _is_junk(match_name):
-            from app.buffer import store_enriched as _store_enriched
+            from app.storage.buffer import store_enriched as _store_enriched
             srl_doc = {**(existing or {}), "sofascore_match_status": "srl_skip", "data_source": "sportybet"}
             _store_enriched(item["match_id"], srl_doc)
             unmatched_count += 1
@@ -689,7 +689,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         # benefits from team-bound IDs, saved IDs, multi-query search, and
         # live-aware thresholds.
         try:
-            from app.match_enrichment import _resolve_sofascore_match
+            from app.enrichment.match_enrichment import _resolve_sofascore_match
 
             match_date = item.get("match_date") or date_cls.today().isoformat()
             sofa, score, source = _resolve_sofascore_match(existing, sporty, match_date)
@@ -861,25 +861,25 @@ def job_unified_live() -> dict[str, Any]:
     if is_shutting_down():
         return {"status": "shutdown", "job": "unified_live"}
     try:
-        from app.pipeline_registry import is_pipeline_enabled
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("unified_live"):
             return {"status": "skipped", "job": "unified_live", "reason": "pipeline_disabled"}
     except Exception:
         pass
 
-    from app.sportybet_client import fetch_live_matches_post
-    from app.buffer import (
+    from app.data_clients.sportybet_client import fetch_live_matches_post
+    from app.storage.buffer import (
         ingest_matches, patch_live_scores, get_unenriched_batch,
         store_enriched, get_buffered_match,
     )
     from app.storage.buffer import _extract_1x2
-    from app.sofascore_client import fetch_live_events, fetch_event_detail, fetch_event_detail_live_refresh
-    from app.enrichment import _fuzzy_match, _is_junk, FUZZY_THRESHOLD
-    from app.league_memory import observe_matches
+    from app.data_clients.sofascore_client import fetch_live_events, fetch_event_detail, fetch_event_detail_live_refresh
+    from app.enrichment.enrichment import _fuzzy_match, _is_junk, FUZZY_THRESHOLD
+    from app.storage.league_memory import observe_matches
     from app.market.market import snapshot_odds
-    from app.match_state import classify_match_state
-    from app.time_context import match_time_context
-    from app.prediction_flow import apply_prediction_state
+    from app.utils.match_state import classify_match_state
+    from app.utils.time_context import match_time_context
+    from app.utils.prediction_flow import apply_prediction_state
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import datetime, timezone
 
@@ -1030,12 +1030,12 @@ def job_competition_special() -> dict[str, Any]:
         return {"status": "shutdown", "job": "competition_special"}
     # ── Pipeline toggle check ──────────────────────────────────────────────────
     try:
-        from app.pipeline_registry import is_pipeline_enabled
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("competition_special"):
             return {"status": "skipped", "job": "competition_special", "reason": "pipeline_disabled"}
     except Exception:
         pass
-    from app.competition_special import run_enabled_competition_cycles
+    from app.competition.competition_special import run_enabled_competition_cycles
 
     record_activity("Competition special cycle checking enabled top-30 buffers", job="competition_special", status="running")
     result = run_enabled_competition_cycles()
@@ -1050,9 +1050,9 @@ def job_competition_special() -> dict[str, Any]:
 
 def job_archive_finished(match_date: str | None = None, limit: int = 1000) -> dict[str, Any]:
     """Archive finished matches to MongoDB via SofaScore."""
-    from app.mongo_store import store_scheduled_matches
-    from app.sofascore_client import fetch_all_scheduled_events
-    from app.league_memory import observe_matches
+    from app.storage.mongo_store import store_scheduled_matches
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events
+    from app.storage.league_memory import observe_matches
 
     target_date = match_date or dt.today().isoformat()
     try:
@@ -1070,7 +1070,7 @@ def job_archive_finished(match_date: str | None = None, limit: int = 1000) -> di
 
 def job_flush_to_mongo() -> dict[str, Any]:
     """Flush live/upcoming enriched buffer rows to MongoDB, then run safety-net cleanup."""
-    from app.mongo_store import flush_buffer_to_mongo, cleanup_buffer
+    from app.storage.mongo_store import flush_buffer_to_mongo, cleanup_buffer
 
     flush_result = flush_buffer_to_mongo()
     cleanup_result = cleanup_buffer()
@@ -1088,9 +1088,9 @@ def job_grade_predictions() -> dict[str, Any]:
     """Auto-grade recent predictions and refresh learning tables."""
     from datetime import date, timedelta
 
-    from app.elo import record_match_result_once
-    from app.league_memory import get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions, grade_predictions_for_date
-    from app.sofascore_client import fetch_all_scheduled_events
+    from app.models.elo import record_match_result_once
+    from app.storage.league_memory import get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions, grade_predictions_for_date
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events
 
     target_dates = [(date.today() - timedelta(days=days)).isoformat() for days in range(0, 4)]
     try:
@@ -1115,7 +1115,7 @@ def job_grade_predictions() -> dict[str, Any]:
 
         # Grade orphaned predictions (matches removed from buffer before grading)
         try:
-            from app.league_memory import grade_orphaned_predictions
+            from app.storage.league_memory import grade_orphaned_predictions
             orphaned_result = grade_orphaned_predictions(limit=1000)
             total_graded += int(orphaned_result.get("graded") or 0)
         except Exception as _oe:
@@ -1125,15 +1125,15 @@ def job_grade_predictions() -> dict[str, Any]:
 
         # Rebuild confidence calibration from updated win/loss history
         try:
-            from app.confidence_calibrator import rebuild_calibration
+            from app.enrichment.confidence_calibrator import rebuild_calibration
             cal_result = rebuild_calibration()
         except Exception as exc:
             cal_result = {"error": str(exc)}
 
         # Run self-learning cycle and optimise ensemble weights.
         try:
-            from app.self_learner import run_learning_cycle
-            from app.weight_optimiser import optimise_ensemble_weights
+            from app.monitoring.self_learner import run_learning_cycle
+            from app.models.weight_optimiser import optimise_ensemble_weights
             self_learn_result = run_learning_cycle()
             learn_result = optimise_ensemble_weights()
             learn_result["self_learner"] = self_learn_result
@@ -1142,20 +1142,20 @@ def job_grade_predictions() -> dict[str, Any]:
 
         # Grade odds patterns for yesterday
         try:
-            from app.odds_pattern import grade_patterns_for_date
+            from app.market.odds_pattern import grade_patterns_for_date
             pattern_result = {"by_date": [{"date": d, **grade_patterns_for_date(d)} for d in target_dates]}
         except Exception as exc:
             pattern_result = {"error": str(exc)}
 
         # Compute CLV for yesterday — fill closing odds + attach results
         try:
-            from app.clv import compute_clv_for_date
+            from app.risk.clv import compute_clv_for_date
             clv_result = {"by_date": [{"date": d, **compute_clv_for_date(d)} for d in target_dates]}
         except Exception as exc:
             clv_result = {"error": str(exc)}
 
         try:
-            from app.mongo_store import cleanup_buffer
+            from app.storage.mongo_store import cleanup_buffer
             cleanup_result = cleanup_buffer()
         except Exception as exc:
             cleanup_result = {"error": str(exc)}
@@ -1197,7 +1197,7 @@ def job_regenerate_research_stats() -> dict[str, Any]:
 
     start = _time.time()
     try:
-        from app.db import db_conn
+        from app.storage.db import db_conn
 
         with db_conn() as conn:
             total = conn.execute(
@@ -1288,7 +1288,7 @@ def job_regenerate_research_stats() -> dict[str, Any]:
 def job_grade_overdue_predictions() -> dict[str, Any]:
     """Frequent safety-net grader using SportyBet results first, SofaScore fallback second."""
     try:
-        from app.league_memory import grade_betbuilder_history, grade_orphaned_predictions, grade_overdue_predictions
+        from app.storage.league_memory import grade_betbuilder_history, grade_orphaned_predictions, grade_overdue_predictions
 
         record_activity("Checking overdue match results", job="grade_overdue", status="running")
         result = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
@@ -1304,9 +1304,9 @@ def job_grade_overdue_predictions() -> dict[str, Any]:
         graded = int(result.get("graded") or 0) + int(result.get("candidate_graded") or 0)
         if graded:
             try:
-                from app.confidence_calibrator import rebuild_calibration
-                from app.self_learner import run_learning_cycle
-                from app.weight_optimiser import optimise_ensemble_weights
+                from app.enrichment.confidence_calibrator import rebuild_calibration
+                from app.monitoring.self_learner import run_learning_cycle
+                from app.models.weight_optimiser import optimise_ensemble_weights
 
                 result["calibration"] = rebuild_calibration()
                 # Rebuild signal weights from fresh graded data
@@ -1338,7 +1338,7 @@ def job_grade_overdue_predictions() -> dict[str, Any]:
 def job_prune_mongo(keep_days: int = 90) -> dict[str, Any]:
     """Prune MongoDB finished_matches older than keep_days to control storage."""
     try:
-        from app.mongo_store import prune_old_finished_matches, is_configured
+        from app.storage.mongo_store import prune_old_finished_matches, is_configured
         if not is_configured():
             return {"status": "skipped", "reason": "mongodb not configured"}
         deleted = prune_old_finished_matches(keep_days=keep_days)
@@ -1380,7 +1380,7 @@ def job_system_supervisor() -> dict[str, Any]:
     """Operational supervisor: observe pipeline health and apply safe repairs."""
     if is_shutting_down():
         return {"status": "shutdown", "job": "system_supervisor"}
-    from app.system_supervisor import run_system_supervisor
+    from app.monitoring.system_supervisor import run_system_supervisor
 
     return run_system_supervisor(auto_correct=True)
 
@@ -1389,7 +1389,7 @@ def job_prediction_monitor() -> dict[str, Any]:
     """Hourly prediction-quality loop: grade truth, diagnose misses, refresh learning."""
     if is_shutting_down():
         return {"status": "shutdown", "job": "prediction_monitor"}
-    from app.prediction_monitor import run_prediction_monitor
+    from app.monitoring.prediction_monitor import run_prediction_monitor
 
     return run_prediction_monitor(auto_correct=True)
 
@@ -1429,7 +1429,7 @@ def job_autopilot_guardian() -> dict[str, Any]:
     if get_live_priority_mode().get("enabled") and _has_live_pressure(stats):
         guarded("live_priority", lambda: run_job_with_guard(job_live_priority, count=12, limit=300))
     elif _needs_enrichment_nudge(stats):
-        from app.pipeline_registry import is_pipeline_enabled
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
         enrich_on = is_pipeline_enabled("sportybet_enrich_live") or is_pipeline_enabled("sportybet_enrich_prematch")
         if enrich_on:
             guarded("enrich_worker", lambda: run_job_with_guard(job_enrich_worker))
@@ -1789,7 +1789,7 @@ def stop_scheduler(wait: bool = False) -> bool:
 
 def scheduler_status() -> dict[str, Any]:
     try:
-        from app.job_state import list_job_states
+        from app.scheduling.job_state import list_job_states
         job_states = list_job_states()
     except Exception:
         job_states = []
@@ -1880,7 +1880,7 @@ def _scheduler_watchdog_tick() -> dict[str, Any]:
         },
     )
 
-    from app.pipeline_registry import is_pipeline_enabled
+    from app.scheduling.pipeline_registry import is_pipeline_enabled
     if ingest_stale and int(stats.get("live") or 0) and is_pipeline_enabled("sportybet_ingest_live"):
         result = run_job_with_guard(job_ingest_live, limit=150)
         actions.append({"action": "ingest_live", "result": _summarise_guardian_result(result)})
@@ -1902,7 +1902,7 @@ def _scheduler_watchdog_tick() -> dict[str, Any]:
 
 
 def _recover_jobs() -> dict[str, Any]:
-    from app.job_state import recover_abandoned_jobs
+    from app.scheduling.job_state import recover_abandoned_jobs
 
     return recover_abandoned_jobs(stale_after_seconds=120)
 
@@ -1940,16 +1940,16 @@ def _deep_audit_due() -> bool:
 
 
 def _run_deep_supervisor(*, auto_correct: bool = True) -> dict[str, Any]:
-    from app.system_supervisor import run_system_supervisor
+    from app.monitoring.system_supervisor import run_system_supervisor
 
     return run_system_supervisor(auto_correct=auto_correct, deep_audit=True)
 
 
 def _seconds_since_job_finished(job_id: str) -> float | None:
     try:
-        from app.job_state import _init_job_table
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.scheduling.job_state import _init_job_table
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
 
         _init_db()
         with db_conn(timeout=10) as conn:
@@ -1970,9 +1970,9 @@ def _seconds_since_job_finished(job_id: str) -> float | None:
 
 def _seconds_since_supervisor_deep_audit() -> float | None:
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
-        from app.system_supervisor import _init_supervisor_table
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
+        from app.monitoring.system_supervisor import _init_supervisor_table
 
         _init_db()
         with db_conn(timeout=10) as conn:
@@ -2082,7 +2082,7 @@ def run_job_with_guard(fn, *args, guard_job_id: str | None = None, **kwargs):
 
 
 def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwargs):
-    from app.job_state import JobBusy, finish_job, heartbeat, job_guard
+    from app.scheduling.job_state import JobBusy, finish_job, heartbeat, job_guard
 
     job_id = guard_job_id or (fn.__name__[4:] if fn.__name__.startswith("job_") else fn.__name__)
     stale_after = _JOB_STALE_SECONDS.get(job_id, 900)
@@ -2149,7 +2149,7 @@ atexit.register(_atexit_stop_scheduler)
 
 
 def _match_time(match: dict[str, Any]) -> dict[str, Any]:
-    from app.time_context import match_time_context
+    from app.utils.time_context import match_time_context
 
     return match_time_context(match)
 
@@ -2164,3 +2164,5 @@ def _group_matches_by_local_date(matches: list[dict[str, Any]]) -> dict[str, lis
     for match in matches:
         groups.setdefault(_match_local_date(match), []).append(match)
     return groups
+
+

@@ -12,7 +12,7 @@ Calibration bands: 50-59, 60-69, 70-79, 80+
 Minimum samples before trusting a band: MIN_SAMPLES (default 30)
 
 Usage:
-    from app.confidence_calibrator import calibrate_confidence, get_calibration_table
+    from app.enrichment.confidence_calibrator import calibrate_confidence, get_calibration_table
 
     # At prediction time — adjust a raw confidence score
     adjusted = calibrate_confidence('match_result', 75)
@@ -25,8 +25,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from app.db import DB_PATH, _conn
-from app.league_memory import _init_db
+from app.storage.db import DB_PATH, _conn
+from app.storage.league_memory import _init_db
 
 MIN_SAMPLES = 30          # bands with fewer samples are not adjusted
 DOUBLE_DOWN_MIN_SAMPLES = 50
@@ -414,3 +414,4 @@ def cap_market_confidence(pick: dict[str, Any], confidence: int) -> int:
             return min(confidence, 68)
 
     return confidence
+

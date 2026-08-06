@@ -15,7 +15,7 @@ import json
 from datetime import date as dt
 from typing import Any
 
-from app.league_memory import list_prediction_history
+from app.storage.league_memory import list_prediction_history
 
 
 # ── System prompt for Groq mode ───────────────────────────────────────────────
@@ -60,7 +60,7 @@ Output ONLY the JSON array. No text outside it."""
 
 def _run_bot2_groq(predictions: list[dict], match_date: str) -> list[dict]:
     """Use Groq LLM to curate picks. Falls back to rules on any error."""
-    from app.llm import get_fast_llm
+    from app.ai.llm import get_fast_llm
     from langchain_core.messages import HumanMessage, SystemMessage
 
     llm = get_fast_llm()
@@ -137,16 +137,17 @@ def run_bot2(match_date: str | None = None, limit: int = 200) -> dict[str, Any]:
     if not predictions:
         return {"status": "no_predictions", "date": target_date, "picks": []}
 
-    # try Groq first, fall back to rules
+    # try OpenRouter first, fall back to rules
     picks: list[dict] = []
     mode = "rules"
     try:
-        from app.llm import is_groq_available
-        if is_groq_available():
+        from app.ai.llm import get_llm
+        llm = get_llm()
+        if llm is not None:
             picks = _run_bot2_groq(predictions, target_date)
-            mode = "groq"
+            mode = "openrouter"
     except Exception as exc:
-        print(f"[bot2] Groq failed ({exc}), falling back to rules engine")
+        print(f"[bot2] OpenRouter failed ({exc}), falling back to rules engine")
 
     if not picks:
         picks = _run_bot2_rules(predictions, target_date)

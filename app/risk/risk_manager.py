@@ -3,11 +3,11 @@ from __future__ import annotations
 from typing import Any
 from copy import deepcopy
 
-from app.db import db_conn
-from app.config import get_settings
-from app.market_intent import classify_market_intent
-from app.risk_learner import get_learned_risk_controls, get_learned_risk_controls_for_pick, LearnedRiskControls
-from app.validation_gate import evaluate_promotion_gate
+from app.storage.db import db_conn
+from app.config.config import get_settings
+from app.market.market_intent import classify_market_intent
+from app.risk.risk_learner import get_learned_risk_controls, get_learned_risk_controls_for_pick, LearnedRiskControls
+from app.risk.validation_gate import evaluate_promotion_gate
 
 
 # ── Static Fallbacks (used when learned data is insufficient) ──────────────────
@@ -530,8 +530,8 @@ def _record_risk_control_application(
 ) -> None:
     """Record risk control application for later learning."""
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         import json
 
         match_id = str(doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
@@ -540,7 +540,7 @@ def _record_risk_control_application(
 
         _init_db()
         with db_conn(timeout=10) as conn:
-            from app.risk_learner import _init_risk_learner_tables
+            from app.risk.risk_learner import _init_risk_learner_tables
             _init_risk_learner_tables(conn)
 
             for idx, pick in enumerate(picks):
@@ -572,3 +572,5 @@ def _record_risk_control_application(
             conn.commit()
     except Exception:
         pass  # Non-critical — don't break prediction flow
+
+

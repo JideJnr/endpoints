@@ -15,7 +15,7 @@ class IntervalPatch(BaseModel):
 @router.get("/intervals")
 def get_intervals(active_only: bool = True) -> dict[str, Any]:
     try:
-        from app.scheduler import scheduler_intervals
+        from app.scheduling.scheduler import scheduler_intervals
 
         return scheduler_intervals(active_only=active_only)
     except Exception as exc:
@@ -25,7 +25,7 @@ def get_intervals(active_only: bool = True) -> dict[str, Any]:
 @router.patch("/intervals")
 def patch_intervals(payload: IntervalPatch) -> dict[str, Any]:
     try:
-        from app.scheduler import patch_scheduler_intervals
+        from app.scheduling.scheduler import patch_scheduler_intervals
 
         return patch_scheduler_intervals(payload.intervals)
     except Exception as exc:
@@ -35,7 +35,7 @@ def patch_intervals(payload: IntervalPatch) -> dict[str, Any]:
 @router.post("/intervals/reset")
 def reset_intervals() -> dict[str, Any]:
     try:
-        from app.scheduler import reset_scheduler_intervals
+        from app.scheduling.scheduler import reset_scheduler_intervals
 
         return reset_scheduler_intervals()
     except Exception as exc:

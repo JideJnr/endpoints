@@ -14,9 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
 
 logger = logging.getLogger(__name__)
 
@@ -472,8 +472,8 @@ def build_analysis_prompt(ctx: AnalysisContext) -> str:
 def run_competition_analysis(
     competition_key: str, round_name: str | None = None
 ) -> dict[str, Any]:
-    from app.ollama_agent import is_ollama_available
-    from app.ollama_agent import _call_ollama
+    from app.ai.ollama_agent import is_ollama_available
+    from app.ai.ollama_agent import _call_ollama
 
     # Determine round_name if not provided
     _init_db()
@@ -581,7 +581,7 @@ def catchup_competition_scores(competition_key: str) -> dict[str, Any]:
     terminal status — handles the case where the engine was offline during a match.
     Returns counts of rows refreshed and newly finished.
     """
-    from app.sofascore_client import fetch_event
+    from app.data_clients.sofascore_client import fetch_event
 
     _init_db()
     refreshed = newly_finished = 0
@@ -667,8 +667,8 @@ def _has_new_finished_since_last_analysis(conn: sqlite3.Connection, competition_
 # ── Scheduler Job ─────────────────────────────────────────────────────────────
 
 def job_competition_analysis() -> dict[str, Any]:
-    from app.pipeline_registry import is_pipeline_enabled
-    from app.activity_log import record_activity
+    from app.scheduling.pipeline_registry import is_pipeline_enabled
+    from app.utils.activity_log import record_activity
 
     if not is_pipeline_enabled("competition_analysis"):
         return {"status": "skipped", "reason": "pipeline_disabled"}

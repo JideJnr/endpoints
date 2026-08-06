@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from app.sofascore_client import (
+from app.data_clients.sofascore_client import (
     fetch_scheduled_events,
     fetch_all_scheduled_events,
     fetch_team_history,

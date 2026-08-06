@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.db import (
+from app.storage.db import (
     DB_PATH,
     _conn,
     close_db,

@@ -17,7 +17,7 @@ These tables are then read by:
   - ensemble.py             → dynamic model weights (via get_learned_weights)
 
 Usage:
-    from app.self_learner import run_learning_cycle, get_signal_weights, get_learned_weights
+    from app.monitoring.self_learner import run_learning_cycle, get_signal_weights, get_learned_weights
 
     # After grading — called automatically by job_grade_predictions
     result = run_learning_cycle()
@@ -35,9 +35,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
 from app.storage.league_memory._helpers import _get_passed_models
 
 UNIQUE_GRADED_HISTORY = """
@@ -805,7 +805,7 @@ def _grade_specialists_from_history(graded_rows: list) -> int:
     credit each available specialist with the outcome.
     """
     try:
-        from app.ai_prediction_pipeline import grade_specialist_contributions
+        from app.ai.ai_prediction_pipeline import grade_specialist_contributions
     except Exception:
         return 0
 
@@ -840,7 +840,7 @@ def _grade_specialists_from_history(graded_rows: list) -> int:
     credit each available specialist with the outcome.
     """
     try:
-        from app.ai_prediction_pipeline import grade_specialist_contributions
+        from app.ai.ai_prediction_pipeline import grade_specialist_contributions
     except Exception:
         return 0
 
@@ -873,7 +873,7 @@ def _incorporate_ai_analysis(conn: sqlite3.Connection, graded_rows: list) -> int
     Reads AI analysis results from MongoDB finished_matches and adjusts signal weights
     and model weights based on AI verdicts on predictions.
     """
-    from app.mongo_store import list_finished_matches, is_configured
+    from app.storage.mongo_store import list_finished_matches, is_configured
 
     if not is_configured():
         return 0
@@ -1004,7 +1004,7 @@ def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> i
     extra agreement_bonus on top of the normal net_signal adjustment.
     """
     try:
-        from app.league_memory import get_user_behavior_summary
+        from app.storage.league_memory import get_user_behavior_summary
     except Exception:
         return 0
 

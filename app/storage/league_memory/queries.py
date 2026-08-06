@@ -13,15 +13,15 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import (
+from app.storage.db import (
     DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db,
     _init_db, _init_db_unlocked, _ensure_column, _is_sqlite_lock,
     _DB_SCHEMA_READY, _DB_SCHEMA_LOCK, _run_schema_migrations,
     _run_legacy_backfills, _existing_schema_can_be_trusted,
     _ensure_prediction_history_columns,
 )
-from app.market_intent import classify_market_intent, grade_market_intent
-from app.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
+from app.market.market_intent import classify_market_intent, grade_market_intent
+from app.monitoring.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
 from ._helpers import (
     normalize_league, _league_from_match, _country_from_match, _country_from_league,
     _is_country_like, _match_fingerprint, _match_1x2_odds_profile,
@@ -569,7 +569,7 @@ def _signal_outcome_payload_for_row(row: sqlite3.Row, result: str) -> dict[str, 
         return None
     try:
         try:
-            from app.self_learner import _decision_signals_for_row
+            from app.monitoring.self_learner import _decision_signals_for_row
 
             signals = _decision_signals_for_row(row)
         except Exception:
@@ -596,7 +596,7 @@ def _store_signal_outcome_payload(payload: dict[str, Any]) -> None:
     """Store signal outcome payload after the grading write transaction commits."""
     store_local_signal_outcomes(**payload)
     try:
-        from app.mongo_store import is_configured, store_signal_outcomes
+        from app.storage.mongo_store import is_configured, store_signal_outcomes
 
         if is_configured():
             store_signal_outcomes(**payload)
@@ -717,8 +717,8 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
 
         # Record outcome for the probability learner
         try:
-            from app.probability_learner import learn_probabilities
-            from app.signal_aggregator import normalize_signal
+            from app.models.probability_learner import learn_probabilities
+            from app.enrichment.signal_aggregator import normalize_signal
 
             signals_json = row.get("signals_json") or "[]"
             signals = json.loads(signals_json) if signals_json else []
@@ -797,7 +797,7 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
     # 1) Sporty result checker. It can grade even when buffer/Mongo state was
     # lost, because the result id matches our Sporty match id.
     try:
-        from app.sportybet_client import fetch_results
+        from app.data_clients.sportybet_client import fetch_results
 
         known_starts = [
             _normalise_start_seconds(row["start_time"]) or _datetime_to_seconds(row["first_seen"])
@@ -838,7 +838,7 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
     # 2) SofaScore fallback and live guard. If SofaScore says the match is live,
     # do not grade it even if kickoff+2h has passed.
     try:
-        from app.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_live_events
+        from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_live_events
 
         try:
             live_events = fetch_live_events()
@@ -947,7 +947,7 @@ def check_and_grade_match_result(match_id: str, hours_back: int = 72) -> dict[st
     now_ms = int(_time.time() * 1000)
     start_ms = now_ms - max(1, hours_back) * 3_600_000
     try:
-        from app.sportybet_client import fetch_results
+        from app.data_clients.sportybet_client import fetch_results
 
         for result in fetch_results(start_ms, now_ms, count=500):
             if str(result.get("id")) != match_id:
@@ -967,7 +967,7 @@ def check_and_grade_match_result(match_id: str, hours_back: int = 72) -> dict[st
     if not match_date:
         return {"status": "not_found", "match_id": match_id, "sporty_error": sporty_error, "reason": "no match date for SofaScore fallback"}
     try:
-        from app.sofascore_client import fetch_all_scheduled_events, fetch_event
+        from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event
 
         events = fetch_all_scheduled_events(str(match_date))
         event_by_id = {str(event.get("id")): event for event in events}
@@ -1061,7 +1061,7 @@ def grade_orphaned_predictions(limit: int = 1000) -> dict[str, Any]:
 
     # ── 3. For each date, fetch SofaScore events and grade matching rows ──────
     try:
-        from app.sofascore_client import fetch_all_scheduled_events, fetch_event
+        from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event
     except Exception as exc:
         return {"status": "error", "reason": f"sofascore import failed: {exc}"}
 
@@ -1724,3 +1724,5 @@ def _finished_scope_stats(
         "avg_goals": round(float(row["avg_goals"] or 0), 3),
         "odds_filtered": bool(odds_profile),
     }
+
+

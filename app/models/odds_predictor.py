@@ -68,7 +68,7 @@ def odds_only_prediction(doc: dict[str, Any]) -> dict[str, Any] | None:
     tournament = _tournament_name(doc)
     category   = doc.get("category") or ""
     try:
-        from app.regime import passes_regime_gate
+        from app.market.regime import passes_regime_gate
         gate = passes_regime_gate(tournament, confidence, category=category)
         if not gate["passed"]:
             return None
@@ -122,3 +122,4 @@ def _tournament_name(doc: dict[str, Any]) -> str | None:
     if isinstance(t, dict):
         return t.get("name")
     return t or None
+

@@ -5,13 +5,13 @@ import sqlite3
 import json
 from typing import Any
 
-from app.db import db_conn
-from app.activity_log import record_activity
-from app.buffer import get_buffer_stats, purge_ghost_matches
-from app.job_state import list_job_states, recover_abandoned_jobs
-from app.db import DB_PATH
-from app.league_memory import _init_db
-from app.mongo_store import cleanup_buffer
+from app.storage.db import db_conn
+from app.utils.activity_log import record_activity
+from app.storage.buffer import get_buffer_stats, purge_ghost_matches
+from app.scheduling.job_state import list_job_states, recover_abandoned_jobs
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
+from app.storage.mongo_store import cleanup_buffer
 
 
 SNAPSHOT_KEEP_ROWS = 1000
@@ -34,7 +34,7 @@ def run_system_supervisor(*, auto_correct: bool = True, deep_audit: bool = False
     issues = audit.get("issues") or {}
 
     if auto_correct:
-        from app.loop_authority import CorrectionAuthorityBusy, correction_authority
+        from app.scheduling.loop_authority import CorrectionAuthorityBusy, correction_authority
 
         try:
             with correction_authority("system_supervisor", "operational", reason="safe operational repair") as lease:

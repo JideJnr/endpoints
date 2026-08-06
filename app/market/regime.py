@@ -24,7 +24,7 @@ Tier 4 — Fringe (women's leagues, youth, obscure regional, unknown)
   - Strategy: avoid or require very high confidence + odds pattern confirmation
 
 Usage:
-    from app.regime import get_regime, RegimeTier
+    from app.market.regime import get_regime, RegimeTier
 
     regime = get_regime("Premier League")
     # regime.tier          → 1
@@ -370,3 +370,4 @@ def regime_summary_for_predictions(predictions: list[dict[str, Any]]) -> dict[st
             if counts[tier] > 0
         ]
     }
+

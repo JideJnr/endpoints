@@ -34,13 +34,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from app.db import DB_PATH, _conn
-from app.league_memory import _init_db
+from app.storage.db import DB_PATH, _conn
+from app.storage.league_memory import _init_db
 from app.market.market import snapshot_odds
 from app.match_facts import enrich_match_facts, normalize_live_statistics
-from app.match_state import classify_match_state
-from app.normalise import normalise
-from app.season_stage import detect_season_stage
+from app.utils.match_state import classify_match_state
+from app.utils.normalise import normalise
+from app.market.season_stage import detect_season_stage
 
 # How many SofaScore detail calls to run in parallel
 ENRICH_WORKERS = 8
@@ -180,7 +180,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
 def _register_ingest_with_team_watcher(matches: list[dict[str, Any]]) -> None:
     """Register ingested SportyBet matches with team watcher on first ingest."""
     try:
-        from app.team_watcher import observe_match as _tw_observe
+        from app.team_watcher.team_watcher import observe_match as _tw_observe
         for m in matches:
             match_id = str(m.get("id") or "")
             if not match_id:
@@ -511,7 +511,7 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
 def _update_team_watcher_sofa_ids(match_id: str, doc: dict[str, Any]) -> None:
     """After SofaScore enrichment resolves team IDs, update team watcher with full context."""
     try:
-        from app.team_watcher import observe_match as _tw_observe
+        from app.team_watcher.team_watcher import observe_match as _tw_observe
         _tw_observe(doc)
     except Exception:
         pass
@@ -641,7 +641,7 @@ def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
 def refresh_sporty_buffer_scope(scope: str = "upcoming", limit: int = 500) -> dict[str, Any]:
     """Pull fresh SportyBet state and update buffered odds/time/status before prediction."""
     from app.market.market import snapshot_odds
-    from app.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
+    from app.data_clients.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
 
     scope = "live" if str(scope).lower() == "live" else "upcoming"
     matches = (fetch_live_matches_post() if scope == "live" else fetch_upcoming_matches_post())[:limit]
@@ -674,7 +674,7 @@ def refresh_sporty_buffer_scope(scope: str = "upcoming", limit: int = 500) -> di
 def refresh_sporty_match_state(match_id: str) -> dict[str, Any]:
     """Refresh one buffered match from SportyBet before enrichment/prediction."""
     from app.market.market import snapshot_odds
-    from app.sportybet_client import fetch_match_info
+    from app.data_clients.sportybet_client import fetch_match_info
 
     match_id = str(match_id)
     info = fetch_match_info(match_id, bypass_cache=True)
@@ -1010,7 +1010,7 @@ def _track_live_data_availability(match_id: str, doc: dict[str, Any]) -> None:
     if not classify_match_state(doc).get("is_live") or _played_seconds_local(doc.get("played_seconds")) < 300:
         return
     try:
-        from app.live_retry_queue import mark_pending, mark_resolved
+        from app.utils.live_retry_queue import mark_pending, mark_resolved
     except Exception:
         return
     sporty_id = str(doc.get("sportybet_id") or match_id or "")
@@ -1057,12 +1057,12 @@ def run_enrichment_worker(
     Called by the scheduler — runs continuously in background.
     Returns a summary of what was done.
     """
-    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
-    from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
-    from app.sportradar_client import fetch_match_intelligence
-    from app.web_context import search_league_sentiment, search_match_context
-    from app.time_context import match_time_context
-    from app.activity_log import record_activity
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
+    from app.enrichment.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
+    from app.data_clients.sportradar_client import fetch_match_intelligence
+    from app.enrichment.web_context import search_league_sentiment, search_match_context
+    from app.utils.time_context import match_time_context
+    from app.utils.activity_log import record_activity
     from datetime import date
 
     batch = get_unenriched_batch(
@@ -1178,7 +1178,7 @@ def run_enrichment_worker(
                 # Not in the pre-fetched cache — do a direct fetch so we don't
                 # fall back to stale sofascore_event and skip fetch_event_detail
                 try:
-                    from app.sofascore_client import fetch_event, is_terminal_event
+                    from app.data_clients.sofascore_client import fetch_event, is_terminal_event
                     direct = fetch_event(str(saved_sofa_id))
                     if direct and not is_terminal_event(direct):
                         sofa = direct
@@ -1236,7 +1236,7 @@ def run_enrichment_worker(
     # live refresh (statistics + incidents + lineups only) instead of the full
     # fetch_event_detail (12 sub-calls). This reduces per-cycle API calls from
     # ~12 to ~3 per live match, saving ~9 SofaScore calls per live match per 30s cycle.
-    from app.sofascore_client import fetch_event_detail_live_refresh
+    from app.data_clients.sofascore_client import fetch_event_detail_live_refresh
 
     def _fetch_detail(idx: int, sofa: dict, item: dict) -> tuple[int, dict | None]:
         try:
@@ -1306,7 +1306,7 @@ def run_enrichment_worker(
     # flag is disabled.
     league_sentiment: dict[str, Any] = {}
     try:
-        from app.config import get_settings as _get_settings
+        from app.config.config import get_settings as _get_settings
         _cfg = _get_settings()
         if getattr(_cfg, "web_search_league_sentiment_enabled", False) and pairs:
             _first_sporty = pairs[0][0]["sporty"]
@@ -1388,12 +1388,12 @@ def run_enrichment_worker(
         # Enrichment owns the manual deterministic prediction path.
         # The AI queue may add a later overlay, but it never blocks this lane.
         try:
-            from app.pipeline_registry import is_pipeline_enabled
+            from app.scheduling.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
         if sofa or item.get("is_live"):
-            from app.prediction_flow import apply_prediction_state
+            from app.utils.prediction_flow import apply_prediction_state
 
             state = apply_prediction_state(
                 doc,
@@ -1442,14 +1442,14 @@ def run_enrichment_worker(
             if ai_queue_enabled and not item.get("is_live"):
                 doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
-            from app.enriched_prediction import prediction_readiness
+            from app.enrichment.enriched_prediction import prediction_readiness
 
             doc["prediction"] = None
             doc["prediction_error"] = None
             doc["prediction_readiness"] = prediction_readiness(doc)
             doc["ai_prediction_queue_pending"] = True
         else:
-            from app.enriched_prediction import prediction_readiness
+            from app.enrichment.enriched_prediction import prediction_readiness
 
             doc["prediction"] = None
             readiness = prediction_readiness(doc)
@@ -1479,12 +1479,12 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
     is matched, detailed, enriched, and predicted one after another. This is
     the manual page action: predictable, date-aware, and gentle on SofaScore.
     """
-    from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
-    from app.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
-    from app.sportradar_client import fetch_match_intelligence
-    from app.web_context import search_league_sentiment, search_match_context
-    from app.time_context import match_time_context
-    from app.activity_log import record_activity
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_live_events
+    from app.enrichment.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
+    from app.data_clients.sportradar_client import fetch_match_intelligence
+    from app.enrichment.web_context import search_league_sentiment, search_match_context
+    from app.utils.time_context import match_time_context
+    from app.utils.activity_log import record_activity
 
     queue = get_unenriched_batch(count)
     if not queue:
@@ -1560,7 +1560,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                 sofa = existing["sofascore_event"]
             else:
                 try:
-                    from app.sofascore_client import fetch_event, is_terminal_event
+                    from app.data_clients.sofascore_client import fetch_event, is_terminal_event
                     direct = fetch_event(str(saved_sofa_id))
                     if direct and not is_terminal_event(direct):
                         sofa = direct
@@ -1630,7 +1630,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
 
         league_sentiment = {}
         try:
-            from app.config import get_settings
+            from app.config.config import get_settings
 
             settings = get_settings()
             if settings.web_search_league_sentiment_enabled:
@@ -1709,12 +1709,12 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
 
         snapshot_odds(doc)
         try:
-            from app.pipeline_registry import is_pipeline_enabled
+            from app.scheduling.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
         if sofa or item.get("is_live"):
-            from app.prediction_flow import apply_prediction_state
+            from app.utils.prediction_flow import apply_prediction_state
 
             state = apply_prediction_state(
                 doc,
@@ -1761,18 +1761,18 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                     match_name=sporty.get("name"),
                 )
             if ai_queue_enabled and not item.get("is_live"):
-                from app.enriched_prediction import prediction_readiness
+                from app.enrichment.enriched_prediction import prediction_readiness
 
                 doc["prediction_readiness"] = prediction_readiness(doc)
                 doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
-            from app.enriched_prediction import prediction_readiness
+            from app.enrichment.enriched_prediction import prediction_readiness
 
             doc["prediction"] = None
             doc["prediction_error"] = None
             doc["ai_prediction_queue_pending"] = True
         else:
-            from app.enriched_prediction import prediction_readiness
+            from app.enrichment.enriched_prediction import prediction_readiness
 
             doc["prediction"] = None
             readiness = prediction_readiness(doc)
@@ -1875,7 +1875,7 @@ def _finalize_buffer_doc(doc: dict[str, Any], sporty: dict[str, Any] | None = No
     doc["is_finished"] = bool(state.get("is_finished") or doc.get("is_finished"))
     if not doc.get("time_context"):
         try:
-            from app.time_context import match_time_context
+            from app.utils.time_context import match_time_context
 
             doc["time_context"] = match_time_context(source_doc)
         except Exception:
@@ -2043,7 +2043,7 @@ def _sync_enriched_sporty_fields(
     is_live: int,
     is_finished: int,
 ) -> None:
-    from app.time_context import match_time_context
+    from app.utils.time_context import match_time_context
 
     row = conn.execute(f"select raw_enriched from {table} where match_id = ?", (match_id,)).fetchone()
     if not row or not row[0]:
@@ -2233,7 +2233,7 @@ def _is_ghost_match(start_time: Any, period: str | None) -> bool:
 def _sofascore_date_candidates(sporty: dict[str, Any], stored_match_date: str | None) -> list[str]:
     """Dates to try against SofaScore for this SportyBet match."""
     try:
-        from app.time_context import match_time_context
+        from app.utils.time_context import match_time_context
 
         ctx = match_time_context(sporty)
     except Exception:
@@ -2268,7 +2268,7 @@ def _candidate_sofascore_events(
     sofa_cache: dict[str, list[dict]],
     live_events: list[dict],
 ) -> list[dict]:
-    from app.sofascore_client import is_usable_event_for_mode
+    from app.data_clients.sofascore_client import is_usable_event_for_mode
 
     events: list[dict] = []
     seen: set[str] = set()
@@ -2327,7 +2327,7 @@ def _with_search_fallback_candidates(
     if best_score >= 0.70:
         return events
     try:
-        from app.sofascore_client import is_usable_event_for_mode, search_events
+        from app.data_clients.sofascore_client import is_usable_event_for_mode, search_events
 
         search_results = []
         seen_search_ids: set[str] = set()
@@ -2412,7 +2412,7 @@ def _split_team_name(name: str, index: int) -> str:
 
 def _is_junk_match_name(name: str) -> bool:
     try:
-        from app.enrichment import _is_junk
+        from app.enrichment.enrichment import _is_junk
 
         return _is_junk(name)
     except Exception:
@@ -2421,7 +2421,7 @@ def _is_junk_match_name(name: str) -> bool:
 
 def _event_score_for_fallback(sporty: dict[str, Any], event: dict[str, Any]) -> float:
     try:
-        from app.enrichment import _event_score
+        from app.enrichment.enrichment import _event_score
 
         return _event_score(sporty, event)
     except Exception:
@@ -2432,7 +2432,7 @@ def _try_archive_finished(match_id: str) -> None:
     """Archive a finished match to MongoDB and local SQLite, then remove from buffer.
     If MongoDB is not configured, still saves locally and deletes from buffer."""
     try:
-        from app.mongo_store import archive_finished_match_from_buffer, is_configured
+        from app.storage.mongo_store import archive_finished_match_from_buffer, is_configured
         if is_configured():
             try:
                 archive_finished_match_from_buffer(match_id)
@@ -2528,3 +2528,8 @@ def _archive_finished_locally(match_id: str) -> None:
         # Delete from buffer regardless
         conn.execute("delete from match_buffer where match_id = ?", (match_id,))
         conn.commit()
+
+
+
+
+

@@ -4,10 +4,9 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import get_settings, public_settings
-from app.db import DB_PATH, close_db
-from app.league_memory import _init_db
-from app.ollama_model_manager import preload_all_models, start_keep_alive, stop_keep_alive
+from app.config.config import get_settings, public_settings
+from app.storage.db import DB_PATH, close_db
+from app.storage.league_memory import _init_db
 from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore, user_behavior, betbuilder
 from app.routers import sofa_pipeline as sofa_pipeline_router
 from app.routers import pipelines as pipelines_router
@@ -15,7 +14,7 @@ from app.routers import scheduler as scheduler_router
 from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
 from app.routers import competition_analysis as competition_analysis_router
-from app.scheduler import start_scheduler
+from app.scheduling.scheduler import start_scheduler
 
 settings = get_settings()
 
@@ -24,39 +23,26 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     _init_db()
     try:
-        from app.pipeline_registry import ensure_default_states
+        from app.scheduling.pipeline_registry import ensure_default_states
         initialised = ensure_default_states()
         if initialised:
             print(f"[startup] pipeline defaults set: {initialised}")
     except Exception as exc:
         print(f"[startup] pipeline default init failed: {exc}")
     try:
-        from app.mongo_store import cleanup_buffer
+        from app.storage.mongo_store import cleanup_buffer
         result = cleanup_buffer()
         if result.get("deleted_finished") or result.get("deleted_stale_unenriched"):
             print(f"[startup] buffer cleanup: removed {result.get('deleted_finished')} finished, {result.get('deleted_stale_unenriched')} stale")
     except Exception as exc:
         print(f"[startup] buffer cleanup failed: {exc}")
     try:
-        from app.job_state import recover_abandoned_jobs
+        from app.scheduling.job_state import recover_abandoned_jobs
         recovery = recover_abandoned_jobs(stale_after_seconds=180)
         if recovery.get("recovered"):
             print(f"[startup] recovered abandoned jobs: {recovery.get('jobs')}")
     except Exception as exc:
         print(f"[startup] job recovery failed: {exc}")
-    try:
-        import threading as _threading
-        from app.ollama_model_manager import preload_all_models, start_keep_alive
-        def _bg_preload():
-            preload_results = preload_all_models()
-            loaded = sum(1 for v in preload_results.values() if v)
-            total = len(preload_results)
-            print(f"[startup] ollama preload: {loaded}/{total} models loaded")
-        _threading.Thread(target=_bg_preload, daemon=True, name="ollama_preload").start()
-        start_keep_alive(interval_seconds=120)
-        print("[startup] ollama keep-alive thread started")
-    except Exception as exc:
-        print(f"[startup] ollama preload failed: {exc}")
     try:
         if settings.environment != "test":
             start_scheduler()
@@ -72,7 +58,7 @@ async def lifespan(app: FastAPI):
     finally:
         await _close_live_websockets()
         stop_keep_alive()
-        from app.scheduler import stop_scheduler
+        from app.scheduling.scheduler import stop_scheduler
         stop_scheduler(wait=False)
 
 
@@ -162,8 +148,8 @@ async def websocket_live(websocket: WebSocket):
     connected_clients.append(websocket)
     try:
         while True:
-            from app.buffer import get_live_buffered_matches
-            from app.match_view import match_summary
+            from app.storage.buffer import get_live_buffered_matches
+            from app.utils.match_view import match_summary
 
             matches = get_live_buffered_matches(limit=50)
             await websocket.send_json(

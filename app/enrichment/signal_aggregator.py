@@ -18,8 +18,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import db_conn, DB_PATH, _conn, _init_db
-from app.league_memory import _init_db as lm_init_db
+from app.storage.db import db_conn, DB_PATH, _conn, _init_db
+from app.storage.league_memory import _init_db as lm_init_db
 
 
 # ── Signal categories ──────────────────────────────────────────
@@ -541,8 +541,8 @@ def prefetch_signal_stats(signal_names: list[str]) -> None:
     if not signal_names:
         return
     try:
-        from app.db import _conn
-        from app.league_memory import _init_db
+        from app.storage.db import _conn
+        from app.storage.league_memory import _init_db
         _init_db()
         placeholders = ",".join("?" * len(signal_names))
         with _conn(timeout=5) as conn:
@@ -585,8 +585,8 @@ def global_signal_stats(signal_name: str) -> dict[str, Any]:
     if cached is not None:
         return cached
     try:
-        from app.db import _conn
-        from app.league_memory import _init_db
+        from app.storage.db import _conn
+        from app.storage.league_memory import _init_db
         _init_db()
         with _conn(timeout=5) as conn:
             row = conn.execute(
@@ -601,7 +601,7 @@ def global_signal_stats(signal_name: str) -> dict[str, Any]:
             ).fetchone()
     except Exception as exc:
         try:
-            from app.health_counters import record_health_event
+            from app.utils.health_counters import record_health_event
             record_health_event("signal_aggregator", "global_signal_stats_failed", exc)
         except Exception:
             pass

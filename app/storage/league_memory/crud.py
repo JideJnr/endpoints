@@ -15,20 +15,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.db import (
+from app.storage.db import (
     DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db,
     _init_db, _init_db_unlocked, _ensure_column, _is_sqlite_lock,
     _DB_SCHEMA_READY, _DB_SCHEMA_LOCK, _run_schema_migrations,
     _run_legacy_backfills, _existing_schema_can_be_trusted,
     _ensure_prediction_history_columns,
 )
-from app.config import get_settings
+from app.config.config import get_settings
 from app.match_facts import enrich_match_facts
-from app.market_intent import classify_market_intent, grade_market_intent
-from app.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
-from app.competition_registry import init_competition_registry_tables, ensure_competition
+from app.market.market_intent import classify_market_intent, grade_market_intent
+from app.monitoring.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
+from app.competition.competition_registry import init_competition_registry_tables, ensure_competition
 from ._helpers import (
-    normalize_league, _league_from_match, _country_from_match,
+    normalize_league, _league_from_match, _country_from_match, _team_name,
     _match_fingerprint, _match_minute, _minute_bucket, _bucket_bounds,
     _score_state, _red_card_state, _favorite_from_match,
     _to_int, _to_float, _safe_json, _safe_float,
@@ -61,7 +61,7 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
     # Use the shared match-state classifier so SportyBet period/status variants
     # (e.g. "FT") resolve snapshots instead of leaving them permanently open.
     try:
-        from app.match_state import classify_match_state
+        from app.utils.match_state import classify_match_state
 
         state = classify_match_state(match)
         is_finished = bool(state.get("is_finished"))
@@ -142,7 +142,7 @@ def observe_matches(source: str, matches: list[dict[str, Any]]) -> dict[str, Any
 
 def _archive_finished_match(source: str, match: dict[str, Any], league: str) -> bool:
     try:
-        from app.mongo_store import save_finished_match
+        from app.storage.mongo_store import save_finished_match
 
         archived = {
             **match,
@@ -293,7 +293,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
 
     # ── Record CLV entry: capture entry odds at prediction time ────────────────
     try:
-        from app.clv import record_clv_entry
+        from app.risk.clv import record_clv_entry
         record_clv_entry(
             match_id=match_id,
             pick_type=best_pick.get("type") or "match_result",
@@ -303,7 +303,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             match_date=prediction.get("match_date"),
         )
     except Exception as exc:
-        from app.health_counters import record_health_event
+        from app.utils.health_counters import record_health_event
 
         record_health_event("league_memory", "clv_entry_record_failed", exc, match_id=match_id)
 
@@ -647,7 +647,7 @@ def store_local_signal_outcomes(
 def _backfill_local_signal_outcomes_from_history(limit: int = 5000) -> int:
     """Populate local signal analytics from already graded rows once."""
     try:
-        from app.self_learner import _decision_signals_for_row
+        from app.monitoring.self_learner import _decision_signals_for_row
     except Exception:
         _decision_signals_for_row = None
     with _conn() as conn:
@@ -1358,7 +1358,7 @@ def store_enriched_matches(documents: list[dict[str, Any]]) -> int:
             )
         conn.commit()
     try:
-        from app.mongo_store import store_enriched_matches as store_mongo_enriched_matches
+        from app.storage.mongo_store import store_enriched_matches as store_mongo_enriched_matches
 
         store_mongo_enriched_matches(documents)
     except Exception:
@@ -1388,7 +1388,7 @@ def get_enriched_matches(match_date: str | None = None, limit: int = 500) -> lis
     if docs:
         return docs
     try:
-        from app.mongo_store import get_enriched_matches as get_mongo_enriched_matches
+        from app.storage.mongo_store import get_enriched_matches as get_mongo_enriched_matches
 
         return get_mongo_enriched_matches(match_date=match_date, limit=limit)
     except Exception:
@@ -1402,7 +1402,7 @@ def get_enriched_match(match_id: str) -> dict[str, Any] | None:
     if row:
         return json.loads(row["raw_json"])
     try:
-        from app.mongo_store import get_enriched_match as get_mongo_enriched_match
+        from app.storage.mongo_store import get_enriched_match as get_mongo_enriched_match
 
         return get_mongo_enriched_match(match_id)
     except Exception:
@@ -1990,7 +1990,7 @@ def _safe_mark_buffer_finished(match_id: str, final_home: Any, final_away: Any) 
 
 def _mark_buffer_finished(match_id: str, final_home: Any, final_away: Any) -> None:
     try:
-        from app.mongo_store import archive_finished_match_from_buffer
+        from app.storage.mongo_store import archive_finished_match_from_buffer
     except Exception:
         archive_finished_match_from_buffer = None
 
@@ -2014,3 +2014,5 @@ def _mark_buffer_finished(match_id: str, final_home: Any, final_away: Any) -> No
             archive_finished_match_from_buffer(match_id)
         except Exception:
             pass
+
+

@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.db import db_conn
-from app.ai_brain import oversee_prediction
-from app.enriched_prediction import predict_enriched_match, prediction_readiness
-from app.db import DB_PATH
-from app.league_memory import record_deferred_prediction_decision, record_prediction
-from app.prediction_audit import build_deferred_prediction_audit, build_prediction_audit
-from app.match_state import classify_match_state
-from app.config import get_settings
+from app.storage.db import db_conn
+from app.ai.ai_brain import oversee_prediction
+from app.enrichment.enriched_prediction import predict_enriched_match, prediction_readiness
+from app.storage.db import DB_PATH
+from app.storage.league_memory import record_deferred_prediction_decision, record_prediction
+from app.monitoring.prediction_audit import build_deferred_prediction_audit, build_prediction_audit
+from app.utils.match_state import classify_match_state
+from app.config.config import get_settings
 
 import sqlite3
 
@@ -46,8 +46,8 @@ def predict_and_record_enriched(
 
     # Use small-context Ollama pipeline if requested and available
     if use_ollama_pipeline:
-        from app.ollama_pipeline import run_ollama_pipeline
-        from app.config import get_settings as _gs
+        from app.ai.ollama_pipeline import run_ollama_pipeline
+        from app.config.config import get_settings as _gs
         if _gs().openrouter_api_key:
             prediction = run_ollama_pipeline(doc, attach_brain=attach_brain)
             prediction["audit"] = build_prediction_audit(prediction, doc)
@@ -245,3 +245,6 @@ def _attach_brain_review(prediction: dict[str, Any], detail: dict[str, Any]) -> 
         "value": brain,
         "impact": adjustment,
     })
+
+
+

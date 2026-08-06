@@ -45,7 +45,7 @@ from app.market.season_stage import (  # noqa: F401
 
 # ── odds_pattern.py — depends on app.db and app.league_memory (via _init_db) ─
 # Deferred to avoid circular: league_memory → market_intent → market.__init__
-# Import directly: from app.market.odds_pattern import extract_pattern, pattern_signal
+# Import directly: from app.market.market.odds_pattern import extract_pattern, pattern_signal
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── market.py — depends on app.db, app.league_memory, app.config ─────────────
@@ -78,3 +78,4 @@ __all__ = [
     "detect_season_stage",
     "season_aware_table_weight",
 ]
+

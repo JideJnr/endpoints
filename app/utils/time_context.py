@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.match_state import classify_match_state
+from app.utils.match_state import classify_match_state
 
 
 DEFAULT_LOCAL_TZ = "Africa/Lagos"

@@ -5,11 +5,11 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import normalize_league, observe_matches, record_prediction
-from app.prediction_agent import predict_sporty_match
-from app.sportybet_client import fetch_live_matches_post
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import normalize_league, observe_matches, record_prediction
+from app.ai.prediction_agent import predict_sporty_match
+from app.data_clients.sportybet_client import fetch_live_matches_post
 
 
 @dataclass

@@ -6,9 +6,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
 
 router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
 
@@ -16,8 +16,8 @@ router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
 @router.get("/live-prediction-gaps")
 def live_prediction_gaps() -> dict[str, Any]:
     try:
-        from app.enriched_prediction import prediction_readiness
-        from app.live_retry_queue import list_active
+        from app.enrichment.enriched_prediction import prediction_readiness
+        from app.utils.live_retry_queue import list_active
 
         _init_db()
         gaps: list[dict[str, Any]] = []
@@ -146,3 +146,5 @@ def prediction_coverage() -> dict[str, Any]:
             }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+

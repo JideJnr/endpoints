@@ -12,8 +12,8 @@ from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError
 
-from app.config import get_settings
-from app.season_stage import detect_season_stage
+from app.config.config import get_settings
+from app.market.season_stage import detect_season_stage
 
 logger = logging.getLogger(__name__)
 
@@ -425,8 +425,8 @@ def _build_model_summary(doc: dict[str, Any]) -> str:
 
 def _build_memory_context(doc: dict[str, Any]) -> str:
     try:
-        from app.self_learner import get_signal_weights, get_league_accuracy
-        from app.clv import get_clv_summary
+        from app.monitoring.self_learner import get_signal_weights, get_league_accuracy
+        from app.risk.clv import get_clv_summary
         league = doc.get("tournament") or doc.get("category") or ""
         if isinstance(league, dict):
             league = league.get("name") or ""
@@ -617,3 +617,5 @@ def run_ollama_pipeline_batch(
         "value_bets": value_bets,
         "predictions": predictions,
     }
+
+

@@ -7,7 +7,7 @@ import re
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app.config import get_settings
+from app.config.config import get_settings
 
 
 def search_match_context(home: str, away: str, tournament: str = "") -> dict[str, Any]:
@@ -513,3 +513,4 @@ def _diagnostics(settings) -> dict[str, Any]:
         "search_timeout_seconds": settings.web_search_timeout_seconds,
         "scrape_timeout_seconds": settings.web_scrape_timeout_seconds,
     }
+

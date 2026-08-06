@@ -4,8 +4,8 @@ import math
 import sqlite3
 from typing import Any
 
-from app.config import get_settings
-from app.db import DB_PATH, _conn
+from app.config.config import get_settings
+from app.storage.db import DB_PATH, _conn
 
 
 MIN_CALIBRATION_SAMPLES = 30
@@ -271,3 +271,4 @@ def _to_float(value: Any) -> float | None:
     except Exception:
         return None
     return result if math.isfinite(result) else None
+

@@ -15,7 +15,7 @@ to the right strength first, then cascades down the chain automatically.
 
 Usage
 ~~~~~
-    from app.ai_router import AIRouter
+    from app.ai.ai_router import AIRouter
 
     router = AIRouter()
 
@@ -43,7 +43,7 @@ import logging
 import re
 from typing import Any
 
-from app.config import get_settings
+from app.config.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +119,14 @@ class AIRouter:
         Full small-context multi-stage OpenRouter pipeline prediction.
         Returns a prediction dict (not just text) with specialist results.
         """
-        from app.ollama_pipeline import run_ollama_pipeline
+        from app.ai.ollama_pipeline import run_ollama_pipeline
         return run_ollama_pipeline(doc, attach_brain=True)
 
     def call_pipeline_batch(self, docs: list[dict[str, Any]], limit: int = 50) -> dict[str, Any]:
         """
         Batch small-context pipeline predictions.
         """
-        from app.ollama_pipeline import run_ollama_pipeline_batch
+        from app.ai.ollama_pipeline import run_ollama_pipeline_batch
         return run_ollama_pipeline_batch(docs, limit=limit, attach_brain=True)
 
     # ── Availability helpers ───────────────────────────────────────────────
@@ -147,17 +147,8 @@ class AIRouter:
                 return entry["model"]
         return None
 
-    def is_groq_available(self) -> bool:
-        if "groq" not in self._availability_cache:
-            try:
-                from app.llm import is_groq_available
-                self._availability_cache["groq"] = is_groq_available()
-            except Exception:
-                self._availability_cache["groq"] = False
-        return self._availability_cache["groq"]
-
     def any_available(self) -> bool:
-        return self.best_available() is not None or self.is_groq_available()
+        return self.best_available() is not None
 
     def status(self) -> dict[str, Any]:
         """Full availability status — used by the API /ai/status endpoint."""
@@ -175,10 +166,9 @@ class AIRouter:
         return {
             "openrouter_models": models,
             "openrouter_pipeline_available": self.is_pipeline_available(),
-            "groq_available": self.is_groq_available(),
             "any_available": self.any_available(),
             "primary_model": self.best_available(),
-            "chain": [e["model"] for e in OPENROUTER_MODELS] + (["groq"] if self.is_groq_available() else []),
+            "chain": [e["model"] for e in OPENROUTER_MODELS],
         }
 
     def invalidate_cache(self) -> None:
@@ -196,7 +186,7 @@ class AIRouter:
 
     def _try_pipeline_from_prompt(self, prompt: str) -> str | None:
         """
-        If the prompt contains a JSON doc prefix (sent by groq_agent or openrouter_agent),
+        If the prompt contains a JSON doc prefix (sent by openrouter_agent),
         try running the full pipeline instead of a single large-context call.
         Returns the pipeline result as a JSON string, or None if pipeline not applicable.
         """
@@ -254,17 +244,6 @@ class AIRouter:
                 # Invalidate so next call re-checks availability
                 self._availability_cache.pop(model, None)
 
-        # Groq final fallback
-        if self.is_groq_available():
-            try:
-                result = self._call_groq(prompt, timeout)
-                self._last_provider = "groq"
-                logger.debug("ai_router: groq succeeded for task=%s", task)
-                return result
-            except Exception as exc:
-                logger.warning("ai_router: groq failed for task=%s: %s", task, exc)
-                self._availability_cache.pop("groq", None)
-
         raise RuntimeError(f"ai_router: all providers exhausted for task={task}")
 
     def _dispatch_messages(self, messages: list[dict[str, str]], task: str, timeout: int) -> str:
@@ -286,39 +265,18 @@ class AIRouter:
                 logger.warning("ai_router: %s failed for task=%s: %s", model, task, exc)
                 self._availability_cache.pop(model, None)
 
-        # Groq handles messages natively
-        if self.is_groq_available():
-            try:
-                result = self._call_groq_messages(messages, timeout)
-                self._last_provider = "groq"
-                logger.debug("ai_router: groq succeeded for task=%s (messages)", task)
-                return result
-            except Exception as exc:
-                logger.warning("ai_router: groq failed for task=%s: %s", task, exc)
-                self._availability_cache.pop("groq", None)
-
         raise RuntimeError(f"ai_router: all providers exhausted for task={task}")
 
     # ── Provider calls ─────────────────────────────────────────────────────
 
     def _call_openrouter(self, model: str, prompt: str, timeout: int) -> str:
-        from app.ollama_agent import _call_llm
+        from app.ai.ollama_agent import _call_llm
         return _call_llm(model, prompt, timeout=timeout)
-
-    def _call_groq(self, prompt: str, timeout: int) -> str:
-        from app.llm import get_llm
-        response = get_llm().invoke([{"role": "user", "content": prompt}])
-        return str(response.content if hasattr(response, "content") else response).strip()
-
-    def _call_groq_messages(self, messages: list[dict[str, str]], timeout: int) -> str:
-        from app.llm import get_llm
-        response = get_llm().invoke(messages)
-        return str(response.content if hasattr(response, "content") else response).strip()
 
     @staticmethod
     def _check_openrouter(model: str) -> bool:
         try:
-            from app.ollama_agent import is_ollama_available
+            from app.ai.ollama_agent import is_ollama_available
             return is_ollama_available(model)
         except Exception:
             return False
@@ -372,3 +330,4 @@ def get_router() -> AIRouter:
     if _router is None:
         _router = AIRouter()
     return _router
+

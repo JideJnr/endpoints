@@ -4,15 +4,15 @@ from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any
 
-from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
-from app.enrichment import FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD, _fuzzy_match, _is_junk, _llm_match
+from app.storage.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
+from app.enrichment.enrichment import FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD, _fuzzy_match, _is_junk, _llm_match
 from app.market.market import snapshot_odds
-from app.match_state import classify_match_state
-from app.season_stage import detect_season_stage
-from app.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_event_detail, fetch_live_events, is_terminal_event, is_usable_event_for_mode
-from app.sportradar_client import fetch_match_intelligence
-from app.time_context import match_time_context
-from app.web_context import search_league_sentiment, search_match_context
+from app.utils.match_state import classify_match_state
+from app.market.season_stage import detect_season_stage
+from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event, fetch_event_detail, fetch_live_events, is_terminal_event, is_usable_event_for_mode
+from app.data_clients.sportradar_client import fetch_match_intelligence
+from app.utils.time_context import match_time_context
+from app.enrichment.web_context import search_league_sentiment, search_match_context
 
 
 class MatchEnrichmentError(Exception):
@@ -89,7 +89,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
     # Fetch league-level sentiment for broader context
     league_sentiment = {}
     try:
-        from app.config import get_settings
+        from app.config.config import get_settings
 
         settings = get_settings()
         if settings.web_search_league_sentiment_enabled:
@@ -145,13 +145,13 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
 
     # A manual SofaScore match and a dedicated competition fixture should get
     # identical league/table/team-strength context before any prediction path.
-    from app.competition_special import apply_known_competition_context
+    from app.competition.competition_special import apply_known_competition_context
     apply_known_competition_context(enriched_doc)
 
     snapshot_odds(enriched_doc)
 
     if auto_predict:
-        from app.prediction_flow import apply_prediction_state
+        from app.utils.prediction_flow import apply_prediction_state
 
         apply_prediction_state(enriched_doc, match_id=sportybet_id)
 
@@ -195,7 +195,7 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
 
     if not _is_live_doc(doc):
         try:
-            from app.buffer import _with_search_fallback_candidates
+            from app.storage.buffer import _with_search_fallback_candidates
 
             search_events = _with_search_fallback_candidates(sporty, [], live=False)
             sofa, score = _fuzzy_match(sporty, search_events)
@@ -211,7 +211,7 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
             if is_usable_event_for_mode(event, live=_is_live_doc(doc))
         ]
         if not _is_live_doc(doc):
-            from app.buffer import _with_search_fallback_candidates
+            from app.storage.buffer import _with_search_fallback_candidates
 
             sofa_events = _with_search_fallback_candidates(sporty, sofa_events, live=False)
     except Exception:
@@ -235,7 +235,7 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
 
 def _team_bound_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_date: str) -> tuple[dict[str, Any] | None, float, str]:
     try:
-        from app.team_watcher import team_watchers_for_match
+        from app.team_watcher.team_watcher import team_watchers_for_match
     except Exception:
         return None, 0.0, "team_watcher_unavailable"
 
@@ -391,7 +391,7 @@ def _candidate_score(event: dict[str, Any] | None, doc: dict[str, Any]) -> float
     if not event:
         return 0.0
     try:
-        from app.enrichment import _event_score
+        from app.enrichment.enrichment import _event_score
 
         sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
         return _event_score(
@@ -459,3 +459,7 @@ def _team_from_name(doc: dict[str, Any], index: int) -> str:
     name = doc.get("sportybet_name") or doc.get("name") or ""
     parts = [part.strip() for part in name.split(" vs ", 1)]
     return parts[index] if len(parts) > index else ""
+
+
+
+

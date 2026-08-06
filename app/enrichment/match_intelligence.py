@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.contextual_intelligence import build_contextual_intelligence
-from app.match_state import classify_match_state
-from app.prediction_audit import build_prediction_audit, build_deferred_prediction_audit
-from app.time_context import match_time_context
+from app.enrichment.contextual_intelligence import build_contextual_intelligence
+from app.utils.match_state import classify_match_state
+from app.monitoring.prediction_audit import build_prediction_audit, build_deferred_prediction_audit
+from app.utils.time_context import match_time_context
 
 
 def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
@@ -23,7 +23,7 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
         else build_contextual_intelligence(doc, prediction or {})
     )
     try:
-        from app.team_watcher import team_context_for_match
+        from app.team_watcher.team_watcher import team_context_for_match
         team_watchers = team_context_for_match(doc)
     except Exception as exc:
         team_watchers = {"available": False, "error": str(exc)}
@@ -71,3 +71,5 @@ def build_match_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
         },
         "lifecycle": doc.get("lifecycle") or {},
     }
+
+

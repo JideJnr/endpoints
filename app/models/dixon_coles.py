@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.poisson import _poisson_prob, _team_stats
+from app.models.poisson import _poisson_prob, _team_stats
 
 
 MAX_GOALS = 7

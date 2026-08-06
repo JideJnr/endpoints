@@ -3,15 +3,15 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
-from app.match_state import classify_match_state
-from app.season_stage import (
+from app.utils.match_state import classify_match_state
+from app.market.season_stage import (
     classify_table_size,
     detect_season_stage,
     season_aware_table_weight,
 )
 
-from app.league_memory import late_goal_memory_signal
-from app.league_strength import league_strength_edge
+from app.storage.league_memory import late_goal_memory_signal
+from app.competition.league_strength import league_strength_edge
 
 
 HIGH_LATE_GOAL_LEAGUES = (
@@ -154,7 +154,7 @@ def predict_sofascore_event(
 
     # Team watch signal — opponent tier, goal timing, signal combo history
     try:
-        from app.team_watcher import team_watch_signal as _tw_signal
+        from app.team_watcher.team_watcher import team_watch_signal as _tw_signal
         tw = _tw_signal(event)
         if tw and tw.get("value", {}).get("available"):
             home_power += float(tw.get("impact") or 0)
@@ -170,8 +170,8 @@ def predict_sofascore_event(
         # If no directional pick qualifies, return no_bet — the logic is strong
         # enough to make a pick or no pick, no double chance fallback needed.
         try:
-            from app.signal_aggregator import SignalAggregator
-            from app.fallback_logic import FallbackHandler
+            from app.enrichment.signal_aggregator import SignalAggregator
+            from app.risk.fallback_logic import FallbackHandler
 
             aggregator = SignalAggregator()
             aggregator.add_signal("home_form", 0.6 if home_power > 0 else 0.4, source="rules")
@@ -1087,3 +1087,6 @@ def _tournament_name(event: dict[str, Any]) -> str:
     if isinstance(t, dict):
         return str(t.get("name") or "")
     return str(t)
+
+
+

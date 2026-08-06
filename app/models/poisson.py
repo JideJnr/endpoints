@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from app.db import db_conn
-from app.sofascore_client import fetch_team_history
+from app.storage.db import db_conn
+from app.data_clients.sofascore_client import fetch_team_history
 
 
 MAX_GOALS = 7
@@ -75,7 +75,7 @@ def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
     # 2. MongoDB finished matches (our own recorded results — grows with training)
     mongo_finished: list[dict[str, Any]] = []
     try:
-        from app.mongo_store import get_team_finished_matches, is_configured
+        from app.storage.mongo_store import get_team_finished_matches, is_configured
         if is_configured():
             mongo_finished = get_team_finished_matches(team_id, limit=last_n)
     except Exception:
@@ -111,8 +111,8 @@ def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
 def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
     """Pull finished matches for a team from our local SQLite finished_matches archive."""
     try:
-        from app.db import DB_PATH
-        from app.league_memory import _init_db
+        from app.storage.db import DB_PATH
+        from app.storage.league_memory import _init_db
         import sqlite3 as _sqlite3
         import json as _json
         _init_db()

@@ -5,8 +5,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.db import db_conn
-from app.league_memory import (
+from app.storage.db import db_conn
+from app.storage.league_memory import (
     get_league_memory,
     get_snapshot_memory,
     list_duplicate_matches,
@@ -14,10 +14,10 @@ from app.league_memory import (
     observe_matches,
     run_memory_maintenance,
 )
-from app.ai_brain import oversee_prediction
-from app.prediction_agent import predict_sofascore_event, predict_sporty_match
-from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_scheduled_events, fetch_team_history
-from app.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post, fetch_upcoming_matches_post
+from app.ai.ai_brain import oversee_prediction
+from app.ai.prediction_agent import predict_sofascore_event, predict_sporty_match
+from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_scheduled_events, fetch_team_history
+from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post, fetch_upcoming_matches_post
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -166,9 +166,9 @@ def get_value_bets(
     """
     Scan buffered/enriched matches for 1X2 prices where model probability beats implied odds.
     """
-    from app.buffer import get_buffered_matches
-    from app.kelly import kelly_fraction
-    from app.poisson import run_poisson
+    from app.storage.buffer import get_buffered_matches
+    from app.risk.kelly import kelly_fraction
+    from app.models.poisson import run_poisson
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     target_date = date or dt.today().isoformat()
@@ -248,7 +248,7 @@ def get_value_bets(
 @router.get("/analytics/performance")
 def get_performance_analytics():
     """Win rates, grading status, market types, and recent graded results."""
-    from app.league_memory import get_grading_metrics
+    from app.storage.league_memory import get_grading_metrics
 
     return {"status": "success", **get_grading_metrics()}
 
@@ -261,8 +261,8 @@ def get_roi_analysis():
     break-even odds instead of treating every win as a 1.00 return.
     """
     import sqlite3
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -406,22 +406,22 @@ def post_groq_predictions(
     OpenRouter is the primary provider, with fallback support when configured.
     """
     try:
-        from app.groq_agent import run_groq_predictions
+        from app.ai.groq_agent import run_groq_predictions
         return run_groq_predictions(match_date=match_date, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.get("/groq/status")
-def get_groq_status():
+@router.get("/ai/status")
+def get_ai_status():
     """Check whether the router-backed AI providers are configured and available."""
     try:
-        from app.llm import is_groq_available, get_llm
-        available = is_groq_available()
+        from app.ai.llm import get_llm
+        available = get_llm() is not None
         return {
             "status": "success",
-            "groq_available": available,
-            "message": "AI router ready" if available else "Set OPENROUTER_API_KEY or GROQ_API_KEY in .env to enable AI routing",
+            "ai_available": available,
+            "message": "AI router ready" if available else "Set OPENROUTER_API_KEY in .env to enable AI routing",
         }
     except Exception as e:
         return {"status": "error", "groq_available": False, "detail": str(e)}
@@ -444,7 +444,7 @@ def post_ollama_predictions(
     Requires Ollama running locally.
     """
     try:
-        from app.ollama_agent import run_ollama_predictions
+        from app.ai.ollama_agent import run_ollama_predictions
         return run_ollama_predictions(match_date=match_date, limit=limit, model=model)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -454,8 +454,8 @@ def post_ollama_predictions(
 def get_ollama_status():
     """Check if Ollama is running and which models are available."""
     try:
-        from app.ollama_agent import is_ollama_available, OLLAMA_MODELS
-        from app.ollama_model_manager import get_model_status, is_model_loaded
+        from app.ai.ollama_agent import is_ollama_available, OLLAMA_MODELS
+        from app.ai.ollama_model_manager import get_model_status, is_model_loaded
         reachable = is_ollama_available()
         model_status = {}
         if reachable:

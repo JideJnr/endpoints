@@ -26,7 +26,7 @@ Tables:
   clv_entries  — one row per prediction, stores entry_odds + closing_odds once known
   
 Usage:
-    from app.clv import record_clv_entry, compute_clv_for_date, get_clv_summary
+    from app.risk.clv import record_clv_entry, compute_clv_for_date, get_clv_summary
 
     # Called at prediction time (inside record_prediction)
     record_clv_entry(match_id, pick_type, selection, entry_odds)
@@ -43,9 +43,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db import db_conn
-from app.db import DB_PATH
-from app.league_memory import _init_db
+from app.storage.db import db_conn
+from app.storage.db import DB_PATH
+from app.storage.league_memory import _init_db
 
 CLV_MIN_SAMPLES = 25
 

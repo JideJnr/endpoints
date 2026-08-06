@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.league_memory import (
+from app.storage.league_memory import (
     get_enriched_match,
     get_enriched_matches,
     get_country_from_memory,
@@ -25,20 +25,20 @@ from app.league_memory import (
     grade_betbuilder_history,
     run_memory_maintenance,
 )
-from app.ai_brain import oversee_prediction
-from app.bot2 import run_bot2
-from app.enrichment import run_enrichment
-from app.dixon_coles import run_dixon_coles
-from app.elo import elo_prediction
-from app.ensemble import ensemble_prediction
-from app.kelly import kelly_fraction
+from app.ai.ai_brain import oversee_prediction
+from app.utils.bot2 import run_bot2
+from app.enrichment.enrichment import run_enrichment
+from app.models.dixon_coles import run_dixon_coles
+from app.models.elo import elo_prediction
+from app.models.ensemble import ensemble_prediction
+from app.risk.kelly import kelly_fraction
 from app.market.market import get_all_movements, get_movement
-from app.poisson import run_poisson
-from app.prediction_agent import predict_sofascore_event
-from app.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_team_history
-from app.sos import compare_schedules, analyse_schedule
-from app.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post
-from app.web_context import context_for_match, search_league_sentiment, search_match_context
+from app.models.poisson import run_poisson
+from app.ai.prediction_agent import predict_sofascore_event
+from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_team_history
+from app.competition.sos import compare_schedules, analyse_schedule
+from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post
+from app.enrichment.web_context import context_for_match, search_league_sentiment, search_match_context
 
 router = APIRouter(tags=["platform"])
 
@@ -291,7 +291,7 @@ def get_predictions_history(limit: int = Query(default=200, ge=1, le=1000), matc
 
 @router.get("/predictions/decisions")
 def get_prediction_decisions(limit: int = Query(default=200, ge=1, le=1000), match_id: Optional[str] = None):
-    from app.league_memory import list_prediction_decisions
+    from app.storage.league_memory import list_prediction_decisions
 
     return {"status": "success", **list_prediction_decisions(limit=limit, match_id=match_id)}
 
@@ -317,10 +317,10 @@ def _prediction_for_match_id(
     date: Optional[str],
     include_web_context: bool,
 ):
-    from app.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
-    from app.enriched_prediction import prediction_readiness
-    from app.match_enrichment import MatchEnrichmentError, enrich_buffered_match
-    from app.prediction_flow import apply_prediction_state
+    from app.storage.buffer import get_buffered_match, refresh_sporty_match_state, store_enriched
+    from app.enrichment.enriched_prediction import prediction_readiness
+    from app.enrichment.match_enrichment import MatchEnrichmentError, enrich_buffered_match
+    from app.utils.prediction_flow import apply_prediction_state
 
     refresh = refresh_sporty_match_state(match_id)
     if not refresh.get("active"):
@@ -406,7 +406,7 @@ def post_betbuilder_book(payload: dict[str, Any] = Body(...)):
     a fully resolved payload they can inspect or submit through their approved
     integration.
     """
-    from app.sportybet_booking import build_booking_payload, request_share_code
+    from app.data_clients.sportybet_booking import build_booking_payload, request_share_code
 
     selections = payload.get("selections") or []
     try:
@@ -426,7 +426,7 @@ def post_betbuilder_book(payload: dict[str, Any] = Body(...)):
 @router.post("/betbuilder/book-smart")
 def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
     """Book a slip, automatically dropping unavailable legs and re-asking Maya for replacements."""
-    from app.sportybet_booking import build_booking_payload, request_share_code
+    from app.data_clients.sportybet_booking import build_booking_payload, request_share_code
 
     selections: list[dict[str, Any]] = list(payload.get("selections") or [])
     stake = int(payload.get("stake") or 0)
@@ -454,7 +454,7 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
         except ValueError as exc:
             msg = str(exc)
             # Identify which leg caused the error by matching event id in the message
-            from app.sportybet_booking import _resolve_sportybet_id
+            from app.data_clients.sportybet_booking import _resolve_sportybet_id
             bad = next(
                 (
                     s for s in remaining
@@ -468,12 +468,12 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
 
             # Try Maya for a fresh pick on this match
             match_id = str(bad.get("sportybet_id") or bad.get("match_id") or "")
-            from app.sportybet_booking import _resolve_sportybet_id
+            from app.data_clients.sportybet_booking import _resolve_sportybet_id
             match_id = _resolve_sportybet_id(match_id)
             maya_pick: dict[str, Any] | None = None
             if match_id:
                 try:
-                    from app.ai_betbuilder import enriched_match_analysis
+                    from app.ai.ai_betbuilder import enriched_match_analysis
                     analysis = enriched_match_analysis(match_id, force_refresh=True)
                     rec = analysis.get("openrouter_recommendation") or analysis.get("recommendation")
                     pick_type = (analysis.get("prediction_engine_pick") or {}).get("type") or "match_result"
@@ -508,8 +508,8 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
 @router.get("/betbuilder/test-book/{sportybet_id}")
 def get_betbuilder_test_book(sportybet_id: str, stake: int = 100):
     """Debug: fetch live markets for a match, run prediction, then attempt booking."""
-    from app.buffer import get_buffered_match, refresh_sporty_match_state
-    from app.sportybet_booking import build_booking_payload
+    from app.storage.buffer import get_buffered_match, refresh_sporty_match_state
+    from app.data_clients.sportybet_booking import build_booking_payload
 
     refresh = refresh_sporty_match_state(sportybet_id)
     doc = get_buffered_match(sportybet_id) or {}
@@ -566,7 +566,7 @@ def post_grade_betbuilder(limit: int = Query(default=300, ge=1, le=1000)):
 @router.post("/matches/{sportybet_id}/enriched-analysis")
 def post_enriched_match_analysis(sportybet_id: str, payload: dict[str, Any] = Body(default_factory=dict)):
     try:
-        from app.ai_betbuilder import enriched_match_analysis
+        from app.ai.ai_betbuilder import enriched_match_analysis
 
         result = enriched_match_analysis(sportybet_id, force_refresh=bool(payload.get("force_refresh")))
     except ValueError as exc:
@@ -582,7 +582,7 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
     if len(analyses) < 2:
         raise HTTPException(status_code=400, detail="At least two completed Enriched Analysis results are required")
     try:
-        from app.ai_betbuilder import synthesize_sure_picks
+        from app.ai.ai_betbuilder import synthesize_sure_picks
         target_odds = max(1.01, _to_float(payload.get("target_odds")) or 5.0)
         max_total_odds = max(target_odds, _to_float(payload.get("max_total_odds")) or target_odds * 3.0)
 
@@ -599,8 +599,32 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
 
 @router.post("/betbuilder/auto")
 def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
-    """Build a Groq-powered slip from upcoming prediction-engine candidates."""
-    from app.ai_betbuilder import build_ai_betbuilder
+    """Build a slip from upcoming prediction-engine candidates.
+
+    Two modes:
+      * Default (``consume_stored`` omitted/false) — the legacy Groq/OpenRouter
+        powered builder (``build_ai_betbuilder``) which re-runs the LLM pipeline
+        on candidates.  Kept for manual, on-demand slip building.
+      * ``consume_stored=true`` — the Layer-2 auto-bet *consumer*
+        (``run_auto_bet``): it reads already-produced predictions, applies the
+        research good/bad gate, and builds a booking slip with NO LLM re-run.
+        This is what the automated bettor should use.
+    """
+    if payload.get("consume_stored"):
+        from app.auto_bet import run_auto_bet
+
+        result = run_auto_bet(
+            target_odds=float(payload.get("target_odds") or 1.80),
+            max_total_odds=(float(payload["max_total_odds"]) if payload.get("max_total_odds") else None),
+            stake=int(payload.get("stake") or 100),
+            candidate_limit=int(payload.get("candidate_limit") or 50),
+            request_code=bool(payload.get("request_code")),
+        )
+        if result.get("status") in ("booking_failed", "synthesis_failed"):
+            raise HTTPException(status_code=503, detail=result)
+        return result
+
+    from app.ai.ai_betbuilder import build_ai_betbuilder
 
     result = build_ai_betbuilder(payload)
     if result.get("status") == "error":
@@ -628,21 +652,21 @@ def get_engine_metrics():
 
 @router.get("/risk/desk")
 def get_risk_desk(limit: int = Query(default=200, ge=20, le=1000)):
-    from app.desk_analytics import desk_observability
+    from app.utils.desk_analytics import desk_observability
 
     return desk_observability(limit=limit)
 
 
 @router.get("/risk/backtest-gate")
 def get_risk_backtest_gate(limit: int = Query(default=1000, ge=50, le=10000), min_samples: int = Query(default=50, ge=10, le=1000)):
-    from app.desk_analytics import backtest_gate
+    from app.utils.desk_analytics import backtest_gate
 
     return backtest_gate(limit=limit, min_samples=min_samples)
 
 
 @router.get("/risk/signal-attribution")
 def get_risk_signal_attribution(min_samples: int = Query(default=5, ge=1, le=100), limit: int = Query(default=5000, ge=100, le=20000)):
-    from app.desk_analytics import signal_attribution_report
+    from app.utils.desk_analytics import signal_attribution_report
 
     return signal_attribution_report(min_samples=min_samples, limit=limit)
 
@@ -691,7 +715,7 @@ def post_run_predict(date: Optional[str] = None, limit: int = Query(default=20, 
     skipped_not_ready = 0
     skipped_already_predicted = 0
     if docs:
-        from app.prediction_flow import apply_prediction_state
+        from app.utils.prediction_flow import apply_prediction_state
 
         predictions = []
         for doc in docs:
@@ -749,7 +773,7 @@ def post_reset_predictions(
     """
     import json as _json
     import sqlite3
-    from app.db import db_conn
+    from app.storage.db import db_conn
 
     _PREDICTION_KEYS = {
         "prediction",
@@ -797,7 +821,7 @@ def post_reset_predictions(
 
         # Also clear the in-memory analysis cache in ai_betbuilder
         try:
-            from app.ai_betbuilder import _ANALYSIS_CACHE
+            from app.ai.ai_betbuilder import _ANALYSIS_CACHE
             if match_id:
                 _ANALYSIS_CACHE.pop(match_id, None)
             else:
@@ -908,7 +932,7 @@ def _safe_predictions_for_date(date: Optional[str], limit: int, include_history:
     today = dt.today().isoformat()
 
     try:
-        from app.current_predictions import list_recent_dashboard_predictions
+        from app.utils.current_predictions import list_recent_dashboard_predictions
 
         dashboard_rows = list_recent_dashboard_predictions(hours=72, limit=max(limit, 200))
         if dashboard_rows:
@@ -1104,3 +1128,6 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+

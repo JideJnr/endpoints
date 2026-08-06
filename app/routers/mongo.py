@@ -4,9 +4,9 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.db import db_conn
-from app.mongo_store import init_mongo, list_finished_matches, mongo_status, save_finished_match, flush_buffer_to_mongo, cleanup_buffer
-from app.scheduler import (
+from app.storage.db import db_conn
+from app.storage.mongo_store import init_mongo, list_finished_matches, mongo_status, save_finished_match, flush_buffer_to_mongo, cleanup_buffer
+from app.scheduling.scheduler import (
     job_ingest_upcoming,
     job_ingest_live,
     job_enrich_worker,
@@ -97,7 +97,7 @@ def post_scan_live(limit: int = Query(default=200, ge=1, le=1000)):
 def post_refresh_buffer_odds(limit: int = Query(default=500, ge=1, le=1000)):
     """Refresh live and upcoming SportyBet state, update buffer odds, and snapshot movement."""
     try:
-        from app.buffer import refresh_sporty_buffer_scope
+        from app.storage.buffer import refresh_sporty_buffer_scope
 
         live = refresh_sporty_buffer_scope("live", limit=min(limit, 1000))
         upcoming = refresh_sporty_buffer_scope("upcoming", limit=min(limit, 1000))
@@ -163,7 +163,7 @@ def post_live_priority(payload: dict = Body(...)):
 def post_match_and_enrich(count: int = Query(default=12, ge=1, le=50)):
     """Date-aware manual run for the upcoming analytics page."""
     try:
-        from app.buffer import run_date_aware_enrichment
+        from app.storage.buffer import run_date_aware_enrichment
 
         ingest = run_job_with_guard(job_ingest_upcoming, limit=500)
         enrich = run_date_aware_enrichment(count=count)
@@ -201,8 +201,8 @@ def post_purge_junk_predictions(confirm: bool = False):
     non-destructive unless the caller explicitly confirms the purge.
     """
     import sqlite3
-    from app.db import DB_PATH
-    from app.league_memory import _init_db
+    from app.storage.db import DB_PATH
+    from app.storage.league_memory import _init_db
     from datetime import date
 
     _init_db()
@@ -249,7 +249,7 @@ def post_cleanup_buffer():
 def post_prune_mongo(keep_days: int = Query(default=90, ge=7, le=365)):
     """Prune finished_matches from MongoDB older than keep_days. Default 90 days."""
     try:
-        from app.scheduler import job_prune_mongo
+        from app.scheduling.scheduler import job_prune_mongo
         return job_prune_mongo(keep_days=keep_days)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))

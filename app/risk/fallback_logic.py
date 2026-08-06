@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.probability_learner import ProbabilityLearner
+from app.models.probability_learner import ProbabilityLearner
 
 
 # ── Fallback configuration ──────────────────────────────
@@ -195,7 +195,7 @@ class FallbackHandler:
         has a proven win rate at the given odds level.
         """
         try:
-            from app.league_memory import betbuilder_pick_memory
+            from app.storage.league_memory import betbuilder_pick_memory
 
             pick_type = "match_result"
             selection = direction

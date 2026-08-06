@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from app.config import get_settings
+from app.config.config import get_settings
 
 
 DB_PATH: Path = get_settings().database_path
@@ -762,3 +762,4 @@ def _init_db() -> None:
                 # next call if this process has not completed initialization yet.
                 return
             raise
+
