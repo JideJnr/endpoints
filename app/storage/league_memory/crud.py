@@ -209,6 +209,9 @@ def run_memory_maintenance(raw_retention_days: int = 30, odds_retention_days: in
                 pass
         conn.commit()
         changed = conn.total_changes - before
+    # VACUUM requires an exclusive lock — run it outside the write transaction
+    # so concurrent readers/writers are not blocked.
+    with _conn() as conn:
         conn.execute("vacuum")
     return {
         "status": "success",
@@ -719,12 +722,35 @@ def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:
-    try:
-        from app.buffer import _init_buffer_table
-
-        _init_buffer_table(conn)
-    except Exception:
-        pass
+    """Ensure match_buffer and future_match_buffer exist without holding a long lock."""
+    for table in ("match_buffer", "future_match_buffer"):
+        try:
+            conn.execute(
+                f"""
+                create table if not exists {table} (
+                    match_id     text primary key,
+                    match_date   text,
+                    tournament   text,
+                    category     text,
+                    name         text,
+                    start_time   integer,
+                    period       text,
+                    score_home   text,
+                    score_away   text,
+                    is_live      integer not null default 0,
+                    is_finished  integer not null default 0,
+                    ingested_at  text not null default current_timestamp,
+                    enriched_at  text,
+                    data_source  text not null default 'sportybet',
+                    sportybet_id text,
+                    sofascore_id text,
+                    raw_sporty   text not null default '{{}}',
+                    raw_enriched text
+                )
+                """
+            )
+        except Exception:
+            pass
 
 
 def list_memory_matches(limit: int = 200, league: str | None = None, source: str | None = None) -> dict[str, Any]:
@@ -1273,8 +1299,8 @@ def set_engine_status(engine_id: str, status: str) -> dict[str, Any]:
 
 def get_engine_states() -> dict[str, str]:
     _init_db()
-    conn = get_db()
-    rows = conn.execute("select id, status from engine_state").fetchall()
+    with db_conn(timeout=5) as conn:
+        rows = conn.execute("select id, status from engine_state").fetchall()
     return {row[0]: row[1] for row in rows}
 
 

@@ -61,10 +61,14 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
     token = OWNER
     start = _now()
     stale_before = time.time() - max(30, stale_after_seconds)
-    with db_conn(timeout=30) as conn:
-        _init_job_table(conn)
-        conn.execute("begin immediate")
-        row = conn.execute(
+    raw_conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    raw_conn.row_factory = sqlite3.Row
+    try:
+        raw_conn.execute("pragma journal_mode = wal")
+        raw_conn.execute("pragma busy_timeout = 30000")
+        _init_job_table(raw_conn)
+        raw_conn.execute("begin immediate")
+        row = raw_conn.execute(
             "select status, owner, heartbeat_at from job_runs where job_id = ?",
             (job_id,),
         ).fetchone()
@@ -72,9 +76,9 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
             status, owner, heartbeat_at = row
             heartbeat_ts = _parse_ts(heartbeat_at)
             if status == "running" and heartbeat_ts and heartbeat_ts > stale_before:
-                conn.rollback()
+                raw_conn.execute("rollback")
                 raise JobBusy(job_id, owner)
-            conn.execute(
+            raw_conn.execute(
                 """
                 update job_runs
                 set status = 'running',
@@ -89,7 +93,7 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
                 (token, start, start, job_id),
             )
         else:
-            conn.execute(
+            raw_conn.execute(
                 """
                 insert into job_runs (
                     job_id, status, owner, started_at, heartbeat_at, run_count
@@ -97,7 +101,9 @@ def job_guard(job_id: str, *, stale_after_seconds: int = 900) -> Iterator[dict[s
                 """,
                 (job_id, token, start, start),
             )
-        conn.commit()
+        raw_conn.execute("commit")
+    finally:
+        raw_conn.close()
 
     state = {"job_id": job_id, "owner": token, "started_at": start}
     try:

@@ -1565,7 +1565,8 @@ def grade_results(hours_back: int = 24):
     from datetime import date as _date, timedelta as _timedelta
     from app.sportybet_client import fetch_results
     from app.db import DB_PATH
-    from app.league_memory import _init_db, _grade_pick_for_match, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
+    from app.league_memory import _init_db, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
+    from app.storage.league_memory._helpers import _grade_pick_for_match
     from app.prediction_audit import grading_reason
     from app.mongo_store import archive_finished_match_from_buffer
     from app.sofascore_client import fetch_all_scheduled_events
@@ -1579,24 +1580,32 @@ def grade_results(hours_back: int = 24):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"SportyBet results fetch failed: {exc}")
 
-    result_map = {
-        str(r["id"]): r
-        for r in results
-        if r.get("score", {}).get("home") is not None
-    }
+    # Accept 0-0 results — both home and away must be present (not None), even if 0.
+    result_map: dict[str, Any] = {}
+    for r in results:
+        rid = r.get("id")
+        score = r.get("score") or {}
+        if rid is not None and score.get("home") is not None and score.get("away") is not None:
+            result_map[str(rid)] = r
 
     _init_db()
     graded = archived = skipped = 0
 
-    # grade pending predictions
+    # Join buffer tables to get the real match_date for each pending prediction.
+    # This is used later to build the SofaScore date scan set.
     with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         pending = conn.execute(
-            "select id, match_id, match_name, league_name, country_name, pick_type, selection, "
-            "confidence, signals_json, audit_json, result, "
-            "(select match_date from match_buffer where match_id=ph.match_id limit 1) as match_date "
-            "from prediction_history ph "
-            "where graded_at is null and pick_type != 'no_bet'"
+            """
+            select ph.id, ph.match_id, ph.match_name, ph.league_name, ph.country_name,
+                   ph.pick_type, ph.selection, ph.confidence, ph.signals_json,
+                   ph.audit_json, ph.result,
+                   coalesce(mb.match_date, fb.match_date, date(ph.created_at)) as match_date
+            from prediction_history ph
+            left join match_buffer mb on mb.match_id = ph.match_id
+            left join future_match_buffer fb on fb.match_id = ph.match_id
+            where ph.graded_at is null and ph.pick_type != 'no_bet'
+            """
         ).fetchall()
 
     for row in pending:
@@ -1683,9 +1692,18 @@ def grade_results(hours_back: int = 24):
             pass
 
     sofascore = {"graded": 0, "skipped": 0, "dates": [], "errors": {}}
+    # Collect distinct match dates from pending predictions rather than a fixed
+    # rolling window — catches fixtures predicted on a different calendar day.
+    pending_dates: set[str] = set()
+    for row in pending:
+        d = str(row["match_date"] or "")[:10]
+        if d:
+            pending_dates.add(d)
+    # Safety net: always include the rolling hours_back window
     days = max(1, min(7, (hours_back + 23) // 24 + 1))
     for offset in range(days):
-        target_date = (_date.today() - _timedelta(days=offset)).isoformat()
+        pending_dates.add((_date.today() - _timedelta(days=offset)).isoformat())
+    for target_date in sorted(pending_dates, reverse=True):
         try:
             events = fetch_all_scheduled_events(target_date)
             result = grade_predictions_for_date(target_date, events)

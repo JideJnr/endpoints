@@ -130,6 +130,8 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "ai_team_watcher_matches", "sofascore_team_id", "text")
     _ensure_column(conn, "ai_team_watcher_matches", "web_context_json", "text not null default '{}'")
     conn.execute("create index if not exists idx_ai_team_watchers_updated on ai_team_watchers(updated_at desc)")
+    conn.execute("create index if not exists idx_ai_team_watchers_sporty_id on ai_team_watchers(sporty_team_id) where sporty_team_id is not null")
+    conn.execute("create index if not exists idx_ai_team_watchers_sofa_id on ai_team_watchers(sofascore_team_id) where sofascore_team_id is not null")
     conn.execute("create index if not exists idx_ai_team_watcher_matches_team on ai_team_watcher_matches(team_key, match_date desc)")
 
 
@@ -311,6 +313,7 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
             name=competition_name,
             category=str(match_doc.get("category") or ""),
             country=str(match_doc.get("country_name") or ""),
+            unique_tournament_id=_unique_tournament_id_for_doc(match_doc),
         )
         competition_key = competition_entry.get("key", "") if competition_entry else ""
 
@@ -879,6 +882,7 @@ def _observation_for_team(doc: dict[str, Any], team: dict[str, Any], analysis: d
             "team_side": side,
             "data_sources": doc.get("data_sources") or {},
             "time_context": time_context,
+            "goal_timing": _extract_goal_timing_from_doc(doc),
         },
     }
 
@@ -923,6 +927,7 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
     web_context = _loads(watcher["web_context_json"], {}) if watcher else {}
     last_web_context_at = watcher["last_web_context_at"] if watcher else None
     venue_split = _venue_split(rows)
+    goal_timing = _team_goal_timing(rows)
     if _should_refresh_web_context({"web_context": web_context, "last_web_context_at": last_web_context_at}, sample):
         team_name = (team or {}).get("team_name") or (watcher and watcher["team_name"]) or "team"
         try:
@@ -996,6 +1001,7 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
         "overview": overview,
         "last_web_context_at": last_web_context_at,
         "venue_split": venue_split,
+        "goal_timing": goal_timing,
         "prediction_context": {
             "usable": sample >= 3,
             "confidence": "high" if sample >= 8 else "medium" if sample >= 4 else "low",
@@ -1023,6 +1029,113 @@ def _market_leans(sample: int, wins: int, losses: int, over_25: int, btts: int, 
     if blanks / sample >= 0.35:
         leans.append({"market": "team_under_goals", "confidence": "medium", "reason": "blank_risk"})
     return leans[:4] or [{"market": "context_only", "confidence": "low", "reason": "mixed_profile"}]
+
+
+def _extract_goal_timing_from_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Extract goal timing from a match doc's sofascore incidents."""
+    detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else {}
+    incidents = detail.get("incidents") or detail.get("match_incidents") or []
+    goal_minutes: list[int] = []
+    for inc in incidents:
+        if not isinstance(inc, dict):
+            continue
+        inc_type = str(inc.get("incidentType") or inc.get("type") or "").lower()
+        if inc_type not in ("goal", "penalty"):
+            continue
+        minute = inc.get("time") or inc.get("minute")
+        try:
+            goal_minutes.append(int(minute))
+        except (TypeError, ValueError):
+            pass
+    if not goal_minutes:
+        return {}
+    goal_minutes.sort()
+
+    def _band(lo: int, hi: int) -> int:
+        return sum(1 for m in goal_minutes if lo <= m <= hi)
+
+    intervals = [float(goal_minutes[i] - goal_minutes[i - 1]) for i in range(1, len(goal_minutes))]
+    return {
+        "total_goals": len(goal_minutes),
+        "first_half_goals": sum(1 for m in goal_minutes if m <= 45),
+        "second_half_goals": sum(1 for m in goal_minutes if m > 45),
+        "band_1_10": _band(1, 10), "band_11_20": _band(11, 20),
+        "band_21_30": _band(21, 30), "band_31_40": _band(31, 40),
+        "band_41_45": _band(41, 45), "band_46_55": _band(46, 55),
+        "band_56_65": _band(56, 65), "band_66_75": _band(66, 75),
+        "band_76_85": _band(76, 85), "band_86_90": _band(86, 90),
+        "first_goal_minute": goal_minutes[0],
+        "avg_interval_minutes": round(sum(intervals) / len(intervals), 2) if intervals else None,
+        "goal_minutes": goal_minutes,
+    }
+
+
+def _team_goal_timing(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    """Aggregate goal timing from raw_match_json.goal_timing across team matches."""
+    total_goals = 0
+    first_half = 0
+    second_half = 0
+    bands: dict[str, int] = {
+        "1-10min": 0, "11-20min": 0, "21-30min": 0, "31-40min": 0, "41-45min": 0,
+        "46-55min": 0, "56-65min": 0, "66-75min": 0, "76-85min": 0, "86-90min": 0,
+    }
+    first_goal_minutes: list[float] = []
+    avg_intervals: list[float] = []
+    matches_with_timing = 0
+
+    for row in rows:
+        raw = row["raw_match_json"]
+        if not raw:
+            continue
+        try:
+            doc = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        gt = doc.get("goal_timing")
+        if not isinstance(gt, dict):
+            continue
+        matches_with_timing += 1
+        total_goals += int(gt.get("total_goals") or 0)
+        first_half += int(gt.get("first_half_goals") or 0)
+        second_half += int(gt.get("second_half_goals") or 0)
+        for band in bands:
+            key = "band_" + band.replace("-", "_").replace("min", "")
+            bands[band] += int(gt.get(key) or 0)
+        fgm = gt.get("first_goal_minute")
+        if fgm is not None:
+            try:
+                first_goal_minutes.append(float(fgm))
+            except (TypeError, ValueError):
+                pass
+        agi = gt.get("avg_interval_minutes")
+        if agi is not None:
+            try:
+                avg_intervals.append(float(agi))
+            except (TypeError, ValueError):
+                pass
+
+    if matches_with_timing == 0:
+        return {"available": False}
+
+    n = matches_with_timing
+    dominant_half = "first" if first_half > second_half else "second" if second_half > first_half else "even"
+    peak_band = max(bands, key=lambda b: bands[b]) if any(bands.values()) else None
+    band_pct = {b: round(bands[b] / total_goals * 100, 1) if total_goals else 0 for b in bands}
+
+    return {
+        "available": True,
+        "sample_matches": n,
+        "avg_goals_per_match": round(total_goals / n, 2),
+        "first_half_goals": first_half,
+        "second_half_goals": second_half,
+        "dominant_half": dominant_half,
+        "peak_band": peak_band,
+        "avg_first_goal_minute": round(sum(first_goal_minutes) / len(first_goal_minutes), 1) if first_goal_minutes else None,
+        "avg_interval_between_goals": round(sum(avg_intervals) / len(avg_intervals), 1) if avg_intervals else None,
+        "band_distribution": band_pct,
+    }
 
 
 def _venue_split(rows: list[sqlite3.Row]) -> dict[str, Any]:
@@ -1220,6 +1333,38 @@ def _analysis_summary(analysis: dict[str, Any] | None) -> str:
 def _resolve_watcher_row(conn: sqlite3.Connection, identifier: str | None, team: dict[str, Any] | None = None) -> sqlite3.Row | None:
     if not identifier and not team:
         return None
+
+    # Fast-path: direct indexed lookups before falling back to full table scan
+    # Priority mirrors _watcher_match_score: team_key(100) > sporty_id(80) > sofa_id(76) > name(60)
+    candidates: list[str | None] = [
+        identifier,
+        (team or {}).get("team_key"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            row = conn.execute(
+                "select * from ai_team_watchers where team_key = ?", (candidate,)
+            ).fetchone()
+            if row:
+                return row
+
+    sporty_id = (team or {}).get("sporty_team_id")
+    if sporty_id:
+        row = conn.execute(
+            "select * from ai_team_watchers where sporty_team_id = ? limit 1", (sporty_id,)
+        ).fetchone()
+        if row:
+            return row
+
+    sofa_id = (team or {}).get("sofascore_team_id")
+    if sofa_id:
+        row = conn.execute(
+            "select * from ai_team_watchers where sofascore_team_id = ? limit 1", (sofa_id,)
+        ).fetchone()
+        if row:
+            return row
+
+    # Fallback: full scoring scan for alias/name matches
     rows = conn.execute("select * from ai_team_watchers").fetchall()
     best_row: sqlite3.Row | None = None
     best_score = 0
@@ -1323,6 +1468,34 @@ def _merge_aliases(existing: sqlite3.Row | None, team: dict[str, Any]) -> list[d
 
 def _norm_token(value: Any) -> str:
     return _slug(str(value or "").strip())
+
+
+def _unique_tournament_id_for_doc(doc: dict[str, Any]) -> int | None:
+    """Extract SofaScore unique_tournament_id from a match doc if present."""
+    for source in (
+        doc.get("sofascore_event"),
+        doc.get("sofascore_detail"),
+        doc.get("raw_sofascore_event"),
+    ):
+        if not isinstance(source, dict):
+            continue
+        tournament = source.get("tournament") if isinstance(source.get("tournament"), dict) else {}
+        # Parsed client shape: tournament.id is the unique_tournament_id
+        tid = tournament.get("id")
+        if tid is not None:
+            try:
+                return int(tid)
+            except (TypeError, ValueError):
+                pass
+        # Raw SofaScore shape: tournament.uniqueTournament.id
+        unique = tournament.get("uniqueTournament") if isinstance(tournament.get("uniqueTournament"), dict) else {}
+        tid = unique.get("id")
+        if tid is not None:
+            try:
+                return int(tid)
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _league_name_for_doc(doc: dict[str, Any]) -> str:
@@ -1527,3 +1700,335 @@ def _matchup_reason(home: dict[str, Any], away: dict[str, Any], better: str) -> 
     winner_name = winner.get("team_name") or better
     loser_name = loser.get("team_name") or ("away" if better == "home" else "home")
     return f"{winner_name} currently carry the stronger memory profile than {loser_name}."
+
+
+# ── Team Watch Signal ─────────────────────────────────────────────────────────
+#
+# Produces a single prediction signal from three sub-signals derived from
+# the team watcher match history:
+#
+#   A. opponent_tier_edge  — win/draw/loss rates split by opponent strength
+#      (stronger / similar / weaker) using stored table_gap values.
+#      A team that consistently beats similar-strength opponents is a real edge.
+#
+#   B. goal_timing_edge    — first goal minute and avg interval between goals
+#      extracted from raw_match_json.goal_timing. Teams that score early or
+#      have short goal intervals push over/btts picks.
+#
+#   C. signal_combo_edge   — when the current match has active signals, look up
+#      past matches for these teams where the stored prediction_json carried
+#      similar signal names. Win rate of those past predictions → if historically
+#      these signals + this team = high win rate, boost confidence.
+#
+# Impact is bounded ±8 and feeds directly into home_power in predict_sofascore_event.
+
+def team_watch_signal(match_doc: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Compute a team-watch-derived prediction signal for a match.
+
+    Returns a signal dict compatible with the signals list in predict_sofascore_event,
+    or None if insufficient data exists for both teams.
+
+    Signal structure:
+        {
+            "name": "team_watch",
+            "impact": float,          # net home_power contribution, ±8
+            "value": {
+                "home": { sub-signal breakdown },
+                "away": { sub-signal breakdown },
+                "matchup_edge": float,
+                "available": bool,
+                "samples": { "home": int, "away": int },
+            }
+        }
+    """
+    try:
+        teams = _teams_for_doc(match_doc)
+        if not teams:
+            return None
+
+        home_team = next((t for t in teams if t["side"] == "home"), None)
+        away_team = next((t for t in teams if t["side"] == "away"), None)
+        if not home_team or not away_team:
+            return None
+
+        _init_db()
+        with db_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            init_team_watcher_tables(conn)
+
+            home_matches = _load_watcher_matches(conn, home_team["team_key"])
+            away_matches = _load_watcher_matches(conn, away_team["team_key"])
+
+        if not home_matches and not away_matches:
+            return None
+
+        active_signal_names = _active_signal_names(match_doc)
+
+        home_sub = _team_sub_signal(home_matches, "home", active_signal_names)
+        away_sub = _team_sub_signal(away_matches, "away", active_signal_names)
+
+        # Net impact: home edge minus away edge, bounded ±8
+        # Positive = home advantage, negative = away advantage
+        matchup_edge = round(
+            max(-8.0, min(8.0, home_sub["total_edge"] - away_sub["total_edge"])),
+            2,
+        )
+
+        if abs(matchup_edge) < 0.5 and not home_sub["available"] and not away_sub["available"]:
+            return None
+
+        return {
+            "name": "team_watch",
+            "impact": matchup_edge,
+            "value": {
+                "home": home_sub,
+                "away": away_sub,
+                "matchup_edge": matchup_edge,
+                "available": home_sub["available"] or away_sub["available"],
+                "samples": {
+                    "home": home_sub["samples"],
+                    "away": away_sub["samples"],
+                },
+            },
+        }
+    except Exception:
+        return None
+
+
+def _load_watcher_matches(conn: sqlite3.Connection, team_key: str) -> list[sqlite3.Row]:
+    """Load the last 20 finished watcher matches for a team."""
+    return conn.execute(
+        """
+        select goals_for, goals_against, result, team_side,
+               table_gap, team_position, opponent_position,
+               prediction_json, raw_match_json
+        from ai_team_watcher_matches
+        where team_key = ?
+          and goals_for is not null
+          and goals_against is not null
+        order by match_date desc, created_at desc
+        limit 20
+        """,
+        (team_key,),
+    ).fetchall()
+
+
+def _team_sub_signal(
+    rows: list[sqlite3.Row],
+    side: str,
+    active_signal_names: set[str],
+) -> dict[str, Any]:
+    """
+    Compute the three sub-signal edges for one team and combine them.
+
+    Returns a dict with individual edges and a total_edge float.
+    """
+    if not rows:
+        return {
+            "available": False,
+            "samples": 0,
+            "opponent_tier_edge": 0.0,
+            "goal_timing_edge": 0.0,
+            "signal_combo_edge": 0.0,
+            "total_edge": 0.0,
+        }
+
+    tier_edge = _opponent_tier_edge(rows, side)
+    timing_edge = _goal_timing_edge(rows, side)
+    combo_edge = _signal_combo_edge(rows, active_signal_names)
+
+    # Weight: tier is most reliable (0.5), timing is factual (0.3), combo is sparse (0.2)
+    total = round(tier_edge * 0.5 + timing_edge * 0.3 + combo_edge * 0.2, 2)
+    total = max(-4.0, min(4.0, total))  # each side capped at ±4 before matchup diff
+
+    return {
+        "available": True,
+        "samples": len(rows),
+        "opponent_tier_edge": round(tier_edge, 2),
+        "goal_timing_edge": round(timing_edge, 2),
+        "signal_combo_edge": round(combo_edge, 2),
+        "total_edge": total,
+    }
+
+
+def _opponent_tier_edge(rows: list[sqlite3.Row], side: str) -> float:
+    """
+    Split matches by opponent strength using table_gap:
+      stronger  = gap < -3  (opponent ranked higher)
+      similar   = gap -3..+3
+      weaker    = gap > +3  (opponent ranked lower)
+
+    Compute win rate per tier. Edge = win_rate_vs_similar - 0.45
+    (similar-opponent performance is the most predictive tier).
+    Falls back to overall win rate when similar-tier sample is thin.
+    """
+    tiers: dict[str, list[str]] = {"stronger": [], "similar": [], "weaker": []}
+    for row in rows:
+        gap = row["table_gap"]
+        result = str(row["result"] or "")
+        if gap is None:
+            tiers["similar"].append(result)
+            continue
+        try:
+            gap_int = int(gap)
+        except (TypeError, ValueError):
+            tiers["similar"].append(result)
+            continue
+        if gap_int < -3:
+            tiers["stronger"].append(result)
+        elif gap_int > 3:
+            tiers["weaker"].append(result)
+        else:
+            tiers["similar"].append(result)
+
+    def _win_rate(results: list[str]) -> float | None:
+        finished = [r for r in results if r in ("win", "draw", "loss")]
+        if len(finished) < 3:
+            return None
+        wins = sum(1 for r in finished if r == "win")
+        draws = sum(1 for r in finished if r == "draw")
+        # Points-per-game normalised to [0,1]: max 3pts → 1.0
+        ppg = (wins * 3 + draws) / (len(finished) * 3)
+        return ppg
+
+    similar_rate = _win_rate(tiers["similar"])
+    stronger_rate = _win_rate(tiers["stronger"])
+
+    if similar_rate is not None:
+        # Edge relative to a 45% baseline (slightly below 50% to account for draw probability)
+        edge = (similar_rate - 0.45) * 10
+        # Bonus: if they also perform well vs stronger opponents
+        if stronger_rate is not None and stronger_rate > 0.35:
+            edge += (stronger_rate - 0.35) * 4
+        return max(-4.0, min(4.0, edge))
+
+    # Fallback: overall win rate
+    all_results = [r for row in rows for r in [str(row["result"] or "")] if r in ("win", "draw", "loss")]
+    if len(all_results) < 3:
+        return 0.0
+    wins = sum(1 for r in all_results if r == "win")
+    draws = sum(1 for r in all_results if r == "draw")
+    ppg = (wins * 3 + draws) / (len(all_results) * 3)
+    return max(-4.0, min(4.0, (ppg - 0.45) * 8))
+
+
+def _goal_timing_edge(rows: list[sqlite3.Row], side: str) -> float:
+    """
+    Extract goal timing from raw_match_json.goal_timing per match.
+    Computes:
+      - avg first goal minute for this team (lower = scores early)
+      - avg goal interval (lower = high-scoring games)
+
+    Edge:
+      - First goal avg < 25 min → +1.5 (early pressure)
+      - Avg interval < 20 min  → +1.5 (high-scoring tendency)
+      - First goal avg > 60 min → -1.0 (late or no goals)
+    """
+    first_goal_minutes: list[float] = []
+    avg_intervals: list[float] = []
+
+    for row in rows:
+        raw = row["raw_match_json"]
+        if not raw:
+            continue
+        try:
+            doc = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+
+        goal_timing = doc.get("goal_timing") or {}
+        if not isinstance(goal_timing, dict):
+            continue
+
+        goal_minutes = goal_timing.get("goal_minutes") or []
+        if isinstance(goal_minutes, list) and goal_minutes:
+            try:
+                first = float(goal_minutes[0])
+                first_goal_minutes.append(first)
+            except (TypeError, ValueError):
+                pass
+
+        avg_interval = goal_timing.get("average_interval_minutes")
+        if avg_interval is not None:
+            try:
+                avg_intervals.append(float(avg_interval))
+            except (TypeError, ValueError):
+                pass
+
+    edge = 0.0
+
+    if first_goal_minutes:
+        avg_first = sum(first_goal_minutes) / len(first_goal_minutes)
+        if avg_first < 25:
+            edge += 1.5
+        elif avg_first < 40:
+            edge += 0.5
+        elif avg_first > 60:
+            edge -= 1.0
+
+    if avg_intervals:
+        avg_interval = sum(avg_intervals) / len(avg_intervals)
+        if avg_interval < 18:
+            edge += 1.5
+        elif avg_interval < 25:
+            edge += 0.5
+        elif avg_interval > 40:
+            edge -= 0.5
+
+    return max(-3.0, min(3.0, edge))
+
+
+def _signal_combo_edge(rows: list[sqlite3.Row], active_signal_names: set[str]) -> float:
+    """
+    Look at past matches where the stored prediction_json carried signals
+    overlapping with the current active signal names.
+
+    Win rate of those past predictions → edge relative to 50% baseline.
+    Requires at least 3 matching past matches to produce a non-zero edge.
+    """
+    if not active_signal_names:
+        return 0.0
+
+    matching_results: list[str] = []
+    for row in rows:
+        pred_raw = row["prediction_json"]
+        if not pred_raw:
+            continue
+        try:
+            pred = json.loads(pred_raw) if isinstance(pred_raw, str) else pred_raw
+        except Exception:
+            continue
+        if not isinstance(pred, dict):
+            continue
+
+        past_signals = pred.get("signals") or []
+        past_names = {str(s.get("name") or "") for s in past_signals if isinstance(s, dict)}
+        overlap = active_signal_names & past_names
+        # Require at least 2 overlapping signals to count as a "similar" prediction context
+        if len(overlap) < 2:
+            continue
+
+        result = str(row["result"] or "")
+        if result in ("win", "draw", "loss"):
+            matching_results.append(result)
+
+    if len(matching_results) < 3:
+        return 0.0
+
+    wins = sum(1 for r in matching_results if r == "win")
+    draws = sum(1 for r in matching_results if r == "draw")
+    ppg = (wins * 3 + draws) / (len(matching_results) * 3)
+    # Edge relative to 50% baseline, capped at ±3
+    return max(-3.0, min(3.0, (ppg - 0.50) * 8))
+
+
+def _active_signal_names(match_doc: dict[str, Any]) -> set[str]:
+    """Extract signal names already computed on the match doc (from a prior prediction pass)."""
+    prediction = match_doc.get("prediction") or {}
+    if not isinstance(prediction, dict):
+        return set()
+    signals = prediction.get("signals") or []
+    return {str(s.get("name") or "") for s in signals if isinstance(s, dict) and s.get("name")}

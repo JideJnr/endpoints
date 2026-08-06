@@ -18,6 +18,7 @@ from app.team_watcher.team_watcher import (  # noqa: F401
     backfill_team_watcher_ids,
     team_context_for_match,
     team_watchers_for_match,
+    team_watch_signal,
 )
 
 from app.team_watcher.team_watcher_engine import (  # noqa: F401

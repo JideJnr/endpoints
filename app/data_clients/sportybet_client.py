@@ -425,7 +425,7 @@ def _parse_result(event: dict, group: dict) -> dict:
     event_category = (event.get("sport") or {}).get("category") or {}
     event_tournament = event_category.get("tournament") or {}
     return {
-        "id":         event.get("eventId"),
+        "id":         event.get("eventId") or event.get("id"),
         "name":       f"{event.get('homeTeamName')} vs {event.get('awayTeamName')}",
         "home_team":  event.get("homeTeamName"),
         "away_team":  event.get("awayTeamName"),

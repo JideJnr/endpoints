@@ -59,72 +59,8 @@ NO_MATCH_MIN_RETRY_LIVE_MINUTES = 15
 # ── Table init ────────────────────────────────────────────────────────────────
 
 def _init_buffer_table(conn: sqlite3.Connection) -> None:
-    conn.execute("pragma busy_timeout = 30000")
-    try:
-        conn.execute("pragma journal_mode = wal")
-        conn.execute("pragma synchronous = normal")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute("""
-        create table if not exists match_buffer (
-            match_id        text primary key,
-            match_date      text,
-            tournament      text,
-            category        text,
-            name            text,
-            start_time      integer,
-            period          text,
-            score_home      text,
-            score_away      text,
-            is_live         integer not null default 0,
-            is_finished     integer not null default 0,
-            ingested_at     text not null default current_timestamp,
-            enriched_at     text,
-            data_source     text not null default 'sportybet',
-            sportybet_id    text,
-            sofascore_id    text,
-            raw_sporty      text not null,
-            raw_enriched    text
-        )
-    """)
-    conn.execute("create index if not exists idx_buffer_date    on match_buffer(match_date)")
-    conn.execute("create index if not exists idx_buffer_live    on match_buffer(is_live)")
-    conn.execute("create index if not exists idx_buffer_enrich  on match_buffer(enriched_at)")
-    conn.execute("""
-        create table if not exists future_match_buffer (
-            match_id        text primary key,
-            match_date      text,
-            tournament      text,
-            category        text,
-            name            text,
-            start_time      integer,
-            period          text,
-            score_home      text,
-            score_away      text,
-            is_live         integer not null default 0,
-            is_finished     integer not null default 0,
-            ingested_at     text not null default current_timestamp,
-            enriched_at     text,
-            data_source     text not null default 'sportybet',
-            sportybet_id    text,
-            sofascore_id    text,
-            raw_sporty      text not null,
-            raw_enriched    text
-        )
-    """)
-    conn.execute("create index if not exists idx_future_buffer_date    on future_match_buffer(match_date)")
-    conn.execute("create index if not exists idx_future_buffer_enrich  on future_match_buffer(enriched_at)")
-    _ensure_buffer_column(conn, "match_buffer", "data_source", "text not null default 'sportybet'")
-    _ensure_buffer_column(conn, "match_buffer", "sportybet_id", "text")
-    _ensure_buffer_column(conn, "future_match_buffer", "data_source", "text not null default 'sportybet'")
-    _ensure_buffer_column(conn, "future_match_buffer", "sportybet_id", "text")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sofa_event_list_cache (
-            date        TEXT PRIMARY KEY,
-            fetched_at  TEXT NOT NULL,
-            events_json TEXT NOT NULL
-        )
-    """)
+    """No-op: buffer tables are now created once in _init_db_unlocked at startup."""
+    pass
 
 
 def _ensure_buffer_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -813,6 +749,9 @@ def purge_ghost_matches() -> int:
     now_ts = datetime.now(timezone.utc).timestamp()
     cutoff_ts_ms = (now_ts - GHOST_MATCH_GRACE_MINUTES * 60) * 1000
     today = date_cls.today().isoformat()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    kickoff_cutoff_ms = (now_ts - 130 * 60) * 1000
+
     with _conn() as conn:
         _init_buffer_table(conn)
 
@@ -840,45 +779,7 @@ def purge_ghost_matches() -> int:
             (today,),
         )
 
-        # 2b. Self-heal: stuck-live matches today that SportyBet stopped reporting.
-        # Conditions: not updated in 20+ min AND (played 95+ min OR kicked off 130+ min ago).
-        stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
-        kickoff_cutoff_ms = (now_ts - 130 * 60) * 1000
-        r2b = conn.execute(
-            """
-            update match_buffer set
-                is_live     = 0,
-                is_finished = 1,
-                period      = coalesce(nullif(period, ''), 'FT')
-            where is_live = 1
-              and is_finished = 0
-              and ingested_at < ?
-              and (
-                cast(coalesce(
-                    json_extract(raw_sporty,   '$.played_seconds'),
-                    json_extract(raw_enriched, '$.played_seconds'),
-                    0
-                ) as real) >= 5700
-                or (start_time is not null and cast(start_time as real) < ?)
-              )
-            """,
-            (stale_cutoff, kickoff_cutoff_ms),
-        )
-        # Archive any rows we just self-healed
-        healed_ids = conn.execute(
-            "select match_id from match_buffer where is_finished = 1 and is_live = 0 and ingested_at < ?",
-            (stale_cutoff,),
-        ).fetchall()
-        conn.commit()
-        for row in healed_ids:
-            _try_archive_finished(row[0])
-
-        # 2b. Stuck-live today: is_live=1 but ingested_at hasn't been updated
-        #     in >20 min AND played_seconds implies the match should be over
-        #     (>= 95 min played, or start_time was >130 min ago).
-        #     Mark is_finished=1 so the frontend stops showing them as live.
-        stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
-        kickoff_cutoff_ms = (now_ts - 130 * 60) * 1000
+        # 2b. Self-heal stuck-live matches today
         r2b = conn.execute(
             """
             update match_buffer set
@@ -887,24 +788,25 @@ def purge_ghost_matches() -> int:
                 period = coalesce(nullif(period, ''), 'FT')
             where is_live = 1
               and is_finished = 0
+              and ingested_at < ?
               and (
-                -- not updated in 20+ minutes
-                ingested_at < ?
-                -- AND either played 95+ minutes or kicked off 130+ min ago
-                and (
-                  cast(coalesce(json_extract(raw_sporty, '$.played_seconds'),
-                               json_extract(raw_enriched, '$.played_seconds'), 0) as real) >= 5700
-                  or (start_time is not null and cast(start_time as real) < ?)
-                )
+                cast(coalesce(json_extract(raw_sporty, '$.played_seconds'),
+                              json_extract(raw_enriched, '$.played_seconds'), 0) as real) >= 5700
+                or (start_time is not null and cast(start_time as real) < ?)
               )
             """,
             (stale_cutoff, kickoff_cutoff_ms),
         )
 
-        # 3. Non-live rows that already failed SofaScore matching and passed
-        #    their retry window should leave the hot queue. Live rows are kept
-        #    because late listings and direct match repair can still happen.
-        #    Future rows are kept and retried by the future enrichment lane.
+        # Collect healed IDs before committing so we can archive them after releasing the lock
+        healed_ids = [
+            row[0] for row in conn.execute(
+                "select match_id from match_buffer where is_finished = 1 and is_live = 0 and ingested_at < ?",
+                (stale_cutoff,),
+            ).fetchall()
+        ]
+
+        # 3. Non-live rows that already failed SofaScore matching and passed their retry window
         r4 = conn.execute(
             """
             delete from match_buffer
@@ -915,6 +817,10 @@ def purge_ghost_matches() -> int:
             """
         )
         conn.commit()
+
+    # Archive healed matches AFTER releasing the write lock
+    for match_id in healed_ids:
+        _try_archive_finished(match_id)
 
     healed = r2b.rowcount
     deleted = r1.rowcount + r2.rowcount + r4.rowcount
@@ -2553,21 +2459,6 @@ def _archive_finished_locally(match_id: str) -> None:
     _init_db()
     with _conn() as conn:
         _init_buffer_table(conn)
-        # Ensure finished_matches table exists
-        conn.execute("""
-            create table if not exists finished_matches (
-                match_id   text primary key,
-                match_date text,
-                home_team  text,
-                away_team  text,
-                tournament text,
-                score_home text,
-                score_away text,
-                finished_at text not null default current_timestamp,
-                raw_json   text not null,
-                raw_doc    text
-            )
-        """)
         try:
             conn.execute("alter table finished_matches add column raw_doc text")
         except Exception:

@@ -130,6 +130,36 @@ def init_competition_tables(conn: sqlite3.Connection) -> None:
         pass
     conn.execute(
         """
+        create table if not exists competition_goal_stats (
+            competition_key text not null,
+            match_id        text not null,
+            match_date      text,
+            home_team       text,
+            away_team       text,
+            total_goals     integer not null default 0,
+            first_half_goals  integer not null default 0,
+            second_half_goals integer not null default 0,
+            band_1_10   integer not null default 0,
+            band_11_20  integer not null default 0,
+            band_21_30  integer not null default 0,
+            band_31_40  integer not null default 0,
+            band_41_45  integer not null default 0,
+            band_46_55  integer not null default 0,
+            band_56_65  integer not null default 0,
+            band_66_75  integer not null default 0,
+            band_76_85  integer not null default 0,
+            band_86_90  integer not null default 0,
+            first_goal_minute integer,
+            avg_interval_minutes real,
+            goal_minutes_json text not null default '[]',
+            updated_at text not null default current_timestamp,
+            primary key (competition_key, match_id)
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_comp_goal_stats_key on competition_goal_stats(competition_key, match_date desc)")
+    conn.execute(
+        """
         create table if not exists competition_special_settings (
             key text primary key,
             name text not null,
@@ -828,6 +858,7 @@ def _save_competition_detail(
     importance = _match_importance_context(key, event)
     doc = _competition_doc(key, event, detail)
     _update_team_watchers_for_match(key, event, detail, prediction)
+    _update_competition_goal_stats(key, event, detail)
     intelligence = _competition_intelligence_context(key, event, detail, doc)
     doc["competition_intelligence"] = intelligence
     doc["team_strength_context"] = intelligence.get("team_strength")
@@ -1219,6 +1250,185 @@ def _competition_raw_sporty(key: str, event: dict[str, Any], match_date: str, im
     }
 
 
+def _extract_goal_timing(detail: dict[str, Any]) -> dict[str, Any]:
+    """Parse goal events from sofascore detail into structured timing data."""
+    incidents = detail.get("incidents") or detail.get("match_incidents") or []
+    goal_minutes: list[int] = []
+    for inc in incidents:
+        if not isinstance(inc, dict):
+            continue
+        inc_type = str(inc.get("incidentType") or inc.get("type") or "").lower()
+        if inc_type not in ("goal", "penalty"):
+            continue
+        minute = inc.get("time") or inc.get("minute")
+        try:
+            goal_minutes.append(int(minute))
+        except (TypeError, ValueError):
+            pass
+
+    goal_minutes.sort()
+    total = len(goal_minutes)
+    first_half = sum(1 for m in goal_minutes if m <= 45)
+    second_half = sum(1 for m in goal_minutes if m > 45)
+
+    def _band(lo: int, hi: int) -> int:
+        return sum(1 for m in goal_minutes if lo <= m <= hi)
+
+    intervals: list[float] = []
+    for i in range(1, len(goal_minutes)):
+        intervals.append(float(goal_minutes[i] - goal_minutes[i - 1]))
+    avg_interval = round(sum(intervals) / len(intervals), 2) if intervals else None
+
+    return {
+        "total_goals": total,
+        "first_half_goals": first_half,
+        "second_half_goals": second_half,
+        "band_1_10":  _band(1, 10),
+        "band_11_20": _band(11, 20),
+        "band_21_30": _band(21, 30),
+        "band_31_40": _band(31, 40),
+        "band_41_45": _band(41, 45),
+        "band_46_55": _band(46, 55),
+        "band_56_65": _band(56, 65),
+        "band_66_75": _band(66, 75),
+        "band_76_85": _band(76, 85),
+        "band_86_90": _band(86, 90),
+        "first_goal_minute": goal_minutes[0] if goal_minutes else None,
+        "avg_interval_minutes": avg_interval,
+        "goal_minutes": goal_minutes,
+    }
+
+
+def _update_competition_goal_stats(
+    key: str,
+    event: dict[str, Any],
+    detail: dict[str, Any],
+) -> None:
+    """Persist per-match goal timing into competition_goal_stats."""
+    status = str(((event.get("status") or {}).get("type") or "")).lower()
+    if status not in ("finished", "ended", "after extra time", "after penalties"):
+        return
+    timing = _extract_goal_timing(detail)
+    if timing["total_goals"] == 0 and not timing["goal_minutes"]:
+        return
+    match_id = str(event.get("id") or "")
+    if not match_id:
+        return
+    match_date = _event_match_date(event, date.today().isoformat())
+    home = str((event.get("home_team") or {}).get("name") or "")
+    away = str((event.get("away_team") or {}).get("name") or "")
+    now = datetime.now(timezone.utc).isoformat()
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        init_competition_tables(conn)
+        conn.execute(
+            """
+            insert into competition_goal_stats (
+                competition_key, match_id, match_date, home_team, away_team,
+                total_goals, first_half_goals, second_half_goals,
+                band_1_10, band_11_20, band_21_30, band_31_40, band_41_45,
+                band_46_55, band_56_65, band_66_75, band_76_85, band_86_90,
+                first_goal_minute, avg_interval_minutes, goal_minutes_json, updated_at
+            ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            on conflict(competition_key, match_id) do update set
+                match_date=excluded.match_date, home_team=excluded.home_team,
+                away_team=excluded.away_team, total_goals=excluded.total_goals,
+                first_half_goals=excluded.first_half_goals,
+                second_half_goals=excluded.second_half_goals,
+                band_1_10=excluded.band_1_10, band_11_20=excluded.band_11_20,
+                band_21_30=excluded.band_21_30, band_31_40=excluded.band_31_40,
+                band_41_45=excluded.band_41_45, band_46_55=excluded.band_46_55,
+                band_56_65=excluded.band_56_65, band_66_75=excluded.band_66_75,
+                band_76_85=excluded.band_76_85, band_86_90=excluded.band_86_90,
+                first_goal_minute=excluded.first_goal_minute,
+                avg_interval_minutes=excluded.avg_interval_minutes,
+                goal_minutes_json=excluded.goal_minutes_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                key, match_id, match_date, home, away,
+                timing["total_goals"], timing["first_half_goals"], timing["second_half_goals"],
+                timing["band_1_10"], timing["band_11_20"], timing["band_21_30"],
+                timing["band_31_40"], timing["band_41_45"], timing["band_46_55"],
+                timing["band_56_65"], timing["band_66_75"], timing["band_76_85"],
+                timing["band_86_90"], timing["first_goal_minute"],
+                timing["avg_interval_minutes"],
+                json.dumps(timing["goal_minutes"]), now,
+            ),
+        )
+        conn.commit()
+
+
+def _competition_goal_profile(key: str, limit: int = 50) -> dict[str, Any]:
+    """Aggregate goal timing stats across recent matches for a competition."""
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        init_competition_tables(conn)
+        rows = conn.execute(
+            """
+            select total_goals, first_half_goals, second_half_goals,
+                   band_1_10, band_11_20, band_21_30, band_31_40, band_41_45,
+                   band_46_55, band_56_65, band_66_75, band_76_85, band_86_90,
+                   first_goal_minute, avg_interval_minutes
+            from competition_goal_stats
+            where competition_key = ?
+            order by match_date desc
+            limit ?
+            """,
+            (key, limit),
+        ).fetchall()
+
+    if not rows:
+        return {"available": False, "sample_matches": 0}
+
+    n = len(rows)
+    total_goals = sum(r["total_goals"] for r in rows)
+    fh = sum(r["first_half_goals"] for r in rows)
+    sh = sum(r["second_half_goals"] for r in rows)
+
+    bands = {}
+    for band in ("band_1_10", "band_11_20", "band_21_30", "band_31_40", "band_41_45",
+                 "band_46_55", "band_56_65", "band_66_75", "band_76_85", "band_86_90"):
+        bands[band] = sum(r[band] for r in rows)
+
+    first_goal_minutes = [r["first_goal_minute"] for r in rows if r["first_goal_minute"] is not None]
+    avg_intervals = [r["avg_interval_minutes"] for r in rows if r["avg_interval_minutes"] is not None]
+
+    avg_goals = round(total_goals / n, 2)
+    fh_pct = round(fh / total_goals * 100, 1) if total_goals else 0
+    sh_pct = round(sh / total_goals * 100, 1) if total_goals else 0
+    dominant_half = "first" if fh > sh else "second" if sh > fh else "even"
+
+    # Peak band — which 10-min window has the most goals
+    peak_band = max(bands, key=lambda b: bands[b]) if any(bands.values()) else None
+    peak_band_label = peak_band.replace("band_", "").replace("_", "-") + "min" if peak_band else None
+
+    avg_first_goal = round(sum(first_goal_minutes) / len(first_goal_minutes), 1) if first_goal_minutes else None
+    avg_interval = round(sum(avg_intervals) / len(avg_intervals), 1) if avg_intervals else None
+
+    # Normalise band counts to percentages of total goals
+    band_pct = {}
+    for band, count in bands.items():
+        label = band.replace("band_", "").replace("_", "-") + "min"
+        band_pct[label] = round(count / total_goals * 100, 1) if total_goals else 0
+
+    return {
+        "available": True,
+        "sample_matches": n,
+        "avg_goals_per_match": avg_goals,
+        "first_half_goals": fh,
+        "second_half_goals": sh,
+        "first_half_pct": fh_pct,
+        "second_half_pct": sh_pct,
+        "dominant_half": dominant_half,
+        "peak_band": peak_band_label,
+        "avg_first_goal_minute": avg_first_goal,
+        "avg_interval_between_goals": avg_interval,
+        "band_distribution": band_pct,
+        "raw_band_counts": {b.replace("band_", "").replace("_", "-") + "min": v for b, v in bands.items()},
+    }
+
+
 def _competition_intelligence_context(
     key: str,
     event: dict[str, Any],
@@ -1286,6 +1496,7 @@ def _competition_intelligence_context(
             "basis": "long_term_competition_team_ai_profiles",
         },
         "ai_team_watchers": ai_team_watchers,
+        "goal_profile": _competition_goal_profile(key),
         "readiness_notes": _competition_readiness_notes(home_table, away_table, home_strength, away_strength, season_stage),
     }
 

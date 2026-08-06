@@ -157,15 +157,18 @@ def _ensure_match_fact_columns(conn: sqlite3.Connection) -> None:
 
 def _init_db_unlocked() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Apply WAL + busy_timeout on a short-lived connection before the long schema write.
+    # This ensures WAL is active so readers never block writers during init.
+    try:
+        _pragma_conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        _pragma_conn.execute("pragma journal_mode = wal")
+        _pragma_conn.execute("pragma synchronous = normal")
+        _pragma_conn.execute("pragma busy_timeout = 60000")
+        _pragma_conn.close()
+    except sqlite3.OperationalError:
+        pass
     with db_conn(timeout=60) as conn:
         conn.execute("pragma busy_timeout = 60000")
-        try:
-            conn.execute("pragma journal_mode = wal")
-            conn.execute("pragma synchronous = normal")
-        except sqlite3.OperationalError:
-            # Another background worker may already hold the database during startup.
-            # Keep initialization moving; busy_timeout still reduces transient lock errors.
-            pass
         conn.execute(
             """
             create table if not exists matches (
@@ -655,6 +658,81 @@ def _init_db_unlocked() -> None:
             "create index if not exists idx_team_comp_notes_match "
             "on team_performance_notes(match_id)"
         )
+        # ── Buffer tables (match_buffer, future_match_buffer, finished_matches) ─
+        conn.execute("""
+            create table if not exists match_buffer (
+                match_id     text primary key,
+                match_date   text,
+                tournament   text,
+                category     text,
+                name         text,
+                start_time   integer,
+                period       text,
+                score_home   text,
+                score_away   text,
+                is_live      integer not null default 0,
+                is_finished  integer not null default 0,
+                ingested_at  text not null default current_timestamp,
+                enriched_at  text,
+                data_source  text not null default 'sportybet',
+                sportybet_id text,
+                sofascore_id text,
+                raw_sporty   text not null,
+                raw_enriched text
+            )
+        """)
+        conn.execute("create index if not exists idx_buffer_date   on match_buffer(match_date)")
+        conn.execute("create index if not exists idx_buffer_live   on match_buffer(is_live)")
+        conn.execute("create index if not exists idx_buffer_enrich on match_buffer(enriched_at)")
+        conn.execute("""
+            create table if not exists future_match_buffer (
+                match_id     text primary key,
+                match_date   text,
+                tournament   text,
+                category     text,
+                name         text,
+                start_time   integer,
+                period       text,
+                score_home   text,
+                score_away   text,
+                is_live      integer not null default 0,
+                is_finished  integer not null default 0,
+                ingested_at  text not null default current_timestamp,
+                enriched_at  text,
+                data_source  text not null default 'sportybet',
+                sportybet_id text,
+                sofascore_id text,
+                raw_sporty   text not null,
+                raw_enriched text
+            )
+        """)
+        conn.execute("create index if not exists idx_future_buffer_date   on future_match_buffer(match_date)")
+        conn.execute("create index if not exists idx_future_buffer_enrich on future_match_buffer(enriched_at)")
+        _ensure_column(conn, "match_buffer",        "data_source",  "text not null default 'sportybet'")
+        _ensure_column(conn, "match_buffer",        "sportybet_id", "text")
+        _ensure_column(conn, "future_match_buffer", "data_source",  "text not null default 'sportybet'")
+        _ensure_column(conn, "future_match_buffer", "sportybet_id", "text")
+        conn.execute("""
+            create table if not exists sofa_event_list_cache (
+                date        text primary key,
+                fetched_at  text not null,
+                events_json text not null
+            )
+        """)
+        conn.execute("""
+            create table if not exists finished_matches (
+                match_id    text primary key,
+                match_date  text,
+                home_team   text,
+                away_team   text,
+                tournament  text,
+                score_home  text,
+                score_away  text,
+                finished_at text not null default current_timestamp,
+                raw_json    text not null,
+                raw_doc     text
+            )
+        """)
         conn.commit()
 
 

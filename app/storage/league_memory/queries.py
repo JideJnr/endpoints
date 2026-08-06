@@ -35,6 +35,7 @@ from ._helpers import (
     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
     _decorate_betbuilder_selections,
 )
+from .crud import _sofascore_ids_for_predictions
 
 def get_league_memory(league: str | None = None) -> dict[str, Any]:
     _init_db()
@@ -648,21 +649,34 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         return {"graded": 0, "skipped": 0, "no_finished_events": True}
 
     with _conn() as conn:
+        _ensure_buffer_tables(conn)
+        # Match by the actual match date from the buffer first, fall back to
+        # date(created_at) so predictions made on a different calendar day than
+        # the match (e.g. late-night predictions for next-day fixtures) are
+        # still picked up.
         rows = conn.execute(
             """
-            select *
-            from prediction_history
-            where graded_at is null
-              and date(created_at) = ?
+            select ph.*
+            from prediction_history ph
+            left join match_buffer mb on mb.match_id = ph.match_id
+            left join future_match_buffer fb on fb.match_id = ph.match_id
+            where ph.graded_at is null
+              and (
+                coalesce(mb.match_date, fb.match_date, date(ph.created_at)) = ?
+              )
             """,
             (match_date,),
         ).fetchall()
         candidate_rows = conn.execute(
             """
-            select distinct match_id
-            from prediction_candidate_history
-            where graded_at is null
-              and date(created_at) = ?
+            select distinct pch.match_id
+            from prediction_candidate_history pch
+            left join match_buffer mb on mb.match_id = pch.match_id
+            left join future_match_buffer fb on fb.match_id = pch.match_id
+            where pch.graded_at is null
+              and (
+                coalesce(mb.match_date, fb.match_date, date(pch.created_at)) = ?
+              )
             """,
             (match_date,),
         ).fetchall()
@@ -1111,6 +1125,38 @@ def grade_orphaned_predictions(limit: int = 1000) -> dict[str, Any]:
         "not_found": not_found,
         "errors": errors[:10],
     }
+
+
+def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:
+    """Ensure match_buffer and future_match_buffer exist so grading never fails with 'no such table'."""
+    for table in ("match_buffer", "future_match_buffer"):
+        try:
+            conn.execute(
+                f"""
+                create table if not exists {table} (
+                    match_id     text primary key,
+                    match_date   text,
+                    tournament   text,
+                    category     text,
+                    name         text,
+                    start_time   integer,
+                    period       text,
+                    score_home   text,
+                    score_away   text,
+                    is_live      integer not null default 0,
+                    is_finished  integer not null default 0,
+                    ingested_at  text not null default current_timestamp,
+                    enriched_at  text,
+                    data_source  text not null default 'sportybet',
+                    sportybet_id text,
+                    sofascore_id text,
+                    raw_sporty   text not null default '{{}}',
+                    raw_enriched text
+                )
+                """
+            )
+        except Exception:
+            pass
 
 
 def _pending_matches_for_grading(cutoff_seconds: float, limit: int) -> list[sqlite3.Row]:

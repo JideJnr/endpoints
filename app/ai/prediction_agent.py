@@ -151,6 +151,16 @@ def predict_sofascore_event(
         })
 
     home_power = form_edge + league_edge + h2h_edge + table_edge + odds_edge + common_opp_edge
+
+    # Team watch signal — opponent tier, goal timing, signal combo history
+    try:
+        from app.team_watcher import team_watch_signal as _tw_signal
+        tw = _tw_signal(event)
+        if tw and tw.get("value", {}).get("available"):
+            home_power += float(tw.get("impact") or 0)
+            signals.append(tw)
+    except Exception:
+        pass
     if abs(home_power) >= 8:
         side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
         picks.append(_pick("match_result", f"{side} Win", 55 + min(abs(home_power), 25), "stronger side has a decisive edge"))

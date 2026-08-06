@@ -613,6 +613,26 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         tw_signal = None
         has_tw_pick = False
 
+    # ── Team Watch signal (opponent tier, goal timing, signal combo history) ──
+    try:
+        from app.team_watcher import team_watch_signal as _tw_watch_signal
+        tw_watch = _tw_watch_signal(doc)
+        if tw_watch and (tw_watch.get("value") or {}).get("available"):
+            signals.append(tw_watch)
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "team_watch_signal_error", exc)
+
+    # ── Team Watch signal (opponent tier, goal timing, signal combo history) ──
+    try:
+        from app.team_watcher import team_watch_signal as _tw_watch_signal
+        tw_watch = _tw_watch_signal(doc)
+        if tw_watch and tw_watch.get("value", {}).get("available"):
+            signals.append(tw_watch)
+    except Exception as exc:
+        from app.health_counters import record_health_event
+        record_health_event("enriched_prediction", "team_watch_signal_error", exc)
+
     # ── SofaScore grade signal ────────────────────────────────────────────────
     longshot_signal = _consensus_longshot_value_signal(doc, ensemble, poisson, dixon, elo, rules, odds_movement)
     if longshot_signal:
@@ -669,7 +689,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     is_live = bool(match_state.get("is_live"))
     live_data_sources = _live_data_sources(doc, detail) if is_live else []
     live_stats_available = bool(live_data_sources or _live_match_statistics(detail).get("has_stats")) if is_live else False
-    from app.prediction_agent import _apply_time_decay, _is_high_late_goal_league, _time_decay_multiplier
+    from app.ai.prediction_agent import _apply_time_decay, _is_high_late_goal_league, _time_decay_multiplier
     late_goal_league = _is_high_late_goal_league(
         (doc.get("tournament") or "") + " " + (doc.get("category") or "")
     )
