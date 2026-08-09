@@ -21,6 +21,7 @@ from app.storage.db import (
     _ensure_prediction_history_columns,
 )
 from app.market.market_intent import classify_market_intent, grade_market_intent
+from app.signal_combinations import build_signal_combination, live_context_from_prediction
 from app.monitoring.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
 from ._helpers import (
     normalize_league, _league_from_match, _country_from_match, _country_from_league,
@@ -36,6 +37,7 @@ from ._helpers import (
     _decorate_betbuilder_selections,
 )
 from .crud import _sofascore_ids_for_predictions, store_local_signal_outcomes, _aggregate_resolved_snapshots, _safe_mark_buffer_finished, _ensure_signal_outcomes_table, _backfill_local_signal_outcomes_from_history
+from .schema import _ensure_signal_combination_outcomes_table
 
 def get_league_memory(league: str | None = None) -> dict[str, Any]:
     _init_db()
@@ -587,6 +589,8 @@ def _signal_outcome_payload_for_row(row: sqlite3.Row, result: str) -> dict[str, 
             "pick_type": row["pick_type"] if "pick_type" in row.keys() else None,
             "selection": row["selection"] if "selection" in row.keys() else None,
             "confidence": int(row["confidence"] or 0) if "confidence" in row.keys() else None,
+            "prediction_mode": row["prediction_mode"] if "prediction_mode" in row.keys() else None,
+            "live_context": _safe_json(row["live_context_json"] if "live_context_json" in row.keys() else "{}", {}),
         }
     except Exception:
         return None
@@ -594,14 +598,107 @@ def _signal_outcome_payload_for_row(row: sqlite3.Row, result: str) -> dict[str, 
 
 def _store_signal_outcome_payload(payload: dict[str, Any]) -> None:
     """Store signal outcome payload after the grading write transaction commits."""
-    store_local_signal_outcomes(**payload)
+    base_payload = {
+        key: payload.get(key)
+        for key in (
+            "match_id",
+            "match_name",
+            "tournament",
+            "country",
+            "match_date",
+            "signals",
+            "result",
+            "pick_type",
+            "selection",
+            "confidence",
+        )
+    }
+    store_local_signal_outcomes(**base_payload)
+    store_local_signal_combination_outcome(
+        **base_payload,
+        prediction_mode=payload.get("prediction_mode"),
+        live_context=payload.get("live_context"),
+    )
     try:
         from app.storage.mongo_store import is_configured, store_signal_outcomes
 
         if is_configured():
-            store_signal_outcomes(**payload)
+            store_signal_outcomes(**base_payload)
     except Exception:
         pass
+
+
+def store_local_signal_combination_outcome(
+    match_id: str,
+    match_name: str | None,
+    tournament: str | None,
+    country: str | None,
+    match_date: str | None,
+    signals: list[dict[str, Any]],
+    result: str,
+    pick_type: str | None,
+    selection: str | None,
+    confidence: int | None,
+    prediction_mode: str | None = None,
+    live_context: dict[str, Any] | None = None,
+) -> int:
+    """Persist the whole signal set as one learnable combination outcome."""
+    if result not in {"win", "loss"} or not signals:
+        return 0
+    resolved_mode = prediction_mode or ("live" if any(str((s or {}).get("name") or "").startswith("live_") for s in signals if isinstance(s, dict)) else "prematch")
+    live_context = live_context or live_context_from_prediction({"prediction_mode": resolved_mode, "signals": signals, "score": {}})
+    combo = build_signal_combination(
+        signals=signals,
+        pick_type=pick_type,
+        selection=selection,
+        prediction_mode=resolved_mode,
+        live_context=live_context,
+    )
+    if not combo.get("key"):
+        return 0
+    with _conn() as conn:
+        _ensure_signal_combination_outcomes_table(conn)
+        conn.execute(
+            """
+            insert into signal_combination_outcomes (
+                combination_key, combination_json, signal_names_json,
+                match_id, match_name, tournament, country, match_date,
+                result, pick_type, selection, confidence, prediction_mode,
+                live_context_json
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(match_id, pick_type, selection, combination_key) do update set
+                combination_json = excluded.combination_json,
+                signal_names_json = excluded.signal_names_json,
+                match_name = excluded.match_name,
+                tournament = excluded.tournament,
+                country = excluded.country,
+                match_date = excluded.match_date,
+                result = excluded.result,
+                confidence = excluded.confidence,
+                prediction_mode = excluded.prediction_mode,
+                live_context_json = excluded.live_context_json,
+                recorded_at = current_timestamp
+            """,
+            (
+                combo["key"],
+                json.dumps(combo.get("payload") or {}),
+                json.dumps(combo.get("signal_names") or []),
+                match_id,
+                match_name,
+                tournament,
+                country,
+                match_date,
+                result,
+                pick_type,
+                selection,
+                confidence,
+                resolved_mode,
+                json.dumps(live_context),
+            ),
+        )
+        conn.commit()
+    return 1
 
 
 def _grade_candidate_predictions_for_match(
@@ -1566,6 +1663,136 @@ def get_local_signal_stats(
             }
             for row in rows
         ],
+    }
+
+
+def weighted_signal_combination_memory(
+    match: dict[str, Any],
+    signals: list[dict[str, Any]],
+    pick_type: str | None,
+    selection: str | None,
+    *,
+    prediction_mode: str | None = None,
+    live_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return learned performance for this signal combination and pick."""
+    _init_db()
+    combo = build_signal_combination(
+        signals=signals,
+        pick_type=pick_type,
+        selection=selection,
+        prediction_mode=prediction_mode,
+        live_context=live_context,
+    )
+    if not combo.get("key"):
+        return {"samples": 0, "win_rate": None, "adjustment": 0, "combination": combo}
+    league = _league_from_match(match)
+    country = _country_from_match(match, league)
+    with _conn() as conn:
+        _ensure_signal_combination_outcomes_table(conn)
+        scopes = [
+            ("exact", "combination_key = ? and pick_type = ?", (combo["key"], pick_type), 0.70),
+            ("tournament", "combination_key = ? and pick_type = ? and tournament = ?", (combo["key"], pick_type, league), 0.20),
+            ("country", "combination_key = ? and pick_type = ? and country = ?", (combo["key"], pick_type, country), 0.10),
+        ]
+        rows = [_combination_scope_stats(conn, where, params, label, weight) for label, where, params, weight in scopes]
+    usable = [row for row in rows if row["samples"] > 0]
+    if not usable:
+        return {"samples": 0, "win_rate": None, "adjustment": 0, "combination": combo, "scope": "none"}
+    weighted = 0.0
+    weight_total = 0.0
+    samples = 0
+    for row in usable:
+        sample_factor = min(1.0, row["samples"] / 20)
+        weight = row["weight"] * sample_factor
+        weighted += row["win_rate"] * weight
+        weight_total += weight
+        samples += row["samples"]
+    win_rate = weighted / weight_total if weight_total else None
+    adjustment = 0
+    if win_rate is not None and samples >= 3:
+        adjustment = round((win_rate - 0.52) * 20)
+        adjustment = max(-10, min(10, adjustment))
+    return {
+        "samples": samples,
+        "win_rate": round(win_rate * 100, 1) if win_rate is not None else None,
+        "adjustment": adjustment,
+        "combination": combo,
+        "scopes": usable,
+    }
+
+
+def get_local_signal_combination_stats(min_samples: int = 3, limit: int = 50) -> dict[str, Any]:
+    _init_db()
+    with _conn() as conn:
+        _ensure_signal_combination_outcomes_table(conn)
+        rows = conn.execute(
+            """
+            select combination_key,
+                   max(combination_json) as combination_json,
+                   max(signal_names_json) as signal_names_json,
+                   pick_type,
+                   count(*) as total,
+                   sum(case when result = 'win' then 1 else 0 end) as wins,
+                   sum(case when result = 'loss' then 1 else 0 end) as losses,
+                   avg(confidence) as avg_confidence
+            from signal_combination_outcomes
+            where result in ('win', 'loss')
+            group by combination_key, pick_type
+            having count(*) >= ?
+            order by (1.0 * wins / nullif(total, 0)) desc, total desc
+            limit ?
+            """,
+            (max(1, int(min_samples or 3)), max(1, int(limit or 50))),
+        ).fetchall()
+    return {
+        "configured": True,
+        "storage": "device",
+        "min_samples": min_samples,
+        "combinations": [
+            {
+                "combination_key": row["combination_key"],
+                "combination": _safe_json(row["combination_json"], {}),
+                "signals": _safe_json(row["signal_names_json"], []),
+                "pick_type": row["pick_type"],
+                "total": row["total"],
+                "wins": row["wins"] or 0,
+                "losses": row["losses"] or 0,
+                "win_rate": round((float(row["wins"] or 0) / max(1, int(row["total"] or 0))) * 100, 1),
+                "avg_confidence": round(float(row["avg_confidence"] or 0), 1),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _combination_scope_stats(
+    conn: sqlite3.Connection,
+    where: str,
+    params: tuple[Any, ...],
+    label: str,
+    weight: float,
+) -> dict[str, Any]:
+    row = conn.execute(
+        f"""
+        select count(*) as samples,
+               sum(case when result = 'win' then 1 else 0 end) as wins,
+               sum(case when result = 'loss' then 1 else 0 end) as losses
+        from signal_combination_outcomes
+        where result in ('win', 'loss') and {where}
+        """,
+        params,
+    ).fetchone()
+    samples = int(row["samples"] or 0) if row else 0
+    wins = int(row["wins"] or 0) if row else 0
+    losses = int(row["losses"] or 0) if row else 0
+    return {
+        "scope": label,
+        "samples": samples,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / samples if samples else 0.0,
+        "weight": weight,
     }
 
 

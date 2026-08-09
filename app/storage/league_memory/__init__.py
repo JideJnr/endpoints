@@ -15,7 +15,7 @@ Sub-modules:
 from __future__ import annotations
 
 # schema helpers (re-export _init_db for backward compat)
-from .schema import _init_db, _ensure_signal_outcomes_table, _ensure_buffer_tables  # noqa: F401
+from .schema import _init_db, _ensure_signal_outcomes_table, _ensure_signal_combination_outcomes_table, _ensure_buffer_tables  # noqa: F401
 
 # all public helper utilities
 from ._helpers import (  # noqa: F401
@@ -72,5 +72,7 @@ from .queries import (  # noqa: F401
     grade_orphaned_predictions,
     get_grading_metrics,
     get_local_signal_stats,
+    get_local_signal_combination_stats,
+    weighted_signal_combination_memory,
     betbuilder_pick_memory,
 )

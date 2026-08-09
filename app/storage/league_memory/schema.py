@@ -48,6 +48,35 @@ def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_signal_outcomes_scope on signal_outcomes(country, tournament, result)")
 
 
+def _ensure_signal_combination_outcomes_table(conn: sqlite3.Connection) -> None:
+    """Create the learned signal-combination outcome table and indexes."""
+    conn.execute(
+        """
+        create table if not exists signal_combination_outcomes (
+            id integer primary key autoincrement,
+            combination_key text not null,
+            combination_json text not null default '{}',
+            signal_names_json text not null default '[]',
+            match_id text not null,
+            match_name text,
+            tournament text,
+            country text,
+            match_date text,
+            result text not null,
+            pick_type text,
+            selection text,
+            confidence integer,
+            prediction_mode text,
+            live_context_json text not null default '{}',
+            recorded_at text not null default current_timestamp,
+            unique (match_id, pick_type, selection, combination_key)
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_signal_combos_key on signal_combination_outcomes(combination_key, result)")
+    conn.execute("create index if not exists idx_signal_combos_scope on signal_combination_outcomes(country, tournament, pick_type, result)")
+
+
 def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:
     """Ensure buffer-related tables exist by delegating to ``app.buffer``."""
     try:

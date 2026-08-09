@@ -24,6 +24,7 @@ from app.storage.db import (
 )
 from app.config.config import get_settings
 from app.match_facts import enrich_match_facts
+from app.signal_combinations import build_signal_combination, live_context_from_prediction
 from app.market.market_intent import classify_market_intent, grade_market_intent
 from app.monitoring.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
 from app.competition.competition_registry import init_competition_registry_tables, ensure_competition
@@ -232,6 +233,14 @@ def record_prediction(prediction: dict[str, Any]) -> None:
     league_name = _league_from_match(prediction)
     country_name = _country_from_match(prediction, league_name)
     audit = prediction.get("audit") if isinstance(prediction.get("audit"), dict) else build_prediction_audit(prediction)
+    live_context = live_context_from_prediction(prediction)
+    combination = build_signal_combination(
+        signals=prediction.get("signals") or [],
+        pick_type=best_pick.get("type"),
+        selection=best_pick.get("selection"),
+        prediction_mode=prediction.get("prediction_mode") or live_context.get("prediction_mode"),
+        live_context=live_context,
+    )
     _record_prediction_decision(prediction, source, match_id, league_name, country_name, audit)
     _record_prediction_candidates(prediction, source, match_id, league_name, country_name)
 
@@ -265,9 +274,10 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 source, match_id, match_name, league_name, pick_type, selection,
                 confidence, reason, signals_json, picks_json, audit_json,
                 country_name, sofascore_id, sportybet_id, prediction_mode,
-                data_source, live_data_sources_json, models_json, created_at
+                data_source, live_data_sources_json, models_json,
+                signal_combination_key, signal_combination_json, live_context_json, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             """,
             (
                 source,
@@ -288,6 +298,9 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 prediction.get("data_source") or ((prediction.get("data_quality") or {}).get("prediction_readiness") or {}).get("data_source"),
                 json.dumps(prediction.get("live_data_sources") or []),
                 json.dumps(prediction.get("models") or {}),
+                combination.get("key"),
+                json.dumps(combination.get("payload") or {}),
+                json.dumps(live_context),
             ),
         )
         conn.commit()

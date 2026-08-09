@@ -366,6 +366,9 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
         "prediction_mode": row["prediction_mode"] if "prediction_mode" in row.keys() else "prematch",
         "data_source": row["data_source"] if "data_source" in row.keys() else None,
         "live_data_sources": _safe_json(row["live_data_sources_json"] if "live_data_sources_json" in row.keys() else "[]", []),
+        "signal_combination_key": row["signal_combination_key"] if "signal_combination_key" in row.keys() else None,
+        "signal_combination": _safe_json(row["signal_combination_json"] if "signal_combination_json" in row.keys() else "{}", {}),
+        "live_context": _safe_json(row["live_context_json"] if "live_context_json" in row.keys() else "{}", {}),
         "grading_reason": _safe_json(row["grading_reason_json"] if "grading_reason_json" in row.keys() else "{}", {}),
         "created_at": row["created_at"],
     }

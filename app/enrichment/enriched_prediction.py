@@ -19,6 +19,7 @@ from app.models.poisson import run_poisson
 from app.ai.prediction_agent import predict_sofascore_event, predict_sporty_match
 from app.risk.risk_manager import apply_risk_controls
 from app.market.season_stage import detect_season_stage
+from app.signal_combinations import live_context_from_doc
 from app.utils.time_context import match_time_context
 from app.config.config import get_settings
 
@@ -776,8 +777,23 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             memory = weighted_prediction_memory(doc, pick.get("type"), pick.get("selection"))
             memory_adj = int(memory.get("confidence_adjustment") or 0)
             pick_learned_adj = _learned_signal_adjustment_for_pick(doc, signals, pick.get("type"))
+            combo_memory = {}
+            combo_adj = 0
+            try:
+                from app.storage.league_memory import weighted_signal_combination_memory
+                combo_memory = weighted_signal_combination_memory(
+                    doc,
+                    signals,
+                    pick.get("type"),
+                    pick.get("selection"),
+                    prediction_mode="live" if is_live else "prematch",
+                    live_context=live_context_from_doc(doc, minute),
+                )
+                combo_adj = int(combo_memory.get("adjustment") or 0)
+            except Exception:
+                combo_memory = {}
             # Apply pattern and market movement adjustment on top.
-            cal_conf = min(99, max(1, cal["adjusted_confidence"] + pattern_adj + market_adj + memory_adj + database_adj + grade_adj + pick_learned_adj))
+            cal_conf = min(99, max(1, cal["adjusted_confidence"] + pattern_adj + market_adj + memory_adj + database_adj + grade_adj + pick_learned_adj + combo_adj))
             # Apply regime tier penalty (Tier 4 gets -5)
             tier_penalty = {1: 0, 2: 0, 3: 0, 4: -5}.get(regime.tier, 0)
             cal_conf = min(99, max(1, cal_conf + tier_penalty))
@@ -844,6 +860,8 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "regime_stake_cap":  regime.stake_cap,
                 "memory_weighting":   memory,
                 "learned_signal_adjustment": pick_learned_adj,
+                "learned_signal_combination": combo_memory,
+                "learned_signal_combination_adjustment": combo_adj,
                 "confidence_floor_applied": bool(pick.get("confidence_floor_applied")),
                 # Preserve league accuracy adj computed above (may have been set before this dict)
                 "league_accuracy_adj": (pick.get("calibration") or {}).get("league_accuracy_adj"),
@@ -877,6 +895,12 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     "name": "prediction_memory",
                     "value": memory,
                     "impact": memory_adj,
+                })
+            if combo_memory.get("samples"):
+                signals.append({
+                    "name": "learned_signal_combination",
+                    "value": combo_memory,
+                    "impact": combo_adj,
                 })
             # Prefer CLV-based stake sizing if enough data exists
             try:
