@@ -467,13 +467,13 @@ def build_analysis_prompt(ctx: AnalysisContext) -> str:
     return prompt
 
 
-# ── Ollama Integration ────────────────────────────────────────────────────────
+# ── LLM Integration ─────────────────────────────────────────────────────────
 
 def run_competition_analysis(
     competition_key: str, round_name: str | None = None
 ) -> dict[str, Any]:
-    from app.ai.ollama_agent import is_ollama_available
-    from app.ai.ollama_agent import _call_ollama
+    from app.ai.llm_agent import is_llm_available
+    from app.ai.llm_agent import _call_llm
 
     # Determine round_name if not provided
     _init_db()
@@ -499,14 +499,14 @@ def run_competition_analysis(
 
     # Model priority
     model = next(
-        (name for name in ("qwen3:1.7b", "openrouter") if is_ollama_available(name)),
+        (name for name in ("openrouter",) if is_llm_available(name)),
         None,
     )
     if not model:
         logger.warning(
-            "run_competition_analysis: Ollama unavailable for %s/%s", competition_key, round_name
+            "run_competition_analysis: LLM unavailable for %s/%s", competition_key, round_name
         )
-        return {"status": "ollama_unavailable", "competition_key": competition_key, "round_name": round_name}
+        return {"status": "llm_unavailable", "competition_key": competition_key, "round_name": round_name}
 
     prompt = build_analysis_prompt(ctx)
     logger.debug(
@@ -516,7 +516,7 @@ def run_competition_analysis(
 
     try:
         started = time.monotonic()
-        raw = _call_ollama(model, prompt, timeout=45)
+        raw = _call_llm(model, prompt, timeout=45)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "run_competition_analysis: elapsed_ms=%d preview=%s",
@@ -524,10 +524,10 @@ def run_competition_analysis(
         )
     except Exception as exc:
         logger.warning(
-            "run_competition_analysis: Ollama call failed for %s/%s: %s",
+            "run_competition_analysis: LLM call failed for %s/%s: %s",
             competition_key, round_name, exc,
         )
-        return {"status": "ollama_error", "competition_key": competition_key, "round_name": round_name, "error": str(exc)}
+        return {"status": "llm_error", "competition_key": competition_key, "round_name": round_name, "error": str(exc)}
 
     # Extract structured analysis from JSON response
     analysis_text = raw.strip()

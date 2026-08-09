@@ -186,6 +186,28 @@ def _ensure_signal_combination_outcomes_table(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_signal_combos_scope on signal_combination_outcomes(country, tournament, pick_type, result)")
 
 
+def _migrate_future_buffer(conn: sqlite3.Connection) -> None:
+    """One-time migration: move future_match_buffer rows into match_buffer then drop the table."""
+    has_future = conn.execute(
+        "select 1 from sqlite_master where type='table' and name='future_match_buffer'"
+    ).fetchone()
+    if not has_future:
+        return
+    conn.execute(
+        """
+        insert or ignore into match_buffer
+            (match_id, match_date, tournament, category, name, start_time, period,
+             score_home, score_away, is_live, is_finished, ingested_at, enriched_at,
+             data_source, sportybet_id, sofascore_id, raw_sporty, raw_enriched)
+        select match_id, match_date, tournament, category, name, start_time, period,
+               score_home, score_away, is_live, is_finished, ingested_at, enriched_at,
+               data_source, sportybet_id, sofascore_id, raw_sporty, raw_enriched
+        from future_match_buffer
+        """
+    )
+    conn.execute("drop table if exists future_match_buffer")
+
+
 def _init_db_unlocked() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # Apply WAL + busy_timeout on a short-lived connection before the long schema write.
@@ -693,60 +715,40 @@ def _init_db_unlocked() -> None:
             "create index if not exists idx_team_comp_notes_match "
             "on team_performance_notes(match_id)"
         )
-        # ── Buffer tables (match_buffer, future_match_buffer, finished_matches) ─
+        # ── Buffer tables (match_buffer, finished_matches) ───────────────────
         conn.execute("""
             create table if not exists match_buffer (
-                match_id     text primary key,
-                match_date   text,
-                tournament   text,
-                category     text,
-                name         text,
-                start_time   integer,
-                period       text,
-                score_home   text,
-                score_away   text,
-                is_live      integer not null default 0,
-                is_finished  integer not null default 0,
-                ingested_at  text not null default current_timestamp,
-                enriched_at  text,
-                data_source  text not null default 'sportybet',
-                sportybet_id text,
-                sofascore_id text,
-                raw_sporty   text not null,
-                raw_enriched text
+                match_id        text primary key,
+                match_date      text,
+                tournament      text,
+                category        text,
+                name            text,
+                start_time      integer,
+                period          text,
+                score_home      text,
+                score_away      text,
+                is_live         integer not null default 0,
+                is_finished     integer not null default 0,
+                ingested_at     text not null default current_timestamp,
+                enriched_at     text,
+                data_source     text not null default 'sportybet',
+                sportybet_id    text,
+                sofascore_id    text,
+                sofascore_only  integer not null default 0,
+                raw_sporty      text,
+                raw_enriched    text
             )
         """)
-        conn.execute("create index if not exists idx_buffer_date   on match_buffer(match_date)")
-        conn.execute("create index if not exists idx_buffer_live   on match_buffer(is_live)")
-        conn.execute("create index if not exists idx_buffer_enrich on match_buffer(enriched_at)")
-        conn.execute("""
-            create table if not exists future_match_buffer (
-                match_id     text primary key,
-                match_date   text,
-                tournament   text,
-                category     text,
-                name         text,
-                start_time   integer,
-                period       text,
-                score_home   text,
-                score_away   text,
-                is_live      integer not null default 0,
-                is_finished  integer not null default 0,
-                ingested_at  text not null default current_timestamp,
-                enriched_at  text,
-                data_source  text not null default 'sportybet',
-                sportybet_id text,
-                sofascore_id text,
-                raw_sporty   text not null,
-                raw_enriched text
-            )
-        """)
-        conn.execute("create index if not exists idx_future_buffer_date   on future_match_buffer(match_date)")
-        conn.execute("create index if not exists idx_future_buffer_enrich on future_match_buffer(enriched_at)")
-        _ensure_column(conn, "match_buffer",        "data_source",  "text not null default 'sportybet'")
-        _ensure_column(conn, "match_buffer",        "sportybet_id", "text")
-        _ensure_column(conn, "future_match_buffer", "data_source",  "text not null default 'sportybet'")
-        _ensure_column(conn, "future_match_buffer", "sportybet_id", "text")
+        conn.execute("create index if not exists idx_buffer_date        on match_buffer(match_date)")
+        conn.execute("create index if not exists idx_buffer_live        on match_buffer(is_live)")
+        conn.execute("create index if not exists idx_buffer_enrich      on match_buffer(enriched_at)")
+        conn.execute("create index if not exists idx_buffer_sofa_only   on match_buffer(sofascore_only, match_date)")
+        conn.execute("create index if not exists idx_buffer_sofascore   on match_buffer(sofascore_id)")
+        _ensure_column(conn, "match_buffer", "data_source",    "text not null default 'sportybet'")
+        _ensure_column(conn, "match_buffer", "sportybet_id",   "text")
+        _ensure_column(conn, "match_buffer", "sofascore_only", "integer not null default 0")
+        # Migrate any remaining future_match_buffer rows into match_buffer then drop the table
+        _migrate_future_buffer(conn)
         conn.execute("""
             create table if not exists sofa_event_list_cache (
                 date        text primary key,

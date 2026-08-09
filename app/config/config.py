@@ -33,8 +33,6 @@ class Settings:
     hf_url: str
     hf_model: str
     hf_token_present: bool
-    ollama_url: str
-    ollama_model: str
     openrouter_api_key: str
     openrouter_model: str
     openrouter_base_url: str
@@ -62,8 +60,7 @@ class Settings:
     risk_manager_volatility_hard_block_threshold: float
     risk_manager_bootstrap_confidence_ceiling: int
     clear_winner_probability_gap: float
-    ollama_pipeline_enabled: bool
-    ollama_keep_alive_interval: int
+    llm_pipeline_enabled: bool
 
 
 _cached_settings: Settings | None = None
@@ -88,8 +85,6 @@ def get_settings() -> Settings:
         hf_url=os.getenv("PREDICTX_HF_URL", "https://router.huggingface.co/v1/chat/completions"),
         hf_model=os.getenv("PREDICTX_HF_MODEL", "Qwen/Qwen2.5-7B-Instruct:fastest"),
         hf_token_present=bool(_hf_token()),
-        ollama_url=os.getenv("PREDICTX_OLLAMA_URL", "http://localhost:11434/api/chat"),
-        ollama_model=os.getenv("PREDICTX_AI_MODEL", "llama3.2:3b"),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),
         openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
@@ -117,8 +112,7 @@ def get_settings() -> Settings:
         risk_manager_volatility_hard_block_threshold=float(os.getenv("RISK_MANAGER_VOLATILITY_HARD_BLOCK_THRESHOLD", "35")),
         risk_manager_bootstrap_confidence_ceiling=_int_env("RISK_MANAGER_BOOTSTRAP_CONFIDENCE_CEILING", 78),
         clear_winner_probability_gap=float(os.getenv("CLEAR_WINNER_PROBABILITY_GAP", "12")),
-        ollama_pipeline_enabled=_bool_env("PREDICTX_OLLAMA_PIPELINE_ENABLED", True),
-        ollama_keep_alive_interval=_int_env("PREDICTX_OLLAMA_KEEP_ALIVE_INTERVAL", 120),
+        llm_pipeline_enabled=_bool_env("PREDICTX_LLM_PIPELINE_ENABLED", True),
     )
     return _cached_settings
 
@@ -134,12 +128,9 @@ def public_settings() -> dict[str, object]:
             "provider": settings.ai_provider,
             "hf_model": settings.hf_model,
             "hf_token_present": settings.hf_token_present,
-            "ollama_url": settings.ollama_url,
-            "ollama_model": settings.ollama_model,
             "timeout_seconds": settings.ai_timeout_seconds,
-        "pipeline_enabled": settings.ollama_pipeline_enabled,
-        "keep_alive_interval_seconds": settings.ollama_keep_alive_interval,
-      },
+            "pipeline_enabled": settings.llm_pipeline_enabled,
+        },
         "web_search": {
             "enabled": settings.web_search_enabled,
             "backends": settings.web_search_backends,

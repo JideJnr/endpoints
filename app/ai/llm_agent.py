@@ -1,6 +1,6 @@
 """
-OpenRouter prediction agent.
-Replaces the Ollama agent — uses OpenRouter cloud inference (fast, no local model load).
+LLM prediction agent.
+Uses OpenRouter cloud inference (fast, no local model load).
 
 Uses the free OpenRouter model (openrouter/free by default).
 Set OPENROUTER_API_KEY in .env.
@@ -56,7 +56,7 @@ def _openrouter_url() -> str:
     return settings.openrouter_base_url.rstrip("/")
 
 
-def is_ollama_available(model: str | None = None) -> bool:
+def is_llm_available(model: str | None = None) -> bool:
     """Check if OpenRouter is reachable (API key is set)."""
     settings = get_settings()
     if not settings.openrouter_api_key:
@@ -133,7 +133,7 @@ def _parse_response(raw: str) -> dict[str, Any]:
     return json.loads(text.strip())
 
 
-def run_ollama_match_analysis(
+def run_llm_match_analysis(
     doc: dict[str, Any],
     model: str = "openrouter/free",
 ) -> dict[str, Any]:
@@ -141,15 +141,15 @@ def run_ollama_match_analysis(
     Run a single OpenRouter model analysis for one enriched match document.
 
     Args:
-        doc:   enriched match document (same format as groq_agent)
+        doc:   enriched match document (same format as llm_analysis)
         model: OpenRouter model name (ignored — uses configured model)
 
     Returns:
         analysis dict with status, recommendation, confidence, reasoning, etc.
     """
-    if not is_ollama_available():
+    if not is_llm_available():
         return {
-            "status": "ollama_unavailable",
+            "status": "llm_unavailable",
             "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env",
             "model": model,
         }
@@ -161,7 +161,7 @@ def run_ollama_match_analysis(
         pass
 
     try:
-        from app.ai.groq_agent import _summarise_doc
+        from app.ai.llm_analysis import _summarise_doc
         summary = _summarise_doc(doc)
     except Exception as exc:
         return {"status": "error", "message": f"Failed to summarise doc: {exc}", "model": model}
@@ -201,7 +201,7 @@ def run_ollama_match_analysis(
     }
 
 
-def run_ollama_all_models(doc: dict[str, Any]) -> dict[str, Any]:
+def run_llm_all_models(doc: dict[str, Any]) -> dict[str, Any]:
     """
     Run OpenRouter models on one match document.
 
@@ -210,7 +210,7 @@ def run_ollama_all_models(doc: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     model = settings.openrouter_model
     results: dict[str, Any] = {}
-    results[model] = run_ollama_match_analysis(doc, model=model)
+    results[model] = run_llm_match_analysis(doc, model=model)
 
     predictions = [
         r.get("recommendation")
@@ -236,7 +236,7 @@ def run_ollama_all_models(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_ollama_predictions(
+def run_llm_predictions(
     match_date: str | None = None,
     docs: list[dict[str, Any]] | None = None,
     limit: int = 50,
@@ -256,8 +256,8 @@ def run_ollama_predictions(
     """
     from datetime import date as dt
 
-    if not is_ollama_available():
-        return {"status": "ollama_unavailable", "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env"}
+    if not is_llm_available():
+        return {"status": "llm_unavailable", "message": "OpenRouter is not available. Check OPENROUTER_API_KEY in .env"}
 
     target_date = match_date or dt.today().isoformat()
 
@@ -269,7 +269,7 @@ def run_ollama_predictions(
         return {"status": "no_matches", "date": target_date, "predictions": []}
 
     docs = docs[:limit]
-    print(f"[openrouter_agent] predicting {len(docs)} matches for {target_date} using {model}")
+    print(f"[llm_agent] predicting {len(docs)} matches for {target_date} using {model}")
 
     predictions = []
     value_bets = 0
@@ -277,8 +277,8 @@ def run_ollama_predictions(
 
     for i, doc in enumerate(docs, 1):
         name = doc.get("sportybet_name") or doc.get("name") or "unknown"
-        print(f"[openrouter_agent] [{i}/{len(docs)}] {name}")
-        pred = run_ollama_match_analysis(doc, model=model)
+        print(f"[llm_agent] [{i}/{len(docs)}] {name}")
+        pred = run_llm_match_analysis(doc, model=model)
         pred["sportybet_id"] = doc.get("sportybet_id")
         pred["match_id"] = doc.get("sportybet_id")
         predictions.append(pred)

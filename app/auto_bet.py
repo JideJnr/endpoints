@@ -47,8 +47,8 @@ def _build_analysis_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "match_name": candidate.get("match_name") or candidate.get("name"),
         "league_name": candidate.get("league_name") or candidate.get("tournament"),
         "country_name": candidate.get("country_name") or candidate.get("category"),
-        "groq_recommendation": pick.get("selection"),
-        "groq_confidence": int(pick.get("confidence") or 0),
+        "llm_recommendation": pick.get("selection"),
+        "llm_confidence": int(pick.get("confidence") or 0),
         "prediction_engine_pick": pick,
         "key_factors": pick.get("key_factors") or candidate.get("key_factors"),
         "market_signal": candidate.get("market_signal"),
@@ -95,7 +95,7 @@ def run_auto_bet(
 
     # Deterministic synthesis — research conviction is already applied inside
     # synthesize_sure_picks (research_conviction_adj / optimal_profile_score).
-    # The deterministic flag skips the LLM _run_groq_synthesis call entirely.
+    # The deterministic flag skips the LLM synthesis call entirely.
     try:
         synthesis = synthesize_sure_picks(
             analyses,

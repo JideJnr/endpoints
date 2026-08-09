@@ -571,7 +571,7 @@ def post_enriched_match_analysis(sportybet_id: str, payload: dict[str, Any] = Bo
         result = enriched_match_analysis(sportybet_id, force_refresh=bool(payload.get("force_refresh")))
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    if result.get("status") in {"groq_unavailable", "agent_build_failed", "error"}:
+    if result.get("status") in {"llm_unavailable", "agent_build_failed", "error"}:
         raise HTTPException(status_code=503, detail=result.get("message") or "AI analysis is unavailable")
     return result
 

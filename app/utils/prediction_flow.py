@@ -30,7 +30,7 @@ def predict_and_record_enriched(
     match_date: str | None = None,
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
-    use_ollama_pipeline: bool | None = False,
+    use_llm_pipeline: bool | None = False,
 ) -> dict[str, Any]:
     """
     Single prediction write path for enriched buffer documents.
@@ -44,12 +44,12 @@ def predict_and_record_enriched(
     if not readiness.get("ready"):
         raise PredictionDeferred(readiness)
 
-    # Use small-context Ollama pipeline if requested and available
-    if use_ollama_pipeline:
-        from app.ai.ollama_pipeline import run_ollama_pipeline
+    # Use LLM pipeline if requested and available
+    if use_llm_pipeline:
+        from app.ai.llm_pipeline import run_llm_pipeline
         from app.config.config import get_settings as _gs
         if _gs().openrouter_api_key:
-            prediction = run_ollama_pipeline(doc, attach_brain=attach_brain)
+            prediction = run_llm_pipeline(doc, attach_brain=attach_brain)
             prediction["audit"] = build_prediction_audit(prediction, doc)
             resolved_match_id = str(
                 match_id
@@ -99,7 +99,7 @@ def apply_prediction_state(
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
     allow_repeat: bool = False,
-    use_ollama_pipeline: bool | None = False,
+    use_llm_pipeline: bool | None = False,
 ) -> dict[str, Any]:
     """
     Apply the single prediction state transition used by workers and endpoints.
@@ -135,7 +135,7 @@ def apply_prediction_state(
             match_date=match_date,
             source=_prediction_source(source, readiness),
             attach_brain=attach_brain,
-            use_ollama_pipeline=use_ollama_pipeline,
+            use_llm_pipeline=use_llm_pipeline,
         )
         readiness = doc.get("prediction_readiness") or prediction.get("prediction_readiness") or prediction_readiness(doc)
         doc["prediction"] = prediction

@@ -1,6 +1,6 @@
 """
 Multi-stage OpenRouter prediction pipeline.
-Same structure as before — HTTP call swapped from Ollama to OpenRouter.
+Same structure as before — HTTP call goes to OpenRouter.
 """
 from __future__ import annotations
 
@@ -136,8 +136,8 @@ Return ONLY valid JSON:
 
 # ── Core LLM call ──────────────────────────────────────────────────────────────
 
-def is_ollama_available(model: str | None = None) -> bool:
-    """Kept for compatibility — pipeline now uses OpenRouter."""
+def is_llm_available(model: str | None = None) -> bool:
+    """Check if OpenRouter is configured (API key is set)."""
     return bool(get_settings().openrouter_api_key)
 
 
@@ -522,7 +522,7 @@ def run_brain_review(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[st
 
 # ── Main entry points ──────────────────────────────────────────────────────────
 
-def run_ollama_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str, Any]:
+def run_llm_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str, Any]:
     """Run the full multi-stage OpenRouter prediction pipeline."""
     settings = get_settings()
     if not settings.openrouter_api_key:
@@ -582,7 +582,7 @@ def run_ollama_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[
     }
 
 
-def run_ollama_pipeline_batch(
+def run_llm_pipeline_batch(
     docs: list[dict[str, Any]],
     limit: int = 50,
     attach_brain: bool = True,
@@ -597,7 +597,7 @@ def run_ollama_pipeline_batch(
         name = doc.get("sportybet_name") or doc.get("name") or "unknown"
         logger.info("[pipeline_batch] [%d/%d] %s", i, len(docs), name)
         try:
-            pred = run_ollama_pipeline(doc, attach_brain=attach_brain)
+            pred = run_llm_pipeline(doc, attach_brain=attach_brain)
             pred["sportybet_id"] = doc.get("sportybet_id")
             pred["match_id"] = doc.get("sportybet_id")
             predictions.append(pred)
@@ -617,5 +617,3 @@ def run_ollama_pipeline_batch(
         "value_bets": value_bets,
         "predictions": predictions,
     }
-
-

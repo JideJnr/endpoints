@@ -35,13 +35,13 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
         raise ValueError("No prediction-engine pick found for this match")
 
     gated = similarity_gate(doc, _similar_matches(doc, limit=10))[:5]
-    groq_input = _analysis_doc(doc, engine_pick, gated)
-    analysis = _run_openrouter_enriched(groq_input)
+    llm_input = _analysis_doc(doc, engine_pick, gated)
+    analysis = _run_openrouter_enriched(llm_input)
     if analysis.get("status") in {"openrouter_unavailable", "agent_build_failed", "error"}:
         return analysis
 
-    groq_selection = analysis.get("recommendation") or analysis.get("groq_recommendation")
-    confirmed = _same_outcome(engine_pick.get("selection"), groq_selection)
+    llm_selection = analysis.get("recommendation") or analysis.get("llm_recommendation")
+    confirmed = _same_outcome(engine_pick.get("selection"), llm_selection)
     result = {
         "status": "success",
         "sportybet_id": cache_key,
@@ -49,8 +49,8 @@ def enriched_match_analysis(sportybet_id: str, *, force_refresh: bool = False) -
         "match_name": doc.get("sportybet_name") or doc.get("match_name") or doc.get("name") or cache_key,
         "league_name": doc.get("tournament") or doc.get("league_name"),
         "country_name": doc.get("category") or doc.get("country_name"),
-        "groq_recommendation": groq_selection,
-        "groq_confidence": _to_int(analysis.get("confidence"), 0),
+        "llm_recommendation": llm_selection,
+        "llm_confidence": _to_int(analysis.get("confidence"), 0),
         "value_bet": bool(analysis.get("value_bet")),
         "market_signal": analysis.get("market_signal"),
         "btts": analysis.get("btts"),
@@ -89,7 +89,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "error",
             "message": "No current prediction-engine candidates are available",
-            "groq_powered": True,
+            "llm_powered": True,
             "candidate_count": 0,
             "candidate_limit": candidate_limit,
         }
@@ -121,7 +121,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "error",
             "message": "Fewer than two AI analyses succeeded",
-            "groq_powered": True,
+            "llm_powered": True,
             "analyses_run": len(candidates),
             "analyses_succeeded": len(analyses),
             "failures": failures,
@@ -139,13 +139,13 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
             analysis_signals = []
             if analysis.get("key_factors"):
                 for factor in analysis.get("key_factors", []):
-                    analysis_signals.append({"name": str(factor), "value": 0.7, "source": "groq"})
+                    analysis_signals.append({"name": str(factor), "value": 0.7, "source": "llm"})
             if analysis.get("market_signal"):
-                analysis_signals.append({"name": str(analysis["market_signal"]), "value": 0.6, "source": "groq"})
+                analysis_signals.append({"name": str(analysis["market_signal"]), "value": 0.6, "source": "llm"})
             if analysis.get("btts") is not None:
-                analysis_signals.append({"name": "btts", "value": 0.8 if analysis["btts"] else 0.2, "source": "groq"})
+                analysis_signals.append({"name": "btts", "value": 0.8 if analysis["btts"] else 0.2, "source": "llm"})
             if analysis.get("over_2_5") is not None:
-                analysis_signals.append({"name": "over_2_5", "value": 0.8 if analysis["over_2_5"] else 0.2, "source": "groq"})
+                analysis_signals.append({"name": "over_2_5", "value": 0.8 if analysis["over_2_5"] else 0.2, "source": "llm"})
 
             normalized_signals = [normalize_signal(s.get("name", ""), s.get("value", 0)) for s in analysis_signals]
             learned = get_learned_probabilities(
@@ -160,7 +160,7 @@ def build_ai_betbuilder(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "status": "success",
-        "groq_powered": True,
+        "llm_powered": True,
         "request": {"target_odds": target_odds, "max_total_odds": max_total_odds},
         "candidate_count": len(candidates),
         "candidate_limit": candidate_limit,
@@ -188,22 +188,22 @@ def synthesize_sure_picks(
     max_total_odds: float,
     deterministic: bool = False,
 ) -> dict[str, Any]:
-    clean = [item for item in analyses if item.get("status") == "success" or item.get("groq_recommendation")]
+    clean = [item for item in analyses if item.get("status") == "success" or item.get("llm_recommendation")]
     if len(clean) < 2:
         raise ValueError("At least two completed enriched analyses are required")
 
     ranked = []
     for item in clean[:100]:  # support up to 100 match pool
-        groq_conf = _to_int(item.get("groq_confidence") or item.get("confidence"), 0)
+        llm_conf = _to_int(item.get("llm_confidence") or item.get("confidence"), 0)
         similar_used = _to_int(item.get("similar_matches_used"), 0)
         engine_pick = item.get("prediction_engine_pick") or {}
-        confirmed = bool(item.get("confirmed")) or _same_outcome(engine_pick.get("selection"), item.get("groq_recommendation"))
+        confirmed = bool(item.get("confirmed")) or _same_outcome(engine_pick.get("selection"), item.get("llm_recommendation"))
         odds = round(_to_float(item.get("estimated_odds")) or _pick_decimal_odds(engine_pick), 3)
         try:
             from app.storage.league_memory import betbuilder_pick_memory
             learning = betbuilder_pick_memory(
                 engine_pick.get("type") or item.get("pick_type"),
-                item.get("groq_recommendation") or engine_pick.get("selection"),
+                item.get("llm_recommendation") or engine_pick.get("selection"),
                 item.get("league_name"),
                 item.get("country_name"),
                 odds,
@@ -221,13 +221,13 @@ def synthesize_sure_picks(
             analysis_signals = []
             if item.get("key_factors"):
                 for factor in item.get("key_factors", []):
-                    analysis_signals.append({"name": str(factor), "value": 0.7, "source": "groq"})
+                    analysis_signals.append({"name": str(factor), "value": 0.7, "source": "llm"})
             if item.get("market_signal"):
-                analysis_signals.append({"name": str(item["market_signal"]), "value": 0.6, "source": "groq"})
+                analysis_signals.append({"name": str(item["market_signal"]), "value": 0.6, "source": "llm"})
             if item.get("btts") is not None:
-                analysis_signals.append({"name": "btts", "value": 0.8 if item["btts"] else 0.2, "source": "groq"})
+                analysis_signals.append({"name": "btts", "value": 0.8 if item["btts"] else 0.2, "source": "llm"})
             if item.get("over_2_5") is not None:
-                analysis_signals.append({"name": "over_2_5", "value": 0.8 if item["over_2_5"] else 0.2, "source": "groq"})
+                analysis_signals.append({"name": "over_2_5", "value": 0.8 if item["over_2_5"] else 0.2, "source": "llm"})
 
             # Add signal from the engine pick
             if engine_pick.get("selection"):
@@ -253,26 +253,26 @@ def synthesize_sure_picks(
             learned_prob = None
 
         # Calculate conviction score with learned probability boost
-        base_conviction = groq_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0)
+        base_conviction = llm_conf * (1 + 0.10 * similar_used) + float(learning.get("adjustment") or 0)
 
         # Apply learned probability boost
         learned_boost = 0.0
         if learned_prob and learned_prob.get("samples", 0) >= 5:
-            # Boost based on how well the learned distribution matches the Groq confidence
+            # Boost based on how well the learned distribution matches the LLM confidence
             learned_away = learned_prob.get("away_prob", 0.25)
             learned_home = learned_prob.get("home_prob", 0.45)
             learned_draw = learned_prob.get("draw_prob", 0.30)
-            groq_selection = (item.get("groq_recommendation") or engine_pick.get("selection") or "").lower()
+            llm_selection = (item.get("llm_recommendation") or engine_pick.get("selection") or "").lower()
 
-            if "away" in groq_selection or "2" == groq_selection:
+            if "away" in llm_selection or "2" == llm_selection:
                 learned_boost = (learned_away - 0.25) * 20  # boost up to +5
-            elif "home" in groq_selection or "1" == groq_selection:
+            elif "home" in llm_selection or "1" == llm_selection:
                 learned_boost = (learned_home - 0.45) * 20  # boost up to +5
-            elif "draw" in groq_selection or "x" == groq_selection:
+            elif "draw" in llm_selection or "x" == llm_selection:
                 learned_boost = (learned_draw - 0.30) * 20  # boost up to +5
 
             # Extra boost for proven away wins (54% baseline)
-            if learned_prob.get("away_prob", 0) >= 0.54 and "away" in groq_selection:
+            if learned_prob.get("away_prob", 0) >= 0.54 and "away" in llm_selection:
                 learned_boost += 3.0
 
         # Apply league accuracy adjustment — boost leagues where we consistently
@@ -305,7 +305,7 @@ def synthesize_sure_picks(
 
         # ── Research conviction adjustment ──────────────────────────
         research_conviction_adj = 0
-        selection = item.get("groq_recommendation") or engine_pick.get("selection") or ""
+        selection = item.get("llm_recommendation") or engine_pick.get("selection") or ""
         sel_lower = str(selection).lower()
         country_name = str(item.get("country_name") or "").lower().strip()
         source = str(item.get("source") or "")
@@ -313,9 +313,9 @@ def synthesize_sure_picks(
         # Home or Away selection → +4
         if "home or away" in sel_lower or sel_lower == "home_or_away":
             research_conviction_adj += 4
-        # Away or Draw with groq_conf >= 72 → -3
+        # Away or Draw with llm_conf >= 72 → -3
         if "away or draw" in sel_lower or sel_lower == "away_or_draw":
-            if groq_conf >= 72:
+            if llm_conf >= 72:
                 research_conviction_adj -= 3
         # Country in dynamic trust countries → +3
         if country_name in _get_dynamic_rules()["trust_countries"]:
@@ -328,7 +328,7 @@ def synthesize_sure_picks(
         optimal_profile_score = 0
         if "home or away" in sel_lower or sel_lower == "home_or_away":
             optimal_profile_score += 1
-        if groq_conf >= 72:
+        if llm_conf >= 72:
             optimal_profile_score += 1
         if 1.50 <= odds <= 1.99:
             optimal_profile_score += 1
@@ -351,9 +351,9 @@ def synthesize_sure_picks(
             "country": item.get("country_name"),
             "type": engine_pick.get("type") or item.get("pick_type") or "ai_pick",
             "pick_type": engine_pick.get("type") or item.get("pick_type") or "ai_pick",
-            "selection": item.get("groq_recommendation") or engine_pick.get("selection"),
-            "groq_confidence": groq_conf,
-            "confidence": groq_conf,
+            "selection": item.get("llm_recommendation") or engine_pick.get("selection"),
+            "llm_confidence": llm_conf,
+            "confidence": llm_conf,
             "odds": odds,
             "estimated_odds": odds,
             "conviction_score": adjusted_conviction,
@@ -365,10 +365,10 @@ def synthesize_sure_picks(
             "league_accuracy_boost": round(league_acc_boost, 2),
             "confirmed": confirmed,
             "similar_matches_used": similar_used,
-            "source": "groq",
+            "source": "llm",
             "synthesis_reasoning": "",
         })
-    ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"] + item.get("optimal_profile_score", 0) * 0.5, item["groq_confidence"]), reverse=True)
+    ranked.sort(key=lambda item: (item["confirmed"], item["conviction_score"] + item.get("optimal_profile_score", 0) * 0.5, item["llm_confidence"]), reverse=True)
 
     try:
         if deterministic:
@@ -388,7 +388,7 @@ def synthesize_sure_picks(
         selected = ranked[:1]
     combined = _combined_odds(selected)
     target_not_met = combined < target_odds
-    avg_confidence = round(sum(float(item.get("groq_confidence") or 0) for item in selected) / len(selected)) if selected else 0
+    avg_confidence = round(sum(float(item.get("llm_confidence") or 0) for item in selected) / len(selected)) if selected else 0
     confirmed_count = len([item for item in selected if item.get("confirmed")])
     for item in selected:
         item["synthesis_reasoning"] = item.get("synthesis_reasoning") or (
@@ -525,9 +525,9 @@ def similarity_gate(doc: dict[str, Any], candidates: list[dict[str, Any]]) -> li
 
 
 def _run_openrouter_enriched(doc: dict[str, Any]) -> dict[str, Any]:
-    from app.ai.groq_agent import run_groq_match_analysis
+    from app.ai.llm_analysis import run_llm_match_analysis
 
-    return run_groq_match_analysis(doc)
+    return run_llm_match_analysis(doc)
 
 
 def _run_openrouter_synthesis(ranked: list[dict[str, Any]], target_odds: float, max_total_odds: float) -> dict[str, Any]:

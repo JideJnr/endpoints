@@ -19,6 +19,7 @@ from app.competition.competition_registry import (
     update_team_competition_stats,
     add_performance_note,
 )
+from app.competition.league_strength import league_strength_score
 
 logger = logging.getLogger(__name__)
 
@@ -902,6 +903,15 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
     ).fetchall()
     finished = [row for row in rows if row["goals_for"] is not None and row["goals_against"] is not None]
     sample = len(finished)
+    _opp_strength_scores = [
+        league_strength_score(row["league_name"])["score"]
+        for row in finished
+        if row["league_name"]
+    ]
+    avg_opponent_league_strength = (
+        round(sum(_opp_strength_scores) / len(_opp_strength_scores), 1)
+        if _opp_strength_scores else None
+    )
     wins = sum(1 for row in finished if row["result"] == "win")
     draws = sum(1 for row in finished if row["result"] == "draw")
     losses = sum(1 for row in finished if row["result"] == "loss")
@@ -1002,6 +1012,7 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
         "last_web_context_at": last_web_context_at,
         "venue_split": venue_split,
         "goal_timing": goal_timing,
+        "avg_opponent_league_strength": avg_opponent_league_strength,
         "prediction_context": {
             "usable": sample >= 3,
             "confidence": "high" if sample >= 8 else "medium" if sample >= 4 else "low",

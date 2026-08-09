@@ -120,16 +120,6 @@ PIPELINES: list[PipelineDef] = [
         default="paused",
     ),
     PipelineDef(
-        engine_id="competition_special",
-        label="Competition Special",
-        description="Dedicated enrichment and prediction lane for all enabled top-30 competitions. "
-                    "Auto-pulls future fixtures and predicts them. Enable individual competitions in the Competition settings.",
-        interval="Every 5 min",
-        source="SofaScore",
-        job_ids=("competition_special",),
-        default="active",
-    ),
-    PipelineDef(
         engine_id="unified_upcoming",
         label="Unified Upcoming Pipeline",
         description="Fetches upcoming matches from both SportyBet and SofaScore, matches them together, "
@@ -151,10 +141,11 @@ PIPELINES: list[PipelineDef] = [
     ),
     PipelineDef(
         engine_id="competition_analysis",
-        label="Competition Analysis",
-        description="Detects newly completed matchdays for enabled competitions and generates "
-                    "Ollama-powered post-matchday analysis with top table and weekly disappointments. "
-                    "Runs automatically each match week.",
+        label="Competition AI Analysis",
+        description="Weekly Ollama-powered post-matchday analysis for all enabled competitions. "
+                    "Detects completed match weeks, analyses all results, surfaces teams performing "
+                    "well or poorly, and generates a general weekly summary. "
+                    "Competition sorting and enrichment always runs regardless of this toggle.",
         interval="Every 24 hrs",
         source="Internal",
         job_ids=("competition_analysis",),
@@ -189,6 +180,7 @@ PRESETS: dict[str, dict[str, StatusType]] = {
             "ai_prediction_queue", "sportybet_ingest_upcoming", "sportybet_enrich_prematch"
         } else "paused")
         for p in PIPELINES
+        if p.engine_id != "competition_special"
     },
     # Cloud: disable SportyBet ingest, enable SofaScore pipeline
     "cloud": {
@@ -197,11 +189,10 @@ PRESETS: dict[str, dict[str, StatusType]] = {
         "sportybet_enrich_prematch": "paused",
         "sportybet_enrich_live":     "paused",
         "sofa_pipeline":             "active",
-        # leave live_priority_mode and competition_special unchanged
     },
     # Local: enable everything
     "local": {p.engine_id: "active" for p in PIPELINES},
-    # Off: disable everything toggleable
+    # Off: disable everything toggleable (competition_special is always-on, not in registry)
     "off": {p.engine_id: "paused" for p in PIPELINES},
 }
 

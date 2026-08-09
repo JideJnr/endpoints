@@ -1025,22 +1025,17 @@ def job_unified_live() -> dict[str, Any]:
 
 
 def job_competition_special() -> dict[str, Any]:
-    """Run the dedicated SofaScore lane for all enabled top-30 competitions."""
+    """Run the dedicated SofaScore lane for all enabled top-30 competitions.
+    Always runs — no toggle. The competition_analysis toggle controls weekly AI analysis.
+    """
     if is_shutting_down():
         return {"status": "shutdown", "job": "competition_special"}
-    # ── Pipeline toggle check ──────────────────────────────────────────────────
-    try:
-        from app.scheduling.pipeline_registry import is_pipeline_enabled
-        if not is_pipeline_enabled("competition_special"):
-            return {"status": "skipped", "job": "competition_special", "reason": "pipeline_disabled"}
-    except Exception:
-        pass
     from app.competition.competition_special import run_enabled_competition_cycles
 
     record_activity("Competition special cycle checking enabled top-30 buffers", job="competition_special", status="running")
     result = run_enabled_competition_cycles()
     record_activity(
-        f"Competition special cycle {result.get('status')}",
+        f"Competition special cycle {result.get('status')}: {result.get('processed', 0)} competitions processed",
         job="competition_special",
         status="ok" if result.get("status") != "error" else "error",
         details=result,

@@ -15,7 +15,7 @@ from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
 from app.routers import competition_analysis as competition_analysis_router
 from app.scheduling.scheduler import start_scheduler
-from app.ai.ollama_model_manager import stop_keep_alive
+from app.ai.llm_model_manager import stop_keep_alive
 
 settings = get_settings()
 
@@ -124,7 +124,7 @@ def readiness():
     checks = {
         "database_parent_exists": DB_PATH.parent.exists(),
         "database_parent_writable": _is_writable(DB_PATH.parent),
-        "ai_configured": settings.ai_provider in {"rules", "none"} or settings.hf_token_present or settings.ai_provider in {"auto", "ollama", "openrouter"},
+        "ai_configured": settings.ai_provider in {"rules", "none"} or settings.hf_token_present or settings.ai_provider in {"auto", "openrouter"},
         "web_search_enabled": settings.web_search_enabled,
     }
     try:

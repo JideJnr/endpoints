@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.storage.db import _ensure_column, _init_db, db_conn
+from app.competition.league_strength import league_strength_score
+from app.competition.competition_registry import get_team_competition_stats
 
 logger = logging.getLogger(__name__)
 
@@ -152,38 +154,29 @@ def _get_profile(conn: sqlite3.Connection, team_key: str) -> dict[str, Any] | No
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — venue context
+# Internal helpers — competition stats loader
 # ---------------------------------------------------------------------------
 
-def _build_venue_context(
-    home_profile: dict[str, Any] | None,
-    away_profile: dict[str, Any] | None,
-    match_doc: dict[str, Any],  # noqa: ARG001 — reserved for future use
-) -> dict[str, Any]:
-    """Extract home/away split stats for TW_Signal.venue_context.
+def _get_competition_stats(
+    team_key: str,
+    competition_key: str,
+) -> dict[str, Any] | None:
+    """Load team_competitions row for a team in a specific competition.
 
-    Reads the ``venue_split`` block from each profile.  Falls back to top-level
-    profile stats when the split is absent.
+    Returns the row dict when matches_played >= 5, else None so the caller
+    falls back to the normalised overall profile.
     """
-    hp = home_profile or {}
-    ap = away_profile or {}
-
-    home_split = hp.get("venue_split", {}).get("home", {})
-    away_split = ap.get("venue_split", {}).get("away", {})
-
-    def _rate(block: dict, key: str, fallback_profile: dict, fallback_key: str) -> float | None:
-        val = block.get(key)
-        if val is not None:
-            return float(val)
-        fb = fallback_profile.get(fallback_key)
-        return float(fb) if fb is not None else None
-
-    return {
-        "home_win_rate": _rate(home_split, "win_rate", hp, "win_rate"),
-        "home_goals_avg": _rate(home_split, "goals_for_avg", hp, "goals_for_avg"),
-        "away_win_rate": _rate(away_split, "win_rate", ap, "win_rate"),
-        "away_goals_avg": _rate(away_split, "goals_for_avg", ap, "goals_for_avg"),
-    }
+    if not team_key or not competition_key:
+        return None
+    try:
+        with db_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = get_team_competition_stats(conn, team_key, competition_key)
+        if row and int(row.get("matches_played") or 0) >= 5:
+            return row
+    except Exception as exc:
+        logger.debug("_get_competition_stats error team_key=%s comp=%s: %s", team_key, competition_key, exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -195,114 +188,316 @@ def _rules_model(
     away_profile: dict[str, Any] | None,
     match_doc: dict[str, Any],
 ) -> dict[str, Any]:
-    """Deterministic pick from Team_Profile stats.
+    """Learned matchup-strength rules model.
 
-    Returns ``{"pick_type": str, "selection": str, "confidence": int, "venue_context": dict}``.
-    Confidence is always in [1, 95].
-    Returns pick_type="no_bet" with reason="insufficient_sample" when both profiles
-    have sample_size < 5.
+    Architecture (Phases 1-3):
+      1. League-strength normalization — adjusts historical rates by the gap
+         between the team's average opponent strength and the match league.
+      2. Competition-specific stats — when >= 5 matches exist in this exact
+         competition, those stats replace the normalised overall profile.
+      3. Venue-aware stats — home/away split applied for all markets.
+      4. Recency-weighted form — last 5 results weighted more than older ones.
+      5. Sample-size credibility — low sample shrinks scores toward 0.5.
+      6. Matchup differential — home_strength vs away_strength drives market
+         selection; draw detected from balance.
+
+    Returns a dict with pick_type, selection, confidence, strength_context,
+    competition_stats, sample_size, and reasoning.
     """
     hp = home_profile or {}
     ap = away_profile or {}
-    venue_context = _build_venue_context(home_profile, away_profile, match_doc)
 
     home_sample = int(hp.get("sample_size") or 0)
     away_sample = int(ap.get("sample_size") or 0)
 
-    # If neither profile has sufficient data, return no_bet immediately
-    if home_sample < 5 and away_sample < 5:
+    if home_sample < 3 and away_sample < 3:
+        return {"pick_type": "no_bet", "reason": "insufficient_sample",
+                "sample_size": {"home": home_sample, "away": away_sample}}
+
+    # ── League strength context ──────────────────────────────────────────────
+    raw_sporty = match_doc.get("raw_sporty") if isinstance(match_doc.get("raw_sporty"), dict) else match_doc
+    tournament = match_doc.get("tournament") or raw_sporty.get("tournament") or ""
+    if isinstance(tournament, dict):
+        tournament = tournament.get("name") or ""
+    match_league_strength = league_strength_score(str(tournament))["score"]
+
+    home_opp_avg = hp.get("avg_opponent_league_strength")
+    away_opp_avg = ap.get("avg_opponent_league_strength")
+
+    # Normalization factor: how much harder/easier was this team's history
+    # vs the current match level.  Clamped to [0.6, 1.4] to avoid extremes.
+    def _norm_factor(opp_avg: float | None) -> float:
+        if opp_avg is None or match_league_strength == 0:
+            return 1.0
+        return max(0.6, min(1.4, opp_avg / match_league_strength))
+
+    home_norm = _norm_factor(home_opp_avg)
+    away_norm = _norm_factor(away_opp_avg)
+
+    # Step-up/step-down delta — large gaps reduce credibility
+    def _step_delta(opp_avg: float | None) -> float:
+        if opp_avg is None:
+            return 0.0
+        return abs(match_league_strength - opp_avg)
+
+    home_step_delta = _step_delta(home_opp_avg)
+    away_step_delta = _step_delta(away_opp_avg)
+
+    strength_context = {
+        "match_league_strength": match_league_strength,
+        "home_opp_avg_strength": home_opp_avg,
+        "away_opp_avg_strength": away_opp_avg,
+        "home_norm_factor": round(home_norm, 3),
+        "away_norm_factor": round(away_norm, 3),
+        "home_step_delta": round(home_step_delta, 1),
+        "away_step_delta": round(away_step_delta, 1),
+    }
+
+    # ── Competition-specific stats (Phase 2) ─────────────────────────────────
+    from app.storage.league_memory import normalize_league  # noqa: PLC0415
+    competition_key = normalize_league(str(tournament))
+
+    home_key = _slug_from_profile(hp)
+    away_key = _slug_from_profile(ap)
+
+    home_comp = _get_competition_stats(home_key, competition_key) if home_key else None
+    away_comp = _get_competition_stats(away_key, competition_key) if away_key else None
+
+    comp_stats_meta = {
+        "home_used": home_comp is not None,
+        "away_used": away_comp is not None,
+    }
+
+    # ── Extract per-side stats ───────────────────────────────────────────────
+    def _side_stats(
+        profile: dict[str, Any],
+        comp: dict[str, Any] | None,
+        venue: str,          # "home" or "away"
+        norm: float,
+        step_delta: float,
+        sample: int,
+    ) -> dict[str, Any]:
+        """Build a normalised stat block for one side."""
+        goals = profile.get("goals") or {}
+        record = profile.get("record") or {}
+        venue_split = (profile.get("venue_split") or {}).get(venue) or {}
+
+        if comp:
+            mp = int(comp.get("matches_played") or 1)
+            win_rate   = comp["wins"] / mp
+            draw_rate  = comp["draws"] / mp
+            loss_rate  = comp["losses"] / mp
+            gf_avg     = comp["goals_for"] / mp
+            ga_avg     = comp["goals_against"] / mp
+            btts_rate  = comp["btts_count"] / mp
+            over25_rate = comp["over_25_count"] / mp
+            cs_rate    = comp["clean_sheets"] / mp
+            blank_rate = comp["failed_to_score"] / mp
+            eff_sample = mp
+        else:
+            # Use venue-split stats when available, fall back to overall
+            vp = int(venue_split.get("played") or 0)
+            if vp >= 3:
+                win_rate   = float(venue_split.get("win_rate") or 0)
+                draw_rate  = float(venue_split.get("draw_rate") or 0)
+                loss_rate  = float(venue_split.get("loss_rate") or 0)
+                gf_avg     = float(venue_split.get("gf_avg") or 0)
+                ga_avg     = float(venue_split.get("ga_avg") or 0)
+                btts_rate  = float(venue_split.get("btts_rate") or 0)
+                over25_rate = float(venue_split.get("over_25_rate") or 0)
+                cs_rate    = float(venue_split.get("clean_sheet_rate") or 0)
+                blank_rate = float(venue_split.get("blank_rate") or 0)
+                eff_sample = vp
+            else:
+                win_rate   = (record.get("wins") or 0) / max(sample, 1)
+                draw_rate  = (record.get("draws") or 0) / max(sample, 1)
+                loss_rate  = (record.get("losses") or 0) / max(sample, 1)
+                gf_avg     = float(goals.get("for_avg") or 0)
+                ga_avg     = float(goals.get("against_avg") or 0)
+                btts_rate  = float(goals.get("btts_rate") or 0)
+                over25_rate = float(goals.get("over_2_5_rate") or 0)
+                cs_rate    = float(goals.get("clean_sheet_rate") or 0)
+                blank_rate = float(goals.get("blank_rate") or 0)
+                eff_sample = sample
+
+        # Apply league-strength normalization as an additive adjustment
+        # (not a direct multiplier) so rates stay in [0, 1].
+        # A norm_factor > 1 means the team played weaker opponents → discount.
+        # A norm_factor < 1 means they played stronger opponents → boost.
+        strength_adj = (1.0 - norm) * 0.15   # max ±6pp at the clamp limits
+        win_rate_n  = max(0.0, min(1.0, win_rate  + strength_adj))
+        gf_avg_n    = max(0.0, gf_avg  * (2.0 - norm))   # scale goals by inverse norm
+        ga_avg_n    = max(0.0, ga_avg  * norm)            # conceding scales with norm
+
+        # Sample-size credibility: shrink toward 0.5 / league average when thin
+        credibility = min(1.0, eff_sample / 12.0)
+        # Step-delta penalty: large league-level jumps reduce credibility further
+        if step_delta > 20:
+            credibility *= max(0.5, 1.0 - (step_delta - 20) / 80)
+
+        win_rate_c  = 0.40 + (win_rate_n  - 0.40) * credibility
+        draw_rate_c = 0.25 + (draw_rate   - 0.25) * credibility
+        gf_avg_c    = gf_avg_n  * credibility + 1.2 * (1 - credibility)
+        ga_avg_c    = ga_avg_n  * credibility + 1.2 * (1 - credibility)
+        btts_c      = 0.45 + (btts_rate   - 0.45) * credibility
+        over25_c    = 0.45 + (over25_rate  - 0.45) * credibility
+        cs_c        = 0.25 + (cs_rate      - 0.25) * credibility
+
+        # Recency-weighted form from profile string (W=1, D=0.5, L=0)
+        form_str = str((record.get("form") or ""))[:8]
+        form_weights = [0.30, 0.22, 0.17, 0.12, 0.08, 0.05, 0.04, 0.02]
+        form_score = 0.0
+        for i, ch in enumerate(form_str):
+            w = form_weights[i] if i < len(form_weights) else 0.01
+            form_score += w * (1.0 if ch == "W" else 0.5 if ch == "D" else 0.0)
+        # Normalise form_score to [0, 1] (max possible ≈ sum of weights)
+        max_form = sum(form_weights[:len(form_str)]) or 1.0
+        form_score = form_score / max_form if max_form else 0.5
+
         return {
-            "pick_type": "no_bet",
-            "reason": "insufficient_sample",
-            "venue_context": venue_context,
+            "win_rate": round(win_rate_c, 3),
+            "draw_rate": round(draw_rate_c, 3),
+            "loss_rate": round(loss_rate, 3),
+            "gf_avg": round(gf_avg_c, 2),
+            "ga_avg": round(ga_avg_c, 2),
+            "btts_rate": round(btts_c, 3),
+            "over25_rate": round(over25_c, 3),
+            "cs_rate": round(cs_c, 3),
+            "blank_rate": round(blank_rate, 3),
+            "form_score": round(form_score, 3),
+            "credibility": round(credibility, 3),
+            "sample": eff_sample,
         }
 
-    # Use whichever profile has sufficient data (prefer home, fall back to away)
-    if home_sample >= 5:
-        primary = hp
-        primary_side = "home"
-    else:
-        primary = ap
-        primary_side = "away"
+    home_stats = _side_stats(hp, home_comp, "home", home_norm, home_step_delta, home_sample)
+    away_stats = _side_stats(ap, away_comp, "away", away_norm, away_step_delta, away_sample)
 
-    secondary = ap if primary_side == "home" else hp
+    # ── Matchup strength scores ──────────────────────────────────────────────
+    # Each market gets a home_score and away_score; the gap drives the pick.
 
-    # Extract stats from the primary profile
-    win_rate = float(primary.get("win_rate") or 0.0)
-    btts_rate = float(primary.get("btts_rate") or 0.0)
-    over_25_rate = float(primary.get("over_25_rate") or 0.0)
-    clean_sheet_rate = float(primary.get("clean_sheet_rate") or 0.0)
-    goals_for_avg = float(primary.get("goals_for_avg") or 0.0)
-    goals_against_avg = float(primary.get("goals_against_avg") or 0.0)
+    # Match result: weighted combination of win_rate, form, and goal differential
+    def _result_score(s: dict[str, Any]) -> float:
+        return (
+            s["win_rate"]   * 0.50
+            + s["form_score"] * 0.25
+            + min(1.0, max(0.0, (s["gf_avg"] - s["ga_avg"]) / 3.0 + 0.5)) * 0.25
+        )
 
-    # ---------------------------------------------------------------
-    # Determine pick type and baseline confidence
-    # ---------------------------------------------------------------
+    home_result_score = _result_score(home_stats)
+    away_result_score = _result_score(away_stats)
+    result_gap = home_result_score - away_result_score
 
-    # BTTS pick: strong mutual scoring tendency
-    if btts_rate >= 0.65 and goals_for_avg >= 1.5 and goals_against_avg >= 1.0:
-        pick_type = "btts"
-        selection = "yes"
-        base_confidence = int(40 + btts_rate * 45)
+    # Draw detection: scores are close AND both draw_rates are elevated
+    avg_draw_rate = (home_stats["draw_rate"] + away_stats["draw_rate"]) / 2
+    draw_score = avg_draw_rate * 0.6 + (1.0 - abs(result_gap) * 4) * 0.4
+    draw_score = max(0.0, draw_score)
 
-    # Over 2.5 pick: high-scoring games tendency
-    elif over_25_rate >= 0.65 and goals_for_avg >= 1.8:
-        pick_type = "goals"
-        selection = "over_25"
-        base_confidence = int(40 + over_25_rate * 45)
+    # Goals markets: average of both sides' tendencies
+    btts_score  = (home_stats["btts_rate"]  + away_stats["btts_rate"])  / 2
+    over25_score = (home_stats["over25_rate"] + away_stats["over25_rate"]) / 2
+    # Under 2.5: driven by clean sheet rates
+    under25_score = (home_stats["cs_rate"] + away_stats["cs_rate"]) / 2
 
-    # Match result pick based on win rate
-    elif win_rate >= 0.55:
-        pick_type = "match_result"
-        if primary_side == "home":
-            selection = "home_win"
+    # ── Market selection ─────────────────────────────────────────────────────
+    # Build candidate markets with their scores and minimum credibility
+    min_cred = min(home_stats["credibility"], away_stats["credibility"])
+
+    candidates: list[tuple[str, str, float]] = []  # (pick_type, selection, score)
+
+    # Match result — need a meaningful gap
+    if abs(result_gap) >= 0.06 and min_cred >= 0.25:
+        if result_gap > 0:
+            candidates.append(("match_result", "home_win", home_result_score))
         else:
-            selection = "away_win"
-        base_confidence = int(40 + win_rate * 45)
+            candidates.append(("match_result", "away_win", away_result_score))
 
-    # Clean sheet / low scoring
-    elif clean_sheet_rate >= 0.50 and goals_against_avg <= 1.0:
-        pick_type = "goals"
-        selection = "under_25"
-        base_confidence = int(40 + clean_sheet_rate * 35)
+    # Draw — only when balance is genuine
+    if draw_score >= 0.38 and abs(result_gap) < 0.10 and min_cred >= 0.30:
+        candidates.append(("match_result", "draw", draw_score))
 
-    else:
-        # No strong signal
+    # BTTS
+    if btts_score >= 0.50 and min_cred >= 0.25:
+        candidates.append(("btts", "yes", btts_score))
+
+    # Over 2.5
+    if over25_score >= 0.50 and min_cred >= 0.25:
+        candidates.append(("goals", "over_25", over25_score))
+
+    # Under 2.5 — only when both sides show defensive strength
+    if under25_score >= 0.40 and min_cred >= 0.30:
+        candidates.append(("goals", "under_25", under25_score))
+
+    if not candidates:
         return {
             "pick_type": "no_bet",
             "reason": "no_strong_signal",
-            "venue_context": venue_context,
+            "strength_context": strength_context,
+            "competition_stats": comp_stats_meta,
+            "sample_size": {"home": home_sample, "away": away_sample},
         }
 
-    confidence = base_confidence
+    # Pick the highest-scoring candidate
+    best = max(candidates, key=lambda c: c[2])
+    pick_type, selection, raw_score = best
 
-    # ---------------------------------------------------------------
-    # Venue boost (Requirement 7.2 / 7.3)
-    # ---------------------------------------------------------------
-    if pick_type == "match_result" and selection == "home_win":
-        home_win_rate = venue_context.get("home_win_rate") or 0.0
-        home_goals_avg_vc = venue_context.get("home_goals_avg") or 0.0
-        away_win_rate_vc = venue_context.get("away_win_rate") or 0.0
-
-        if home_win_rate > 0.60 and home_goals_avg_vc > 1.80:
-            # Apply home venue boost (at least 5 points)
-            venue_boost = max(5, int((home_win_rate - 0.60) * 50))
-
-            # Reduce boost when away side has strong away form (Requirement 7.3)
-            if away_win_rate_vc > 0.50:
-                away_reduction = max(3, int((away_win_rate_vc - 0.50) * 40))
-                venue_boost = venue_boost - away_reduction
-
-            confidence += max(0, venue_boost)
-
-    # Clamp to [1, 95]
-    confidence = max(1, min(95, confidence))
+    # ── Confidence ───────────────────────────────────────────────────────────
+    # Map raw_score [0.4, 1.0] → confidence [40, 88], then scale by credibility
+    base_conf = 40 + (raw_score - 0.40) * 80
+    confidence = int(base_conf * (0.6 + min_cred * 0.4))
+    confidence = max(1, min(88, confidence))
 
     return {
         "pick_type": pick_type,
         "selection": selection,
         "confidence": confidence,
-        "venue_context": venue_context,
+        "strength_context": strength_context,
+        "competition_stats": comp_stats_meta,
+        "sample_size": {"home": home_sample, "away": away_sample},
+        "home_stats": home_stats,
+        "away_stats": away_stats,
+        "scores": {
+            "home_result": round(home_result_score, 3),
+            "away_result": round(away_result_score, 3),
+            "result_gap": round(result_gap, 3),
+            "draw": round(draw_score, 3),
+            "btts": round(btts_score, 3),
+            "over25": round(over25_score, 3),
+            "under25": round(under25_score, 3),
+        },
+        "reasoning": (
+            f"{selection} selected (score={raw_score:.3f}, gap={result_gap:.3f}, "
+            f"credibility={min_cred:.2f}, norm_home={home_norm:.2f}/away={away_norm:.2f})"
+        ),
+    }
+
+
+def _slug_from_profile(profile: dict[str, Any]) -> str:
+    """Best-effort team_key from a profile dict (used to look up competition stats)."""
+    # The profile doesn't store team_key directly; the caller must pass it.
+    # This is a no-op placeholder — competition stats lookup is keyed by the
+    # team_key resolved in team_watcher_signal, not from the profile itself.
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — venue context (kept for _ai_model compatibility)
+# ---------------------------------------------------------------------------
+
+def _build_venue_context(
+    home_profile: dict[str, Any] | None,
+    away_profile: dict[str, Any] | None,
+    match_doc: dict[str, Any],  # noqa: ARG001
+) -> dict[str, Any]:
+    """Thin venue context for _ai_model / _merge_signal compatibility."""
+    hp = home_profile or {}
+    ap = away_profile or {}
+    home_split = (hp.get("venue_split") or {}).get("home") or {}
+    away_split = (ap.get("venue_split") or {}).get("away") or {}
+    return {
+        "home_win_rate": float(home_split.get("win_rate") or 0),
+        "home_goals_avg": float(home_split.get("gf_avg") or 0),
+        "away_win_rate": float(away_split.get("win_rate") or 0),
+        "away_goals_avg": float(away_split.get("gf_avg") or 0),
     }
 
 

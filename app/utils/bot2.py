@@ -56,10 +56,10 @@ You have access to:
 Output ONLY the JSON array. No text outside it."""
 
 
-# ── Groq-powered run ──────────────────────────────────────────────────────────
+# ── LLM-powered run ──────────────────────────────────────────────────────────
 
-def _run_bot2_groq(predictions: list[dict], match_date: str) -> list[dict]:
-    """Use Groq LLM to curate picks. Falls back to rules on any error."""
+def _run_bot2_llm(predictions: list[dict], match_date: str) -> list[dict]:
+    """Use LLM to curate picks. Falls back to rules on any error."""
     from app.ai.llm import get_fast_llm
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -144,7 +144,7 @@ def run_bot2(match_date: str | None = None, limit: int = 200) -> dict[str, Any]:
         from app.ai.llm import get_llm
         llm = get_llm()
         if llm is not None:
-            picks = _run_bot2_groq(predictions, target_date)
+            picks = _run_bot2_llm(predictions, target_date)
             mode = "openrouter"
     except Exception as exc:
         print(f"[bot2] OpenRouter failed ({exc}), falling back to rules engine")

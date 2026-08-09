@@ -391,27 +391,6 @@ def _is_finished_doc(doc: dict) -> bool:
     return period in ("ft", "finished", "ended", "aet", "ap", "full time")
 
 
-# ── Groq LangChain agent endpoints ───────────────────────────────────────────
-# Ported from migrated predictz/agent.py
-# Requires GROQ_API_KEY in .env
-
-@router.post("/groq/predict")
-def post_groq_predictions(
-    match_date: Optional[str] = None,
-    limit: int = Query(default=20, ge=1, le=100),
-):
-    """
-    Run the router-backed AI predictions over today's enriched matches.
-    Full 10-step reasoning: standings, H2H, Poisson, odds movement, SOS, web context.
-    OpenRouter is the primary provider, with fallback support when configured.
-    """
-    try:
-        from app.ai.groq_agent import run_groq_predictions
-        return run_groq_predictions(match_date=match_date, limit=limit)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
 @router.get("/ai/status")
 def get_ai_status():
     """Check whether the router-backed AI providers are configured and available."""
@@ -424,55 +403,4 @@ def get_ai_status():
             "message": "AI router ready" if available else "Set OPENROUTER_API_KEY in .env to enable AI routing",
         }
     except Exception as e:
-        return {"status": "error", "groq_available": False, "detail": str(e)}
-
-
-# ── Ollama local LLM endpoints ────────────────────────────────────────────────
-# Requires Ollama running locally. Pull models:
-#   ollama pull qwen3:8b
-#   ollama pull openrouter
-
-@router.post("/ollama/predict")
-def post_ollama_predictions(
-    match_date: Optional[str] = None,
-    limit: int = Query(default=20, ge=1, le=100),
-    model: str = Query(default="qwen3:8b"),
-):
-    """
-    Run Ollama local LLM predictions over today's enriched matches.
-    Supported models: qwen3:8b (Best Overall), openrouter (Best Reasoning).
-    Requires Ollama running locally.
-    """
-    try:
-        from app.ai.ollama_agent import run_ollama_predictions
-        return run_ollama_predictions(match_date=match_date, limit=limit, model=model)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@router.get("/ollama/status")
-def get_ollama_status():
-    """Check if Ollama is running and which models are available."""
-    try:
-        from app.ai.ollama_agent import is_ollama_available, OLLAMA_MODELS
-        from app.ai.ollama_model_manager import get_model_status, is_model_loaded
-        reachable = is_ollama_available()
-        model_status = {}
-        if reachable:
-            for model in OLLAMA_MODELS:
-                info = OLLAMA_MODELS[model]
-                model_status[model] = {
-                    **info,
-                    "available": is_ollama_available(model),
-                    "resident": is_model_loaded(model),
-                    "pull_command": f"ollama pull {model}",
-                }
-        return {
-            "status": "success",
-            "ollama_running": reachable,
-            "message": "Ollama ready" if reachable else "Ollama not running. Start with: ollama serve",
-            "models": model_status,
-            "model_manager": get_model_status(),
-        }
-    except Exception as e:
-        return {"status": "error", "ollama_running": False, "detail": str(e)}
+        return {"status": "error", "ai_available": False, "detail": str(e)}

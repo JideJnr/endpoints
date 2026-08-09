@@ -1178,7 +1178,7 @@ def get_team_performance_notes_endpoint(
 
 @router.get("/competition-special/{competition_key}/analysis/latest")
 def get_competition_analysis_latest(competition_key: str):
-    """Most recent post-matchday Ollama analysis for a competition."""
+    """Most recent post-matchday LLM analysis for a competition."""
     import sqlite3
     from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
     from app.storage.db import DB_PATH
@@ -1224,7 +1224,7 @@ def get_competition_analysis_history(
 
 @router.post("/competition-special/{competition_key}/analysis/trigger")
 def trigger_competition_analysis(competition_key: str):
-    """Manually trigger post-matchday Ollama analysis for a competition."""
+    """Manually trigger post-matchday LLM analysis for a competition."""
     from app.competition.competition_analyser import run_competition_analysis
 
     return run_competition_analysis(competition_key)
@@ -2357,7 +2357,7 @@ def predict_single_match(
             source="manual_deterministic",
             attach_brain=False,
             allow_repeat=allow_repeat,
-            use_ollama_pipeline=False,
+            use_llm_pipeline=False,
         )
     except HTTPException:
         raise
@@ -2478,7 +2478,7 @@ def analyze_match_with_ai(sportybet_id: str):
         source="manual_ai_prediction",
         attach_brain=True,
         allow_repeat=True,
-        use_ollama_pipeline=True,
+        use_llm_pipeline=True,
     )
     if state.get("status") not in {"predicted", "success"} and not state.get("prediction"):
         raise HTTPException(status_code=503, detail=state.get("message") or "AI analysis is unavailable")
@@ -2499,7 +2499,7 @@ def analyze_match_with_ai(sportybet_id: str):
 @router.get("/matches/{sportybet_id}/ai-analysis-all")
 def get_all_ai_analyses(sportybet_id: str):
     """
-    Return all stored AI analyses for a match: Groq + Ollama (qwen3:8b + openrouter).
+    Return all stored AI analyses for a match.
     Runs nothing — only returns what has already been computed and persisted.
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
@@ -2507,20 +2507,20 @@ def get_all_ai_analyses(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in the buffer")
 
-    groq_analysis = doc.get("ai_analysis")
-    ollama_analysis = doc.get("ai_analysis_ollama")
+    llm_analysis = doc.get("ai_analysis")
+    llm_analysis_secondary = doc.get("ai_analysis_ollama")
 
     providers: dict[str, Any] = {}
-    if groq_analysis:
-        providers["groq"] = {
-            "label": "Groq (llama-3.3-70b)",
-            "emoji": "⚡",
+    if llm_analysis:
+        providers["llm_router"] = {
+            "label": "LLM Router",
+            "emoji": "🧠",
             "role": "Cloud LLM — fast, high-quality reasoning",
-            **groq_analysis,
+            **llm_analysis,
         }
-    if ollama_analysis:
-        for model_key, model_result in (ollama_analysis.get("models") or {}).items():
-            providers[f"ollama_{model_key.replace(':', '_').replace('.', '_')}"] = model_result
+    if llm_analysis_secondary:
+        for model_key, model_result in (llm_analysis_secondary.get("models") or {}).items():
+            providers[f"llm_{model_key.replace(':', '_').replace('.', '_')}"] = model_result
 
     # Build overall consensus across all providers
     all_predictions = [
@@ -2541,8 +2541,8 @@ def get_all_ai_analyses(sportybet_id: str):
         "overall_consensus": overall_consensus,
         "consensus_reached": overall_consensus is not None,
         "provider_count": len(providers),
-        "ollama_consensus": ollama_analysis.get("consensus") if ollama_analysis else None,
-        "ollama_consensus_reached": (ollama_analysis or {}).get("consensus_reached", False),
+        "llm_consensus": llm_analysis_2.get("consensus") if llm_analysis_2 else None,
+        "llm_consensus_reached": (llm_analysis_2 or {}).get("consensus_reached", False),
     }
 
 
@@ -2551,7 +2551,6 @@ def analyze_match_snapshot(sportybet_id: str):
     """
     Full AI analysis of a finished match snapshot.
     Used after grading to see if the prediction was correct and how the match fared.
-    Tries Groq first, falls back to Ollama if Groq is unavailable.
     """
     sportybet_id = _resolve_buffer_match_id(sportybet_id)
 
@@ -2563,26 +2562,26 @@ def analyze_match_snapshot(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Match not found in buffer or archive")
 
-    from app.ai.groq_agent import run_groq_match_analysis
-    from app.ai.ollama_agent import run_ollama_all_models
+    from app.ai.llm_analysis import run_llm_match_analysis
+    from app.ai.llm_agent import run_llm_all_models
 
     # Run the router-backed AI analysis first
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+    analysis = run_llm_match_analysis(doc)
+    if analysis.get("status") not in {"ai_unavailable", "agent_build_failed", "error"}:
         analysis["provider"] = analysis.get("provider") or "openrouter"
         analysis["fallback"] = None
         doc["ai_analysis"] = analysis
         store_enriched(sportybet_id, doc)
         return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": analysis["provider"]}
 
-    # Fall back to Ollama
-    ollama_result = run_ollama_all_models(doc)
-    if ollama_result.get("status") == "success":
-        ollama_result["provider"] = "ollama"
-        ollama_result["fallback"] = "groq_unavailable"
-        doc["ai_analysis_ollama"] = ollama_result
+    # Fall back to secondary LLM
+    llm_result = run_llm_all_models(doc)
+    if llm_result.get("status") == "success":
+        llm_result["provider"] = "llm"
+        llm_result["fallback"] = "router_unavailable"
+        doc["ai_analysis_ollama"] = llm_result
         store_enriched(sportybet_id, doc)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": llm_result, "provider": "llm", "fallback": "router_unavailable"}
 
     raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
 
@@ -2601,8 +2600,8 @@ def analyze_graded_match(sportybet_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Finished match not found")
 
-    from app.ai.groq_agent import run_groq_match_analysis
-    from app.ai.ollama_agent import run_ollama_all_models
+    from app.ai.llm_analysis import run_llm_match_analysis
+    from app.ai.llm_agent import run_llm_all_models
 
     # Add grading result context to the document
     prediction = doc.get("prediction")
@@ -2614,8 +2613,8 @@ def analyze_graded_match(sportybet_id: str):
         }
 
     # Run the router-backed AI analysis first
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+    analysis = run_llm_match_analysis(doc)
+    if analysis.get("status") not in {"ai_unavailable", "agent_build_failed", "error"}:
         analysis["provider"] = analysis.get("provider") or "openrouter"
         analysis["fallback"] = None
         analysis["graded_result"] = doc.get("_grading_result")
@@ -2624,16 +2623,16 @@ def analyze_graded_match(sportybet_id: str):
         _observe_team_watchers_after_analysis(doc, analysis)
         return {"status": "success", "sportybet_id": sportybet_id, "analysis": analysis, "provider": analysis["provider"]}
 
-    # Fall back to Ollama
-    ollama_result = run_ollama_all_models(doc)
-    if ollama_result.get("status") == "success":
-        ollama_result["provider"] = "ollama"
-        ollama_result["fallback"] = "groq_unavailable"
-        ollama_result["graded_result"] = doc.get("_grading_result")
-        doc["ai_analysis_ollama"] = ollama_result
+    # Fall back to secondary LLM
+    llm_result = run_llm_all_models(doc)
+    if llm_result.get("status") == "success":
+        llm_result["provider"] = "llm"
+        llm_result["fallback"] = "router_unavailable"
+        llm_result["graded_result"] = doc.get("_grading_result")
+        doc["ai_analysis_ollama"] = llm_result
         store_enriched(sportybet_id, doc)
-        _observe_team_watchers_after_analysis(doc, ollama_result)
-        return {"status": "success", "sportybet_id": sportybet_id, "analysis": ollama_result, "provider": "ollama", "fallback": "groq_unavailable"}
+        _observe_team_watchers_after_analysis(doc, llm_result)
+        return {"status": "success", "sportybet_id": sportybet_id, "analysis": llm_result, "provider": "llm", "fallback": "router_unavailable"}
 
     raise HTTPException(status_code=503, detail=analysis.get("message") or "AI analysis is unavailable")
 
@@ -2643,8 +2642,8 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
     Run AI analysis on a graded match to see what happened and if the prediction was correct.
     Tries the router-backed OpenRouter path first, then falls back if needed.
     """
-    from app.ai.groq_agent import run_groq_match_analysis
-    from app.ai.ollama_agent import run_ollama_all_models
+    from app.ai.llm_analysis import run_llm_match_analysis
+    from app.ai.llm_agent import run_llm_all_models
 
     prediction = doc.get("prediction")
     if prediction:
@@ -2654,8 +2653,8 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
             "prediction_type": prediction.get("type") or prediction.get("pick_type"),
         }
 
-    analysis = run_groq_match_analysis(doc)
-    if analysis.get("status") not in {"groq_unavailable", "agent_build_failed", "error"}:
+    analysis = run_llm_match_analysis(doc)
+    if analysis.get("status") not in {"ai_unavailable", "agent_build_failed", "error"}:
         analysis["provider"] = analysis.get("provider") or "openrouter"
         analysis["fallback"] = None
         analysis["graded_result"] = doc.get("_grading_result")
@@ -2664,15 +2663,15 @@ def _run_ai_analysis_on_graded_match(doc: dict[str, Any]) -> dict[str, Any] | No
         _observe_team_watchers_after_analysis(doc, analysis)
         return analysis
 
-    ollama_result = run_ollama_all_models(doc)
-    if ollama_result.get("status") == "success":
-        ollama_result["provider"] = "ollama"
-        ollama_result["fallback"] = "groq_unavailable"
-        ollama_result["graded_result"] = doc.get("_grading_result")
-        doc["ai_analysis_ollama"] = ollama_result
+    llm_result = run_llm_all_models(doc)
+    if llm_result.get("status") == "success":
+        llm_result["provider"] = "llm"
+        llm_result["fallback"] = "router_unavailable"
+        llm_result["graded_result"] = doc.get("_grading_result")
+        doc["ai_analysis_ollama"] = llm_result
         store_enriched(str(doc.get("_id") or doc.get("sportybet_id") or ""), doc)
-        _observe_team_watchers_after_analysis(doc, ollama_result)
-        return ollama_result
+        _observe_team_watchers_after_analysis(doc, llm_result)
+        return llm_result
 
     return None
 
@@ -3268,7 +3267,7 @@ def get_brain_league_profile(league_name: str):
 def get_brain_model_weights():
     """
     Return the current auto-tuned ensemble model weights.
-    Shows how much each model (Poisson, Dixon-Coles, ELO, Rules, Groq)
+    Shows how much each model (Poisson, Dixon-Coles, ELO, Rules, LLM)
     has been adjusted based on historical accuracy.
     """
     from app.monitoring.self_learner import get_learned_weights
@@ -3317,7 +3316,7 @@ def get_brain_health():
 
     try:
         weights = get_learned_weights()
-        defaults = {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "groq": 0.10}
+        defaults = {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "llm": 0.10}
         health["ensemble_weights"] = {
             "status": "ok",
             "weights": weights,

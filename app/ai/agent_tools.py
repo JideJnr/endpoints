@@ -4,7 +4,7 @@ LangChain Agent Tools
 Ported from migrated predictz/tools.py.
 These are the tools the LangChain prediction agent can call during reasoning.
 
-Requires: langchain, langchain-groq, GROQ_API_KEY
+Requires: langchain, openrouter API key
 """
 from __future__ import annotations
 

@@ -1,15 +1,15 @@
 """
-Groq LangChain Prediction Agent
+LLM Prediction Analysis Agent
 ---------------------------------
 Ported from migrated predictz/agent.py.
-Full 10-step reasoning agent using llama-3.3-70b-versatile via Groq.
+Full match analysis using OpenRouter cloud inference.
 
 This is an OPTIONAL enhancement on top of the existing rules-based prediction_agent.py.
-Falls back gracefully if GROQ_API_KEY is not set.
+Falls back gracefully if OPENROUTER_API_KEY is not set.
 
 Usage:
-    from app.ai.groq_agent import run_groq_predictions
-    results = run_groq_predictions(match_date="2026-05-16", docs=enriched_docs)
+    from app.ai.llm_analysis import run_llm_predictions
+    results = run_llm_predictions(match_date="2026-05-16", docs=enriched_docs)
 """
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ def _build_agent():
 
 def _summarise_doc(doc: dict[str, Any]) -> str:
     """
-    Distil an enriched match doc into a tight summary for Groq.
+    Distil an enriched match doc into a tight summary for LLM analysis.
     Hard target: < 800 tokens total. No JSON blobs, no full history arrays.
     """
     detail = doc.get("sofascore_detail") or {}
@@ -247,7 +247,7 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
         parsed = json.loads(raw.strip())
         parsed["sportybet_id"] = doc.get("sportybet_id")
         parsed["match_id"] = doc.get("sportybet_id")
-        parsed["source"] = "groq_agent"
+        parsed["source"] = "llm_analysis"
         return parsed
     except Exception as exc:
         return {
@@ -255,16 +255,16 @@ def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
             "sportybet_id": doc.get("sportybet_id"),
             "status": "error",
             "error": str(exc),
-            "source": "groq_agent",
+            "source": "llm_analysis",
         }
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
+def run_llm_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     """
     Run a match analysis for one enriched document.
-    Routes through AIRouter with OpenRouter first, then Groq as fallback.
+    Routes through AIRouter with OpenRouter first, then falls back as needed.
     """
     from app.ai.ai_router import get_router, parse_json_response
 
@@ -275,12 +275,12 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     # Try small-context pipeline first if available
     if router.is_pipeline_available():
         try:
-            from app.ai.ollama_pipeline import run_ollama_pipeline
-            pipeline_result = run_ollama_pipeline(doc, attach_brain=False)
+            from app.ai.llm_pipeline import run_llm_pipeline
+            pipeline_result = run_llm_pipeline(doc, attach_brain=False)
             if pipeline_result.get("status") == "predicted":
                 return pipeline_result
         except Exception as exc:
-            logger.warning("groq_agent: pipeline failed, falling back to single-call: %s", exc)
+            logger.warning("llm_analysis: pipeline failed, falling back to single-call: %s", exc)
 
     try:
         from app.competition.competition_special import apply_known_competition_context
@@ -305,7 +305,7 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
 
     status_info = router.status()
     active_model = status_info.get("primary_model") or "openrouter/free"
-    active_provider = router.last_provider() or ("openrouter" if status_info.get("primary_model") else "groq")
+    active_provider = router.last_provider() or ("openrouter" if status_info.get("primary_model") else "llm")
 
     return {
         "status": result.get("status") or "predicted",
@@ -324,13 +324,13 @@ def run_groq_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_groq_predictions(
+def run_llm_predictions(
     match_date: str | None = None,
     docs: list[dict[str, Any]] | None = None,
     limit: int = 50,
 ) -> dict[str, Any]:
     """
-    Run the Groq LangChain agent over enriched match documents.
+    Run the LLM analysis agent over enriched match documents.
 
     Args:
         match_date: YYYY-MM-DD, defaults to today
@@ -354,7 +354,7 @@ def run_groq_predictions(
         return {"status": "no_matches", "date": target_date, "predictions": []}
 
     docs = docs[:limit]
-    print(f"[groq_agent] predicting {len(docs)} matches for {target_date}")
+    print(f"[llm_analysis] predicting {len(docs)} matches for {target_date}")
 
     try:
         executor = _build_agent()
@@ -367,7 +367,7 @@ def run_groq_predictions(
 
     for i, doc in enumerate(docs, 1):
         name = doc.get("sportybet_name") or doc.get("name") or "unknown"
-        print(f"[groq_agent] [{i}/{len(docs)}] {name}")
+        print(f"[llm_analysis] [{i}/{len(docs)}] {name}")
         pred = _predict_one(executor, doc)
         predictions.append(pred)
 
@@ -379,7 +379,7 @@ def run_groq_predictions(
                     **pred,
                     "match_id": str(doc.get("sportybet_id") or ""),
                     "match_date": target_date,
-                    "source": "groq_agent",
+                    "source": "llm_analysis",
                 })
             except Exception:
                 pass
@@ -396,4 +396,3 @@ def run_groq_predictions(
         "value_bets": value_bets,
         "predictions": predictions,
     }
-

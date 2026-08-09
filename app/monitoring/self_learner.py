@@ -456,7 +456,7 @@ def get_learned_weights() -> dict[str, float]:
 
     if not rows:
         # Return hardcoded defaults
-        return {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "groq": 0.10}
+        return {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "llm": 0.10}
 
     weights = {row["model_name"]: float(row["learned_weight"]) for row in rows}
     # Normalise so weights sum to 1.0
@@ -968,7 +968,7 @@ def _incorporate_ai_analysis(conn: sqlite3.Connection, graded_rows: list) -> int
             # If AI is more confident than our prediction, boost the model
             # If AI is less confident, suppress the model
             if abs(confidence_gap) > 0.1:
-                model_name = "groq" if doc.get("ai_analysis") else "ollama"
+                model_name = "llm"
                 try:
                     conn.execute("""
                         update learned_model_weights

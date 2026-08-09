@@ -70,14 +70,75 @@ def _ensure_buffer_column(conn: sqlite3.Connection, table: str, column: str, ddl
 
 
 def _buffer_table_for(match_date: str | None, is_live: int = 0) -> str:
-    """Hot buffer keeps live/today/tomorrow. Later fixtures live in a lower-priority buffer."""
-    if is_live:
-        return "match_buffer"
-    tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
-    return "future_match_buffer" if match_date and match_date > tomorrow else "match_buffer"
+    """Always returns match_buffer — single buffer model."""
+    return "match_buffer"
 
 
 # ── Phase 1: Ingest ───────────────────────────────────────────────────────────
+
+def ingest_competition_match(event: dict[str, Any], match_date: str, competition_key: str) -> bool:
+    """
+    Insert a SofaScore-only competition match into match_buffer.
+    Uses match_id = sofascore:{event_id} so it never collides with SportyBet rows.
+    When SportyBet later ingests the same fixture, ingest_matches merges them by sofascore_id.
+    Returns True if a new row was inserted.
+    """
+    sofa_id = str(event.get("id") or "")
+    if not sofa_id:
+        return False
+    match_id = f"sofascore:{sofa_id}"
+    _init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    status = event.get("status") or {}
+    score = event.get("score") or {}
+    state = classify_match_state({
+        "period": status.get("description") or status.get("type") or "Not start",
+        "start_time": int((event.get("start_timestamp") or 0) * 1000),
+        "score": score,
+    })
+    is_live = 1 if state.get("is_live") else 0
+    is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
+    if is_finished:
+        return False
+    with _conn() as conn:
+        exists = conn.execute("select 1 from match_buffer where match_id = ?", (match_id,)).fetchone()
+        conn.execute(
+            """
+            insert into match_buffer (
+                match_id, match_date, tournament, category, name, start_time, period,
+                score_home, score_away, is_live, is_finished, ingested_at,
+                data_source, sofascore_id, sofascore_only, raw_sporty
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            on conflict(match_id) do update set
+                match_date   = excluded.match_date,
+                tournament   = excluded.tournament,
+                name         = excluded.name,
+                start_time   = excluded.start_time,
+                period       = excluded.period,
+                score_home   = excluded.score_home,
+                score_away   = excluded.score_away,
+                is_live      = excluded.is_live,
+                is_finished  = excluded.is_finished,
+                ingested_at  = excluded.ingested_at,
+                raw_sporty   = excluded.raw_sporty
+            """,
+            (
+                match_id, match_date,
+                (event.get("tournament") or {}).get("name"),
+                (event.get("tournament") or {}).get("category", {}).get("name") if isinstance((event.get("tournament") or {}).get("category"), dict) else None,
+                event.get("name"),
+                int((event.get("start_timestamp") or 0) * 1000),
+                status.get("description") or status.get("type") or "Not start",
+                str(score.get("home") or ""), str(score.get("away") or ""),
+                is_live, is_finished, now,
+                "sofascore", sofa_id,
+                json.dumps(event),
+            ),
+        )
+        conn.commit()
+    return not exists
+
 
 def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     """
@@ -107,54 +168,85 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             is_live = 1 if state.get("is_live") else 0
             is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
 
-            # finished matches are handled by patch_live_scores on transition — skip here
             if is_finished:
                 continue
-
-            # Reject matches dated before today that are not currently live
-            # SportyBet sometimes keeps old fixtures in the upcoming feed indefinitely
             if match_date < today and not is_live:
                 continue
-
-            # kick-off time passed 2+ hours ago and still not live — ghost/postponed, skip
             if _is_ghost_match(m.get("start_time"), period):
                 continue
 
-            table = _buffer_table_for(match_date, is_live)
-            other_table = "future_match_buffer" if table == "match_buffer" else "match_buffer"
-            conn.execute(f"delete from {other_table} where match_id = ?", (match_id,))
+            # Check if a SofaScore-only row already exists for this fixture.
+            # Match by sofascore_id if we have it, otherwise by name+date.
+            # If found, merge: adopt the sofascore row's match_id and attach sporty data.
+            sofa_match_id: str | None = None
+            sofa_row = None
+            sporty_sofa_id = str(m.get("sofascore_id") or "")
+            if sporty_sofa_id:
+                sofa_row = conn.execute(
+                    "select match_id from match_buffer where sofascore_id = ? and sofascore_only = 1",
+                    (sporty_sofa_id,),
+                ).fetchone()
+                if sofa_row:
+                    sofa_match_id = sofa_row[0]
 
-            # only count genuinely new rows
+            if sofa_match_id:
+                # Merge: update the existing SofaScore-only row with SportyBet data
+                conn.execute(
+                    """
+                    update match_buffer set
+                        sportybet_id  = ?,
+                        data_source   = 'both',
+                        sofascore_only = 0,
+                        period        = ?,
+                        score_home    = ?,
+                        score_away    = ?,
+                        is_live       = ?,
+                        is_finished   = ?,
+                        ingested_at   = ?,
+                        raw_sporty    = ?
+                    where match_id = ?
+                    """,
+                    (
+                        match_id, period,
+                        str(score.get("home") or ""), str(score.get("away") or ""),
+                        is_live, is_finished, now, json.dumps(m),
+                        sofa_match_id,
+                    ),
+                )
+                _sync_enriched_sporty_fields(conn, "match_buffer", sofa_match_id, m, match_date, is_live, is_finished)
+                count += 1
+                continue
+
             exists = conn.execute(
-                f"select 1 from {table} where match_id = ?", (match_id,)
+                "select 1 from match_buffer where match_id = ?", (match_id,)
             ).fetchone()
 
             conn.execute(
-                f"""
-                insert into {table} (
+                """
+                insert into match_buffer (
                     match_id, match_date, tournament, category, name,
                     start_time, period, score_home, score_away,
                     is_live, is_finished, ingested_at, data_source, sportybet_id, raw_sporty
                 )
                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(match_id) do update set
-                    match_date  = excluded.match_date,
-                    tournament  = excluded.tournament,
-                    category    = excluded.category,
-                    name        = excluded.name,
-                    start_time  = excluded.start_time,
-                    period      = excluded.period,
-                    score_home  = excluded.score_home,
-                    score_away  = excluded.score_away,
-                    is_live     = excluded.is_live,
-                    is_finished = excluded.is_finished,
-                    data_source = case
-                        when {table}.sofascore_id is not null then 'both'
+                    match_date   = excluded.match_date,
+                    tournament   = excluded.tournament,
+                    category     = excluded.category,
+                    name         = excluded.name,
+                    start_time   = excluded.start_time,
+                    period       = excluded.period,
+                    score_home   = excluded.score_home,
+                    score_away   = excluded.score_away,
+                    is_live      = excluded.is_live,
+                    is_finished  = excluded.is_finished,
+                    data_source  = case
+                        when match_buffer.sofascore_id is not null then 'both'
                         else excluded.data_source
                     end,
                     sportybet_id = excluded.sportybet_id,
-                    raw_sporty  = excluded.raw_sporty,
-                    ingested_at = excluded.ingested_at
+                    raw_sporty   = excluded.raw_sporty,
+                    ingested_at  = excluded.ingested_at
                 """,
                 (
                     match_id, match_date,
@@ -164,7 +256,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                     is_live, is_finished, now, "sportybet", match_id, json.dumps(m),
                 ),
             )
-            _sync_enriched_sporty_fields(conn, table, match_id, m, match_date, is_live, is_finished)
+            _sync_enriched_sporty_fields(conn, "match_buffer", match_id, m, match_date, is_live, is_finished)
             if not exists:
                 count += 1
         conn.commit()
@@ -390,7 +482,7 @@ def get_unenriched_batch(
               )
         """
         query = f"""
-            select match_id, raw_sporty, raw_enriched, is_live, match_date, ? as source_table
+            select match_id, raw_sporty, raw_enriched, is_live, match_date
             from {{table}}
             where is_finished = 0
               and (start_time is null or cast(start_time as real) >= ?)
@@ -403,14 +495,12 @@ def get_unenriched_batch(
               )
               and {retry_clause}
         """
-        rows = []
-        if not future_only:
-            hot_params = (
+        hot_params = (
                 ("match_buffer", cutoff_ts_ms, today, tomorrow, limit)
                 if force_live_retry
                 else ("match_buffer", cutoff_ts_ms, now_ts, today, tomorrow, limit)
             )
-            rows = conn.execute(
+        rows = conn.execute(
                 (query.format(table="match_buffer") + """
                 order by
                   is_live desc,
@@ -435,29 +525,14 @@ def get_unenriched_batch(
                 """),
                 hot_params,
             ).fetchall()
-        if (future_only or len(rows) < limit) and not live_only:
-            future_params = (
-                ("future_match_buffer", cutoff_ts_ms, limit - len(rows))
-                if force_live_retry
-                else ("future_match_buffer", cutoff_ts_ms, now_ts, limit - len(rows))
-            )
-            future_rows = conn.execute(
-                (query.format(table="future_match_buffer") + """
-                order by
-                  case when enriched_at is null then 0 else 1 end asc,
-                  start_time asc
-                limit ?
-                """),
-                future_params,
-            ).fetchall()
-            rows = list(rows) + list(future_rows)
+
     return [
         {
             "match_id": row["match_id"],
             "is_live": bool(row["is_live"]),
             "match_date": row["match_date"],
-            "source_table": row["source_table"],
-            "sporty": json.loads(row["raw_sporty"]),
+            "source_table": "match_buffer",
+            "sporty": json.loads(row["raw_sporty"]) if row["raw_sporty"] else {},
             "existing": json.loads(row["raw_enriched"]) if row["raw_enriched"] else None,
         }
         for row in rows
@@ -470,19 +545,15 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
         _init_buffer_table(conn)
-        table = "match_buffer"
         row = conn.execute("select raw_sporty, raw_enriched from match_buffer where match_id = ?", (match_id,)).fetchone()
-        if not row:
-            table = "future_match_buffer"
-            row = conn.execute("select raw_sporty, raw_enriched from future_match_buffer where match_id = ?", (match_id,)).fetchone()
         if row:
             raw_sporty = json.loads(row[0]) if row[0] else {}
             existing = json.loads(row[1]) if row[1] else {}
             doc = _merge_enriched(raw_sporty, existing, doc)
         doc = enrich_match_facts(doc)
         conn.execute(
-            f"""
-            update {table} set
+            """
+            update match_buffer set
                 enriched_at  = ?,
                 data_source  = ?,
                 sportybet_id = ?,
@@ -506,6 +577,11 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     sofa_id = str(doc.get("sofascore_id") or "")
     if sofa_id:
         _update_team_watcher_sofa_ids(match_id, doc)
+        try:
+            from app.competition.competition_special import sort_enriched_doc_into_competition
+            sort_enriched_doc_into_competition(doc)
+        except Exception:
+            pass
 
 
 def _update_team_watcher_sofa_ids(match_id: str, doc: dict[str, Any]) -> None:
@@ -533,26 +609,16 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
         if match_date:
             clauses.append("match_date = ?")
             params.append(match_date)
-        hot_rows = conn.execute(
+        rows = conn.execute(
             f"""
-            select raw_enriched, raw_sporty, is_live, enriched_at, match_date, 0 as future_priority, start_time
+            select raw_enriched, raw_sporty, is_live, enriched_at, match_date, start_time
             from match_buffer
             where {" and ".join(clauses)}
+            order by is_live desc, start_time asc
+            limit ?
             """,
-            tuple(params),
+            tuple(params) + (limit,),
         ).fetchall()
-        future_rows = conn.execute(
-            f"""
-            select raw_enriched, raw_sporty, is_live, enriched_at, match_date, 1 as future_priority, start_time
-            from future_match_buffer
-            where {" and ".join(clauses)}
-            """,
-            tuple(params),
-        ).fetchall()
-        rows = sorted(
-            list(hot_rows) + list(future_rows),
-            key=lambda row: (row["future_priority"], -int(row["is_live"] or 0), int(row["start_time"] or 0)),
-        )[:limit]
 
     result = []
     for row in rows:
@@ -579,12 +645,6 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
         for lookup_id in lookup_ids:
             row = conn.execute(
                 "select raw_enriched, raw_sporty, match_date from match_buffer where match_id = ?",
-                (lookup_id,),
-            ).fetchone()
-            if row:
-                break
-            row = conn.execute(
-                "select raw_enriched, raw_sporty, match_date from future_match_buffer where match_id = ?",
                 (lookup_id,),
             ).fetchone()
             if row:
@@ -841,11 +901,9 @@ def get_buffer_stats() -> dict[str, Any]:
     with _conn() as conn:
         _init_buffer_table(conn)
         total       = conn.execute("select count(*) from match_buffer").fetchone()[0]
-        future_total = conn.execute("select count(*) from future_match_buffer").fetchone()[0]
         today_count = conn.execute("select count(*) from match_buffer where match_date = ?", (today,)).fetchone()[0]
         live_count  = conn.execute("select count(*) from match_buffer where is_live = 1").fetchone()[0]
         enriched    = conn.execute("select count(*) from match_buffer where enriched_at is not null").fetchone()[0]
-        future_enriched = conn.execute("select count(*) from future_match_buffer where enriched_at is not null").fetchone()[0]
         pending     = conn.execute(
             """
             select count(*) from match_buffer
@@ -861,21 +919,7 @@ def get_buffer_stats() -> dict[str, Any]:
               )
             """
         ).fetchone()[0]
-        future_pending = conn.execute(
-            """
-            select count(*) from future_match_buffer
-            where is_finished = 0 and (
-                enriched_at is null
-                or sofascore_id is null
-                or sofascore_id = ''
-            )
-              and (
-                json_extract(raw_enriched, '$.sofascore_match_status') is null
-                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
-                or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= strftime('%s','now')
-              )
-            """
-        ).fetchone()[0]
+
         last_ingest = conn.execute("select max(ingested_at) from match_buffer").fetchone()[0]
         last_enrich = conn.execute("select max(enriched_at) from match_buffer").fetchone()[0]
         no_sofa_match = conn.execute(
@@ -928,30 +972,28 @@ def get_buffer_stats() -> dict[str, Any]:
         ).fetchone()[0]
 
     return {
-        "total_buffered": total + future_total,
+        "total_buffered": total,
         "visible_buffered": total,
         "hot_buffered": total,
-        "future_buffered": future_total,
+        "future_buffered": 0,
         "today": today_count,
         "live": live_count,
         "upcoming": hot_upcoming,
-        "enriched": enriched + future_enriched,
+        "enriched": enriched,
         "hot_enriched": enriched,
-        "future_enriched": future_enriched,
-        # Legacy field kept for callers, but now intentionally excludes the
-        # low-priority future queue so it no longer looks like an urgent fault.
+        "future_enriched": 0,
         "pending_enrichment": pending,
         "hot_pending_enrichment": pending,
-        "future_pending_enrichment": future_pending,
+        "future_pending_enrichment": 0,
         "needs_enrichment": needs_enrichment,
         "no_sofa_match": no_sofa_match,
         "ready": ready,
         "deferred": deferred,
         "stale_live": stale_live,
-        "future_queued": future_total,
+        "future_queued": 0,
         "queue_labels": {
             "upcoming": hot_upcoming,
-            "future_queued": future_total,
+            "future_queued": 0,
             "needs_enrichment": needs_enrichment,
             "no_sofa_match": no_sofa_match,
             "ready": ready,
@@ -1398,7 +1440,7 @@ def run_enrichment_worker(
             state = apply_prediction_state(
                 doc,
                 match_id=str(item.get("match_id") or ""),
-                use_ollama_pipeline=False,
+                use_llm_pipeline=False,
                 attach_brain=False,
             )
             readiness = state.get("readiness") or {}
@@ -1719,7 +1761,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
             state = apply_prediction_state(
                 doc,
                 match_id=str(item.get("match_id") or ""),
-                use_ollama_pipeline=False,
+                use_llm_pipeline=False,
                 attach_brain=False,
             )
             readiness = state.get("readiness") or {}
@@ -2099,10 +2141,8 @@ def _mark_missing_from_sporty(match_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
         _init_buffer_table(conn)
-        for table in ("match_buffer", "future_match_buffer"):
-            row = conn.execute(f"select raw_enriched from {table} where match_id = ?", (str(match_id),)).fetchone()
-            if not row or not row[0]:
-                continue
+        row = conn.execute("select raw_enriched from match_buffer where match_id = ?", (str(match_id),)).fetchone()
+        if row and row[0]:
             try:
                 doc = json.loads(row[0])
             except Exception:
@@ -2116,7 +2156,7 @@ def _mark_missing_from_sporty(match_id: str) -> None:
                 doc.get("sportradar_detail"),
             )
             doc["sporty_missing_at"] = now
-            conn.execute(f"update {table} set raw_enriched = ? where match_id = ?", (json.dumps(doc), str(match_id)))
+            conn.execute("update match_buffer set raw_enriched = ? where match_id = ?", (json.dumps(doc), str(match_id)))
         conn.commit()
 
 

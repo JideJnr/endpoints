@@ -119,15 +119,15 @@ class AIRouter:
         Full small-context multi-stage OpenRouter pipeline prediction.
         Returns a prediction dict (not just text) with specialist results.
         """
-        from app.ai.ollama_pipeline import run_ollama_pipeline
-        return run_ollama_pipeline(doc, attach_brain=True)
+        from app.ai.llm_pipeline import run_llm_pipeline
+        return run_llm_pipeline(doc, attach_brain=True)
 
     def call_pipeline_batch(self, docs: list[dict[str, Any]], limit: int = 50) -> dict[str, Any]:
         """
         Batch small-context pipeline predictions.
         """
-        from app.ai.ollama_pipeline import run_ollama_pipeline_batch
-        return run_ollama_pipeline_batch(docs, limit=limit, attach_brain=True)
+        from app.ai.llm_pipeline import run_llm_pipeline_batch
+        return run_llm_pipeline_batch(docs, limit=limit, attach_brain=True)
 
     # ── Availability helpers ───────────────────────────────────────────────
 
@@ -270,14 +270,14 @@ class AIRouter:
     # ── Provider calls ─────────────────────────────────────────────────────
 
     def _call_openrouter(self, model: str, prompt: str, timeout: int) -> str:
-        from app.ai.ollama_agent import _call_llm
+        from app.ai.llm_agent import _call_llm
         return _call_llm(model, prompt, timeout=timeout)
 
     @staticmethod
     def _check_openrouter(model: str) -> bool:
         try:
-            from app.ai.ollama_agent import is_ollama_available
-            return is_ollama_available(model)
+            from app.ai.llm_agent import is_llm_available
+            return is_llm_available(model)
         except Exception:
             return False
 

@@ -818,12 +818,12 @@ def _local_llm_plan_advice(
             raw = json.loads(resp.read().decode("utf-8") or "{}")
         return {
             "enabled": True,
-            "provider": "ollama_compatible",
+            "provider": "llm",
             "model": model,
             "advice": raw.get("response"),
         }
     except Exception as exc:
-        return {"enabled": False, "provider": "ollama_compatible", "error": str(exc)}
+        return {"enabled": False, "provider": "llm", "error": str(exc)}
 
 
 def _local_llm_context_advice(state: dict[str, Any]) -> dict[str, Any]:
@@ -868,14 +868,14 @@ def _local_llm_context_advice(state: dict[str, Any]) -> dict[str, Any]:
             raw = json.loads(resp.read().decode("utf-8") or "{}")
         return {
             "enabled": True,
-            "provider": "ollama_compatible",
+            "provider": "llm",
             "model": model,
             "advice": raw.get("response"),
         }
     except Exception as exc:
         return {
             "enabled": False,
-            "provider": "ollama_compatible",
+            "provider": "llm",
             "error": str(exc),
             "deterministic_summary": _deterministic_context_summary(compact),
         }

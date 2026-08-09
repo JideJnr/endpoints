@@ -7,21 +7,21 @@ from urllib import error, request
 from app.config.config import get_settings
 
 
-DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
+DEFAULT_LLM_MODEL = "llama3.2:3b"
 DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 
 
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     AI supervisor with memory-aware reasoning.
-    Routes through AIRouter (qwen3 → openrouter → groq) then falls back to
+    Routes through AIRouter then falls back to
     deterministic rules when no model is available.
     """
     safe_detail = detail if isinstance(detail, dict) else {}
     match_context = _build_match_context(prediction, safe_detail)
     memory_context = _build_memory_context(prediction)
     prompt_payload = _compact_prediction(prediction, safe_detail, memory_context, match_context)
-    # Try AIRouter first (covers ollama + groq in one call)
+    # Try AIRouter first (covers all LLM providers in one call)
     from app.ai.ai_router import get_router
     if get_router().any_available():
         ai = _router_review(prompt_payload)
@@ -151,15 +151,13 @@ def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
 def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if provider in {"hf", "huggingface", "hugging-face"}:
         return _huggingface_review(payload)
-    if provider == "ollama":
-        return _router_review(payload)  # route through OpenRouter instead
-    if provider in {"groq", "auto"}:
+    if provider in {"llm", "auto"}:
         return _router_review(payload)
     return None
 
 
 def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Use AIRouter for supervisor review: qwen3 → openrouter → groq."""
+    """Use AIRouter for supervisor review."""
     from app.ai.ai_router import get_router, parse_json_safe
     try:
         messages = _review_messages(payload)
@@ -167,7 +165,7 @@ def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
         parsed = parse_json_safe(raw)
         if not parsed:
             return None
-        model = get_router().best_available() or "groq"
+        model = get_router().best_available() or "openrouter"
         return _review_result("ai_router", model, parsed)
     except Exception:
         return None

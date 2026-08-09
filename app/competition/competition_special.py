@@ -66,34 +66,53 @@ _CATALOGUE_BY_KEY = {entry["key"]: entry for entry in TOP_30_COMPETITIONS}
 def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
     """Attach competition-special intelligence to any ordinary match document.
 
-    This keeps manual match matching and Open Router analysis on the same known-league
-    footing as fixtures that entered through the dedicated competition lane.
+    Checks the TOP_30_COMPETITIONS catalogue first (fast, no DB), then falls
+    back to a DB lookup for dynamically tracked competitions discovered via ingest.
     """
     event = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else {}
     detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else {}
     tournament = event.get("tournament") if isinstance(event.get("tournament"), dict) else {}
-    tournament_id = tournament.get("tournament_id") or doc.get("unique_tournament_id")
+    tournament_id = tournament.get("id") or tournament.get("tournament_id") or doc.get("unique_tournament_id")
     name = str(tournament.get("name") or doc.get("tournament") or "")
-    entry = next((item for item in TOP_30_COMPETITIONS if str(item["unique_tournament_id"]) == str(tournament_id)), None)
-    if not entry:
-        normalized = _normalise_competition_name(name)
-        entry = next((item for item in TOP_30_COMPETITIONS if _normalise_competition_name(item["name"]) == normalized), None)
-    if not entry:
+
+    key: str | None = None
+    comp_name: str = name
+
+    if tournament_id is not None:
+        entry = next((item for item in TOP_30_COMPETITIONS if str(item["unique_tournament_id"]) == str(tournament_id)), None)
+        if entry:
+            key, comp_name = entry["key"], entry["name"]
+
+    if not key and tournament_id is not None:
+        try:
+            _init_db()
+            with db_conn(timeout=5) as conn:
+                init_competition_tables(conn)
+                row = conn.execute(
+                    "select key, name from competition_special_settings where unique_tournament_id = ? limit 1",
+                    (int(tournament_id),),
+                ).fetchone()
+            if row:
+                key, comp_name = row[0], row[1]
+        except Exception:
+            pass
+
+    if not key:
         doc["known_competition"] = {"known": False, "provider": "sofascore", "tournament": name or None}
         return doc
 
-    intelligence = _competition_intelligence_context(entry["key"], event, detail, doc)
+    intelligence = _competition_intelligence_context(key, event, detail, doc)
     context = {
         "known": True,
         "provider": "sofascore",
-        "key": entry["key"],
-        "name": entry["name"],
-        "unique_tournament_id": entry["unique_tournament_id"],
-        "importance": _match_importance_context(entry["key"], event),
+        "key": key,
+        "name": comp_name,
+        "unique_tournament_id": tournament_id,
+        "importance": _match_importance_context(key, event),
         "intelligence": intelligence,
     }
     doc["known_competition"] = context
-    doc["competition_special"] = {"key": entry["key"], "name": entry["name"], "source": "known_competition_match"}
+    doc["competition_special"] = {"key": key, "name": comp_name, "source": "known_competition_match"}
     doc["competition_intelligence"] = intelligence
     doc["competition_team_watchers"] = intelligence.get("team_watchers")
     doc["ai_team_watchers"] = intelligence.get("ai_team_watchers")
@@ -107,8 +126,16 @@ def _normalise_competition_name(value: str) -> str:
 
 
 def list_top_competitions() -> list[dict[str, Any]]:
-    """Return the complete curated catalogue with persisted enablement."""
-    return [get_competition_settings(entry["key"]) for entry in TOP_30_COMPETITIONS]
+    """Return all tracked competitions with persisted enablement (catalogue + dynamic)."""
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        init_competition_tables(conn)
+        _ensure_catalogue_settings(conn)
+        rows = conn.execute(
+            "select * from competition_special_settings order by enabled desc, name asc"
+        ).fetchall()
+    return [_settings_row(row) for row in rows]
 
 
 def _catalogue_default(key: str) -> dict[str, Any]:
@@ -192,13 +219,16 @@ def init_competition_tables(conn: sqlite3.Connection) -> None:
             raw_detail text,
             prediction_json text,
             importance_context_json text not null default '{}',
+            sportybet_match_id text,
             primary key (competition_key, match_id)
         )
         """
     )
     _ensure_column(conn, "competition_special_buffer", "importance_context_json", "text not null default '{}'")
+    _ensure_column(conn, "competition_special_buffer", "sportybet_match_id", "text")
     conn.execute("create index if not exists idx_comp_special_date on competition_special_buffer(competition_key, match_date)")
     conn.execute("create index if not exists idx_comp_special_start on competition_special_buffer(competition_key, start_time)")
+    conn.execute("create index if not exists idx_comp_special_sporty on competition_special_buffer(sportybet_match_id)")
     conn.execute(
         """
         create table if not exists competition_team_watchers (
@@ -598,11 +628,13 @@ def ensure_competition_main_buffer(key: str = "world-cup-2026") -> int:
 
 
 def run_competition_special_cycle(key: str = "world-cup-2026") -> dict[str, Any]:
+    """Sync fixtures, mirror to main buffer, enrich and predict — always runs.
+    The competition_analysis pipeline toggle controls the separate weekly AI analysis job.
+    """
     settings = get_competition_settings(key)
     if not settings.get("enabled"):
         return {"status": "idle", "competition": key, "enabled": False}
     configured_start = _parse_date(settings.get("start_date") or date.today().isoformat())
-    # For rolling leagues end_date is empty — use a 14-day rolling horizon.
     configured_end_raw = settings.get("end_date") or ""
     configured_end = _parse_date(configured_end_raw) if configured_end_raw else date.today() + timedelta(days=14)
     loaded_until = _sync_cursor(key) or _loaded_until(key)
@@ -610,8 +642,6 @@ def run_competition_special_cycle(key: str = "world-cup-2026") -> dict[str, Any]
         window_start = loaded_until + timedelta(days=1)
     else:
         window_start = max(date.today(), configured_start)
-    # Continuous lane: keep a rolling 7-day fixture window fresh, then enrich
-    # and predict the highest-priority competition matches.
     window_end = min(configured_end, window_start + timedelta(days=7))
     sync = sync_competition_fixtures(
         key,
@@ -626,9 +656,10 @@ def run_competition_special_cycle(key: str = "world-cup-2026") -> dict[str, Any]
 
 
 def run_enabled_competition_cycles(limit: int = 31) -> dict[str, Any]:
-    """Run the rolling lane for enabled top-30 entries and the existing World Cup special."""
-    settings = [get_competition_settings(DEFAULT_WORLD_CUP["key"]), *list_top_competitions()]
-    enabled = [item for item in settings if item.get("enabled")][:max(1, limit)]
+    """Run the full cycle for all enabled competitions — always sorts, enriches, and predicts.
+    The competition_analysis pipeline toggle controls the separate weekly AI analysis job.
+    """
+    enabled = [item for item in list_top_competitions() if item.get("enabled")][:max(1, limit)]
     results = [run_competition_special_cycle(item["key"]) for item in enabled]
     return {"status": "success", "processed": len(results), "enabled": len(enabled), "competitions": results}
 
@@ -675,6 +706,60 @@ def refresh_competition_context(key: str = "world-cup-2026", limit: int = 12) ->
             errors += 1
             items.append({"match_id": event.get("id"), "match": event.get("name"), "status": "error", "error": str(exc)})
     return {"status": "success", "competition": key, "refreshed": refreshed, "errors": errors, "matches": items}
+
+
+def sort_enriched_doc_into_competition(doc: dict[str, Any]) -> None:
+    """Sort any ingest-enriched doc into competition tracking using the existing main buffer match_id.
+
+    Writes to competition_special_buffer for competition-scoped analysis queries and
+    registers both teams in competition_team_watchers — but does NOT create a separate
+    prefixed entry in the main buffer. The SportyBet match already in the main buffer
+    is the canonical record; competition context is attached to it via raw_enriched.
+    """
+    try:
+        event = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else {}
+        if not event:
+            return
+        tournament = event.get("tournament") if isinstance(event.get("tournament"), dict) else {}
+        tournament_id = tournament.get("id")
+        if tournament_id is None:
+            return
+        try:
+            tournament_id = int(tournament_id)
+        except (TypeError, ValueError):
+            return
+        key = _tournament_key(tournament_id, tournament)
+        name = str(tournament.get("name") or key)
+        match_date = doc.get("match_date") or _event_match_date(event, date.today().isoformat())
+        sportybet_match_id = str(doc.get("sportybet_id") or doc.get("match_id") or "")
+        _init_db()
+        with db_conn() as conn:
+            init_competition_tables(conn)
+            _ensure_dynamic_competition(conn, key, name, tournament_id)
+            _upsert_competition_index(conn, key, event, match_date, sportybet_match_id)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _tournament_key(tournament_id: int, tournament: dict[str, Any]) -> str:
+    """Derive a stable slug key from tournament name + id."""
+    name = str(tournament.get("name") or "").strip()
+    slug = "-".join(_normalise_competition_name(name).split()) if name else ""
+    return f"{slug}-{tournament_id}" if slug else f"tournament-{tournament_id}"
+
+
+def _ensure_dynamic_competition(conn: sqlite3.Connection, key: str, name: str, tournament_id: int) -> None:
+    """Upsert a competition_special_settings row for any dynamically discovered competition."""
+    conn.execute(
+        """
+        insert into competition_special_settings
+            (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
+        values (?, ?, 1, ?, null, '', '', ?)
+        on conflict(key) do nothing
+        """,
+        (key, name, tournament_id, json.dumps({"source": "ingest", "mode": "dynamic"})),
+    )
 
 
 def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
@@ -748,10 +833,9 @@ def purge_misclassified_competition_rows() -> dict[str, int]:
             ).rowcount
             prefixed = [f"competition:brasileirao:{item}" for item in wrong_ids]
             main_placeholders = ",".join("?" for _ in prefixed)
-            for table in ("match_buffer", "future_match_buffer"):
-                removed_main += conn.execute(
-                    f"delete from {table} where match_id in ({main_placeholders})", prefixed
-                ).rowcount
+            removed_main += conn.execute(
+                f"delete from match_buffer where match_id in ({main_placeholders})", prefixed
+            ).rowcount
         conn.commit()
     return {"competition_rows": removed_special, "main_buffer_rows": removed_main}
 
@@ -798,6 +882,63 @@ def _mark_sync_cursor(key: str, scanned_end: str) -> None:
             (json.dumps(metadata), datetime.now(timezone.utc).isoformat(), key),
         )
         conn.commit()
+
+
+def _upsert_competition_index(
+    conn: sqlite3.Connection,
+    key: str,
+    event: dict[str, Any],
+    match_date: str,
+    sportybet_match_id: str,
+) -> None:
+    """Write a competition_special_buffer row referencing the existing main buffer match_id.
+
+    Unlike _upsert_competition_event, this does NOT mirror to the main buffer —
+    the SportyBet match is already there. The buffer row stores the sportybet_match_id
+    so competition analysis queries can join back to the canonical record.
+    """
+    status = event.get("status") or {}
+    score = event.get("score") or {}
+    tournament = event.get("tournament") or {}
+    event_match_date = _event_match_date(event, match_date)
+    importance = _match_importance_context(key, event)
+    conn.execute(
+        """
+        insert into competition_special_buffer (
+            competition_key, match_id, match_date, group_name, round_name, name, start_time,
+            status, score_home, score_away, raw_event, importance_context_json, sportybet_match_id
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(competition_key, match_id) do update set
+            match_date = excluded.match_date,
+            group_name = excluded.group_name,
+            round_name = excluded.round_name,
+            name = excluded.name,
+            start_time = excluded.start_time,
+            status = excluded.status,
+            score_home = excluded.score_home,
+            score_away = excluded.score_away,
+            raw_event = excluded.raw_event,
+            importance_context_json = excluded.importance_context_json,
+            sportybet_match_id = coalesce(excluded.sportybet_match_id, competition_special_buffer.sportybet_match_id)
+        """,
+        (
+            key,
+            str(event.get("id")),
+            event_match_date,
+            tournament.get("name"),
+            str(event.get("round") or ""),
+            event.get("name"),
+            int((event.get("start_timestamp") or 0) * 1000),
+            (status.get("type") or status.get("description") or "").lower(),
+            _score_value(score.get("home")),
+            _score_value(score.get("away")),
+            json.dumps(event),
+            json.dumps(importance),
+            sportybet_match_id or None,
+        ),
+    )
+    _register_competition_teams(conn, key, event)
 
 
 def _upsert_competition_event(conn: sqlite3.Connection, key: str, event: dict[str, Any], match_date: str) -> None:
@@ -1165,7 +1306,7 @@ def _mirror_competition_event_to_main_buffer(
     *,
     enriched_doc: dict[str, Any] | None = None,
 ) -> None:
-    from app.storage.buffer import _buffer_table_for, _init_buffer_table
+    from app.storage.buffer import _init_buffer_table
 
     _init_buffer_table(conn)
     status = event.get("status") or {}
@@ -1178,14 +1319,11 @@ def _mirror_competition_event_to_main_buffer(
     })
     is_live = 1 if state.get("is_live") else 0
     is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
-    table = _buffer_table_for(match_date, is_live)
-    other_table = "future_match_buffer" if table == "match_buffer" else "match_buffer"
     match_id = _prefixed_match_id(key, event.get("id"))
     raw_sporty = _competition_raw_sporty(key, event, match_date, importance)
-    conn.execute(f"delete from {other_table} where match_id = ?", (match_id,))
     conn.execute(
-        f"""
-        insert into {table} (
+        """
+        insert into match_buffer (
             match_id, match_date, tournament, category, name, start_time, period,
             score_home, score_away, is_live, is_finished, ingested_at,
             sofascore_id, raw_sporty, raw_enriched
@@ -1205,7 +1343,7 @@ def _mirror_competition_event_to_main_buffer(
             ingested_at = excluded.ingested_at,
             sofascore_id = excluded.sofascore_id,
             raw_sporty = excluded.raw_sporty,
-            raw_enriched = coalesce(excluded.raw_enriched, {table}.raw_enriched)
+            raw_enriched = coalesce(excluded.raw_enriched, match_buffer.raw_enriched)
         """,
         (
             match_id,
@@ -2040,12 +2178,17 @@ def list_all_competition_summaries(
 ) -> dict[str, Any]:
     """Return a lightweight summary for every tracked competition.
 
-    This is the production-ready data source for the unified competition
-    dashboard page.  It aggregates settings, buffer health, and latest
-    analysis for all 30 curated competitions plus the World Cup special.
+    Covers all competitions in competition_special_settings — both the curated
+    catalogue and any dynamically discovered via ingest.
     """
     _init_db()
-    all_keys = [DEFAULT_WORLD_CUP["key"], *[entry["key"] for entry in TOP_30_COMPETITIONS]]
+    with db_conn(timeout=30) as conn:
+        init_competition_tables(conn)
+        _ensure_catalogue_settings(conn)
+        rows = conn.execute(
+            "select key from competition_special_settings order by enabled desc, name asc"
+        ).fetchall()
+    all_keys = [row[0] for row in rows]
     summaries: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 

@@ -79,7 +79,6 @@ def enable_pipeline(engine_id: str):
         "unified_upcoming": "app.scheduler.job_unified_upcoming",
         "unified_live":     "app.scheduler.job_unified_live",
         "sofa_pipeline":    "app.scheduler.job_sofa_pipeline",
-        "competition_special": "app.scheduler.job_competition_special",
     }
     if engine_id in _IMMEDIATE_RUN_MAP:
         def _run():

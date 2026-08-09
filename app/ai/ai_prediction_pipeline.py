@@ -319,21 +319,21 @@ def _build_h2h_statement(h2h_matches: list[dict], team_duel: dict | None = None)
     return f"Decay-weighted H2H: home wins {home/total:.0%}, draws {draw/total:.0%}, away wins {away/total:.0%} across {len(rows)} meetings."
 
 
-def _ollama_model() -> str | None:
-    """Return the first available local model via the router."""
+def _llm_model() -> str | None:
+    """Return the first available model via the router."""
     from app.ai.ai_router import get_router
     return get_router().best_available()
 
 
 def _call_provider(model: str, prompt: str, timeout: int) -> str:
-    """Route through AIRouter — Ollama primary, Groq final fallback."""
+    """Route through AIRouter — OpenRouter primary."""
     from app.ai.ai_router import get_router
-    task = "reasoning" if model not in ("groq",) else "analysis"
+    task = "reasoning"
     return get_router().call_auto(prompt, task=task)
 
 
 # Kept as an internal compatibility alias for existing step tests/call sites.
-def _ollama(model: str, prompt: str, timeout: int) -> str:
+def _call_llm(model: str, prompt: str, timeout: int) -> str:
     from app.ai.ai_router import get_router
     # Step functions pass the model name as a hint for task routing
     task = "reasoning"
@@ -364,7 +364,7 @@ def _step_h2h(doc: dict, model: str, timeout: int = 20) -> str:
                 matches = list(fetched) if isinstance(fetched, list) else []
         evidence = _build_h2h_statement(matches, team_duel=team_duel)
         if evidence == H2H_FALLBACK: return evidence
-        return _ollama(model, f"Summarise this H2H evidence for a football prediction in one factual sentence: {evidence}", timeout) or evidence
+        return _call_llm(model, f"Summarise this H2H evidence for a football prediction in one factual sentence: {evidence}", timeout) or evidence
     except Exception as exc:
         logger.warning("AI step h2h failed: %s", exc)
         return H2H_FALLBACK
@@ -386,7 +386,7 @@ def _step_common_opponent(doc: dict, model: str, timeout: int = 20) -> str:
         common = sorted(opponents & away_opponents)
         if not common: return COMMON_FALLBACK
         evidence = f"Both teams have faced common recent opponents: {', '.join(common[:5])}."
-        return _ollama(model, f"Give one cautious football insight from: {evidence}", timeout) or evidence
+        return _call_llm(model, f"Give one cautious football insight from: {evidence}", timeout) or evidence
     except Exception as exc:
         logger.warning("AI step common_opponent failed: %s", exc)
         return COMMON_FALLBACK
@@ -459,7 +459,7 @@ def _step_form(doc: dict, model: str, timeout: int = 20) -> str:
             f"{evidence}\n"
             f"Summarise in one factual sentence which team has the better league position and why."
         )
-        return _ollama(model, prompt, timeout) or evidence
+        return _call_llm(model, prompt, timeout) or evidence
     except Exception as exc:
         logger.warning("AI step form failed: %s", exc)
         return FORM_FALLBACK
@@ -477,7 +477,7 @@ def _step_odds(doc: dict, model: str, timeout: int = 20) -> str:
         data = get_odds_movement(match_id) or {}
         if not data: return ODDS_FALLBACK
         evidence = f"Odds movement: {json.dumps(data, default=str)[:350]}"
-        return _ollama(model, f"State the market signal in one cautious sentence: {evidence}", timeout) or evidence
+        return _call_llm(model, f"State the market signal in one cautious sentence: {evidence}", timeout) or evidence
     except Exception as exc:
         logger.warning("AI step odds failed: %s", exc)
         return ODDS_FALLBACK
@@ -495,7 +495,7 @@ def _step_similar_matches(doc: dict, model: str, timeout: int = 20) -> str:
         candidates = apply_tier_filter(list(candidates or []), classify_tournament_tier(_tournament(doc)))
         if not candidates: return SIMILAR_FALLBACK
         evidence = f"Comparable historical matches: {json.dumps(candidates[:3], default=str)[:420]}"
-        return _ollama(model, f"Give one evidence-only insight: {evidence}", timeout) or evidence
+        return _call_llm(model, f"Give one evidence-only insight: {evidence}", timeout) or evidence
     except Exception as exc:
         logger.warning("AI step similar_matches failed: %s", exc)
         return SIMILAR_FALLBACK
@@ -631,7 +631,7 @@ def _step_team_history(doc: dict, model: str, timeout: int = 25) -> str:
             "Use only the supplied previous-match evidence and give one cautious prediction insight. "
             f"Evidence: {evidence}"
         )
-        return _ollama(model, prompt, timeout) or evidence
+        return _call_llm(model, prompt, timeout) or evidence
     except Exception as exc:
         logger.warning("AI step team_history failed: %s", exc)
         return "Team previous-match history analyst unavailable."
@@ -746,21 +746,21 @@ def _convert_confidence(raw: float) -> int:
 def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
     from app.utils.prediction_flow import apply_prediction_state
     logger.warning("Rules-engine fallback invoked: %s", reason)
-    kwargs["use_ollama_pipeline"] = False
+    kwargs["use_llm_pipeline"] = False
     result = apply_prediction_state(doc, **kwargs)
     result["prediction_source"] = "rules_engine_fallback"
     if isinstance(result.get("prediction"), dict): result["prediction"]["prediction_source"] = "rules_engine_fallback"
     return result
 
 
-def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None = None, match_date: str | None = None, source: str = "enriched_ensemble", attach_brain: bool = False, allow_repeat: bool = False, use_ollama_pipeline: bool | None = None) -> dict[str, Any]:
+def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None = None, match_date: str | None = None, source: str = "enriched_ensemble", attach_brain: bool = False, allow_repeat: bool = False, use_llm_pipeline: bool | None = None) -> dict[str, Any]:
     kwargs = dict(
         match_id=match_id,
         match_date=match_date,
         source=source,
         attach_brain=attach_brain,
         allow_repeat=allow_repeat,
-        use_ollama_pipeline=True if use_ollama_pipeline is None else use_ollama_pipeline,
+        use_llm_pipeline=True if use_llm_pipeline is None else use_llm_pipeline,
     )
     try:
         from app.ai.ai_router import get_router
@@ -839,7 +839,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             ],
         }
         prediction.update({
-            "prediction_source": "ollama_pipeline",
+            "prediction_source": "llm_pipeline",
             "ai_provider": model,
             "reasoning_context": reasoning_context,
             "market": decision["market"],
@@ -851,7 +851,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             "btts": decision["btts"],
             "over_2_5": decision["over_2_5"],
         })
-        result["prediction_source"] = "ollama_pipeline"
+        result["prediction_source"] = "llm_pipeline"
         result["reasoning_context"] = prediction["reasoning_context"]
         result["competition_analysis_used"] = competition_context is not None
         result["competition_analysis_key"] = competition_analysis_key
@@ -873,7 +873,7 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
         return {"status": "skipped", "reason": "pipeline_disabled"}
     record_activity("AI prediction queue started", job="ai_prediction_queue", status="running")
     _init_db()
-    summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "ollama_used": 0, "fallback_used": 0, "errors": 0}
+    summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "llm_used": 0, "fallback_used": 0, "errors": 0}
     with db_conn(timeout=30) as conn:
         rows = conn.execute(
             """
@@ -918,7 +918,7 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
             doc,
             match_id=str(doc.get("match_id") or ""),
             match_date=doc.get("match_date"),
-            use_ollama_pipeline=True,
+            use_llm_pipeline=True,
         )
         doc["ai_prediction_queue_pending"] = False
         _store(str(doc.get("match_id") or ""), doc)
@@ -930,7 +930,7 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
             try:
                 outcome = future.result()
                 summary["processed"] += 1
-                summary["ollama_used" if outcome.get("prediction_source") == "ollama_pipeline" else "fallback_used"] += 1
+                summary["llm_used" if outcome.get("prediction_source") == "llm_pipeline" else "fallback_used"] += 1
             except Exception as exc:
                 logger.exception("AI queue match failed: %s", exc)
                 summary["errors"] += 1

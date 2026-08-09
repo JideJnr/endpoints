@@ -1,7 +1,7 @@
 """
 AI domain package.
 
-AI and LLM layer — provider routing, Groq/Ollama/HuggingFace agents,
+AI and LLM layer — provider routing, LLM agents,
 prompt construction, response parsing, agentic prediction pipelines.
 
 Sub-modules are not eagerly imported here to avoid circular import chains
@@ -19,6 +19,6 @@ Or import the module object itself:
     from app.ai import ai_router
 """
 # Sub-modules available in this package:
-#   ai_brain, ai_router, llm, groq_agent, ollama_agent, ollama_pipeline,
-#   ollama_model_manager, chat_agent, agentic_prediction, prediction_agent,
+#   ai_brain, ai_router, llm, llm_agent, llm_pipeline, llm_model_manager,
+#   llm_analysis, chat_agent, agentic_prediction, prediction_agent,
 #   ai_prediction_pipeline, ai_betbuilder, agent_tools
