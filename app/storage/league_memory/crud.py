@@ -41,6 +41,7 @@ from ._helpers import (
     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
     _decorate_betbuilder_selections, _betbuilder_learning_summary,
     _TEAM_HISTORY_CACHE_DAYS,
+    _country_from_league, _is_country_like,
 )
 
 logger = logging.getLogger(__name__)
@@ -894,6 +895,7 @@ def get_country_from_memory(country_id: str) -> dict[str, Any]:
 
 
 def get_league_detail_from_memory(league_id: str) -> dict[str, Any]:
+    from .queries import get_league_memory, get_snapshot_memory
     memory = get_league_memory(league_id)
     snapshots = get_snapshot_memory(league=league_id, min_samples=1)["snapshots"]
     matches = list_memory_matches(limit=100, league=league_id)["matches"]

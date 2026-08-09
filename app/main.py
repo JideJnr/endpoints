@@ -15,6 +15,7 @@ from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
 from app.routers import competition_analysis as competition_analysis_router
 from app.scheduling.scheduler import start_scheduler
+from app.ai.ollama_model_manager import stop_keep_alive
 
 settings = get_settings()
 

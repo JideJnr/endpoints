@@ -373,7 +373,7 @@ def synthesize_sure_picks(
     try:
         if deterministic:
             raise RuntimeError("deterministic mode requested — skipping LLM synthesis")
-        model_plan = _run_groq_synthesis(ranked, target_odds, max_total_odds)
+        model_plan = _run_openrouter_synthesis(ranked, target_odds, max_total_odds)
         selected_ids = [str(item.get("match_id") or "") for item in model_plan.get("selected_picks") or []]
         selected = [item for item in ranked if str(item.get("match_id") or "") in selected_ids] if selected_ids else []
         reasoning = model_plan.get("synthesis_reasoning") or "Groq ranked the completed analyses by consensus and conviction."

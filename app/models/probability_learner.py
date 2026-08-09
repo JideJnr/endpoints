@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.storage.db import db_conn, DB_PATH, _conn, _init_db
+from app.enrichment.signal_aggregator import normalize_signal
 
 
 # ── Signal pattern key builder ──────────────────────────────

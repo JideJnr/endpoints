@@ -1567,6 +1567,7 @@ def grade_results(hours_back: int = 24):
     from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
     from app.storage.league_memory._helpers import _grade_pick_for_match
+    from app.storage.league_memory.queries import _numeric_id
     from app.monitoring.prediction_audit import grading_reason
     from app.storage.mongo_store import archive_finished_match_from_buffer
     from app.data_clients.sofascore_client import fetch_all_scheduled_events
@@ -1586,7 +1587,7 @@ def grade_results(hours_back: int = 24):
         rid = r.get("id")
         score = r.get("score") or {}
         if rid is not None and score.get("home") is not None and score.get("away") is not None:
-            result_map[str(rid)] = r
+            result_map[_numeric_id(rid)] = r
 
     _init_db()
     graded = archived = skipped = 0
@@ -1609,7 +1610,7 @@ def grade_results(hours_back: int = 24):
         ).fetchall()
 
     for row in pending:
-        result = result_map.get(str(row["match_id"]))
+        result = result_map.get(_numeric_id(row["match_id"]))
         if not result:
             skipped += 1
             continue
@@ -1675,9 +1676,9 @@ def grade_results(hours_back: int = 24):
         ).fetchall()
 
     for row in buffer_rows:
-        if str(row["match_id"]) not in result_map:
+        if _numeric_id(row["match_id"]) not in result_map:
             continue
-        score = result_map[str(row["match_id"])]["score"]
+        score = result_map[_numeric_id(row["match_id"])]["score"]
         with db_conn(timeout=30) as conn:
             conn.execute(
                 "update match_buffer set period='Ended', score_home=?, score_away=?, "

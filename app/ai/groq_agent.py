@@ -14,10 +14,13 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date as dt, datetime, timezone
 from typing import Any
 
 from app.storage.league_memory import record_prediction
+
+logger = logging.getLogger(__name__)
 from app.market.season_stage import detect_season_stage
 from app.research.research_filter import get_research_context_for_prompt
 
@@ -226,7 +229,6 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         f"OPEN_ROUTER_PROBABILITY: {probability_str}"
         f"{research_section}"
         f"\nOutput prediction as JSON."
-    )
     )
 
 

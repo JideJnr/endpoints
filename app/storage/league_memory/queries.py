@@ -35,7 +35,7 @@ from ._helpers import (
     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
     _decorate_betbuilder_selections,
 )
-from .crud import _sofascore_ids_for_predictions
+from .crud import _sofascore_ids_for_predictions, store_local_signal_outcomes, _aggregate_resolved_snapshots, _safe_mark_buffer_finished, _ensure_signal_outcomes_table, _backfill_local_signal_outcomes_from_history
 
 def get_league_memory(league: str | None = None) -> dict[str, Any]:
     _init_db()
@@ -644,7 +644,7 @@ def _grade_candidate_predictions_for_match(
 
 def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     _init_db()
-    finished = {str(e["id"]): e for e in events if (e.get("status") or {}).get("type") == "finished"}
+    finished = {_numeric_id(e["id"]): e for e in events if (e.get("status") or {}).get("type") == "finished"}
     if not finished:
         return {"graded": 0, "skipped": 0, "no_finished_events": True}
 
@@ -686,7 +686,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
     graded = skipped = candidate_graded = 0
     for row in rows:
         match_id = str(row["match_id"])
-        event = finished.get(match_id)
+        event = finished.get(_numeric_id(match_id))
         sofa_ids = sofa_ids_by_match.get(match_id, [])
         if not event:
             event = next((finished.get(sofa_id) for sofa_id in sofa_ids if finished.get(sofa_id)), None)
@@ -745,7 +745,7 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
     for match_id in all_match_ids:
         if match_id in primary_ids:
             continue
-        event = finished.get(match_id)
+        event = finished.get(_numeric_id(match_id))
         sofa_ids = sofa_ids_by_match.get(match_id, [])
         if not event:
             event = next((finished.get(sofa_id) for sofa_id in sofa_ids if finished.get(sofa_id)), None)
@@ -760,20 +760,44 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
     return {"graded": graded, "candidate_graded": candidate_graded, "skipped": skipped, "date": match_date}
 
 
-def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300) -> dict[str, Any]:
-    """Grade any pending match once it is 2+ hours past kickoff, unless still live.
+def _numeric_id(raw: Any) -> str:
+    """Extract the numeric event id from any match_id form.
 
-    SportyBet is tried first because its result endpoint is keyed by the same
-    `sr:match:*` id used in our prediction history. SofaScore is the fallback
-    for matches where Sporty does not return a result or the match was archived
-    after enrichment with only a SofaScore id.
+    Handles:
+      sr:match:72180092                 -> 72180092
+      competition:eliteserien:15260867 -> 15260867
+      72180092                         -> 72180092
+    """
+    s = str(raw or "").strip()
+    if s.startswith("sr:match:"):
+        return s[len("sr:match:"):]
+    parts = s.split(":")
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return parts[-1]
+    return s
+
+
+def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300) -> dict[str, Any]:
+    """Grade every ungraded match that has finished.
+
+    A match becomes a grading candidate as soon as it has **kicked off** — we no
+    longer wait an arbitrary number of hours after kickoff.  The actual gate is
+    the finished-status check from the result providers (SportyBet tried first,
+    then SofaScore): only matches reported as ``finished`` are graded, so live
+    or not-yet-played matches are safely skipped.  This guarantees that *all*
+    finished-but-ungraded matches get graded on the next cycle.
+
+    ``hours_after_kickoff`` is retained only for API compatibility and no longer
+    delays grading.
     """
     _init_db()
     import time as _time
     from collections import defaultdict
 
     now_seconds = _time.time()
-    cutoff_seconds = now_seconds - hours_after_kickoff * 3600
+    # Candidate = any match that has kicked off.  The finished-status check
+    # inside the Sporty/Sofa lookups is what actually decides gradability.
+    cutoff_seconds = now_seconds
     rows = _pending_matches_for_grading(cutoff_seconds, limit)
     if not rows:
         return {
@@ -808,14 +832,14 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
         end_ms = int((now_seconds + 30 * 60) * 1000)
         sporty_results = fetch_results(start_ms, end_ms, count=max(500, limit))
         sporty_by_id = {
-            str(result.get("id")): result
+            _numeric_id(result.get("id")): result
             for result in sporty_results
             if (result.get("score") or {}).get("home") is not None
             and (result.get("score") or {}).get("away") is not None
         }
         for row in rows:
             match_id = str(row["match_id"])
-            result = sporty_by_id.get(match_id)
+            result = sporty_by_id.get(_numeric_id(match_id))
             if not result:
                 continue
             score = result.get("score") or {}
@@ -861,14 +885,14 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
                 errors.append(f"sofascore {match_date}: {exc}")
                 skipped += len(date_rows)
                 continue
-            event_by_id = {str(event.get("id")): event for event in events}
+            event_by_id = {_numeric_id(event.get("id")): event for event in events}
             for row in date_rows:
                 match_id = str(row["match_id"])
                 sofa_ids = _sofa_ids_from_raw(row["raw_enriched"])
                 _row_sofa = str(row["sofascore_id"]) if row["sofascore_id"] else None
                 if _row_sofa and _row_sofa not in sofa_ids:
                     sofa_ids.append(_row_sofa)
-                event = event_by_id.get(match_id)
+                event = event_by_id.get(_numeric_id(match_id))
                 if not event:
                     event = next((event_by_id.get(sofa_id) for sofa_id in sofa_ids if event_by_id.get(sofa_id)), None)
                 if not event and sofa_ids:
@@ -950,7 +974,7 @@ def check_and_grade_match_result(match_id: str, hours_back: int = 72) -> dict[st
         from app.data_clients.sportybet_client import fetch_results
 
         for result in fetch_results(start_ms, now_ms, count=500):
-            if str(result.get("id")) != match_id:
+            if _numeric_id(result.get("id")) != _numeric_id(match_id):
                 continue
             score = result.get("score") or {}
             if score.get("home") is None or score.get("away") is None:
@@ -1073,7 +1097,7 @@ def grade_orphaned_predictions(limit: int = 1000) -> dict[str, Any]:
             not_found += len(date_rows)
             continue
 
-        event_by_id = {str(e.get("id")): e for e in events}
+        event_by_id = {_numeric_id(e.get("id")): e for e in events}
         finished = {eid: e for eid, e in event_by_id.items()
                     if str(((e.get("status") or {}).get("type")) or "").lower() == "finished"}
 
@@ -1085,7 +1109,7 @@ def grade_orphaned_predictions(limit: int = 1000) -> dict[str, Any]:
                 sofa_ids.append(str(row["sofascore_id"]))
 
             # Try to find a matching finished event
-            event = finished.get(match_id)
+            event = finished.get(_numeric_id(match_id))
             if not event:
                 event = next((finished.get(sid) for sid in sofa_ids if finished.get(sid)), None)
 

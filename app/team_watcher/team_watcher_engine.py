@@ -1,4 +1,4 @@
-﻿"""
+"""
 Team Watcher Prediction Engine
 ================================
 Autonomous prediction subsystem that sits alongside the existing team_watcher.py
