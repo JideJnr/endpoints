@@ -160,4 +160,4 @@ def _division_offset(text: str) -> tuple[str | None, int]:
 
 
 def _clean(value: str | None) -> str:
-    return " ".join((value or "").lower().replace("-", " ").split())
+    return " ".join(str(value or "").lower().replace("-", " ").split())

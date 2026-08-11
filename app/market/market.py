@@ -425,7 +425,7 @@ def _extract_sofascore_market_rows(detail: dict[str, Any]) -> list[dict[str, Any
 
 def _extract_1x2_sportybet(markets: list[dict[str, Any]]) -> dict[str, float]:
     for market in markets:
-        name = (market.get("name") or "").lower()
+        name = str(market.get("name") or "").lower()
         if market.get("id") == "1" or "1x2" in name or name == "match result":
             odds = {selection.get("name"): _to_float(selection.get("odds")) for selection in market.get("selections", [])}
             return {"home": odds.get("Home") or odds.get("1"), "draw": odds.get("Draw") or odds.get("X"), "away": odds.get("Away") or odds.get("2")}

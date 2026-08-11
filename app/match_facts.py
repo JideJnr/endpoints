@@ -243,7 +243,7 @@ def _iter_stat_items(period: dict[str, Any]):
 
 
 def _stat_key(name: str) -> str | None:
-    normalized = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
     for key, aliases in LIVE_STAT_NAMES.items():
         if normalized in aliases:
             return key

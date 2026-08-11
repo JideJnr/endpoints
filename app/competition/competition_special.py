@@ -122,7 +122,7 @@ def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalise_competition_name(value: str) -> str:
-    return "".join(char for char in value.lower() if char.isalnum())
+    return "".join(char for char in str(value or "").lower() if char.isalnum())
 
 
 def list_top_competitions() -> list[dict[str, Any]]:
@@ -930,7 +930,7 @@ def _upsert_competition_index(
             str(event.get("round") or ""),
             event.get("name"),
             int((event.get("start_timestamp") or 0) * 1000),
-            (status.get("type") or status.get("description") or "").lower(),
+            str(status.get("type") or status.get("description") or "").lower(),
             _score_value(score.get("home")),
             _score_value(score.get("away")),
             json.dumps(event),
@@ -974,7 +974,7 @@ def _upsert_competition_event(conn: sqlite3.Connection, key: str, event: dict[st
             str(event.get("round") or ""),
             event.get("name"),
             int((event.get("start_timestamp") or 0) * 1000),
-            (status.get("type") or status.get("description") or "").lower(),
+            str(status.get("type") or status.get("description") or "").lower(),
             _score_value(score.get("home")),
             _score_value(score.get("away")),
             json.dumps(event),
@@ -2100,7 +2100,7 @@ def _safe_num(value: Any) -> float:
 
 
 def _name_quality_score(name: str) -> float:
-    lower = name.lower()
+    lower = str(name or "").lower()
     elite = ("brazil", "argentina", "france", "spain", "england", "germany", "portugal", "netherlands", "italy")
     strong = ("belgium", "croatia", "uruguay", "colombia", "mexico", "usa", "morocco", "japan", "switzerland")
     if any(token in lower for token in elite):

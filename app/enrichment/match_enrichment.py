@@ -407,11 +407,11 @@ def _candidate_score(event: dict[str, Any] | None, doc: dict[str, Any]) -> float
             event,
         )
     except Exception:
-        sofa_name = event.get("name") or ""
-        sporty_name = doc.get("sportybet_name") or doc.get("name") or ""
+        sofa_name = str(event.get("name") or "")
+        sporty_name = str(doc.get("sportybet_name") or doc.get("name") or "")
         direct = SequenceMatcher(None, sofa_name.lower(), sporty_name.lower()).ratio()
-        home = SequenceMatcher(None, ((event.get("home_team") or {}).get("name") or "").lower(), _home_team(doc).lower()).ratio()
-        away = SequenceMatcher(None, ((event.get("away_team") or {}).get("name") or "").lower(), _away_team(doc).lower()).ratio()
+        home = SequenceMatcher(None, str((event.get("home_team") or {}).get("name") or "").lower(), str(_home_team(doc) or "").lower()).ratio()
+        away = SequenceMatcher(None, str((event.get("away_team") or {}).get("name") or "").lower(), str(_away_team(doc) or "").lower()).ratio()
         return round(max(direct, (home + away) / 2), 3)
 
 
@@ -426,7 +426,7 @@ def _is_finished_doc(doc: dict[str, Any]) -> bool:
 
 def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
     for market in markets:
-        name = (market.get("name") or "").lower()
+        name = str(market.get("name") or "").lower()
         if market.get("id") == "1" or "1x2" in name or name == "match result":
             odds = {selection.get("name"): selection.get("odds") for selection in market.get("selections", [])}
             return {

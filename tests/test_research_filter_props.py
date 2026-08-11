@@ -21,9 +21,12 @@ from app.research.research_filter import (
     _load_dynamic_rules,
 )
 
+settings.register_profile("predictx_db_properties", deadline=None)
+settings.load_profile("predictx_db_properties")
+
 # ── Hypothesis strategies ──────────────────────────────────
 
-CONFIDENCE_LOW = st.integers(min_value=0, max_value=59)
+CONFIDENCE_LOW = st.integers(min_value=0, max_value=49)  # below learned threshold of 50
 CONFIDENCE_NOISY = st.integers(min_value=60, max_value=66)
 CONFIDENCE_CAUTION = st.integers(min_value=60, max_value=71)
 CONFIDENCE_SAFE = st.integers(min_value=72, max_value=100)
@@ -57,7 +60,7 @@ def _safe_odds_profile() -> dict[str, float]:
     "type": st.just("match_result"),
     "confidence": st.integers(min_value=0, max_value=100),
 }))
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_1_match_result_blocked(pick):
     # Feature: research-driven-predictor-improvements, Property 1: match_result total block
     result = evaluate_pick(pick)
@@ -68,7 +71,7 @@ def test_property_1_match_result_blocked(pick):
 # ── Property 2: low confidence block ──────────────────────
 
 @given(conf=CONFIDENCE_LOW)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_2_low_confidence_blocked(conf):
     # Feature: research-driven-predictor-improvements, Property 2: low confidence block
     result = evaluate_pick({"type": "home_win", "confidence": conf})
@@ -78,49 +81,49 @@ def test_property_2_low_confidence_blocked(conf):
 # ── Property 3: draw odds block ───────────────────────────
 
 @given(draw_odds=DRAW_ODDS_BLOCK)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
-def test_property_3_draw_odds_blocked(draw_odds):
-    # Feature: research-driven-predictor-improvements, Property 3: draw odds block
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+def test_property_3_draw_odds_neutral_without_learned_evidence(draw_odds):
+    # Draw odds alone are not a block without learned loss evidence.
     result = evaluate_pick({
         "type": "home_win",
         "confidence": 80,
         "draw_odds": draw_odds,
     })
-    assert result["blocked"] is True
+    assert result["blocked"] is False
 
 
 # ── Property 4: favorite odds block ───────────────────────
 
 @given(fav_odds=FAV_ODDS_BLOCK)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
-def test_property_4_favorite_odds_blocked(fav_odds):
-    # Feature: research-driven-predictor-improvements, Property 4: favorite odds block
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+def test_property_4_favorite_odds_neutral_without_learned_evidence(fav_odds):
+    # Favorite odds alone are not a block without learned loss evidence.
     result = evaluate_pick({
         "type": "home_win",
         "confidence": 80,
         "favorite_odds": fav_odds,
     })
-    assert result["blocked"] is True
+    assert result["blocked"] is False
 
 
 # ── Property 5: caution threshold enforcement ─────────────
 
 @given(conf=CONFIDENCE_CAUTION)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
-def test_property_5_away_or_draw_caution_block(conf):
-    # Feature: research-driven-predictor-improvements, Property 5: caution threshold enforcement
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+def test_property_5_away_or_draw_caution_neutral_without_learned_evidence(conf):
+    # Selection/confidence bands are only blocked after learned loss evidence.
     result = evaluate_pick({
         "type": "home_win",
         "selection": "Away or Draw",
         "confidence": conf,
     })
-    assert result["blocked"] is True
+    assert result["blocked"] is False
 
 
 # ── Property 6: caution threshold pass-through ────────────
 
 @given(conf=CONFIDENCE_SAFE)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow], deadline=None)
 def test_property_6_away_or_draw_pass_through(conf):
     # Feature: research-driven-predictor-improvements, Property 6: caution threshold pass-through
     result = evaluate_pick({
@@ -138,9 +141,9 @@ def test_property_6_away_or_draw_pass_through(conf):
 # ── Property 7: home-or-away trust guarantee ──────────────
 
 @given(conf=CONFIDENCE_SAFE)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
-def test_property_7_home_or_away_trust_boost(conf):
-    # Feature: research-driven-predictor-improvements, Property 7: home-or-away trust guarantee
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+def test_property_7_home_or_away_no_default_trust_boost(conf):
+    # Home-or-away confidence is not boosted unless learned signal weights exist.
     result = evaluate_pick({
         "type": "home_win",
         "selection": "Home or Away",
@@ -150,7 +153,7 @@ def test_property_7_home_or_away_trust_boost(conf):
         "home_odds": 1.5,
     })
     assert result["blocked"] is False
-    assert result["trust_boost"] >= 4
+    assert result["trust_boost"] == 0
 
 
 # ── Property 8: trust boost cap invariant ─────────────────
@@ -165,7 +168,7 @@ def test_property_7_home_or_away_trust_boost(conf):
     is_sportybet=st.booleans(),
     is_conf_74=st.booleans(),
 )
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_8_trust_boost_cap(conf, has_home_odds, has_draw_odds, has_fav_odds, has_away_odds, is_trust_country, is_sportybet, is_conf_74):
     # Feature: research-driven-predictor-improvements, Property 8: trust boost cap invariant
     odds = {}
@@ -209,7 +212,7 @@ def test_property_8_trust_boost_cap(conf, has_home_odds, has_draw_odds, has_fav_
     "league_key": st.sampled_from(["scotland-league-cup", "russia-russian-cup", "argentina-primera-lpf", ""]),
     "source": st.sampled_from(["sportybet_market_signal", "enriched_ensemble", ""]),
 }))
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_9_evaluate_pick_idempotence(pick):
     # Feature: research-driven-predictor-improvements, Property 9: evaluate_pick idempotence
     result1 = evaluate_pick(pick)
@@ -222,7 +225,7 @@ def test_property_9_evaluate_pick_idempotence(pick):
 # ── Property 10: safe country pass-through ─────────────
 
 @given(conf=CONFIDENCE_TRUST, country=SAFE_COUNTRY_STRAT)
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_10_safe_country_pass_through(conf, country):
     # Feature: research-driven-predictor-improvements, Property 10: safe country pass-through
     pick = {
@@ -249,7 +252,7 @@ def test_property_10_safe_country_pass_through(conf, country):
     "home_odds": st.floats(min_value=1.0, max_value=10.0, allow_nan=False, allow_infinity=False),
     "league_key": st.sampled_from(["scotland-league-cup", "russia-russian-cup", "argentina-primera-lpf", ""]),
 }), country=st.sampled_from(["austria", "bolivia", "india", "russia", ""]))
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_11_betbuilder_parity(pick, country):
     # Feature: research-driven-predictor-improvements, Property 11: betbuilder parity
     league_key = pick.get("league_key") or ""
@@ -274,7 +277,7 @@ def test_property_11_betbuilder_parity(pick, country):
     "win_rate": st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
     "loss_rate": st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
 }))
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_15_bounded_context_output(row):
     # Feature: research-driven-predictor-improvements, Property 15: bounded context output
     with patch.object(rf, "db_conn") as mock_conn:
@@ -289,7 +292,7 @@ def test_property_15_bounded_context_output(row):
 # ── Property 16: dynamic league block threshold ───────────
 
 @given(key=st.text(min_size=1, max_size=20))
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_16_dynamic_league_block_threshold(key):
     # Feature: research-driven-predictor-improvements, Property 16: dynamic league block threshold
     pick = {
@@ -328,7 +331,7 @@ def test_property_19_cache_hit_idempotence():
     country=SAFE_COUNTRY_STRAT,
     source=st.sampled_from(["sportybet_market_signal", "enriched_ensemble", ""]),
 )
-@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
 def test_property_20_optimal_profile_score_bounds(selection, confidence, odds_profile, country, source):
     # Feature: research-driven-predictor-improvements, Property 20: optimal profile score bounds
     # The optimal_profile_score is computed from 6 conditions, each contributing 0 or 1

@@ -1279,7 +1279,7 @@ def _value_bets(
     markets = doc.get("sportybet_markets") or doc.get("markets") or []
     bets = []
     for market in markets:
-        name = (market.get("name") or "").lower()
+        name = str(market.get("name") or "").lower()
         if not (market.get("id") == "1" or "1x2" in name or name == "match result"):
             continue
         for selection in market.get("selections") or []:
@@ -2489,7 +2489,7 @@ def _apply_live_stat_result_boosts(
 
 
 def _stat_key(name: str) -> str | None:
-    normalized = name.lower().replace("%", "").replace("-", " ").replace("_", " ")
+    normalized = str(name or "").lower().replace("%", "").replace("-", " ").replace("_", " ")
     if "expected goals" in normalized or normalized.strip() == "xg":
         return "xg"
     if "shot on target" in normalized or "shots on target" in normalized:

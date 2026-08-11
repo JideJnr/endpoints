@@ -14,6 +14,7 @@ from app.scheduling.scheduler import (
     job_flush_to_mongo,
     job_live_priority,
     job_competition_special,
+    reset_deferred_predictions_and_repredict,
     get_live_priority_mode,
     set_live_priority_mode,
     scheduler_status,
@@ -168,6 +169,28 @@ def post_match_and_enrich(count: int = Query(default=12, ge=1, le=50)):
         ingest = run_job_with_guard(job_ingest_upcoming, limit=500)
         enrich = run_date_aware_enrichment(count=count)
         return {"status": "success", "ingest": ingest, "enrich": enrich}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/scan/reset-deferred")
+def post_reset_deferred_predictions():
+    """
+    Clear all deferred predictions (insufficient data) and reset match state
+    so the system can rematch, renrich, and repredict.
+
+    This endpoint:
+    1. Finds all matches in the buffer with deferred predictions
+       (``prediction_error`` set in ``raw_enriched``) or with a
+       ``sofascore_match_status`` of ``no_match`` / ``srl_skip``.
+    2. Resets their enrichment state — clears ``sofascore_match_status``,
+       ``sofascore_id``, ``sofascore_detail``, ``enriched_at``, and all
+       prediction-related fields from the ``raw_enriched`` JSON.
+    3. Runs ``job_unified_upcoming`` so the pipeline immediately re-ingests,
+       re-matches, re-enriches, and re-predicts the affected fixtures.
+    """
+    try:
+        return reset_deferred_predictions_and_repredict()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 

@@ -60,25 +60,39 @@ class TestEvaluatePickBlock(unittest.TestCase):
         self.assertTrue(result["blocked"])
         self.assertEqual(result["reason"], "research_block:match_result_61pct_loss")
 
-    def test_confidence_below_60_blocked(self):
-        result = evaluate_pick({"type": "home_win", "confidence": 55})
+    def test_confidence_below_learned_threshold_blocked(self):
+        """Confidence below learned threshold (default 50) should be blocked."""
+        result = evaluate_pick({"type": "home_win", "confidence": 45})
         self.assertTrue(result["blocked"])
-        self.assertEqual(result["reason"], "research_block:confidence_below_60")
+        self.assertIn("confidence_below_learned", result["reason"])
 
-    def test_draw_odds_below_2_blocked(self):
+    def test_draw_odds_below_2_neutral_without_learned_evidence(self):
         result = evaluate_pick({"type": "home_win", "confidence": 80, "draw_odds": 1.50})
-        self.assertTrue(result["blocked"])
-        self.assertEqual(result["reason"], "research_block:draw_odds_below_2")
+        self.assertFalse(result["blocked"])
 
-    def test_favorite_odds_2_50_plus_blocked(self):
+    def test_favorite_odds_2_50_plus_neutral_without_learned_evidence(self):
         result = evaluate_pick({"type": "home_win", "confidence": 80, "favorite_odds": 3.00})
-        self.assertTrue(result["blocked"])
-        self.assertEqual(result["reason"], "research_block:favorite_odds_2_50_plus")
+        self.assertFalse(result["blocked"])
 
-    def test_home_odds_danger_zone_blocked(self):
+    def test_home_odds_danger_zone_neutral_without_learned_evidence(self):
         result = evaluate_pick({"type": "home_win", "confidence": 80, "home_odds": 2.70})
-        self.assertTrue(result["blocked"])
-        self.assertEqual(result["reason"], "research_block:home_odds_danger_zone")
+        self.assertFalse(result["blocked"])
+
+    def test_odds_bucket_blocked_with_learned_evidence(self):
+        conn = _make_mem_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO research_stats (dimension, key, wins, losses, total, win_rate, loss_rate, min_samples) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("odds_bucket", "draw_odds_1.50_1.99", 2, 18, 20, 0.10, 0.90, 10),
+            )
+            conn.commit()
+            with patch.object(rf, "db_conn") as mock_db:
+                mock_db.return_value.__enter__.return_value = conn
+                result = evaluate_pick({"type": "home_win", "confidence": 80, "draw_odds": 1.50})
+            self.assertTrue(result["blocked"])
+            self.assertEqual(result["reason"], "research_block:dynamic_odds_bucket")
+        finally:
+            conn.close()
 
     def test_blocked_league_dynamic(self):
         """A league with loss_rate >= 0.75 in research_stats should be blocked."""
@@ -134,13 +148,31 @@ class TestEvaluatePickBlock(unittest.TestCase):
 class TestEvaluatePickCaution(unittest.TestCase):
     """Tests for caution checks in evaluate_pick()."""
 
-    def test_away_or_draw_low_conf_blocked(self):
+    def test_away_or_draw_low_conf_neutral_without_learned_evidence(self):
         result = evaluate_pick({
             "type": "home_win", "selection": "Away or Draw",
             "confidence": 65,
         })
-        self.assertTrue(result["blocked"])
-        self.assertIn("away_or_draw_low_conf", result["reason"])
+        self.assertFalse(result["blocked"])
+
+    def test_away_or_draw_low_conf_blocked_with_learned_evidence(self):
+        conn = _make_mem_conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO research_stats (dimension, key, wins, losses, total, win_rate, loss_rate, min_samples) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("selection_confidence_band", "away_or_draw:60_71", 1, 19, 20, 0.05, 0.95, 10),
+            )
+            conn.commit()
+            with patch.object(rf, "db_conn") as mock_db:
+                mock_db.return_value.__enter__.return_value = conn
+                result = evaluate_pick({
+                    "type": "home_win", "selection": "Away or Draw",
+                    "confidence": 65,
+                })
+            self.assertTrue(result["blocked"])
+            self.assertEqual(result["reason"], "research_caution:dynamic_selection_confidence")
+        finally:
+            conn.close()
 
     def test_away_or_draw_high_conf_passes(self):
         result = evaluate_pick({
@@ -163,7 +195,7 @@ class TestEvaluatePickCaution(unittest.TestCase):
             "confidence": 75,
         })
         self.assertFalse(result["blocked"])
-        self.assertGreaterEqual(result["trust_boost"], 4)
+        self.assertEqual(result["trust_boost"], 0)
 
     def test_trust_boost_sportybet_market_signal(self):
         result = evaluate_pick({
@@ -171,7 +203,7 @@ class TestEvaluatePickCaution(unittest.TestCase):
             "confidence": 75, "source": "sportybet_market_signal",
         })
         self.assertFalse(result["blocked"])
-        self.assertGreaterEqual(result["trust_boost"], 5)
+        self.assertEqual(result["trust_boost"], 0)
 
     def test_trust_boost_trust_country(self):
         """A country with win_rate >= 0.80 in research_stats should get trust boost."""
@@ -190,7 +222,7 @@ class TestEvaluatePickCaution(unittest.TestCase):
                     "confidence": 75, "country": "austria",
                 })
             self.assertFalse(result["blocked"])
-            self.assertGreaterEqual(result["trust_boost"], 3)
+            self.assertEqual(result["trust_boost"], 0)
         finally:
             conn.close()
 
@@ -219,8 +251,7 @@ class TestEvaluatePickCaution(unittest.TestCase):
         })
         self.assertFalse(result["blocked"])
         boosts = result["evidence"].get("research_trust_boosts", [])
-        self.assertTrue(len(boosts) > 0)
-        self.assertIn("home_or_away", [b["rule"] for b in boosts])
+        self.assertEqual(boosts, [])
 
 
 class TestResearchFilterCandidate(unittest.TestCase):
@@ -230,10 +261,11 @@ class TestResearchFilterCandidate(unittest.TestCase):
         self.assertFalse(_research_filter_candidate({"type": "match_result", "confidence": 80}))
 
     def test_low_confidence_excluded(self):
-        self.assertFalse(_research_filter_candidate({"type": "home_win", "confidence": 55}))
+        """Confidence below learned threshold (default 50) should be excluded."""
+        self.assertFalse(_research_filter_candidate({"type": "home_win", "confidence": 45}))
 
-    def test_draw_odds_below_2_excluded(self):
-        self.assertFalse(_research_filter_candidate(
+    def test_draw_odds_below_2_included_without_learned_evidence(self):
+        self.assertTrue(_research_filter_candidate(
             {"type": "home_win", "confidence": 80},
             odds_profile={"draw_odds": 1.50},
         ))

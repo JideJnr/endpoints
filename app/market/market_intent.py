@@ -235,7 +235,7 @@ def _side_from_selection_and_match(selection: str, match_name: str | None) -> st
     if not match_name or " vs " not in match_name:
         return None
     home_name, away_name = [part.strip().lower() for part in match_name.split(" vs ", 1)]
-    sel = selection.lower()
+    sel = str(selection or "").lower()
     if home_name and home_name in sel:
         return "home"
     if away_name and away_name in sel:

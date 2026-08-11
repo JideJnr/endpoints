@@ -256,12 +256,12 @@ def _best_odds(doc: dict[str, Any]) -> float:
 
 
 def classify_tournament_tier(tournament_name: str) -> int:
-    name = (tournament_name or "").lower()
-    if any(x in name for x in ("champions league", "premier league", "laliga", "serie a", "bundesliga", "ligue 1")):
-        return 1
-    if any(x in name for x in ("europa league", "championship", "eredivisie", "primeira liga", "super lig")):
-        return 2
-    return 3
+    try:
+        from app.monitoring.self_learner import get_tournament_priority
+        priority = int(get_tournament_priority(tournament_name).get("priority", 4))
+    except Exception:
+        priority = 4
+    return priority
 
 
 def sort_gate(matches: list[dict]) -> list[dict]:

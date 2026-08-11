@@ -574,11 +574,10 @@ def job_unified_upcoming() -> dict[str, Any]:
         pass
 
     from app.data_clients.sportybet_client import fetch_upcoming_matches_post
-    from app.data_clients.sofascore_client import fetch_all_scheduled_events, is_usable_event_for_mode, search_events
+    from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
     from app.storage.buffer import ingest_matches, get_unenriched_batch, store_enriched, get_buffered_match
     from app.storage.buffer import _extract_1x2
-    from app.enrichment.enrichment import _fuzzy_match, _llm_match, _is_junk, FUZZY_THRESHOLD, LLM_FALLBACK_THRESHOLD
-    from app.data_clients.sofascore_client import fetch_event_detail
+    from app.enrichment.enrichment import _is_junk
     from app.market.market import snapshot_odds
     from app.utils.time_context import match_time_context
     from app.utils.match_state import classify_match_state
@@ -607,19 +606,9 @@ def job_unified_upcoming() -> dict[str, Any]:
         except Exception:
             pass
 
-    # ── Step 2: Fetch SofaScore events for today + tomorrow ───────────────────
+    # ── Step 2 + 3: Match unmatched buffer matches against SofaScore ─────────
     today = date_cls.today().isoformat()
     tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
-    sofa_cache: dict[str, list] = {}
-    for d in [today, tomorrow]:
-        try:
-            sofa_cache[d] = fetch_all_scheduled_events(d)
-        except Exception as exc:
-            _logger.warning("unified_upcoming: sofa fetch failed for %s: %s", d, exc)
-            sofa_cache[d] = []
-    all_sofa_events = [e for events in sofa_cache.values() for e in events]
-
-    # ── Step 3: Match ALL unmatched buffer matches against SofaScore ──────────
     # Work through a small, time-bounded queue.  One enriched fixture fans out
     # into multiple SofaScore detail calls; processing the whole backlog here
     # leaves the scheduler job running indefinitely and blocks later cycles.
@@ -635,7 +624,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         f"Unified upcoming matching {len(pending)} next fixtures",
         job="unified_upcoming",
         status="running",
-        details={"batch_size": UNIFIED_UPCOMING_BATCH_SIZE, "sofa_candidates": len(all_sofa_events)},
+        details={"batch_size": UNIFIED_UPCOMING_BATCH_SIZE},
     )
 
     now = datetime.now(timezone.utc).isoformat()
@@ -647,27 +636,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         except Exception:
             return None
 
-    def _search_match_safe(sporty_event: dict) -> tuple[dict | None, float]:
-        """Use SofaScore's team search only when the daily feed misses a real fixture."""
-        if _is_junk(sporty_event.get("name") or ""):
-            return None, 0.0
-        query = " ".join(filter(None, [
-            str(sporty_event.get("home_team") or ""),
-            str(sporty_event.get("away_team") or ""),
-        ])).strip()
-        if not query:
-            return None, 0.0
-        try:
-            candidates = [
-                event for event in search_events(query, limit=12)
-                if is_usable_event_for_mode(event, live=False)
-            ]
-            sofa_event, candidate_score = _fuzzy_match(sporty_event, candidates)
-            # Search results are already team-specific. Allow minor provider-name
-            # differences (e.g. FC/Hana Citizen) when kickoff also agrees.
-            return (sofa_event, candidate_score) if candidate_score >= 0.70 else (None, candidate_score)
-        except Exception:
-            return None, 0.0
+    from app.enrichment.match_enrichment import _resolve_sofascore_match
 
     # Match all in parallel detail fetches
     pairs: list[tuple[dict, Any, float]] = []
@@ -676,7 +645,6 @@ def job_unified_upcoming() -> dict[str, Any]:
         existing = item.get("existing") or {}
 
         # ── SRL / simulated match guard ───────────────────────────────────────
-        # Skip SofaScore matching entirely for SRL/virtual fixtures.
         match_name = sporty.get("name") or item.get("match_id") or ""
         if _is_junk(match_name):
             from app.storage.buffer import store_enriched as _store_enriched
@@ -685,67 +653,14 @@ def job_unified_upcoming() -> dict[str, Any]:
             unmatched_count += 1
             continue
 
-        # Use the same resolution logic as the manual endpoint so auto-matching
-        # benefits from team-bound IDs, saved IDs, multi-query search, and
-        # live-aware thresholds.
-        try:
-            from app.enrichment.match_enrichment import _resolve_sofascore_match
-
-            match_date = item.get("match_date") or date_cls.today().isoformat()
-            sofa, score, source = _resolve_sofascore_match(existing, sporty, match_date)
-            if source == "team_watcher_exact":
-                matched_count += 1
-            elif source == "team_watcher_reversed":
-                matched_count += 1
-            elif source == "team_watcher_partial":
-                matched_count += 1
-            elif source == "saved":
-                matched_count += 1
-            elif source == "search":
-                matched_count += 1
+        match_date = item.get("match_date") or date_cls.today().isoformat()
+        sofa, score, source = _resolve_sofascore_match(existing, sporty, match_date)
+        if sofa:
+            matched_count += 1
+            if source == "search":
                 search_matched_count += 1
-            elif source == "llm":
-                matched_count += 1
-            elif source == "auto":
-                matched_count += 1
-            elif source == "no_match":
-                unmatched_count += 1
-            elif source == "team_watcher_no_exact_match":
-                unmatched_count += 1
-            elif source == "team_watcher_no_sofascore_id":
-                unmatched_count += 1
-            elif source == "team_watcher_unavailable":
-                unmatched_count += 1
-            else:
-                if sofa:
-                    matched_count += 1
-                else:
-                    unmatched_count += 1
-        except Exception:
-            sofa, score = _fuzzy_match(sporty, all_sofa_events)
-            threshold = FUZZY_THRESHOLD
-            if score < threshold:
-                searched_sofa, searched_score = _search_match_safe(sporty)
-                if searched_sofa:
-                    sofa = searched_sofa
-                    score = searched_score
-                    matched_count += 1
-                    search_matched_count += 1
-                    pairs.append((item, sofa, score))
-                    continue
-                if score >= LLM_FALLBACK_THRESHOLD and not _is_junk(sporty.get("name") or ""):
-                    llm_sofa = _llm_match(sporty, all_sofa_events)
-                    if llm_sofa:
-                        sofa = llm_sofa
-                        matched_count += 1
-                    else:
-                        sofa = None
-                        unmatched_count += 1
-                else:
-                    sofa = None
-                    unmatched_count += 1
-            else:
-                matched_count += 1
+        else:
+            unmatched_count += 1
         pairs.append((item, sofa, score))
 
     # Fetch SofaScore detail in parallel for all matched
@@ -848,6 +763,96 @@ def job_unified_upcoming() -> dict[str, Any]:
         "predicted": predicted_count, "deferred": deferred_count,
         "search_matched": search_matched_count,
     }
+
+
+# ── Deferred prediction reset ───────────────────────────────────────────────────
+
+# JSON paths removed from raw_enriched when resetting a match for re-match/re-enrich/re-predict.
+_RESET_ENRICHMENT_FIELDS = [
+    '$.sofascore_match_status',
+    '$.sofascore_retry_after_ts',
+    '$.sofascore_id',
+    '$.sofascore_detail',
+    '$.sofascore_event',
+    '$.sofascore_best_score',
+    '$.sofascore_no_match_at',
+    '$.sofascore_candidate_count',
+    '$.sofascore_dates_scanned',
+    '$.enriched_at',
+    '$.prediction',
+    '$.prediction_error',
+    '$.prediction_readiness',
+    '$.prediction_audit',
+    '$.match_score',
+    '$.minimum_enrichment_status',
+]
+_RESET_REMOVE_EXPR = ", ".join(f"'{f}'" for f in _RESET_ENRICHMENT_FIELDS)
+
+
+def reset_deferred_predictions_and_repredict() -> dict[str, Any]:
+    """
+    Clear all deferred predictions (insufficient data) and reset match state
+    so the system can rematch, renrich, and repredict.
+
+    This function:
+    1. Finds all matches in the buffer with deferred predictions
+       (``prediction_error`` set in ``raw_enriched``) or with a
+       ``sofascore_match_status`` of ``no_match`` / ``srl_skip``.
+    2. Resets their enrichment state — clears ``sofascore_match_status``,
+       ``sofascore_id``, ``sofascore_detail``, ``enriched_at``, and all
+       prediction-related fields from the ``raw_enriched`` JSON, and nulls
+       the ``enriched_at`` / ``sofascore_id`` columns.
+    3. Runs ``job_unified_upcoming`` so the pipeline immediately re-ingests,
+       re-matches, re-enriches, and re-predicts the affected fixtures.
+    """
+    _init_db()
+    from app.storage.buffer import _init_buffer_table
+
+    with _conn() as conn:
+        _init_buffer_table(conn)
+        rows = conn.execute(
+            f"""
+            select match_id, match_date, name,
+                   json_extract(raw_enriched, '$.prediction_error') as prediction_error,
+                   json_extract(raw_enriched, '$.sofascore_match_status') as sofascore_match_status
+            from match_buffer
+            where is_finished = 0
+              and raw_enriched is not null
+              and (
+                json_extract(raw_enriched, '$.prediction_error') is not null
+                or json_extract(raw_enriched, '$.sofascore_match_status') in ('no_match', 'srl_skip')
+              )
+            """
+        ).fetchall()
+
+        reset_count = 0
+        for row in rows:
+            match_id = row["match_id"]
+            conn.execute(
+                f"""
+                update match_buffer set
+                    enriched_at = null,
+                    sofascore_id = null,
+                    raw_enriched = json_remove(raw_enriched, {_RESET_REMOVE_EXPR})
+                where match_id = ?
+                """,
+                (match_id,),
+            )
+            reset_count += 1
+
+        conn.commit()
+
+    record_activity(
+        f"Reset {reset_count} deferred predictions for rematch/renrich/repredict",
+        job="reset_deferred_predictions",
+        status="ok",
+        details={"reset_count": reset_count},
+    )
+
+    # Run the unified upcoming pipeline to re-process the reset matches
+    result = job_unified_upcoming()
+    result["reset_count"] = reset_count
+    return result
 
 
 def job_unified_live() -> dict[str, Any]:

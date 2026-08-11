@@ -30,6 +30,7 @@ from app.scheduling.scheduler import (  # noqa: F401
     job_sofa_pipeline,
     job_enrich_future,
     job_unified_upcoming,
+    reset_deferred_predictions_and_repredict,
     job_unified_live,
     job_competition_special,
     job_archive_finished,

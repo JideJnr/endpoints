@@ -442,6 +442,26 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
 
 # ── Phase 2: Enrichment queue ─────────────────────────────────────────────────
 
+def _tournament_priority_for_row(row: sqlite3.Row) -> int:
+    """Extract tournament from a buffer row and return its dynamic priority."""
+    try:
+        raw_sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
+    except (json.JSONDecodeError, TypeError):
+        raw_sporty = {}
+
+    tournament = raw_sporty.get("tournament") or ""
+    if isinstance(tournament, dict):
+        tournament = tournament.get("name") or ""
+
+    # Quality filters — always deprioritise these regardless of accuracy
+    try:
+        from app.monitoring.self_learner import get_tournament_priority  # noqa: PLC0415
+        pref = get_tournament_priority(tournament)
+        return int(pref.get("priority", 4))
+    except Exception:
+        return 4
+
+
 def get_unenriched_batch(
     limit: int = ENRICH_BATCH_SIZE,
     live_only: bool = False,
@@ -455,6 +475,11 @@ def get_unenriched_batch(
       2. Today's unenriched matches
       3. Tomorrow's unenriched matches
       4. Future matches (beyond tomorrow) — enriched once per day, not every cycle
+
+    Tournament priority is now dynamic: liked tournaments (high prediction
+    accuracy) are processed first, disliked tournaments (low accuracy) are
+    processed later.  Quality filters (reserve, youth, friendly) still
+    deprioritise those matches regardless of accuracy.
 
     Future matches are normally included only after the hot queue. The
     scheduled future lane can request them explicitly with future_only=True.
@@ -481,8 +506,13 @@ def get_unenriched_batch(
                 or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= ?
               )
         """
+        # Fetch a larger batch so Python-level re-sorting by dynamic priority
+        # does not accidentally drop high-accuracy tournaments that would have
+        # been beyond the raw SQL limit.
+        fetch_limit = max(limit * 3, 30)
         query = f"""
-            select match_id, raw_sporty, raw_enriched, is_live, match_date
+            select match_id, raw_sporty, raw_enriched, is_live, match_date,
+                   enriched_at, start_time
             from {{table}}
             where is_finished = 0
               and (start_time is null or cast(start_time as real) >= ?)
@@ -496,35 +526,39 @@ def get_unenriched_batch(
               and {retry_clause}
         """
         hot_params = (
-                ("match_buffer", cutoff_ts_ms, today, tomorrow, limit)
+                (cutoff_ts_ms, today, tomorrow, fetch_limit)
                 if force_live_retry
-                else ("match_buffer", cutoff_ts_ms, now_ts, today, tomorrow, limit)
+                else (cutoff_ts_ms, now_ts, today, tomorrow, fetch_limit)
             )
         rows = conn.execute(
                 (query.format(table="match_buffer") + """
                 order by
                   is_live desc,
                   case when match_date = ? then 0 when match_date = ? then 1 else 2 end asc,
-                  case
-                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%reserve%' then 8
-                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%u20%' then 8
-                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%u19%' then 8
-                    when lower(coalesce(json_extract(raw_sporty, '$.name'), '') || ' ' || coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%friendly%' then 7
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%champions league%' then 0
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%premier league%' then 1
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%laliga%' then 1
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%serie a%' then 1
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%bundesliga%' then 1
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%ligue 1%' then 1
-                    when lower(coalesce(json_extract(raw_sporty, '$.tournament'), '')) like '%europa league%' then 1
-                    else 4
-                  end asc,
                   case when enriched_at is null then 0 else 1 end asc,
                   start_time asc
                 limit ?
                 """),
                 hot_params,
             ).fetchall()
+
+    # Annotate each row with its dynamic tournament priority and re-sort.
+    annotated: list[tuple[tuple, sqlite3.Row]] = []
+    for row in rows:
+        t_pri = _tournament_priority_for_row(row)
+        date_pri = 0 if row["match_date"] == today else (1 if row["match_date"] == tomorrow else 2)
+        enriched_pri = 0 if row["enriched_at"] is None else 1
+        sort_key = (
+            -int(row["is_live"]),   # live first
+            date_pri,               # today, then tomorrow, then later
+            t_pri,                  # dynamic tournament priority (lower = liked)
+            enriched_pri,           # unenriched first
+            row["start_time"] or 0, # earliest start first
+        )
+        annotated.append((sort_key, row))
+
+    annotated.sort(key=lambda item: item[0])
+    top_rows = [row for _, row in annotated[:limit]]
 
     return [
         {
@@ -535,7 +569,7 @@ def get_unenriched_batch(
             "sporty": json.loads(row["raw_sporty"]) if row["raw_sporty"] else {},
             "existing": json.loads(row["raw_enriched"]) if row["raw_enriched"] else None,
         }
-        for row in rows
+        for row in top_rows
     ]
 
 
@@ -2195,7 +2229,7 @@ def _lifecycle_state(doc: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
     for market in markets:
-        name = (market.get("name") or "").lower()
+        name = str(market.get("name") or "").lower()
         if market.get("id") == "1" or "1x2" in name:
             odds = {s.get("name"): s.get("odds") for s in market.get("selections", [])}
             return {
@@ -2209,14 +2243,14 @@ def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
 def _is_finished_period(period: str | None) -> bool:
     if not period:
         return False
-    p = period.lower().strip()
+    p = str(period or "").lower().strip()
     return p in ("ft", "finished", "ended", "aet", "ap", "full time", "after penalties", "after extra time")
 
 
 def _is_not_started_period(period: str | None) -> bool:
     if not period:
         return True
-    return period.lower().strip().replace("_", " ") in {
+    return str(period or "").lower().strip().replace("_", " ") in {
         "",
         "not start",
         "not started",

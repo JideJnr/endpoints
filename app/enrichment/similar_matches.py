@@ -77,10 +77,10 @@ def _compute_league_bonus(
     cand_category: str,
 ) -> float:
     """Returns 1.0 (same league), 0.5 (same category), or 0.0."""
-    tl = (target_league_key or "").lower().strip()
-    cl = (cand_league_key or "").lower().strip()
-    tc = (target_category or "").lower().strip()
-    cc = (cand_category or "").lower().strip()
+    tl = str(target_league_key or "").lower().strip()
+    cl = str(cand_league_key or "").lower().strip()
+    tc = str(target_category or "").lower().strip()
+    cc = str(cand_category or "").lower().strip()
 
     if tl and tl == cl:
         return 1.0
@@ -275,7 +275,7 @@ def _batch_load_elos(
     placeholders = ",".join("?" * len(team_names))
     rows = conn.execute(
         f"select lower(team_name), rating from elo_ratings where lower(team_name) in ({placeholders})",
-        [n.lower() for n in team_names],
+        [str(n or "").lower() for n in team_names],
     ).fetchall()
     return {row[0]: float(row[1]) for row in rows}
 
@@ -432,10 +432,10 @@ def _extract_target_odds_implied(
     if not home_o:
         markets = doc.get("sportybet_markets") or doc.get("markets") or []
         for mkt in markets:
-            mkt_name = (mkt.get("name") or "").lower()
+            mkt_name = str(mkt.get("name") or "").lower()
             if mkt.get("id") == "1" or "1x2" in mkt_name or mkt_name in {"match result", "3 way", "full time result"}:
                 sel_map: dict[str, Any] = {
-                    (s.get("name") or "").lower(): s
+                    str(s.get("name") or "").lower(): s
                     for s in mkt.get("selections", [])
                 }
                 h_sel = sel_map.get("home") or sel_map.get("1") or sel_map.get("home win")

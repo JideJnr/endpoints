@@ -81,7 +81,7 @@ REPLACEMENTS = {
 
 
 def normalise(name: str) -> str:
-    text = (name or "").lower().strip()
+    text = str(name or "").lower().strip()
     for source, target in REPLACEMENTS.items():
         text = text.replace(source, target)
     return " ".join(text.split())

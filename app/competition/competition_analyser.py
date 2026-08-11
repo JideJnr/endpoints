@@ -603,7 +603,7 @@ def catchup_competition_scores(competition_key: str) -> dict[str, Any]:
                 if not fresh:
                     continue
                 status_obj = fresh.get("status") or {}
-                new_status = (status_obj.get("type") or status_obj.get("description") or "").lower()
+                new_status = str(status_obj.get("type") or status_obj.get("description") or "").lower()
                 score = fresh.get("score") or {}
                 conn.execute(
                     """

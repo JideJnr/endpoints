@@ -7,7 +7,7 @@ contributes a graded TW_Signal to every main prediction, produces structured
 weekly analysis reports, tracks its own accuracy, and improves its weights over
 time using the same formula already in self_learner.py.
 
-This module is designed to be additive — the existing team_watcher.py passive
+This module is designed to be additive â€” the existing team_watcher.py passive
 memory remains untouched.  Any exception inside the engine must not abort the
 main pipeline.
 """
@@ -23,6 +23,10 @@ from typing import Any
 from app.storage.db import _ensure_column, _init_db, db_conn
 from app.competition.league_strength import league_strength_score
 from app.competition.competition_registry import get_team_competition_stats
+from app.monitoring.self_learner import (
+    get_signal_weights, get_league_accuracy, get_learned_weights,
+    get_signal_combination_performance, get_learned_thresholds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +132,7 @@ def init_tw_tables(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — profile loading
+# Internal helpers â€” profile loading
 # ---------------------------------------------------------------------------
 
 def _get_profile(conn: sqlite3.Connection, team_key: str) -> dict[str, Any] | None:
@@ -154,7 +158,7 @@ def _get_profile(conn: sqlite3.Connection, team_key: str) -> dict[str, Any] | No
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — competition stats loader
+# Internal helpers â€” competition stats loader
 # ---------------------------------------------------------------------------
 
 def _get_competition_stats(
@@ -180,25 +184,27 @@ def _get_competition_stats(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — deterministic rules model
+# Internal helpers â€” deterministic rules model
 # ---------------------------------------------------------------------------
 
 def _rules_model(
     home_profile: dict[str, Any] | None,
     away_profile: dict[str, Any] | None,
     match_doc: dict[str, Any],
+    home_key: str = "",
+    away_key: str = "",
 ) -> dict[str, Any]:
     """Learned matchup-strength rules model.
 
     Architecture (Phases 1-3):
-      1. League-strength normalization — adjusts historical rates by the gap
+      1. League-strength normalization â€” adjusts historical rates by the gap
          between the team's average opponent strength and the match league.
-      2. Competition-specific stats — when >= 5 matches exist in this exact
+      2. Competition-specific stats â€” when >= 5 matches exist in this exact
          competition, those stats replace the normalised overall profile.
-      3. Venue-aware stats — home/away split applied for all markets.
-      4. Recency-weighted form — last 5 results weighted more than older ones.
-      5. Sample-size credibility — low sample shrinks scores toward 0.5.
-      6. Matchup differential — home_strength vs away_strength drives market
+      3. Venue-aware stats â€” home/away split applied for all markets.
+      4. Recency-weighted form â€” last 5 results weighted more than older ones.
+      5. Sample-size credibility â€” low sample shrinks scores toward 0.5.
+      6. Matchup differential â€” home_strength vs away_strength drives market
          selection; draw detected from balance.
 
     Returns a dict with pick_type, selection, confidence, strength_context,
@@ -214,7 +220,7 @@ def _rules_model(
         return {"pick_type": "no_bet", "reason": "insufficient_sample",
                 "sample_size": {"home": home_sample, "away": away_sample}}
 
-    # ── League strength context ──────────────────────────────────────────────
+    # â”€â”€ League strength context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     raw_sporty = match_doc.get("raw_sporty") if isinstance(match_doc.get("raw_sporty"), dict) else match_doc
     tournament = match_doc.get("tournament") or raw_sporty.get("tournament") or ""
     if isinstance(tournament, dict):
@@ -234,7 +240,7 @@ def _rules_model(
     home_norm = _norm_factor(home_opp_avg)
     away_norm = _norm_factor(away_opp_avg)
 
-    # Step-up/step-down delta — large gaps reduce credibility
+    # Step-up/step-down delta â€” large gaps reduce credibility
     def _step_delta(opp_avg: float | None) -> float:
         if opp_avg is None:
             return 0.0
@@ -253,12 +259,10 @@ def _rules_model(
         "away_step_delta": round(away_step_delta, 1),
     }
 
-    # ── Competition-specific stats (Phase 2) ─────────────────────────────────
+    # â”€â”€ Competition-specific stats (Phase 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     from app.storage.league_memory import normalize_league  # noqa: PLC0415
     competition_key = normalize_league(str(tournament))
 
-    home_key = _slug_from_profile(hp)
-    away_key = _slug_from_profile(ap)
 
     home_comp = _get_competition_stats(home_key, competition_key) if home_key else None
     away_comp = _get_competition_stats(away_key, competition_key) if away_key else None
@@ -268,7 +272,7 @@ def _rules_model(
         "away_used": away_comp is not None,
     }
 
-    # ── Extract per-side stats ───────────────────────────────────────────────
+    # â”€â”€ Extract per-side stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _side_stats(
         profile: dict[str, Any],
         comp: dict[str, Any] | None,
@@ -322,9 +326,9 @@ def _rules_model(
 
         # Apply league-strength normalization as an additive adjustment
         # (not a direct multiplier) so rates stay in [0, 1].
-        # A norm_factor > 1 means the team played weaker opponents → discount.
-        # A norm_factor < 1 means they played stronger opponents → boost.
-        strength_adj = (1.0 - norm) * 0.15   # max ±6pp at the clamp limits
+        # A norm_factor > 1 means the team played weaker opponents â†’ discount.
+        # A norm_factor < 1 means they played stronger opponents â†’ boost.
+        strength_adj = (1.0 - norm) * 0.15   # max Â±6pp at the clamp limits
         win_rate_n  = max(0.0, min(1.0, win_rate  + strength_adj))
         gf_avg_n    = max(0.0, gf_avg  * (2.0 - norm))   # scale goals by inverse norm
         ga_avg_n    = max(0.0, ga_avg  * norm)            # conceding scales with norm
@@ -350,7 +354,7 @@ def _rules_model(
         for i, ch in enumerate(form_str):
             w = form_weights[i] if i < len(form_weights) else 0.01
             form_score += w * (1.0 if ch == "W" else 0.5 if ch == "D" else 0.0)
-        # Normalise form_score to [0, 1] (max possible ≈ sum of weights)
+        # Normalise form_score to [0, 1] (max possible â‰ˆ sum of weights)
         max_form = sum(form_weights[:len(form_str)]) or 1.0
         form_score = form_score / max_form if max_form else 0.5
 
@@ -372,7 +376,7 @@ def _rules_model(
     home_stats = _side_stats(hp, home_comp, "home", home_norm, home_step_delta, home_sample)
     away_stats = _side_stats(ap, away_comp, "away", away_norm, away_step_delta, away_sample)
 
-    # ── Matchup strength scores ──────────────────────────────────────────────
+    # â”€â”€ Matchup strength scores â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Each market gets a home_score and away_score; the gap drives the pick.
 
     # Match result: weighted combination of win_rate, form, and goal differential
@@ -398,20 +402,20 @@ def _rules_model(
     # Under 2.5: driven by clean sheet rates
     under25_score = (home_stats["cs_rate"] + away_stats["cs_rate"]) / 2
 
-    # ── Market selection ─────────────────────────────────────────────────────
+    # â”€â”€ Market selection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Build candidate markets with their scores and minimum credibility
     min_cred = min(home_stats["credibility"], away_stats["credibility"])
 
     candidates: list[tuple[str, str, float]] = []  # (pick_type, selection, score)
 
-    # Match result — need a meaningful gap
+    # Match result â€” need a meaningful gap
     if abs(result_gap) >= 0.06 and min_cred >= 0.25:
         if result_gap > 0:
             candidates.append(("match_result", "home_win", home_result_score))
         else:
             candidates.append(("match_result", "away_win", away_result_score))
 
-    # Draw — only when balance is genuine
+    # Draw â€” only when balance is genuine
     if draw_score >= 0.38 and abs(result_gap) < 0.10 and min_cred >= 0.30:
         candidates.append(("match_result", "draw", draw_score))
 
@@ -423,7 +427,7 @@ def _rules_model(
     if over25_score >= 0.50 and min_cred >= 0.25:
         candidates.append(("goals", "over_25", over25_score))
 
-    # Under 2.5 — only when both sides show defensive strength
+    # Under 2.5 â€” only when both sides show defensive strength
     if under25_score >= 0.40 and min_cred >= 0.30:
         candidates.append(("goals", "under_25", under25_score))
 
@@ -436,15 +440,86 @@ def _rules_model(
             "sample_size": {"home": home_sample, "away": away_sample},
         }
 
+    # -- Phase 4a: signal weight adjustments ----------------------------------
+    # signal_weights from self_learner nudge each candidate score by up to +-5pp.
+    _SIGNAL_NAME = {
+        "match_result": "recent_history_edge",
+        "btts":         "goal_pressure",
+        "goals":        "goal_pressure",
+    }
+    try:
+        _sig_cache: dict = {}
+
+        def _sw(pt: str) -> dict:
+            if pt not in _sig_cache:
+                _sig_cache[pt] = get_signal_weights(str(tournament), pt)
+            return _sig_cache[pt]
+
+        candidates = [
+            (pt, sel, score + float(_sw(pt).get(_SIGNAL_NAME.get(pt, "recent_history_edge"), 0.0)) * 0.05)
+            for pt, sel, score in candidates
+        ]
+    except Exception:
+        pass
+
     # Pick the highest-scoring candidate
     best = max(candidates, key=lambda c: c[2])
     pick_type, selection, raw_score = best
 
-    # ── Confidence ───────────────────────────────────────────────────────────
-    # Map raw_score [0.4, 1.0] → confidence [40, 88], then scale by credibility
+    # â”€â”€ Confidence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Map raw_score [0.4, 1.0] -> confidence [40, 88], then scale by credibility
     base_conf = 40 + (raw_score - 0.40) * 80
     confidence = int(base_conf * (0.6 + min_cred * 0.4))
     confidence = max(1, min(88, confidence))
+
+    # -- Phase 4b: league calibration gap -------------------------------------
+    # calibration_gap (pp) > 0 = underconfident -> boost; < 0 = overconfident -> cut.
+    try:
+        league_acc = get_league_accuracy(str(tournament))
+        if league_acc.get("known"):
+            for entry in league_acc.get("by_pick_type", []):
+                if entry["pick_type"] == pick_type:
+                    gap_pp = float(entry.get("calibration_gap") or 0)
+                    confidence = max(1, min(88, confidence + max(-8, min(8, int(gap_pp * 0.5)))))
+                    break
+    except Exception:
+        pass
+
+    # -- Phase 4c: learned model weight for "rules" ---------------------------
+    # Scale confidence proportionally to rules model performance vs base (0.20).
+    try:
+        lw = get_learned_weights()
+        scale = max(0.75, min(1.25, float(lw.get("rules", 0.20)) / 0.20))
+        confidence = max(1, min(88, int(confidence * scale)))
+    except Exception:
+        pass
+
+    # -- Phase 4d: signal combination performance ----------------------------
+    # If this exact signal combination has a tracked win_rate, nudge confidence.
+    try:
+        from app.signal_combinations import build_signal_combination  # noqa: PLC0415
+        _signals_for_combo = [
+            {"name": _SIGNAL_NAME.get(pick_type, "recent_history_edge"), "impact": raw_score * 10}
+        ]
+        _combo = build_signal_combination(_signals_for_combo, pick_type, selection)
+        _combo_perf = get_signal_combination_performance(
+            _combo["key"], league=str(tournament), pick_type=pick_type
+        )
+        if _combo_perf["win_rate"] is not None and _combo_perf["samples"] >= 5:
+            # win_rate > 0.55 -> boost up to +6; < 0.45 -> cut up to -6
+            combo_nudge = int((_combo_perf["win_rate"] - 0.50) * 12)
+            confidence = max(1, min(88, confidence + max(-6, min(6, combo_nudge))))
+    except Exception:
+        pass
+
+    # -- Phase 4e: learned threshold cap -------------------------------------
+    # Clamp confidence to the learned confidence_cap for this league + pick_type.
+    try:
+        _thresh = get_learned_thresholds(league=str(tournament), pick_type=pick_type)
+        cap = int(_thresh["confidence_cap"])
+        confidence = min(confidence, cap)
+    except Exception:
+        pass
 
     return {
         "pick_type": pick_type,
@@ -471,16 +546,16 @@ def _rules_model(
     }
 
 
-def _slug_from_profile(profile: dict[str, Any]) -> str:
-    """Best-effort team_key from a profile dict (used to look up competition stats)."""
-    # The profile doesn't store team_key directly; the caller must pass it.
-    # This is a no-op placeholder — competition stats lookup is keyed by the
-    # team_key resolved in team_watcher_signal, not from the profile itself.
-    return ""
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — venue context (kept for _ai_model compatibility)
+# Internal helpers â€” venue context (kept for _ai_model compatibility)
 # ---------------------------------------------------------------------------
 
 def _build_venue_context(
@@ -502,7 +577,7 @@ def _build_venue_context(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — AI model
+# Internal helpers â€” AI model
 # ---------------------------------------------------------------------------
 
 def _ai_model(
@@ -626,7 +701,7 @@ def _merge_signal(
     rules_sup = r_adj < -0.6
     ai_sup = a_adj < -0.6
 
-    # Both models suppressed → no_bet
+    # Both models suppressed â†’ no_bet
     if rules_sup and ai_sup:
         return {
             "name": "team_watcher_engine",
@@ -652,7 +727,7 @@ def _merge_signal(
 
     total = w_rules_raw + w_ai_raw
     if total <= 0:
-        # Fallback — equal weights
+        # Fallback â€” equal weights
         w_rules = 0.5
         w_ai = 0.5
     else:
@@ -780,7 +855,7 @@ def team_watcher_signal(match_doc: dict[str, Any]) -> dict[str, Any]:
         # ------------------------------------------------------------------
         # Run sub-models
         # ------------------------------------------------------------------
-        rules_out = _rules_model(home_profile, away_profile, match_doc)
+        rules_out = _rules_model(home_profile, away_profile, match_doc, home_key=home_key, away_key=away_key)
         ai_out = _ai_model(home_profile, away_profile, match_doc)
 
         # Determine which team key to use for weights (prefer home if profile exists)
@@ -941,7 +1016,7 @@ def _grade_tw_selection(
     if pt == "match_result":
         if actual_outcome is None:
             return "void"
-        # Direct selection→outcome comparison
+        # Direct selectionâ†’outcome comparison
         # Normalise selection to match canonical outcome strings
         sel_norm = sel.replace(" ", "_")
         if sel_norm == actual_outcome:
@@ -1008,9 +1083,9 @@ def grade_tw_predictions(match_id: str, result: dict[str, Any]) -> dict[str, Any
     - If ``result`` has an ``"outcome"`` key, use it directly.
     - Otherwise derive the outcome from ``"home_score"`` / ``"away_score"``.
 
-    ``selection == actual_outcome``  → ``"win"``
-    ``selection != actual_outcome``  → ``"loss"``
-    Undetermined / ambiguous        → ``"void"``
+    ``selection == actual_outcome``  â†’ ``"win"``
+    ``selection != actual_outcome``  â†’ ``"loss"``
+    Undetermined / ambiguous        â†’ ``"void"``
 
     Already-graded rows are automatically skipped via the ``graded_at IS NULL``
     WHERE clause, making this function idempotent.
@@ -1077,12 +1152,12 @@ def update_tw_weights(team_key: str) -> dict[str, Any]:
     Recompute TW_Weights for a team from graded ``team_watcher_predictions``.
 
     Only runs if >= 10 graded rows (``graded_at IS NOT NULL``) exist for the
-    team across all sub_models — mirrors the ``MIN_SAMPLES`` guard in
+    team across all sub_models â€” mirrors the ``MIN_SAMPLES`` guard in
     ``self_learner.py``.
 
     Per-sub_model stats are computed (wins, losses, samples, win_rate) and
     ``weight_adj = round((win_rate - 0.50) * 2.0, 3)`` is stored in
-    ``team_watcher_weights`` using an idempotent ``INSERT … ON CONFLICT … DO
+    ``team_watcher_weights`` using an idempotent ``INSERT â€¦ ON CONFLICT â€¦ DO
     UPDATE`` (same pattern as ``signal_weights`` in ``self_learner.py``).
 
     Returns ``{"status": "skipped", "reason": "insufficient_samples"}`` when
@@ -1198,18 +1273,18 @@ def generate_weekly_analysis(team_key: str) -> dict[str, Any]:
     ``sufficient_data: False`` and all trend fields set to ``None``.
 
     Otherwise computes:
-    - ``rolling_form``         — last 8 results as a "WWDLWWLW" string
-    - ``record``               — {wins, draws, losses}
-    - ``points_per_game``      — float (3 per win, 1 per draw)
-    - ``goals_for_avg``        — float
-    - ``goals_against_avg``    — float
-    - ``btts_rate``            — fraction of matches where both teams scored
-    - ``over_25_rate``         — fraction of matches with total goals > 2.5
-    - ``clean_sheet_rate``     — fraction of matches where team conceded 0
-    - ``venue_split``          — separate home/away sub-dicts
-    - ``market_lean_trend``    — {direction, magnitude} default neutral
-    - ``trend_summary``        — human-readable string
-    - ``upcoming_pick_confidence`` — int from _rules_model, or None
+    - ``rolling_form``         â€” last 8 results as a "WWDLWWLW" string
+    - ``record``               â€” {wins, draws, losses}
+    - ``points_per_game``      â€” float (3 per win, 1 per draw)
+    - ``goals_for_avg``        â€” float
+    - ``goals_against_avg``    â€” float
+    - ``btts_rate``            â€” fraction of matches where both teams scored
+    - ``over_25_rate``         â€” fraction of matches with total goals > 2.5
+    - ``clean_sheet_rate``     â€” fraction of matches where team conceded 0
+    - ``venue_split``          â€” separate home/away sub-dicts
+    - ``market_lean_trend``    â€” {direction, magnitude} default neutral
+    - ``trend_summary``        â€” human-readable string
+    - ``upcoming_pick_confidence`` â€” int from _rules_model, or None
 
     Persists the report to ``ai_team_watchers.weekly_analysis_json`` and sets
     ``weekly_analysis_at = current_timestamp``.
@@ -1292,7 +1367,7 @@ def generate_weekly_analysis(team_key: str) -> dict[str, Any]:
         over_25_rate = round(over_25_count / sample_size, 3)
         clean_sheet_rate = round(clean_sheet_count / sample_size, 3)
 
-        # Rolling form — last 8 results (rows are already newest-first)
+        # Rolling form â€” last 8 results (rows are already newest-first)
         form_chars = []
         for r in rows[:8]:
             res = r["result"]
@@ -1339,7 +1414,7 @@ def generate_weekly_analysis(team_key: str) -> dict[str, Any]:
         market_lean_trend: dict[str, Any] = {"direction": "neutral", "magnitude": 0.0}
 
         # ------------------------------------------------------------------
-        # 5. Trend summary — human-readable description based on form & venue
+        # 5. Trend summary â€” human-readable description based on form & venue
         # ------------------------------------------------------------------
         recent_4 = rows[:4]
         recent_wins = sum(1 for r in recent_4 if r["result"] == "win")
@@ -1422,7 +1497,7 @@ def _maybe_generate_weekly_analysis(team_key: str) -> None:
     - the stored timestamp is more than 7 days older than
       ``datetime.now(timezone.utc)``.
 
-    Returns ``None`` silently in all cases — including when the 7-day gate
+    Returns ``None`` silently in all cases â€” including when the 7-day gate
     blocks generation or when the team has no watcher row yet.
 
     Requirements: 3.1, 6.1, 6.2
@@ -1438,13 +1513,13 @@ def _maybe_generate_weekly_analysis(team_key: str) -> None:
             ).fetchone()
 
         if row is None:
-            # No watcher row at all — nothing to generate
+            # No watcher row at all â€” nothing to generate
             return
 
         weekly_analysis_at = row["weekly_analysis_at"]
 
         if weekly_analysis_at is None:
-            # First-ever report — generate immediately
+            # First-ever report â€” generate immediately
             generate_weekly_analysis(team_key)
             return
 
@@ -1470,7 +1545,7 @@ def _maybe_generate_weekly_analysis(team_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Post-match AI monitoring — context-rich performance notes
+# Post-match AI monitoring â€” context-rich performance notes
 # ---------------------------------------------------------------------------
 
 def monitor_team_performance(
@@ -1492,7 +1567,7 @@ def monitor_team_performance(
     4. Records notes via the competition registry for persistence.
 
     Returns a dict with ``status`` and ``notes_generated`` count.
-    Never raises — all errors are caught and logged.
+    Never raises â€” all errors are caught and logged.
     """
     try:
         _init_db()
@@ -1500,7 +1575,7 @@ def monitor_team_performance(
             conn.row_factory = sqlite3.Row
             init_tw_tables(conn)
 
-            # ── 1. Resolve the actual outcome ────────────────────────────────
+            # â”€â”€ 1. Resolve the actual outcome â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             score = match_doc.get("score") or {}
             home_goals = _to_int(score.get("home"))
             away_goals = _to_int(score.get("away"))
@@ -1522,13 +1597,13 @@ def monitor_team_performance(
             actual_result = "win" if own_goals > opp_goals else "loss" if own_goals < opp_goals else "draw"
             competition_key = _normalize_league_name(str(team_row["league_name"] or ""))
 
-            # ── 2. Load team profile for context ─────────────────────────────
+            # â”€â”€ 2. Load team profile for context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             profile = _get_profile(conn, team_key) or {}
             sample_size = int(profile.get("sample_size") or 0)
 
             notes: list[dict[str, Any]] = []
 
-            # ── 3. Generate typed notes ─────────────────────────────────────
+            # â”€â”€ 3. Generate typed notes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # 3a. Result note
             result_note = _note_for_result(actual_result, own_goals, opp_goals, side, profile)
             if result_note:
@@ -1550,7 +1625,7 @@ def monitor_team_performance(
                 if trend_note:
                     notes.append(trend_note)
 
-            # ── 4. Persist notes via competition registry ────────────────────
+            # â”€â”€ 4. Persist notes via competition registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             from app.competition.competition_registry import (
                 add_performance_note as _add_note,
                 ensure_team_competition,
@@ -1721,11 +1796,11 @@ def _note_for_situation(side: str, gf: int, ga: int, profile: dict[str, Any], ma
 
     # Goal patterns
     if gf == 0 and ga == 0:
-        notes.append("Goalless draw — neither side could break through.")
+        notes.append("Goalless draw â€” neither side could break through.")
     elif gf >= 3:
         notes.append(f"High-scoring performance with {gf} goals scored.")
     elif ga >= 3:
-        notes.append(f"Conceded {ga} goals — defensive vulnerability exposed.")
+        notes.append(f"Conceded {ga} goals â€” defensive vulnerability exposed.")
 
     if not notes:
         return None
@@ -1839,7 +1914,7 @@ def regrade_void_predictions(limit: int = 2000) -> dict[str, Any]:
     3. Updates the ``result`` in-place; resets ``graded_at`` to now so weight
        updates see fresh data.
 
-    Rows whose match has no score data remain ``"void"`` — they are skipped
+    Rows whose match has no score data remain ``"void"`` â€” they are skipped
     to avoid making things worse.
 
     Returns::

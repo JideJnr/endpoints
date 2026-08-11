@@ -8,14 +8,15 @@ from app.data_clients.sofascore_client import fetch_team_history
 
 
 MAX_GOALS = 7
-HOME_ADVANTAGE = 1.10
+HOME_ADVANTAGE = 1.0
 
 
 def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[str, Any]:
     home_stats = _team_stats(home_team_id, last_n)
     away_stats = _team_stats(away_team_id, last_n)
 
-    home_lambda = home_stats["scored"] * HOME_ADVANTAGE * (away_stats["conceded"] / 1.3)
+    home_advantage = _learned_home_advantage_multiplier()
+    home_lambda = home_stats["scored"] * home_advantage * (away_stats["conceded"] / 1.3)
     away_lambda = away_stats["scored"] * (home_stats["conceded"] / 1.3)
     home_lambda = max(home_lambda, 0.3)
     away_lambda = max(away_lambda, 0.3)
@@ -37,21 +38,27 @@ def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[
                 btts += probability
             scorelines.append((home_goals, away_goals, round(probability * 100, 2)))
 
+    calibrated_1x2 = _apply_bias_corrections({
+        "home_win": home_win,
+        "draw": draw,
+        "away_win": away_win,
+    })
     probabilities = {
-        "home_win": round(home_win * 100, 1),
-        "draw": round(draw * 100, 1),
-        "away_win": round(away_win * 100, 1),
+        "home_win": round(calibrated_1x2["home_win"] * 100, 1),
+        "draw": round(calibrated_1x2["draw"] * 100, 1),
+        "away_win": round(calibrated_1x2["away_win"] * 100, 1),
         "over_2_5": round(over_2_5 * 100, 1),
         "btts": round(btts * 100, 1),
     }
     prediction = max(
-        {"Home Win": home_win, "Draw": draw, "Away Win": away_win},
-        key={"Home Win": home_win, "Draw": draw, "Away Win": away_win}.get,
+        {"Home Win": calibrated_1x2["home_win"], "Draw": calibrated_1x2["draw"], "Away Win": calibrated_1x2["away_win"]},
+        key={"Home Win": calibrated_1x2["home_win"], "Draw": calibrated_1x2["draw"], "Away Win": calibrated_1x2["away_win"]}.get,
     )
 
     return {
         "home_lambda": round(home_lambda, 3),
         "away_lambda": round(away_lambda, 3),
+        "home_advantage_multiplier": home_advantage,
         "home_stats": home_stats,
         "away_stats": away_stats,
         "probabilities": probabilities,
@@ -156,6 +163,31 @@ def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
 
 def _poisson_prob(lam: float, goals: int) -> float:
     return (math.exp(-lam) * (lam ** goals)) / math.factorial(goals)
+
+
+def _learned_home_advantage_multiplier() -> float:
+    try:
+        from app.monitoring.self_learner import get_bias_corrections
+        bias = get_bias_corrections()
+        return max(0.80, min(1.05, float(bias.get("home_advantage_multiplier") or 1.0)))
+    except Exception:
+        return HOME_ADVANTAGE
+
+
+def _apply_bias_corrections(probs: dict[str, float]) -> dict[str, float]:
+    try:
+        from app.monitoring.self_learner import get_bias_corrections
+        bias = get_bias_corrections()
+        weighted = {
+            key: float(value) * float(bias.get(f"{key}_multiplier") or 1.0)
+            for key, value in probs.items()
+        }
+    except Exception:
+        weighted = dict(probs)
+    total = sum(weighted.values())
+    if total <= 0:
+        return dict(probs)
+    return {key: value / total for key, value in weighted.items()}
 
 
 def _to_int(value: Any, default: int = 0) -> int:

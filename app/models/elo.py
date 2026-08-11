@@ -10,7 +10,7 @@ from app.storage.league_memory import _init_db
 
 
 K_FACTOR = 32
-HOME_ADVANTAGE_ELO = 100
+HOME_ADVANTAGE_ELO = 0
 
 
 def _init_elo_table(conn: sqlite3.Connection) -> None:
@@ -58,7 +58,7 @@ def update_elo(
     home_elo = get_elo(home_id)
     away_elo = get_elo(away_id)
 
-    home_expected = 1 / (1 + 10 ** ((away_elo - (home_elo + HOME_ADVANTAGE_ELO)) / 400))
+    home_expected = 1 / (1 + 10 ** ((away_elo - home_elo) / 400))
     away_expected = 1 - home_expected
 
     if home_goals > away_goals:
@@ -134,12 +134,25 @@ def record_match_result_once(source: str, event: dict[str, Any]) -> dict[str, An
 def elo_prediction(home_id: str, away_id: str) -> dict[str, Any]:
     home_elo = get_elo(home_id)
     away_elo = get_elo(away_id)
-    home_expected = 1 / (1 + 10 ** ((away_elo - (home_elo + HOME_ADVANTAGE_ELO)) / 400))
+    home_expected = 1 / (1 + 10 ** ((away_elo - home_elo) / 400))
+    away_expected = 1 - home_expected
+    try:
+        from app.models.poisson import _apply_bias_corrections
+        calibrated = _apply_bias_corrections({
+            "home_win": home_expected,
+            "draw": 0.0,
+            "away_win": away_expected,
+        })
+        home_expected = calibrated["home_win"]
+        away_expected = calibrated["away_win"]
+    except Exception:
+        pass
     return {
         "model": "elo",
         "home_elo": round(home_elo),
         "away_elo": round(away_elo),
         "home_win_probability": round(home_expected * 100, 1),
-        "away_win_probability": round((1 - home_expected) * 100, 1),
+        "away_win_probability": round(away_expected * 100, 1),
         "elo_diff": round(home_elo - away_elo),
+        "home_advantage_elo": HOME_ADVANTAGE_ELO,
     }

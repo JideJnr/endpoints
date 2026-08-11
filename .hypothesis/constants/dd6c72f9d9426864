@@ -1,0 +1,4 @@
+# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\scheduling\pipeline_registry.py
+# hypothesis_version: 6.141.1
+
+['AI Prediction Queue', 'Every 2 min', 'Every 24 hrs', 'Every 30 s', 'Every 5 min', 'Every 60 s', 'Internal', 'Live Priority Lane', 'Prematch Enrichment', 'SofaScore', 'SportyBet', 'active', 'ai_prediction_queue', 'ai_prematch', 'always_on', 'both', 'cloud', 'competition_analysis', 'competition_special', 'conflict_warning', 'consecutive_failures', 'default', 'description', 'disabled', 'enabled', 'engine_id', 'enrich_worker', 'exclude_live', 'fail_count', 'finished_at', 'heartbeat_at', 'ingest_live', 'ingest_upcoming', 'interval', 'job_id', 'job_ids', 'label', 'last_error', 'last_run_at', 'live_only', 'live_priority_mode', 'live_priority_toggle', 'local', 'off', 'paused', 'run_count', 'sofa_pipeline', 'source', 'sporty_only_upcoming', 'unified_live', 'unified_upcoming']

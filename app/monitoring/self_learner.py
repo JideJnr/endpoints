@@ -133,6 +133,61 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
             last_updated    text not null default current_timestamp
         )
     """)
+    # Signal combination memory — which signal patterns win/lose per league+pick_type
+    conn.execute("""
+        create table if not exists signal_combination_memory (
+            combination_key text not null,
+            league_key      text not null default '__global__',
+            pick_type       text not null default '__all__',
+            selection       text not null default '__all__',
+            samples         integer not null default 0,
+            wins            integer not null default 0,
+            losses          integer not null default 0,
+            win_rate        real,
+            avg_confidence  real,
+            last_updated    text not null default current_timestamp,
+            primary key (combination_key, league_key, pick_type, selection)
+        )
+    """)
+    # Learned thresholds per league + pick_type (replaces hardcoded filter/engine values)
+    conn.execute("""
+        create table if not exists learned_thresholds (
+            league_key          text not null,
+            pick_type           text not null,
+            min_confidence      real,
+            block_loss_rate     real,
+            caution_loss_rate   real,
+            trust_win_rate      real,
+            confidence_cap      real,
+            samples             integer not null default 0,
+            last_updated        text not null default current_timestamp,
+            primary key (league_key, pick_type)
+        )
+    """)
+    # Dynamic tournament preferences for enrichment priority ordering
+    conn.execute("""
+        create table if not exists tournament_preferences (
+            league_key      text not null primary key,
+            priority        integer not null default 4,
+            samples         integer not null default 0,
+            win_rate        real,
+            last_updated    text not null default current_timestamp
+        )
+    """)
+    # Outcome bias corrections learned from overconfident losses by side.
+    conn.execute("""
+        create table if not exists model_bias_corrections (
+            bias_key        text not null primary key,
+            samples         integer not null default 0,
+            wins            integer not null default 0,
+            losses          integer not null default 0,
+            win_rate        real,
+            avg_confidence  real,
+            multiplier      real not null default 1.0,
+            flagged         integer not null default 0,
+            last_updated    text not null default current_timestamp
+        )
+    """)
 
 
 # ── Main learning cycle ───────────────────────────────────────────────────────
@@ -253,6 +308,7 @@ def run_learning_cycle() -> dict[str, Any]:
         conn.execute("delete from signal_pick_weights")
         conn.execute("delete from league_accuracy")
         conn.execute("delete from learned_model_weights")
+        conn.execute("delete from model_bias_corrections")
 
         # Signal weights
         for (signal_name, league_key), stats in signal_stats.items():
@@ -365,7 +421,12 @@ def run_learning_cycle() -> dict[str, Any]:
             """, (model, base, learned, samples, round(win_rate, 4), now))
             model_updates += 1
 
+        bias_updates = _learn_bias_corrections(conn, rows)
+
         conn.commit()
+
+        # -- 4. Tournament preferences for enrichment priority ------------------
+        pref_result = update_tournament_preferences()
 
         # ── 5. AI analysis feedback loop ────────────────────────────────
         ai_updates = _incorporate_ai_analysis(conn, rows)
@@ -376,16 +437,27 @@ def run_learning_cycle() -> dict[str, Any]:
         # ── 7. Grade specialist contributions ─────────────────────────
         specialist_updates = _grade_specialists_from_history(rows)
 
+        # -- 8. Signal combination memory -----------------------------------------
+        combination_updates = _learn_signal_combinations(conn, rows)
+
+        # -- 9. Learned thresholds ------------------------------------------------
+        threshold_updates = _learn_thresholds(conn, rows)
+
         conn.commit()
 
+    pref_updates = pref_result.get("updates", 0) if isinstance(pref_result, dict) else 0
     print(
         f"[self_learner] cycle complete: "
         f"{signal_updates} signal weights | "
         f"{league_updates} league accuracy rows | "
         f"{model_updates} model weights updated | "
+        f"{bias_updates} bias corrections | "
         f"{ai_updates} AI analysis adjustments | "
         f"{behavior_updates} behavior adjustments | "
-        f"{specialist_updates} specialist credits"
+        f"{specialist_updates} specialist credits | "
+        f"{combination_updates} combination patterns | "
+        f"{threshold_updates} learned thresholds | "
+        f"{pref_updates} tournament preferences"
     )
     return {
         "status": "ok",
@@ -393,9 +465,13 @@ def run_learning_cycle() -> dict[str, Any]:
         "signal_updates": signal_updates,
         "league_updates": league_updates,
         "model_weight_updates": model_updates,
+        "bias_correction_updates": bias_updates,
         "ai_analysis_adjustments": ai_updates,
         "behavior_adjustments": behavior_updates,
         "specialist_credits": specialist_updates,
+        "combination_updates": combination_updates,
+        "threshold_updates": threshold_updates,
+        "tournament_preference_updates": pref_updates,
     }
 
 
@@ -466,6 +542,55 @@ def get_learned_weights() -> dict[str, float]:
     return weights
 
 
+def get_bias_corrections() -> dict[str, Any]:
+    """
+    Return learned outcome multipliers used to correct systemic side bias.
+
+    Multipliers are neutral at 1.0. Values below 1.0 suppress outcomes that
+    have been overconfident and loss-heavy in graded history.
+    """
+    defaults = {
+        "home_win_multiplier": 1.0,
+        "draw_multiplier": 1.0,
+        "away_win_multiplier": 1.0,
+        "home_advantage_multiplier": 1.0,
+        "flagged": [],
+        "source": "neutral_default",
+    }
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        _init_learner_tables(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            select bias_key, samples, wins, losses, win_rate,
+                   avg_confidence, multiplier, flagged
+            from model_bias_corrections
+        """).fetchall()
+    if not rows:
+        return defaults
+
+    result = dict(defaults)
+    result["source"] = "learned"
+    flagged: list[dict[str, Any]] = []
+    for row in rows:
+        key = str(row["bias_key"] or "")
+        multiplier = float(row["multiplier"] or 1.0)
+        if key in {"home_win", "draw", "away_win"}:
+            result[f"{key}_multiplier"] = multiplier
+        if key == "home_advantage":
+            result["home_advantage_multiplier"] = multiplier
+        if int(row["flagged"] or 0):
+            flagged.append({
+                "bias": key,
+                "samples": int(row["samples"] or 0),
+                "win_rate": round(float(row["win_rate"] or 0), 4),
+                "avg_confidence": round(float(row["avg_confidence"] or 0), 2),
+                "multiplier": multiplier,
+            })
+    result["flagged"] = flagged
+    return result
+
+
 def get_league_accuracy(league: str) -> dict[str, Any]:
     """
     Return accuracy stats for a specific league.
@@ -500,6 +625,110 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
             }
             for row in rows
         ],
+    }
+
+
+def update_tournament_preferences() -> dict[str, Any]:
+    """
+    Recompute tournament_preferences from league_accuracy.
+
+    Aggregates win rates across all pick_types per league, then maps the
+    overall accuracy to a priority score used by buffer.py for enrichment
+    queue ordering.
+
+    Priority mapping (lower = liked, processed first):
+      0 = high accuracy (win_rate >= 60%, samples >= 10)
+      1 = good accuracy (win_rate >= 55%, samples >= 5)
+      2 = decent (win_rate >= 50%, samples >= 5)
+      3 = neutral (win_rate >= 45%, samples >= 5)
+      4 = unknown / insufficient data (default)
+      5 = below average (win_rate >= 40%, samples >= 5)
+      6 = poor (win_rate >= 35%, samples >= 5)
+      7 = avoid (win_rate < 35%, samples >= 5)
+    """
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        _init_learner_tables(conn)
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Aggregate league_accuracy across all pick_types per league
+        rows = conn.execute("""
+            select league_key, league_name, sum(samples) as total_samples,
+                   sum(wins) as total_wins
+            from league_accuracy
+            where samples >= 1
+            group by league_key
+        """).fetchall()
+
+        updates = 0
+        for row in rows:
+            league_key = row["league_key"]
+            samples = row["total_samples"] or 0
+            wins = row["total_wins"] or 0
+            win_rate = wins / samples if samples > 0 else 0.0
+
+            if samples >= 10 and win_rate >= 0.60:
+                priority = 0
+            elif samples >= 5 and win_rate >= 0.55:
+                priority = 1
+            elif samples >= 5 and win_rate >= 0.50:
+                priority = 2
+            elif samples >= 5 and win_rate >= 0.45:
+                priority = 3
+            elif samples < 5:
+                priority = 4
+            elif win_rate >= 0.40:
+                priority = 5
+            elif win_rate >= 0.35:
+                priority = 6
+            else:
+                priority = 7
+
+            conn.execute("""
+                insert into tournament_preferences
+                    (league_key, priority, samples, win_rate, last_updated)
+                values (?, ?, ?, ?, ?)
+                on conflict(league_key) do update set
+                    priority = excluded.priority,
+                    samples = excluded.samples,
+                    win_rate = excluded.win_rate,
+                    last_updated = excluded.last_updated
+            """, (league_key, priority, samples, round(win_rate, 4), now))
+            updates += 1
+
+        conn.commit()
+
+    return {"status": "ok", "updates": updates}
+
+
+def get_tournament_priority(league: str) -> dict[str, Any]:
+    """
+    Return the dynamic priority for a tournament/league.
+
+    Used by buffer.py to order the enrichment queue.  Falls back to
+    priority 4 (default) when no learned data exists yet.
+    """
+    _init_db()
+    league_key = _norm_league(league)
+    with db_conn(timeout=30) as conn:
+        _init_learner_tables(conn)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            select priority, samples, win_rate, last_updated
+            from tournament_preferences
+            where league_key = ?
+        """, (league_key,)).fetchone()
+
+    if not row:
+        return {"league": league, "priority": 4, "known": False}
+
+    return {
+        "league": league,
+        "priority": row["priority"],
+        "samples": row["samples"],
+        "win_rate": round(float(row["win_rate"] or 0) * 100, 1),
+        "known": True,
+        "last_updated": row["last_updated"],
     }
 
 
@@ -594,6 +823,254 @@ def get_learning_summary() -> dict[str, Any]:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# -- Signal combination learning -----------------------------------------
+
+def _learn_signal_combinations(conn: sqlite3.Connection, rows: list) -> int:
+    """Learn which signal combinations win/lose per league + pick_type.
+
+    Uses build_signal_combination() from signal_combinations.py to produce
+    a stable 16-char key for each prediction's signal set, then tallies
+    wins/losses per (key, league_key, pick_type, selection).
+    Requires >= 5 samples before writing a row.
+    """
+    from app.signal_combinations import build_signal_combination, live_context_from_prediction  # noqa: PLC0415
+
+    stats: dict[tuple, dict] = {}
+    for row in rows:
+        signals = _safe_json(row["signals_json"])
+        if not signals:
+            continue
+        league_key = _norm_league(row["league_name"] or "")
+        pick_type  = str(row["pick_type"] or "unknown")
+        selection  = str(row["selection"] or "unknown")
+        result     = row["result"]
+        try:
+            combo = build_signal_combination(
+                signals=signals,
+                pick_type=pick_type,
+                selection=selection,
+            )
+            key = combo["key"]
+        except Exception:
+            continue
+        for lk in ("__global__", league_key) if league_key else ("__global__",):
+            bucket = (key, lk, pick_type, selection)
+            if bucket not in stats:
+                stats[bucket] = {"samples": 0, "wins": 0, "losses": 0, "conf_sum": 0.0}
+            stats[bucket]["samples"] += 1
+            stats[bucket]["conf_sum"] += float(row["confidence"] or 0)
+            if result == "win":
+                stats[bucket]["wins"] += 1
+            else:
+                stats[bucket]["losses"] += 1
+
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for (ckey, lk, pt, sel), s in stats.items():
+        if s["samples"] < 5:
+            continue
+        wr = s["wins"] / s["samples"]
+        avg_conf = s["conf_sum"] / s["samples"]
+        conn.execute("""
+            insert into signal_combination_memory
+                (combination_key, league_key, pick_type, selection,
+                 samples, wins, losses, win_rate, avg_confidence, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(combination_key, league_key, pick_type, selection) do update set
+                samples        = excluded.samples,
+                wins           = excluded.wins,
+                losses         = excluded.losses,
+                win_rate       = excluded.win_rate,
+                avg_confidence = excluded.avg_confidence,
+                last_updated   = excluded.last_updated
+        """, (ckey, lk, pt, sel, s["samples"], s["wins"], s["losses"],
+              round(wr, 4), round(avg_conf, 2), now))
+        written += 1
+    return written
+
+
+def _learn_bias_corrections(conn: sqlite3.Connection, rows: list) -> int:
+    """Flag and correct systemic home/draw/away overconfidence.
+
+    The learner watches settled picks by selected side. If a side has enough
+    samples, a weak win rate, and confidence that ran ahead of reality, it
+    writes a multiplier below 1.0. Prediction models then apply that multiplier
+    to the final 1X2 distribution instead of relying on fixed priors.
+    """
+    stats: dict[str, dict[str, float]] = {
+        "home_win": {"samples": 0, "wins": 0, "losses": 0, "confidence_sum": 0.0},
+        "draw": {"samples": 0, "wins": 0, "losses": 0, "confidence_sum": 0.0},
+        "away_win": {"samples": 0, "wins": 0, "losses": 0, "confidence_sum": 0.0},
+    }
+    for row in rows:
+        side = _selection_bias_key(str(row["selection"] or row["pick_type"] or ""))
+        if not side:
+            continue
+        bucket = stats[side]
+        bucket["samples"] += 1
+        bucket["confidence_sum"] += float(row["confidence"] or 0)
+        if row["result"] == "win":
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for key, bucket in stats.items():
+        samples = int(bucket["samples"])
+        if samples < MIN_SAMPLES:
+            continue
+        wins = int(bucket["wins"])
+        losses = int(bucket["losses"])
+        win_rate = wins / samples if samples else 0.0
+        avg_conf = bucket["confidence_sum"] / samples if samples else 0.0
+        expected = avg_conf / 100 if avg_conf > 1 else avg_conf
+        overconfidence = max(0.0, expected - win_rate)
+        flagged = int(overconfidence >= 0.08 or (losses / samples) >= 0.58)
+        multiplier = 1.0
+        if flagged:
+            multiplier = max(0.72, round(1.0 - min(0.28, overconfidence * 0.9), 4))
+        conn.execute("""
+            insert into model_bias_corrections
+                (bias_key, samples, wins, losses, win_rate,
+                 avg_confidence, multiplier, flagged, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(bias_key) do update set
+                samples        = excluded.samples,
+                wins           = excluded.wins,
+                losses         = excluded.losses,
+                win_rate       = excluded.win_rate,
+                avg_confidence = excluded.avg_confidence,
+                multiplier     = excluded.multiplier,
+                flagged        = excluded.flagged,
+                last_updated   = excluded.last_updated
+        """, (key, samples, wins, losses, round(win_rate, 4),
+              round(avg_conf, 2), multiplier, flagged, now))
+        written += 1
+
+    home = stats["home_win"]
+    away = stats["away_win"]
+    paired_samples = int(min(home["samples"], away["samples"]))
+    if paired_samples >= MIN_SAMPLES:
+        home_rate = home["wins"] / home["samples"] if home["samples"] else 0.0
+        away_rate = away["wins"] / away["samples"] if away["samples"] else 0.0
+        gap = home_rate - away_rate
+        flagged = int(gap < -0.08 or (home["losses"] / home["samples"] if home["samples"] else 0.0) >= 0.58)
+        multiplier = max(0.80, round(1.0 + min(0.0, gap) * 0.6, 4)) if flagged else 1.0
+        conn.execute("""
+            insert into model_bias_corrections
+                (bias_key, samples, wins, losses, win_rate,
+                 avg_confidence, multiplier, flagged, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(bias_key) do update set
+                samples        = excluded.samples,
+                wins           = excluded.wins,
+                losses         = excluded.losses,
+                win_rate       = excluded.win_rate,
+                avg_confidence = excluded.avg_confidence,
+                multiplier     = excluded.multiplier,
+                flagged        = excluded.flagged,
+                last_updated   = excluded.last_updated
+        """, (
+            "home_advantage", paired_samples, int(home["wins"]), int(home["losses"]),
+            round(home_rate, 4), round(home["confidence_sum"] / home["samples"], 2),
+            multiplier, flagged, now,
+        ))
+        written += 1
+
+    return written
+
+
+def _learn_thresholds(conn: sqlite3.Connection, rows: list) -> int:
+    """Derive per-league + pick_type learned thresholds from graded history.
+
+    For each (league_key, pick_type) bucket with >= 20 samples:
+      - min_confidence : lowest confidence that still achieved >= 50% win rate
+        (Youden-style: scan confidence bands, pick the floor that maximises
+         win_rate - loss_rate)
+      - block_loss_rate  : observed loss rate when confidence < 60
+      - caution_loss_rate: observed loss rate when confidence 60-70
+      - trust_win_rate   : observed win rate when confidence >= 75
+      - confidence_cap   : 95th-percentile confidence seen in wins
+    """
+    # Bucket rows by (league_key, pick_type)
+    buckets: dict[tuple, list] = {}
+    for row in rows:
+        lk = _norm_league(row["league_name"] or "")
+        pt = str(row["pick_type"] or "unknown")
+        for key in (("__global__", pt), (lk, pt) if lk else None):
+            if key is None:
+                continue
+            buckets.setdefault(key, []).append(row)
+
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for (lk, pt), bucket_rows in buckets.items():
+        if len(bucket_rows) < 20:
+            continue
+
+        confs  = [float(r["confidence"] or 0) for r in bucket_rows]
+        results = [r["result"] for r in bucket_rows]
+
+        # min_confidence: scan bands [40,45,50,55,60,65,70], pick floor
+        # where win_rate - loss_rate is maximised
+        best_floor = 50.0
+        best_j = -1.0
+        for floor in (40, 45, 50, 55, 60, 65, 70):
+            above = [(c, r) for c, r in zip(confs, results) if c >= floor]
+            if len(above) < 5:
+                continue
+            n = len(above)
+            wr = sum(1 for _, r in above if r == "win") / n
+            lr = sum(1 for _, r in above if r == "loss") / n
+            j = wr - lr
+            if j > best_j:
+                best_j = j
+                best_floor = float(floor)
+
+        def _band_loss_rate(lo: float, hi: float) -> float | None:
+            band = [r for c, r in zip(confs, results) if lo <= c < hi]
+            if len(band) < 5:
+                return None
+            return round(sum(1 for r in band if r == "loss") / len(band), 4)
+
+        def _band_win_rate(lo: float, hi: float = 101.0) -> float | None:
+            band = [r for c, r in zip(confs, results) if lo <= c < hi]
+            if len(band) < 5:
+                return None
+            return round(sum(1 for r in band if r == "win") / len(band), 4)
+
+        # 95th-percentile confidence among wins
+        win_confs = sorted(c for c, r in zip(confs, results) if r == "win")
+        conf_cap: float | None = None
+        if win_confs:
+            idx = max(0, int(len(win_confs) * 0.95) - 1)
+            conf_cap = round(win_confs[idx], 1)
+
+        conn.execute("""
+            insert into learned_thresholds
+                (league_key, pick_type, min_confidence,
+                 block_loss_rate, caution_loss_rate, trust_win_rate,
+                 confidence_cap, samples, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(league_key, pick_type) do update set
+                min_confidence    = excluded.min_confidence,
+                block_loss_rate   = excluded.block_loss_rate,
+                caution_loss_rate = excluded.caution_loss_rate,
+                trust_win_rate    = excluded.trust_win_rate,
+                confidence_cap    = excluded.confidence_cap,
+                samples           = excluded.samples,
+                last_updated      = excluded.last_updated
+        """, (
+            lk, pt, best_floor,
+            _band_loss_rate(0, 60), _band_loss_rate(60, 70), _band_win_rate(75),
+            conf_cap, len(bucket_rows), now,
+        ))
+        written += 1
+    return written
+
+
 
 def _tally(stats: dict, key: tuple, result: str) -> None:
     if key not in stats:
@@ -762,6 +1239,17 @@ def _signal_mentions_selection(signal: dict[str, Any], selection: str) -> bool:
     value = signal.get("value") if isinstance(signal.get("value"), dict) else {}
     signal_selection = str(value.get("selection") or value.get("pick") or "").lower()
     return bool(signal_selection and (signal_selection in selection or selection in signal_selection))
+
+
+def _selection_bias_key(selection: str) -> str | None:
+    text = selection.lower().strip().replace("_", " ")
+    if text in {"home", "1", "home win"} or "home win" in text:
+        return "home_win"
+    if text in {"draw", "x"} or text == "match draw":
+        return "draw"
+    if text in {"away", "2", "away win"} or "away win" in text:
+        return "away_win"
+    return None
 
 
 def _norm_league(name: str) -> str:
@@ -1144,3 +1632,91 @@ def _incorporate_user_behavior(conn: sqlite3.Connection, graded_rows: list) -> i
             continue
 
     return behavior_adjustments
+
+
+# -- Read-back helpers for signal combinations and learned thresholds --------
+
+def get_signal_combination_performance(
+    combination_key: str,
+    league: str | None = None,
+    pick_type: str | None = None,
+) -> dict[str, Any]:
+    """Return win-rate stats for a signal combination key.
+
+    Prefers league-specific data; falls back to global.
+    Returns {"samples": 0, "win_rate": None} when no data exists.
+    """
+    _init_db()
+    league_key = _norm_league(league or "")
+    pt = pick_type or "__all__"
+    with db_conn(timeout=30) as conn:
+        _init_learner_tables(conn)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            select samples, wins, losses, win_rate, avg_confidence
+            from signal_combination_memory
+            where combination_key = ?
+              and league_key in (?, '__global__')
+              and pick_type = ?
+            order by case when league_key = ? then 0 else 1 end
+            limit 1
+        """, (combination_key, league_key, pt, league_key)).fetchone()
+    if not row:
+        return {"samples": 0, "win_rate": None, "avg_confidence": None}
+    return {
+        "samples":        row["samples"],
+        "wins":           row["wins"],
+        "losses":         row["losses"],
+        "win_rate":       float(row["win_rate"] or 0),
+        "avg_confidence": float(row["avg_confidence"] or 0),
+    }
+
+
+def get_learned_thresholds(
+    league: str | None = None,
+    pick_type: str | None = None,
+) -> dict[str, Any]:
+    """Return learned thresholds for a league + pick_type.
+
+    Falls back to global thresholds, then to hardcoded defaults.
+    Returned keys: min_confidence, block_loss_rate, caution_loss_rate,
+                   trust_win_rate, confidence_cap, samples, source.
+    """
+    _DEFAULTS: dict[str, Any] = {
+        "min_confidence":    50.0,
+        "block_loss_rate":   0.75,
+        "caution_loss_rate": 0.55,
+        "trust_win_rate":    0.65,
+        "confidence_cap":    88.0,
+        "samples":           0,
+        "source":            "hardcoded_default",
+    }
+    _init_db()
+    league_key = _norm_league(league or "")
+    pt = pick_type or "__all__"
+    with db_conn(timeout=30) as conn:
+        _init_learner_tables(conn)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            select min_confidence, block_loss_rate, caution_loss_rate,
+                   trust_win_rate, confidence_cap, samples, league_key
+            from learned_thresholds
+            where league_key in (?, '__global__')
+              and pick_type in (?, '__all__')
+            order by
+                case when league_key = ? then 0 else 1 end,
+                case when pick_type  = ? then 0 else 1 end
+            limit 1
+        """, (league_key, pt, league_key, pt)).fetchone()
+    if not row:
+        return _DEFAULTS
+    source = "league_learned" if row["league_key"] == league_key else "global_learned"
+    return {
+        "min_confidence":    float(row["min_confidence"]   or _DEFAULTS["min_confidence"]),
+        "block_loss_rate":   float(row["block_loss_rate"]  or _DEFAULTS["block_loss_rate"]) if row["block_loss_rate"]  is not None else _DEFAULTS["block_loss_rate"],
+        "caution_loss_rate": float(row["caution_loss_rate"] or _DEFAULTS["caution_loss_rate"]) if row["caution_loss_rate"] is not None else _DEFAULTS["caution_loss_rate"],
+        "trust_win_rate":    float(row["trust_win_rate"]   or _DEFAULTS["trust_win_rate"])  if row["trust_win_rate"]   is not None else _DEFAULTS["trust_win_rate"],
+        "confidence_cap":    float(row["confidence_cap"]   or _DEFAULTS["confidence_cap"])  if row["confidence_cap"]   is not None else _DEFAULTS["confidence_cap"],
+        "samples":           int(row["samples"]),
+        "source":            source,
+    }

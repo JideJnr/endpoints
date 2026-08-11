@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models.poisson import _poisson_prob, _team_stats
+from app.models.poisson import _apply_bias_corrections, _learned_home_advantage_multiplier, _poisson_prob, _team_stats
 
 
 MAX_GOALS = 7
-HOME_ADVANTAGE = 1.10
+HOME_ADVANTAGE = 1.0
 RHO = -0.13
 
 
@@ -27,7 +27,8 @@ def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> d
     home_stats = _team_stats(home_team_id, last_n)
     away_stats = _team_stats(away_team_id, last_n)
 
-    mu = home_stats["scored"] * HOME_ADVANTAGE * (away_stats["conceded"] / 1.3)
+    home_advantage = _learned_home_advantage_multiplier()
+    mu = home_stats["scored"] * home_advantage * (away_stats["conceded"] / 1.3)
     lam = away_stats["scored"] * (home_stats["conceded"] / 1.3)
     mu = max(mu, 0.3)
     lam = max(lam, 0.3)
@@ -58,16 +59,23 @@ def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> d
     if total_probability <= 0:
         total_probability = 1.0
 
+    calibrated_1x2 = _apply_bias_corrections({
+        "home_win": home_win / total_probability,
+        "draw": draw / total_probability,
+        "away_win": away_win / total_probability,
+    })
+
     return {
         "model": "dixon_coles",
         "home_lambda": round(mu, 3),
         "away_lambda": round(lam, 3),
+        "home_advantage_multiplier": home_advantage,
         "home_stats": home_stats,
         "away_stats": away_stats,
         "probabilities": {
-            "home_win": round(home_win / total_probability * 100, 1),
-            "draw": round(draw / total_probability * 100, 1),
-            "away_win": round(away_win / total_probability * 100, 1),
+            "home_win": round(calibrated_1x2["home_win"] * 100, 1),
+            "draw": round(calibrated_1x2["draw"] * 100, 1),
+            "away_win": round(calibrated_1x2["away_win"] * 100, 1),
             "over_2_5": round(over_2_5 / total_probability * 100, 1),
             "btts": round(btts / total_probability * 100, 1),
         },

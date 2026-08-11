@@ -15,7 +15,7 @@ from typing import Any
 
 _TEAM_HISTORY_CACHE_DAYS = 7
 def normalize_league(value: str | None) -> str:
-    text = (value or "").lower()
+    text = str(value or "").lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split()).strip()
 
@@ -26,7 +26,7 @@ def _league_from_match(match: dict[str, Any]) -> str:
         tournament_name = tournament.get("name") or tournament.get("uniqueTournament", {}).get("name") or ""
         category = tournament.get("category") or {}
         category_text = category.get("name") if isinstance(category, dict) else ""
-        if category_text and tournament_name and not tournament_name.lower().startswith(str(category_text).lower() + " "):
+        if category_text and tournament_name and not str(tournament_name).lower().startswith(str(category_text).lower() + " "):
             return f"{category_text} {tournament_name}".strip()
         return tournament_name
     if match.get("league_name"):
@@ -61,7 +61,7 @@ def _country_from_match(match: dict[str, Any], league_name: str | None = None) -
 
 
 def _country_from_league(league_name: str | None) -> str:
-    text = (league_name or "Unknown").strip()
+    text = str(league_name or "Unknown").strip()
     countries = {
         "argentina", "australia", "austria", "belgium", "brazil", "bulgaria",
         "canada", "chile", "china", "colombia", "croatia", "czech republic",
@@ -83,7 +83,7 @@ def _country_from_league(league_name: str | None) -> str:
 def _is_country_like(value: str | None) -> bool:
     if not value:
         return False
-    normalized = value.strip().lower()
+    normalized = str(value or "").strip().lower()
     if normalized in {"global", "international"}:
         return True
     countries = {
@@ -188,7 +188,7 @@ def _favorite_from_match(match: dict[str, Any]) -> dict[str, Any]:
 def _main_decimal_odds(match: dict[str, Any]) -> list[dict[str, Any]]:
     sporty_markets = match.get("markets") or []
     for market in sporty_markets:
-        name = (market.get("name") or "").lower()
+        name = str(market.get("name") or "").lower()
         if "1x2" in name or "winner" in name or name in {"3 way", "match result"}:
             odds = []
             for index, selection in enumerate(market.get("selections", [])):
@@ -612,8 +612,8 @@ def _grade_pick(pick_type: str | None, selection: str | None, home: int, away: i
 
 def _grade_pick_for_match(pick_type: str | None, selection: str | None, home: int, away: int, match_name: str | None = None) -> str:
     total = home + away
-    sel = (selection or "").lower()
-    pt = (pick_type or "").lower()
+    sel = str(selection or "").lower()
+    pt = str(pick_type or "").lower()
 
     if pt == "no_bet":
         return "void"
@@ -683,7 +683,7 @@ def _side_from_selection_and_match(selection: str, match_name: str | None) -> st
     if not match_name or " vs " not in match_name:
         return None
     home_name, away_name = [part.strip().lower() for part in match_name.split(" vs ", 1)]
-    sel = selection.lower()
+    sel = str(selection or "").lower()
     if home_name and home_name in sel:
         return "home"
     if away_name and away_name in sel:

@@ -382,7 +382,7 @@ def close_match_strength_context(match: dict[str, Any], limit: int = 8) -> dict[
             order by last_seen_at desc
             limit ?
             """,
-            (home.lower(), away.lower(), home.lower(), away.lower(), max(limit * 2, 12)),
+            (str(home or "").lower(), str(away or "").lower(), str(home or "").lower(), str(away or "").lower(), max(limit * 2, 12)),
         ).fetchall()
         league_stats = _finished_scope_stats(conn, "m.league_name = ?", (league,))
         country_stats = _finished_scope_stats(conn, "m.country_name = ?", (country,))
@@ -1616,11 +1616,11 @@ def get_local_signal_stats(
     scope = "device"
     if tournament:
         clauses.append("lower(coalesce(tournament, '')) like ?")
-        params.append(f"%{tournament.lower()}%")
+        params.append(f"%{str(tournament or '').lower()}%")
         scope = f"device:tournament:{tournament}"
     elif country:
         clauses.append("lower(coalesce(country, '')) like ?")
-        params.append(f"%{country.lower()}%")
+        params.append(f"%{str(country or '').lower()}%")
         scope = f"device:country:{country}"
     params.append(max(1, int(min_samples or 5)))
     with _conn() as conn:

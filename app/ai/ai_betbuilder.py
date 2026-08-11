@@ -10,6 +10,7 @@ from typing import Any
 from app.storage.buffer import get_buffered_match
 from app.storage.league_memory import list_prediction_history
 from app.research.research_filter import _research_filter_candidate, _normalise_league_key, _get_dynamic_rules
+from app.monitoring.self_learner import get_signal_combination_performance, get_learned_thresholds
 
 
 _ANALYSIS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -301,34 +302,57 @@ def synthesize_sure_picks(
         except Exception:
             pass
 
-        conviction = round(base_conviction + learned_boost + league_acc_boost, 2)
+        conviction = round(base_conviction + learned_boost + league_acc_boost + signal_boost, 2)
 
-        # ── Research conviction adjustment ──────────────────────────
+        # ── Research conviction adjustment (learned values where available) ──
         research_conviction_adj = 0
         selection = item.get("llm_recommendation") or engine_pick.get("selection") or ""
         sel_lower = str(selection).lower()
         country_name = str(item.get("country_name") or "").lower().strip()
         source = str(item.get("source") or "")
 
-        # Home or Away selection → +4
+        # Get learned thresholds for this pick type
+        try:
+            learned = get_learned_thresholds(
+                league=item.get("league_name") or "__global__",
+                pick_type=engine_pick.get("type") or item.get("pick_type") or "match_result",
+            )
+        except Exception:
+            learned = {}
+
+        # Home or Away selection -> learned boost (default 4)
         if "home or away" in sel_lower or sel_lower == "home_or_away":
-            research_conviction_adj += 4
-        # Away or Draw with llm_conf >= 72 → -3
+            boost = learned.get("home_or_away_boost", 4)
+            research_conviction_adj += boost
+        # Away or Draw with llm_conf >= 72 -> learned penalty (default -3)
         if "away or draw" in sel_lower or sel_lower == "away_or_draw":
             if llm_conf >= 72:
-                research_conviction_adj -= 3
-        # Country in dynamic trust countries → +3
+                penalty = learned.get("away_or_draw_penalty", -3)
+                research_conviction_adj += penalty
+        # Country in dynamic trust countries -> learned boost (default 3)
         if country_name in _get_dynamic_rules()["trust_countries"]:
-            research_conviction_adj += 3
-        # Source sportybet_market_signal → +5
+            boost = learned.get("trust_country_boost", 3)
+            research_conviction_adj += boost
+        # Source sportybet_market_signal -> learned boost (default 5)
         if source == "sportybet_market_signal":
-            research_conviction_adj += 5
+            boost = learned.get("sportybet_signal_boost", 5)
+            research_conviction_adj += boost
 
-        # ── Optimal profile score (0-6) ─────────────────────────────
+        # ── Optimal profile score (0-6, learned thresholds) ──────────
         optimal_profile_score = 0
+        # Use learned confidence threshold if available
+        try:
+            learned = get_learned_thresholds(
+                league=item.get("league_name") or "__global__",
+                pick_type=engine_pick.get("type") or item.get("pick_type") or "match_result",
+            )
+            conf_threshold = learned.get("min_confidence", 72.0)
+        except Exception:
+            conf_threshold = 72.0
+
         if "home or away" in sel_lower or sel_lower == "home_or_away":
             optimal_profile_score += 1
-        if llm_conf >= 72:
+        if llm_conf >= conf_threshold:
             optimal_profile_score += 1
         if 1.50 <= odds <= 1.99:
             optimal_profile_score += 1
@@ -341,6 +365,36 @@ def synthesize_sure_picks(
 
         # Cap optimal_profile_score at 6
         optimal_profile_score = min(optimal_profile_score, 6)
+
+        # ── Signal combination boost/penalty ──────────────────────────
+        # Use learned signal combination performance to adjust conviction
+        signal_boost = 0.0
+        try:
+            from app.signal_combinations import build_signal_combination
+            # Build signal combination key from the analysis signals
+            signals = []
+            if item.get("key_factors"):
+                for factor in item.get("key_factors", []):
+                    signals.append(str(factor))
+            if item.get("market_signal"):
+                signals.append(str(item["market_signal"]))
+            if item.get("btts") is not None:
+                signals.append("btts" if item["btts"] else "no_btts")
+            if item.get("over_2_5") is not None:
+                signals.append("over_2_5" if item["over_2_5"] else "under_2_5")
+            if engine_pick.get("selection"):
+                signals.append(str(engine_pick["selection"]))
+
+            if signals:
+                combo_key = build_signal_combination(signals)
+                combo_perf = get_signal_combination_performance(combo_key)
+                if combo_perf.get("samples", 0) >= 5:
+                    wr = combo_perf.get("win_rate", 0.5)
+                    # Boost/penalty based on signal combination win rate
+                    # 50% = neutral, >50% = boost, <50% = penalty
+                    signal_boost = (wr - 0.5) * 10  # up to +5 or -5
+        except Exception:
+            pass
 
         adjusted_conviction = round(conviction + research_conviction_adj, 2)
 

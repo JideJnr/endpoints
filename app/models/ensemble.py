@@ -79,7 +79,7 @@ def compute_ensemble_diversity(
         }
     
     rules_prob = max(0, min(100, rules_confidence))
-    pick = (rules_pick or "").lower()
+    pick = str(rules_pick or "").lower()
     if "home" in pick:
         model_probs["rules"] = {"home_win": rules_prob, "draw": 10, "away_win": 100 - rules_prob}
     elif "away" in pick:
@@ -193,7 +193,7 @@ def ensemble_prediction(
         models_used.append("poisson")
 
     rules_prob = max(0, min(100, rules_confidence))
-    pick = (rules_pick or "").lower()
+    pick = str(rules_pick or "").lower()
     if "home" in pick:
         _add({"home_win": rules_prob, "draw": 10, "away_win": 100 - rules_prob}, weights.get("rules", 0.20))
         models_used.append("rules")

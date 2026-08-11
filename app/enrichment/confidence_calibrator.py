@@ -269,10 +269,35 @@ def compute_calibration_gap(pick_type: str, raw_confidence: int) -> dict[str, An
     historical_conf = cal["win_rate"]  # Already in percentage form (0-100)
     gap = round(raw_confidence - historical_conf, 1)
     
-    if gap <= 10:
+    # Derive severity thresholds from the distribution of calibration gaps
+    # stored in confidence_calibration.  Use the 50th and 75th percentile of
+    # abs(band_mid - win_rate*100) across all bands with enough samples.
+    # Falls back to hardcoded 10 / 20 when insufficient data.
+    moderate_threshold = 10.0
+    severe_threshold = 20.0
+    try:
+        with _conn() as _c:
+            _init_calibration_table(_c)
+            _gap_rows = _c.execute(
+                "SELECT band_low, win_rate FROM confidence_calibration "
+                "WHERE pick_type = '__global__' AND samples >= ? AND win_rate IS NOT NULL",
+                (MIN_SAMPLES,),
+            ).fetchall()
+        if len(_gap_rows) >= 3:
+            _abs_gaps = sorted(
+                abs((r["band_low"] + 5) - float(r["win_rate"]) * 100)
+                for r in _gap_rows
+            )
+            n = len(_abs_gaps)
+            moderate_threshold = _abs_gaps[max(0, int(n * 0.50) - 1)]
+            severe_threshold   = _abs_gaps[max(0, int(n * 0.75) - 1)]
+    except Exception:
+        pass
+
+    if gap <= moderate_threshold:
         severity = "none"
         recommendation = "proceed"
-    elif gap <= 20:
+    elif gap <= severe_threshold:
         severity = "moderate"
         recommendation = "caution"
     else:
@@ -373,45 +398,69 @@ def stake_multiplier(pick_type: str, raw_confidence: int) -> float:
 
 # ── Market-specific confidence capping (extracted from enriched_prediction.py) ─
 
+# Hardcoded fallback caps for cap_market_confidence (used when no learned data)
+_MARKET_CAP_DEFAULTS: dict[str, dict[str, int]] = {
+    "under_3_5": {"calm": 88, "warm": 76, "hot": 64, "unknown": 82},
+    "under_2_5": {"calm": 84, "warm": 72, "hot": 60, "unknown": 78},
+    "over_1_5_nil_nil_high":   54,
+    "over_1_5_nil_nil_medium": 68,
+}
+
+
+def _get_market_cap(pick_type_key: str, profile: str) -> int | None:
+    """Return a learned confidence cap for a goal-market + profile combination.
+
+    Queries get_learned_thresholds() using a synthetic pick_type that encodes
+    both the market and the goal-environment profile, e.g.
+    ``under_3_5__calm``.  Falls back to hardcoded defaults.
+    """
+    try:
+        from app.monitoring.self_learner import get_learned_thresholds
+        synthetic_pt = f"{pick_type_key}__{profile}" if profile else pick_type_key
+        learned = get_learned_thresholds(league="__global__", pick_type=synthetic_pt)
+        if learned.get("samples", 0) >= 15 and learned.get("confidence_cap"):
+            return int(round(learned["confidence_cap"]))
+    except Exception:
+        pass
+    return None
+
+
 def cap_market_confidence(pick: dict[str, Any], confidence: int) -> int:
     """Cap confidence for goal-market picks based on the goal environment profile.
 
-    Under-goals picks are inherently environment-sensitive: a "calm" goal
-    environment supports higher confidence caps, while "hot" environments
-    (high goal pressure, elevated over-2.5 / BTTS rates) warrant lower caps.
+    Caps are read from learned_thresholds when enough samples exist;
+    falls back to hardcoded defaults.
 
-    Args:
-        pick:       A pick dict that may carry an ``evidence.goal_environment``
-                    sub-dict with at least a ``profile`` key.
-        confidence: Raw or calibrated confidence score (0–100 integer).
-
-    Returns:
-        The capped confidence (≤ the input value).
-
-    Caps by profile:
+    Caps by profile (defaults):
     - Under 3.5:  calm → 88, warm → 76, hot → 64, unknown → 82
     - Under 2.5:  calm → 84, warm → 72, hot → 60, unknown → 78
     - Over 1.5:   high nil-nil risk → 54, medium → 68, low/none → unchanged
     """
     selection = str(pick.get("selection") or pick.get("pick") or "").lower()
     goal_env = ((pick.get("evidence") or {}).get("goal_environment") or {})
-    profile = str(goal_env.get("profile") or "").lower()
+    profile = str(goal_env.get("profile") or "").lower() or "unknown"
 
     if "under 3.5" in selection:
-        cap = 88 if profile == "calm" else 76 if profile == "warm" else 64 if profile == "hot" else 82
+        cap = _get_market_cap("under_3_5", profile)
+        if cap is None:
+            cap = _MARKET_CAP_DEFAULTS["under_3_5"].get(profile, _MARKET_CAP_DEFAULTS["under_3_5"]["unknown"])
         return min(confidence, cap)
 
     if "under 2.5" in selection:
-        cap = 84 if profile == "calm" else 72 if profile == "warm" else 60 if profile == "hot" else 78
+        cap = _get_market_cap("under_2_5", profile)
+        if cap is None:
+            cap = _MARKET_CAP_DEFAULTS["under_2_5"].get(profile, _MARKET_CAP_DEFAULTS["under_2_5"]["unknown"])
         return min(confidence, cap)
 
     if "over 1.5" in selection:
         nil_nil = goal_env.get("nil_nil_risk") or {}
         level = str(nil_nil.get("level") or "").lower()
         if level == "high":
-            return min(confidence, 54)
+            cap = _get_market_cap("over_1_5_nil_nil", "high")
+            return min(confidence, cap if cap is not None else _MARKET_CAP_DEFAULTS["over_1_5_nil_nil_high"])
         if level == "medium":
-            return min(confidence, 68)
+            cap = _get_market_cap("over_1_5_nil_nil", "medium")
+            return min(confidence, cap if cap is not None else _MARKET_CAP_DEFAULTS["over_1_5_nil_nil_medium"])
 
     return confidence
 

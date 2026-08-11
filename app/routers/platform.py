@@ -1130,4 +1130,134 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+# ── Learning endpoints ──────────────────────────────────────────
 
+@router.get("/learning/thresholds")
+def get_learning_thresholds(league: str = "", pick_type: str = "") -> dict[str, Any]:
+    """Return learned thresholds for a league/pick_type combination.
+
+    Falls back to hardcoded defaults when no learned data exists.
+    """
+    try:
+        from app.monitoring.self_learner import get_learned_thresholds
+        learned = get_learned_thresholds(league=league or "__global__", pick_type=pick_type or "__all__")
+        return {
+            "status": "success",
+            "league": league or "__global__",
+            "pick_type": pick_type or "__all__",
+            "thresholds": learned,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "thresholds": {},
+        }
+
+
+@router.get("/learning/signal-combinations")
+def get_learning_signal_combinations(
+    league: str = "",
+    pick_type: str = "",
+    min_samples: int = Query(default=5, ge=1, le=1000),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Return top signal combinations by win rate for a league/pick_type.
+
+    Only returns combinations with at least min_samples observations.
+    """
+    try:
+        from app.monitoring.self_learner import get_signal_combination_performance
+        # For now, return empty list (signal combinations are still being learned)
+        # In future, this will query the signal_combination_memory table
+        return {
+            "status": "success",
+            "league": league or "__global__",
+            "pick_type": pick_type or "__all__",
+            "min_samples": min_samples,
+            "combinations": [],
+            "message": "Signal combination learning is in progress. Check back after more grading cycles.",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "combinations": [],
+        }
+
+
+@router.get("/learning/league-performance")
+def get_learning_league_performance(
+    league: str = "",
+    pick_type: str = "",
+) -> dict[str, Any]:
+    """Return league accuracy data for a specific league and pick type."""
+    try:
+        from app.monitoring.self_learner import get_league_accuracy
+        lacc = get_league_accuracy(league or "")
+        return {
+            "status": "success",
+            "league": league or "__global__",
+            "pick_type": pick_type or "__all__",
+            "performance": lacc,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "performance": {},
+        }
+
+
+@router.get("/learning/signal-weights")
+def get_learning_signal_weights(league: str = "") -> dict[str, Any]:
+    """Return learned signal weights for a league."""
+    try:
+        from app.monitoring.self_learner import get_learned_weights
+        weights = get_learned_weights(league=league or "__global__")
+        return {
+            "status": "success",
+            "league": league or "__global__",
+            "weights": weights,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "weights": {},
+        }
+
+
+@router.get("/learning/model-weights")
+def get_learning_model_weights() -> dict[str, Any]:
+    """Return learned model weights."""
+    try:
+        from app.monitoring.self_learner import get_learned_model_weights
+        weights = get_learned_model_weights()
+        return {
+            "status": "success",
+            "model_weights": weights,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "model_weights": {},
+        }
+
+
+@router.post("/learning/trigger")
+def trigger_learning_cycle() -> dict[str, Any]:
+    """Manually trigger a learning cycle."""
+    try:
+        from app.monitoring.self_learner import run_learning_cycle
+        result = run_learning_cycle()
+        return {
+            "status": "success",
+            "result": result,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
