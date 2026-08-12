@@ -19,6 +19,7 @@ from datetime import date as dt, datetime, timezone
 from typing import Any
 
 from app.storage.league_memory import record_prediction
+from app.ai.ai_router import _call_llm, is_llm_available
 
 logger = logging.getLogger(__name__)
 from app.market.season_stage import detect_season_stage

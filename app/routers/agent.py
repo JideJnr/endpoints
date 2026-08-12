@@ -19,6 +19,8 @@ from app.ai.prediction_agent import predict_sofascore_event, predict_sporty_matc
 from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail, fetch_scheduled_events, fetch_team_history
 from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post, fetch_upcoming_matches_post
 
+from app.utils.primitives import _to_int, _to_float
+
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
@@ -372,26 +374,6 @@ def _with_ai_brain(prediction: dict, detail: dict | None = None) -> dict:
     return prediction
 
 
-def _to_int(value, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _is_finished_doc(doc: dict) -> bool:
-    period = (doc.get("period") or "").lower()
-    return period in ("ft", "finished", "ended", "aet", "ap", "full time")
-
-
-@router.get("/ai/status")
 def get_ai_status():
     """Check whether the router-backed AI providers are configured and available."""
     try:

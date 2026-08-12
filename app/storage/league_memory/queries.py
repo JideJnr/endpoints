@@ -35,6 +35,7 @@ from ._helpers import (
     _grade_pick, _grade_pick_for_match, _side_from_selection_and_match,
     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
     _decorate_betbuilder_selections,
+    grade_prediction_row, update_prediction_result,
 )
 from .crud import _sofascore_ids_for_predictions, store_local_signal_outcomes, _aggregate_resolved_snapshots, _safe_mark_buffer_finished, _ensure_signal_outcomes_table, _backfill_local_signal_outcomes_from_history
 from .schema import _ensure_signal_combination_outcomes_table
@@ -468,19 +469,10 @@ def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> di
         row = conn.execute("select * from prediction_history where id = ?", (prediction_id,)).fetchone()
         if not row:
             return {"graded": False, "reason": "not found"}
-        grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-        result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-        grade_info["result"] = result
+        result, grade_info = grade_prediction_row(row, final_home, final_away)
         models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
         grade_info["passed_models"] = _get_passed_models(models, result)
-        conn.execute(
-            """
-            update prediction_history
-            set result = ?, final_home = ?, final_away = ?, grading_reason_json = ?, graded_at = current_timestamp
-            where id = ?
-            """,
-            (result, final_home, final_away, json.dumps(grade_info), prediction_id),
-        )
+        update_prediction_result(conn, prediction_id, result, final_home, final_away, grade_info)
         conn.commit()
     _grade_decision_logs_by_ids([str(row["match_id"])], final_home, final_away)
     _store_signal_outcome_for_row(row, result)
@@ -795,20 +787,11 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
         final_away = _to_int(score.get("away"), 0)
         candidate_graded += _grade_candidate_predictions_for_match(match_id, sofa_ids, final_home, final_away)
         _grade_decision_logs_by_ids([match_id, *sofa_ids], final_home, final_away)
-        grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-        result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-        grade_info["result"] = result
+        result, grade_info = grade_prediction_row(row, final_home, final_away)
         models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
         grade_info["passed_models"] = _get_passed_models(models, result)
         with _conn() as conn:
-            conn.execute(
-                """
-                update prediction_history
-                set result = ?, final_home = ?, final_away = ?, grading_reason_json = ?, graded_at = current_timestamp
-                where id = ?
-                """,
-                (result, final_home, final_away, json.dumps(grade_info), row["id"]),
-            )
+            update_prediction_result(conn, row["id"], result, final_home, final_away, grade_info)
             conn.commit()
         _store_signal_outcome_for_row(row, result)
 
@@ -1359,19 +1342,10 @@ def _grade_match_predictions_by_ids(match_id: str, linked_ids: list[str], final_
             tuple(keys),
         ).fetchall()
         for row in rows:
-            grade_info = grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-            result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-            grade_info["result"] = result
+            result, grade_info = grade_prediction_row(row, final_home, final_away)
             models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
             grade_info["passed_models"] = _get_passed_models(models, result)
-            conn.execute(
-                """
-                update prediction_history
-                set result = ?, final_home = ?, final_away = ?, grading_reason_json = ?, graded_at = current_timestamp
-                where id = ?
-                """,
-                (result, final_home, final_away, json.dumps(grade_info), row["id"]),
-            )
+            update_prediction_result(conn, row["id"], result, final_home, final_away, grade_info)
             payload = _signal_outcome_payload_for_row(row, result)
             if payload:
                 signal_payloads.append(payload)

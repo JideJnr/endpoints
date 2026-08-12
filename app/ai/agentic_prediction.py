@@ -678,15 +678,15 @@ def _historical_intelligence(doc: dict[str, Any]) -> dict[str, Any]:
     h2h = detail.get("h2h") or {}
     return {
         "available": bool(home_history or away_history or h2h),
-        "home": _team_history_summary(home_history),
-        "away": _team_history_summary(away_history),
+        "home": _team_history_stats(home_history),
+        "away": _team_history_stats(away_history),
         "h2h": _h2h_summary(h2h),
         "patterns": _pattern_summary(home_history, away_history, h2h),
         "source": "sofascore_team_history_and_h2h",
     }
 
 
-def _team_history_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+def _team_history_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
     finished = [event for event in events if _score_pair(event) is not None]
     totals = []
     btts = 0
@@ -726,8 +726,8 @@ def _h2h_summary(h2h: dict[str, Any]) -> dict[str, Any]:
 
 def _pattern_summary(home_history: list[dict[str, Any]], away_history: list[dict[str, Any]], h2h: dict[str, Any]) -> list[str]:
     patterns: list[str] = []
-    home = _team_history_summary(home_history)
-    away = _team_history_summary(away_history)
+    home = _team_history_stats(home_history)
+    away = _team_history_stats(away_history)
     for label, summary in (("home", home), ("away", away)):
         if (summary.get("over_2_5_rate") or 0) >= 0.65:
             patterns.append(f"{label}_recent_matches_high_total_goals")

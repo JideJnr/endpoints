@@ -14,6 +14,7 @@ from app.market.season_stage import (
     detect_season_stage,
     season_aware_table_weight,
 )
+from app.utils.primitives import _optional_int, _safe_num
 
 
 DEFAULT_WORLD_CUP = {
@@ -1280,22 +1281,82 @@ def _event_match_date(event: dict[str, Any], fallback: str) -> str:
         return fallback
 
 
+def _match_importance_context(key: str, event: dict[str, Any]) -> dict[str, Any]:
+    """Classify competition fixture importance from event metadata."""
+    tournament = event.get("tournament") if isinstance(event.get("tournament"), dict) else {}
+    status = event.get("status") if isinstance(event.get("status"), dict) else {}
+    round_value = event.get("round") or event.get("round_info") or event.get("roundInfo") or {}
+    round_text = " ".join(
+        str(value or "")
+        for value in (
+            round_value.get("name") if isinstance(round_value, dict) else round_value,
+            event.get("round_name"),
+            event.get("stage"),
+            event.get("slug"),
+            event.get("name"),
+        )
+    ).lower()
+    score = 50
+    reasons: list[str] = []
+
+    knockout_terms = {
+        "final": 96,
+        "semi": 88,
+        "quarter": 82,
+        "round of 16": 76,
+        "last 16": 76,
+        "knockout": 74,
+        "playoff": 72,
+        "play-off": 72,
+        "decider": 72,
+    }
+    for term, value in knockout_terms.items():
+        if term in round_text:
+            score = max(score, value)
+            reasons.append(term)
+
+    if "group" in round_text:
+        score = max(score, 62)
+        reasons.append("group_stage")
+    if key == DEFAULT_WORLD_CUP["key"]:
+        score += 6
+        reasons.append("world_cup")
+    if tournament.get("unique_tournament_id") or tournament.get("id"):
+        reasons.append("verified_competition")
+
+    status_text = str(status.get("type") or status.get("description") or "").lower()
+    state = classify_match_state(
+        {
+            "period": status.get("description") or status.get("type"),
+            "status": status,
+            "start_time": int((event.get("start_timestamp") or 0) * 1000) if event.get("start_timestamp") else None,
+            "score": event.get("score") or {},
+        }
+    )
+    if state.get("is_live") or status_text in {"inprogress", "live"}:
+        score += 4
+        reasons.append("live")
+    if state.get("is_terminal"):
+        score -= 8
+        reasons.append("terminal")
+
+    score = max(0, min(100, int(score)))
+    tier = "critical" if score >= 90 else "high" if score >= 78 else "medium" if score >= 60 else "normal"
+    return {
+        "competition_key": key,
+        "importance_score": score,
+        "tier": tier,
+        "is_high_importance": score >= 78,
+        "is_critical": score >= 90,
+        "round": round_value,
+        "round_text": " ".join(round_text.split()),
+        "status": status,
+        "reasons": sorted(set(reasons)),
+    }
+
+
 def _score_value(value: Any) -> str:
     return "" if value is None else str(value)
-
-
-def _optional_int(value: Any) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _prefixed_match_id(key: str, event_id: Any) -> str:
-    return f"competition:{key}:{event_id}"
-
 
 def _mirror_competition_event_to_main_buffer(
     conn: sqlite3.Connection,
@@ -1303,7 +1364,6 @@ def _mirror_competition_event_to_main_buffer(
     event: dict[str, Any],
     match_date: str,
     importance: dict[str, Any],
-    *,
     enriched_doc: dict[str, Any] | None = None,
 ) -> None:
     from app.storage.buffer import _init_buffer_table
@@ -2091,91 +2151,7 @@ def _team_watcher_context(key: str, team: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return {"available": False, "team_id": team_id, "team_name": team_name, "error": str(exc)}
 
-
-def _safe_num(value: Any) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
-
-
-def _name_quality_score(name: str) -> float:
-    lower = str(name or "").lower()
-    elite = ("brazil", "argentina", "france", "spain", "england", "germany", "portugal", "netherlands", "italy")
-    strong = ("belgium", "croatia", "uruguay", "colombia", "mexico", "usa", "morocco", "japan", "switzerland")
-    if any(token in lower for token in elite):
-        return 72.0
-    if any(token in lower for token in strong):
-        return 62.0
-    return 50.0
-
-
-def _match_importance_context(key: str, event: dict[str, Any]) -> dict[str, Any]:
-    name = str(event.get("name") or "")
-    tournament = event.get("tournament") or {}
-    round_value = str(event.get("round") or tournament.get("round") or "")
-    round_lower = f"{round_value} {name}".lower()
-    status_type = str((event.get("status") or {}).get("type") or "").lower()
-    reasons: list[str] = []
-    score = 60
-    stage = "group"
-
-    if "final" in round_lower and "semi" not in round_lower:
-        stage, score = "final", 100
-        reasons.append("trophy_decider")
-    elif "semi" in round_lower:
-        stage, score = "semi_final", 92
-        reasons.append("final_place_at_stake")
-    elif "quarter" in round_lower:
-        stage, score = "quarter_final", 85
-        reasons.append("knockout_elimination")
-    elif "round of 16" in round_lower or "last 16" in round_lower:
-        stage, score = "round_of_16", 78
-        reasons.append("knockout_elimination")
-    elif "knockout" in round_lower or "playoff" in round_lower:
-        stage, score = "knockout", 82
-        reasons.append("single_game_elimination")
-    elif "group" in round_lower:
-        stage, score = "group_stage", 62
-        reasons.append("group_table_points")
-        if any(token in round_lower for token in ("round 3", "matchday 3", "3")):
-            score = 70
-            reasons.append("final_group_round_pressure")
-
-    if status_type == "inprogress":
-        score = min(100, score + 8)
-        reasons.append("live_state_priority")
-    if "opening" in round_lower or "opening" in name.lower():
-        score = max(score, 75)
-        reasons.append("opening_match_pressure")
-
-    if key == DEFAULT_WORLD_CUP["key"]:
-        reasons.append("world_cup_special_context")
-
-    tier = "critical" if score >= 90 else "high" if score >= 78 else "medium" if score >= 62 else "normal"
-    return {
-        "competition_key": key,
-        "stage": stage,
-        "tier": tier,
-        "importance_score": score,
-        "round": round_value,
-        "reasons": reasons,
-        "prediction_focus": _importance_prediction_focus(stage),
-    }
-
-
-def _importance_prediction_focus(stage: str) -> list[str]:
-    if stage in {"final", "semi_final", "quarter_final", "round_of_16", "knockout"}:
-        return ["lineup_strength", "game_state", "extra_time_risk", "defensive_caution", "late_goal_pressure"]
-    if stage == "group_stage":
-        return ["table_pressure", "goal_difference", "rotation_risk", "qualification_scenario"]
-    return ["freshness", "team_strength", "market_context"]
-
-
-def list_all_competition_summaries(
-    buffer_limit: int = 50,
-    analysis_limit: int = 1,
-) -> dict[str, Any]:
+def competition_dashboard_summary(buffer_limit: int = 200) -> dict[str, Any]:
     """Return a lightweight summary for every tracked competition.
 
     Covers all competitions in competition_special_settings — both the curated

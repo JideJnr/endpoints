@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+from app.utils.primitives import _first_present, _to_int, _optional_int
+from app.utils.match_helpers import _norm, _played_seconds, _to_datetime_utc
+
 NOT_STARTED_PERIODS = {
     "",
     "not start",
@@ -176,54 +179,3 @@ def _contains_any(text: str, needles: set[str]) -> bool:
     return any(needle in text for needle in needles)
 
 
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value is not None and value != "":
-            return value
-    return None
-
-
-def _norm(value: Any) -> str:
-    return str(value or "").lower().strip().replace("_", " ")
-
-
-def _to_int(value: Any) -> int | None:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _played_seconds(value: Any) -> int:
-    if value is None or value == "":
-        return 0
-    if isinstance(value, str) and ":" in value:
-        parts = value.split(":")
-        try:
-            if len(parts) == 2:
-                return int(parts[0] or 0) * 60 + int(parts[1] or 0)
-            if len(parts) == 3:
-                return int(parts[0] or 0) * 3600 + int(parts[1] or 0) * 60 + int(parts[2] or 0)
-        except ValueError:
-            return 0
-    try:
-        return int(float(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _to_datetime_utc(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    try:
-        if isinstance(value, (int, float)):
-            timestamp = float(value)
-            if timestamp > 1e10:
-                timestamp /= 1000
-            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        text = str(value)
-        if text.isdigit():
-            return _to_datetime_utc(int(text))
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None

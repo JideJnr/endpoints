@@ -11,6 +11,8 @@ from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 
 
+from app.utils.primitives import _loads
+
 def list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list[dict[str, Any]]:
     """Recent ungraded rows that are still eligible for current-pick views."""
     _init_db()
@@ -72,12 +74,5 @@ def list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list
             "created_at": row["created_at"],
         })
     return predictions
-
-
-def _loads(value: Any, default: Any) -> Any:
-    try:
-        return json.loads(value or "")
-    except Exception:
-        return default
 
 

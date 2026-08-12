@@ -11,6 +11,8 @@ from app.storage.league_memory import _init_db
 from app.monitoring.system_audit import prediction_system_audit
 
 
+from app.utils.primitives import _safe_json, _to_float
+
 def signal_attribution_report(min_samples: int = 5, limit: int = 5000) -> dict[str, Any]:
     """Grade signal contribution across settled primary and candidate decisions."""
     rows = _graded_rows(limit=limit)
@@ -226,15 +228,3 @@ def _result_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
     }
 
 
-def _safe_json(value: Any, fallback: Any) -> Any:
-    try:
-        return json.loads(value or json.dumps(fallback))
-    except Exception:
-        return fallback
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except Exception:
-        return None

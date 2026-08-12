@@ -249,3 +249,4 @@ def _side_from_selection_and_match(selection: str, match_name: str | None) -> st
     if away_hits > home_hits:
         return "away"
     return None
+

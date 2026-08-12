@@ -22,6 +22,8 @@ import random
 import time
 from typing import Any, Optional
 
+from app.utils.primitives import _first_present_key as _first_present
+
 try:
     from curl_cffi import requests as cffi_requests
     _USE_CFFI = True
@@ -524,8 +526,3 @@ def _parse_market(market: dict) -> dict:
     }
 
 
-def _first_present(source: dict, *keys: str):
-    for key in keys:
-        if key in source:
-            return source[key]
-    return None

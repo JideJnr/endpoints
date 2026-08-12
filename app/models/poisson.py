@@ -7,6 +7,8 @@ from app.storage.db import db_conn
 from app.data_clients.sofascore_client import fetch_team_history
 
 
+from app.utils.primitives import _to_int
+
 MAX_GOALS = 7
 HOME_ADVANTAGE = 1.0
 
@@ -190,8 +192,3 @@ def _apply_bias_corrections(probs: dict[str, float]) -> dict[str, float]:
     return {key: value / total for key, value in weighted.items()}
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default

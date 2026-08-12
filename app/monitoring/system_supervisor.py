@@ -14,6 +14,8 @@ from app.storage.league_memory import _init_db
 from app.storage.mongo_store import cleanup_buffer
 
 
+from app.utils.primitives import _loads
+
 SNAPSHOT_KEEP_ROWS = 1000
 
 
@@ -241,6 +243,36 @@ def _persist_supervisor_snapshot(result: dict[str, Any]) -> None:
         pass
 
 
+def _record_supervisor_activity(result: dict[str, Any]) -> None:
+    """Write a compact human-readable supervisor summary to the activity log."""
+    actions = result.get("actions") or []
+    errors = result.get("errors") or []
+    issues = result.get("issues") if isinstance(result.get("issues"), dict) else {}
+    issue_count = sum(int(value or 0) for value in issues.values() if isinstance(value, (int, float)))
+    status = str(result.get("status") or "ok")
+    message = (
+        f"System supervisor {status}: "
+        f"{len(actions)} action(s), {len(errors)} error(s), {issue_count} issue signal(s)"
+    )
+    try:
+        record_activity(
+            message,
+            job="system_supervisor",
+            status="ok" if status == "ok" else "warning",
+            details={
+                "mode": result.get("mode"),
+                "audit_depth": result.get("audit_depth"),
+                "duration_seconds": result.get("duration_seconds"),
+                "actions": actions[:10],
+                "errors": errors[:8],
+                "issues": issues,
+                "authority": result.get("authority"),
+            },
+        )
+    except Exception:
+        pass
+
+
 def _init_supervisor_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -293,38 +325,3 @@ def _snapshot_summary(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _loads(value: Any, fallback: Any) -> Any:
-    try:
-        return json.loads(value or "")
-    except Exception:
-        return fallback
-
-
-def _age_seconds(value: Any) -> float:
-    if not value:
-        return 0.0
-    try:
-        from datetime import datetime
-
-        return max(0.0, time.time() - datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
-    except Exception:
-        return 0.0
-
-
-def _record_supervisor_activity(result: dict[str, Any]) -> None:
-    action_count = len(result.get("actions") or [])
-    error_count = len(result.get("errors") or [])
-    status = "ok" if not error_count else "error"
-    try:
-        record_activity(
-            f"System supervisor pass: {action_count} correction(s), {error_count} error(s)",
-            job="system_supervisor",
-            status=status,
-            details={
-                "actions": result.get("actions") or [],
-                "errors": result.get("errors") or [],
-                "issues": result.get("issues") or {},
-            },
-        )
-    except Exception:
-        pass

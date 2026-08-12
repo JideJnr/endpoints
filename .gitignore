@@ -21,3 +21,4 @@ releases/
 _migrated_predictz/.env
 _migrated_predictz/.git/
 _migrated_predictz/__pycache__/
+.hypothesis

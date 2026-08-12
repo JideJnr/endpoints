@@ -4,100 +4,33 @@ from statistics import mean
 from typing import Any
 
 
-COUNTRY_STRENGTH = {
-    "england": 95,
-    "spain": 93,
-    "germany": 91,
-    "italy": 90,
-    "france": 86,
-    "portugal": 80,
-    "netherlands": 78,
-    "belgium": 73,
-    "turkey": 72,
-    "brazil": 72,
-    "argentina": 71,
-    "scotland": 69,
-    "austria": 68,
-    "switzerland": 68,
-    "denmark": 67,
-    "croatia": 66,
-    "greece": 66,
-    "norway": 65,
-    "sweden": 65,
-    "poland": 64,
-    "czech": 63,
-    "romania": 61,
-    "serbia": 61,
-    "ukraine": 60,
-    "usa": 59,
-    "mexico": 59,
-    "japan": 58,
-    "south korea": 57,
-    "nigeria": 54,
-}
-
-COMPETITION_STRENGTH = {
-    "champions league": 96,
-    "europa league": 84,
-    "conference league": 74,
-    "club world cup": 82,
-    "copa libertadores": 76,
-    "copa sudamericana": 66,
-}
-
-DIVISION_OFFSETS = {
-    "premier league": 0,
-    "first division": 0,
-    "1st division": 0,
-    "division 1": 0,
-    "super league": 0,
-    "serie a": 0,
-    "bundesliga": 0,
-    "la liga": 0,
-    "ligue 1": 0,
-    "eredivisie": 0,
-    "championship": -10,
-    "second division": -12,
-    "2nd division": -12,
-    "division 2": -12,
-    "league one": -18,
-    "third division": -20,
-    "league two": -26,
-    "fourth division": -28,
-}
-
-LOWER_CONTEXT_OFFSETS = {
-    "u23": -18,
-    "u21": -20,
-    "u20": -20,
-    "u19": -24,
-    "u18": -26,
-    "women": -12,
-    "reserves": -18,
-    "srl": -35,
-    "virtual": -45,
-}
+COUNTRY_STRENGTH: dict[str, int] = {}
+COMPETITION_STRENGTH: dict[str, int] = {}
+DIVISION_OFFSETS: dict[str, int] = {}
+LOWER_CONTEXT_OFFSETS: dict[str, int] = {}
 
 
 def league_strength_score(name: str | None) -> dict[str, Any]:
-    text = _clean(name)
-    if not text:
+    if not _clean(name):
         return {"name": name, "score": 55, "country": None, "basis": "unknown league"}
 
-    for key, score in COMPETITION_STRENGTH.items():
-        if key in text:
-            return {"name": name, "score": score, "country": None, "basis": key}
+    try:
+        from app.monitoring.self_learner import get_tournament_priority
 
-    country, base = _country_base(text)
-    division, offset = _division_offset(text)
-    context_offset = sum(value for key, value in LOWER_CONTEXT_OFFSETS.items() if key in text)
-    score = max(20, min(98, base + offset + context_offset))
+        learned = get_tournament_priority(name or "")
+        if not learned.get("known"):
+            return {"name": name, "score": 55, "country": None, "basis": "neutral_unknown"}
+        priority = int(learned.get("priority", 4))
+    except Exception:
+        return {"name": name, "score": 55, "country": None, "basis": "neutral_fallback"}
+
+    score = max(20, min(98, 85 - priority * 8))
     return {
         "name": name,
         "score": score,
-        "country": country,
-        "division": division,
-        "basis": "country/division estimate",
+        "country": None,
+        "division": None,
+        "basis": "learned_tournament_priority",
     }
 
 

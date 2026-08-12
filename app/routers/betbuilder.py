@@ -1,140 +1,67 @@
+"""
+Bet Builder Router
+==================
+Two clearly separated endpoints:
+
+  POST /betbuilder/manual   — deterministic, no LLM, fast
+  POST /betbuilder/llm      — LLM-enriched per match, slower
+
+Both share the same request/response contract so the frontend can swap
+between them without any schema changes.
+"""
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
-
-from app.storage.db import db_conn
-from app.storage.db import DB_PATH
-from app.storage.league_memory import _init_db, get_behavior_weighted_picks, track_user_behavior
 
 router = APIRouter(prefix="/betbuilder", tags=["betbuilder"])
 
 
-class AutoPlaceRequest(BaseModel):
-    model_config = {"populate_by_name": True}
-    selections: list[dict[str, Any]]
-    stake: float
-    share_code: Optional[str] = Field(default=None, alias="shareCode")
+class BetBuilderRequest(BaseModel):
+    target_odds: float = Field(default=1.80, gt=1.0)
+    max_total_odds: Optional[float] = Field(default=None, gt=1.0)
+    stake: int = Field(default=100, gt=0)
+    candidate_limit: int = Field(default=50, gt=0, le=200)
+    request_code: bool = False
 
 
-@router.get("/auto-suggestions")
-def auto_suggestions(max_picks: int = 5, min_confidence: float = 65.0) -> dict[str, Any]:
-    """Get auto-bet suggestions based on predictions and user behavior."""
-    max_picks = max(1, min(max_picks, 100))  # support up to 100 picks
-    try:
-        _init_db()
-        import sqlite3
+@router.post("/manual")
+def manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
+    """
+    Deterministic bet builder.
 
-        with db_conn(timeout=30) as conn:
-            conn.row_factory = sqlite3.Row
-            # Get top predictions across all active matches
-            preds = conn.execute(
-                """
-                select ph.*
-                from prediction_history ph
-                where ph.result is null
-                  and ph.confidence >= ?
-                order by ph.confidence desc
-                limit ?
-                """,
-                (min_confidence, max_picks * 3),  # get more to filter
-            ).fetchall()
+    Reads stored predictions, applies the research filter gate, scores and
+    ranks picks using conviction scoring, and builds a SportyBet booking slip.
+    No LLM calls — fast and always available.
+    """
+    from app.bet_builder.manual_builder import run_manual_bet
 
-            if not preds:
-                return {"status": "no_suggestions", "reason": "No qualifying predictions found"}
-
-            suggestions = []
-            for row in preds:
-                pick = dict(row)
-                match_id = pick.get("match_id", "")
-
-                # Get user's past behavior for this match
-                user_history = get_behavior_weighted_picks(match_id)
-                user_actions = {h["user_action"] for h in user_history}
-
-                # Adjust confidence based on user behavior
-                boost = 1.0
-                if "accepted" in user_actions:
-                    boost = 1.05
-                if "rejected" in user_actions:
-                    boost = 0.95
-
-                adjusted_confidence = round((pick.get("confidence") or 0) * boost, 2)
-
-                # Only include if still above minimum after adjustment
-                if adjusted_confidence < min_confidence:
-                    continue
-
-                suggestions.append({
-                    "match_id": match_id,
-                    "match_name": pick.get("match_name"),
-                    "pick_type": pick.get("pick_type"),
-                    "selection": pick.get("selection"),
-                    "confidence": adjusted_confidence,
-                    "original_confidence": pick.get("confidence"),
-                    "reason": pick.get("reason"),
-                    "user_boost": boost,
-                })
-
-            # Sort by adjusted confidence and limit
-            suggestions.sort(key=lambda x: x["confidence"], reverse=True)
-            suggestions = suggestions[:max_picks]
-
-            return {
-                "status": "success",
-                "suggestions": suggestions,
-                "count": len(suggestions),
-            }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    return run_manual_bet(
+        target_odds=body.target_odds,
+        max_total_odds=body.max_total_odds,
+        stake=body.stake,
+        candidate_limit=body.candidate_limit,
+        request_code=body.request_code,
+    )
 
 
-@router.post("/auto-place")
-def auto_place(body: AutoPlaceRequest) -> dict[str, Any]:
-    """Auto-place bets based on selections."""
-    try:
-        _init_db()
-        import sqlite3
+@router.post("/llm")
+def llm_bet(body: BetBuilderRequest) -> dict[str, Any]:
+    """
+    LLM-powered bet builder.
 
-        placed = []
-        with db_conn(timeout=30) as conn:
-            conn.row_factory = sqlite3.Row
+    Enriches each candidate with a per-match OpenRouter/Groq analysis, then
+    ranks using conviction scoring with an optional LLM synthesis pass.
+    Slower than /manual but uses live LLM reasoning per match.
+    """
+    from app.bet_builder.llm_builder import run_llm_bet
 
-            for sel in body.selections:
-                match_id = sel.get("match_id", "")
-                pick_type = sel.get("pick_type", "")
-                selection = sel.get("selection", "")
-                confidence = sel.get("confidence", 0)
-
-                # Track the auto-place action
-                track_user_behavior(
-                    match_id=match_id,
-                    user_action="bet_placed",
-                    pick_type=pick_type,
-                    selection=selection,
-                    confidence=confidence,
-                    metadata={
-                        "auto_placed": True,
-                        "stake": body.stake,
-                        "share_code": body.share_code,
-                    },
-                )
-
-                placed.append({
-                    "match_id": match_id,
-                    "pick_type": pick_type,
-                    "selection": selection,
-                    "confidence": confidence,
-                    "stake": body.stake,
-                })
-
-        return {
-            "status": "placed",
-            "placed_count": len(placed),
-            "total_stake": body.stake * len(placed),
-            "selections": placed,
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    return run_llm_bet(
+        target_odds=body.target_odds,
+        max_total_odds=body.max_total_odds,
+        stake=body.stake,
+        candidate_limit=body.candidate_limit,
+        request_code=body.request_code,
+    )

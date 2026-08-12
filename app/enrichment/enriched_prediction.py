@@ -22,6 +22,7 @@ from app.market.season_stage import detect_season_stage
 from app.signal_combinations import live_context_from_doc
 from app.utils.time_context import match_time_context
 from app.config.config import get_settings
+from app.storage.league_memory._helpers import build_pick, build_sporty_doc
 
 # ── Imports from extracted sub-modules ───────────────────────────────────────
 from app.enrichment.signal_aggregator import (  # noqa: F401
@@ -34,6 +35,8 @@ from app.enrichment.signal_aggregator import (  # noqa: F401
 from app.enrichment.confidence_calibrator import (  # noqa: F401
     cap_market_confidence as _cap_market_confidence,
 )
+from app.utils.primitives import _to_float, _to_int
+from app.utils.match_helpers import _team_name, _played_seconds
 
 
 LONGSHOT_MIN_DECIMAL_ODDS = 2.0
@@ -154,222 +157,14 @@ def _is_live_period(period: Any) -> bool:
         return False
     return text not in {"ft", "finished", "ended", "aet", "ap", "full time", "after penalties", "after extra time"}
 
-
-def _played_seconds(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, str) and ":" in value:
-        parts = value.split(":")
-        try:
-            if len(parts) == 2:
-                return int(parts[0] or 0) * 60 + int(parts[1] or 0)
-            if len(parts) == 3:
-                return int(parts[0] or 0) * 3600 + int(parts[1] or 0) * 60 + int(parts[2] or 0)
-        except ValueError:
-            return 0
-    try:
-        return int(float(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _provider_state(doc: dict[str, Any]) -> str:
-    source = str(doc.get("data_source") or "").strip().lower()
-    if source in {"sportybet", "sofascore", "both"}:
-        return source
-    sources = doc.get("data_sources") or {}
-    sporty = sources.get("sportybet") if isinstance(sources, dict) else {}
-    sofa = sources.get("sofascore") if isinstance(sources, dict) else {}
-    sporty_available = bool((sporty or {}).get("available") or doc.get("sportybet_detail") or doc.get("raw_sporty"))
-    sofa_available = bool((sofa or {}).get("available") or doc.get("sofascore_detail") or doc.get("sofascore_id"))
-    if sporty_available and sofa_available:
-        return "both"
-    if sofa_available:
-        return "sofascore"
-    return "sportybet" if sporty_available else "both"
-
-
-def _live_data_sources(doc: dict[str, Any], detail: dict[str, Any] | None = None) -> list[str]:
-    sources: list[str] = []
-    sporty_live = doc.get("live_data_sportybet") or {}
-    sofa_live = doc.get("live_data_sofascore") or {}
-    detail = detail or doc.get("sofascore_detail") or {}
-    if sporty_live or (doc.get("sportybet_markets") and _played_seconds(doc.get("played_seconds")) >= 300):
-        sources.append("sportybet")
-    if sofa_live or detail.get("statistics") or detail.get("match_statistics"):
-        sources.append("sofascore")
-    return sources
-
-
-def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
-    """Strict data contract before any prediction is allowed."""
-    detail = doc.get("sofascore_detail") or {}
-    sporty_detail = doc.get("sportybet_detail") or {}
-    sportradar_detail = doc.get("sportradar_detail") or {}
-    match_state = classify_match_state(doc)
-    status = detail.get("status") or doc.get("status") or {}
-    if not isinstance(status, dict):
-        status = {"code": status}
-    is_live = bool(match_state.get("is_live"))
-    if is_live:
-        detail = _hydrate_live_data_if_possible(doc, detail)
-    home_history = detail.get("home_last_matches") or []
-    away_history = detail.get("away_last_matches") or []
-    home_sample = len([m for m in home_history if (m.get("status") or {}).get("type") == "finished"])
-    away_sample = len([m for m in away_history if (m.get("status") or {}).get("type") == "finished"])
-    markets = doc.get("sportybet_markets") or doc.get("markets") or sporty_detail.get("markets") or []
-    has_sporty_baseline = bool((sporty_detail or doc.get("raw_sporty")) and markets and (doc.get("time_context") or match_time_context(doc)))
-    provider_state = _provider_state(doc)
-    needs_sofascore = provider_state in {"sofascore", "both"}
-    needs_sportybet = provider_state in {"sportybet", "both"}
-    live_sources = _live_data_sources(doc, detail) if is_live else []
-    clock_mature = _played_seconds(doc.get("played_seconds")) >= 5 * 60
-    prematch_missing: list[str] = []
-    if match_state.get("state") not in {"prematch", "live"}:
-        prematch_missing.append(f"non_predictable_state:{match_state.get('state')}")
-    if needs_sofascore and provider_state == "both" and doc.get("sofascore_match_status") != "matched" and not doc.get("sofascore_id"):
-        prematch_missing.append("confident_sofascore_match")
-    if needs_sofascore and not detail:
-        prematch_missing.append("sofascore_detail")
-    if needs_sofascore and home_sample < 3:
-        prematch_missing.append("home_recent_history")
-    if needs_sofascore and away_sample < 3:
-        prematch_missing.append("away_recent_history")
-    if needs_sportybet and not markets:
-        prematch_missing.append("sportybet_markets")
-    if needs_sportybet and not sporty_detail and not doc.get("raw_sporty"):
-        prematch_missing.append("sportybet_detail")
-    if not (doc.get("time_context") or match_time_context(doc)):
-        prematch_missing.append("time_context")
-    missing: list[str] = []
-    missing.extend(prematch_missing)
-    if is_live and live_sources and not clock_mature and prematch_missing:
-        missing.append("live_clock_mature")
-    elif is_live and not live_sources and prematch_missing:
-        missing.append("live_statistics")
-    if markets and (doc.get("time_context") or match_time_context(doc)):
-        # SportyBet markets are sufficient for a degraded prediction in all cases:
-        # - prematch: market-only signal is valid
-        # - live: allow as soon as markets exist, regardless of clock or SofaScore state
-        # - SofaScore match/detail failures should not block when we have odds data
-        removable = {
-            "confident_sofascore_match",
-            "sofascore_detail",
-            "home_recent_history",
-            "away_recent_history",
-            "live_statistics",
-            "live_clock_mature",
-        }
-        missing = [
-            item for item in missing
-            if item not in removable
-        ]
-    ready = not missing
-    assurance = "deferred"
-    prediction_mode = "live" if (is_live and live_sources and clock_mature and ready) else "prematch"
-    if ready:
-        if prediction_mode == "live":
-            assurance = "live_" + "_".join(live_sources) + "_signal"
-        elif provider_state == "sportybet" and has_sporty_baseline:
-            assurance = "sportybet_market_signal"
-        elif provider_state == "sofascore" and detail:
-            assurance = "sofascore_form_signal"
-        elif detail and sporty_detail:
-            assurance = "full_signal_plus_sporty"
-        elif detail:
-            assurance = "full_signal"
-        else:
-            assurance = "sportybet_market_signal"
-    return {
-        "ready": ready,
-        "missing": missing,
-        "home_history_sample": home_sample,
-        "away_history_sample": away_sample,
-        "has_markets": bool(markets),
-        "has_detail": bool(detail),
-        "has_sportybet_detail": bool(sporty_detail or doc.get("raw_sporty")),
-        "has_sportradar": bool(sportradar_detail.get("available")),
-        "minimum_enriched": bool(has_sporty_baseline or detail),
-        "minimum_enrichment_status": (
-            "full_provider_match"
-            if provider_state == "both" and detail and has_sporty_baseline
-            else "sofascore_only"
-            if provider_state == "sofascore" and detail
-            else "sportybet_only"
-            if has_sporty_baseline
-            else "missing_baseline"
-        ),
-        "data_sources": doc.get("data_sources") or {},
-        "data_source": provider_state,
-        "live_data_sources": live_sources,
-        "live_stats_source": _live_stats_source(doc, live_sources),
-        "live_fetch_errors": doc.get("live_fetch_errors") or [],
-        "deferred_reason": ", ".join(missing),
-        "is_live": is_live,
-        "prediction_mode": prediction_mode,
-        "match_state": match_state,
-        "assurance": assurance,
-        "blocking_reasons": _blocking_reasons(missing, doc, home_sample, away_sample, is_live, bool(doc.get("sofascore_id"))),
-        "readiness_score": _readiness_score(missing),
-    }
-
-
-def _hydrate_live_data_if_possible(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
-    sofa_id = doc.get("sofascore_id") or detail.get("id")
-    errors: list[dict[str, str]] = list(doc.get("live_fetch_errors") or [])
-    if sofa_id and not _live_match_statistics(detail).get("has_stats"):
-        try:
-            from app.data_clients.sofascore_client import fetch_event_incidents, fetch_event_lineups, fetch_event_statistics
-
-            statistics = fetch_event_statistics(int(sofa_id))
-            incidents = fetch_event_incidents(int(sofa_id))
-            lineups = fetch_event_lineups(int(sofa_id))
-            detail = dict(detail)
-            if statistics:
-                detail["statistics"] = statistics
-                doc["live_data_sofascore"] = {"statistics": statistics}
-            if incidents:
-                detail["incidents"] = incidents
-                doc.setdefault("live_data_sofascore", {})["incidents"] = incidents
-            if lineups:
-                detail["lineups"] = lineups
-                doc.setdefault("live_data_sofascore", {})["lineups"] = lineups
-            doc["sofascore_detail"] = detail
-        except Exception as exc:
-            errors.append({"source": "sofascore", "error": str(exc)})
-    sporty_id = str(doc.get("sportybet_id") or doc.get("id") or "")
-    if sporty_id and not doc.get("live_data_sportybet"):
-        try:
-            from app.data_clients.sportybet_client import fetch_live_matches_post
-
-            for match in fetch_live_matches_post() or []:
-                if str(match.get("id") or match.get("eventId") or match.get("match_id") or "") == sporty_id:
-                    doc["live_data_sportybet"] = match
-                    if match.get("markets") and not doc.get("sportybet_markets"):
-                        doc["sportybet_markets"] = match.get("markets")
-                    break
-        except Exception as exc:
-            errors.append({"source": "sportybet", "error": str(exc)})
-    if errors:
-        doc["live_fetch_errors"] = errors
-    return detail
-
-
-def _live_stats_source(doc: dict[str, Any], live_sources: list[str]) -> str:
-    if "sofascore" in live_sources:
-        return "sofascore_api"
-    if "sportybet" in live_sources:
-        return "sportybet_api"
-    return "prematch_fallback" if doc.get("sofascore_id") else "none"
-
-
-def _blocking_reasons(
+def _readiness_reasons(
     missing: list[str],
+    *,
     doc: dict[str, Any],
     home_sample: int,
     away_sample: int,
-    is_live: bool,
     has_sofascore_id: bool,
+    is_live: bool,
 ) -> list[dict[str, str]]:
     descriptions = {
         "sofascore_detail": ("SofaScore detail is missing.", "call fetch_event_detail(sofascore_id)"),
@@ -403,6 +198,56 @@ def _readiness_score(missing: list[str]) -> int:
     total_required = 8
     present = max(0, total_required - len(set(missing)))
     return round(100 * present / total_required)
+
+
+def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
+    detail = doc.get("sofascore_detail") or {}
+    home_history = detail.get("home_last_matches") or doc.get("home_recent_history") or []
+    away_history = detail.get("away_last_matches") or doc.get("away_recent_history") or []
+    home_sample = len([m for m in home_history if (m.get("status") or {}).get("type") == "finished"])
+    away_sample = len([m for m in away_history if (m.get("status") or {}).get("type") == "finished"])
+    has_sofascore_id = bool(doc.get("sofascore_id") or detail.get("id"))
+    markets = doc.get("sportybet_markets") or doc.get("markets") or []
+    period = doc.get("period") or (doc.get("sportybet_detail") or {}).get("period")
+    is_live = bool(doc.get("is_live")) or _is_live_period(period)
+
+    missing: list[str] = []
+    if not detail:
+        missing.append("sofascore_detail")
+    if home_sample < 3:
+        missing.append("home_recent_history")
+    if away_sample < 3:
+        missing.append("away_recent_history")
+    if not markets:
+        missing.append("sportybet_markets")
+    if not (doc.get("sportybet_detail") or doc.get("raw_sporty") or markets):
+        missing.append("sportybet_detail")
+    if is_live and has_sofascore_id and "sofascore" not in _live_data_sources(doc, detail):
+        missing.append("live_statistics")
+
+    # The full enriched model requires SofaScore detail and both team histories.
+    hard_missing = {"sofascore_detail", "home_recent_history", "away_recent_history"}
+    ready = not any(item in hard_missing for item in missing)
+    live_sources = _live_data_sources(doc, detail)
+    return {
+        "ready": ready,
+        "missing": missing,
+        "score": _readiness_score(missing),
+        "assurance": "full" if ready and markets else "partial" if ready else "deferred",
+        "has_sofascore_id": has_sofascore_id,
+        "home_finished_history": home_sample,
+        "away_finished_history": away_sample,
+        "live_data_sources": live_sources,
+        "live_stats_source": _live_stats_source(doc, live_sources) if is_live else None,
+        "reasons": _readiness_reasons(
+            missing,
+            doc=doc,
+            home_sample=home_sample,
+            away_sample=away_sample,
+            has_sofascore_id=has_sofascore_id,
+            is_live=is_live,
+        ),
+    }
 
 
 def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
@@ -1053,12 +898,7 @@ def _rules_prediction(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, 
         except Exception as exc:
             from app.utils.health_counters import record_health_event
             record_health_event("enriched_prediction", "rules_prediction_failed", exc)
-    sporty_doc = {
-        **doc,
-        "id": doc.get("id") or doc.get("sportybet_id"),
-        "name": doc.get("name") or doc.get("sportybet_name"),
-        "markets": doc.get("markets") or doc.get("sportybet_markets") or [],
-    }
+    sporty_doc = build_sporty_doc(doc)
     return predict_sporty_match(sporty_doc)
 
 
@@ -1081,12 +921,7 @@ def _fallback_market_prediction(
     away_sample: int,
 ) -> dict[str, Any]:
     """Prematch fallback when SofaScore matched but historical detail is thin."""
-    sporty_doc = {
-        **doc,
-        "id": doc.get("id") or doc.get("sportybet_id"),
-        "name": doc.get("name") or doc.get("sportybet_name"),
-        "markets": doc.get("markets") or doc.get("sportybet_markets") or [],
-    }
+    sporty_doc = build_sporty_doc(doc)
     rules = predict_sporty_match(sporty_doc)
     raw_picks = [dict(pick) for pick in (rules.get("picks") or [])]
     raw_picks = _upgrade_over_1_5_to_over_2_5(raw_picks, rules.get("signals") or [])
@@ -1714,7 +1549,7 @@ def _neutral_or_cross_country_cup(doc: dict[str, Any]) -> bool:
     tournament_name = tournament.get("name") if isinstance(tournament, dict) else str(tournament or "")
     category = doc.get("category") or doc.get("country") or ""
     text = " ".join([str(tournament_name or ""), str(category or "")]).lower()
-    if any(key in text for key in ("international clubs", "europa league", "champions league", "conference league")):
+    if "international clubs" in text:
         return True
     if any(key in text for key in ("final", "knockout", "cup")):
         home_country = _team_country(detail, "home")
@@ -4152,14 +3987,7 @@ def _blend_rate(model_rate: float, memory_rate: float, sample_factor: float) -> 
 
 
 def _selector_pick(kind: str, selection: str, confidence: float, reason: str) -> dict[str, Any]:
-    return {
-        "type": kind,
-        "selection": selection,
-        "market_intent": classify_market_intent(kind, selection),
-        "confidence": max(1, min(95, round(confidence))),
-        "reason": reason,
-        "source": "market_selector",
-    }
+    return build_pick(kind, selection, confidence, reason, source="market_selector", include_market_intent=True)
 
 
 def _dedupe_picks(picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4173,14 +4001,7 @@ def _dedupe_picks(picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _pick(kind: str, selection: str, confidence: float, reason: str) -> dict[str, Any]:
-    return {
-        "type": kind,
-        "selection": selection,
-        "market_intent": classify_market_intent(kind, selection),
-        "confidence": max(1, min(95, round(confidence))),
-        "reason": reason,
-        "family": "live" if kind.startswith("live_") else kind,
-    }
+    return build_pick(kind, selection, confidence, reason, include_market_intent=True)
 
 
 def _finalize_prediction_output(prediction: dict[str, Any], ensemble: dict[str, Any]) -> None:
@@ -4437,67 +4258,6 @@ def _finished_memory_adjustment(ensemble: dict[str, Any], memory: dict[str, Any]
     return max(-6, min(6, round((rate - baseline) * 18 * sample_factor)))
 
 
-def _team_name(doc: dict[str, Any], side: str) -> str:
-    team = doc.get(f"{side}_team")
-    if isinstance(team, dict):
-        return team.get("name") or ""
-    if team:
-        return str(team)
-    name = doc.get("sportybet_name") or doc.get("name") or ""
-    parts = [part.strip() for part in str(name).split(" vs ", 1)]
-    index = 0 if side == "home" else 1
-    return parts[index] if len(parts) > index else ""
-
-
-def _detail_country(detail: dict[str, Any]) -> str | None:
-    tournament = detail.get("tournament") or {}
-    if isinstance(tournament, dict):
-        category = tournament.get("category") or {}
-        if isinstance(category, dict) and category.get("name"):
-            return str(category.get("name"))
-    return None
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _probability_unit(value: Any) -> float | None:
-    number = _to_float(value)
-    if number is None:
-        return None
-    probability = number / 100 if number > 1 else number
-    return max(0.0, min(1.0, probability))
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _regime_info(doc: dict[str, Any]) -> dict[str, Any]:
-    try:
-        from app.market.regime import get_regime_for_doc
-        r = get_regime_for_doc(doc)
-        return {
-            "tier":           r.tier,
-            "name":           r.name,
-            "min_confidence": r.min_confidence,
-            "edge_threshold": r.edge_threshold,
-            "stake_cap":      r.stake_cap,
-            "description":    r.description,
-        }
-    except Exception:
-        return {}
-
-
-# ── Orchestration class ───────────────────────────────────────────────────────
-# Thin wrapper around the module-level pipeline functions, providing a class-
 # based entry point for callers that prefer object-oriented composition.
 
 class EnrichedPrediction:

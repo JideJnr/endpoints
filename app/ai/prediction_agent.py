@@ -12,21 +12,13 @@ from app.market.season_stage import (
 
 from app.storage.league_memory import late_goal_memory_signal
 from app.competition.league_strength import league_strength_edge
+from app.storage.league_memory._helpers import build_pick as _pick
 
 
-HIGH_LATE_GOAL_LEAGUES = (
-    "spain",
-    "laliga",
-    "la liga",
-    "primera",
-    "netherlands",
-    "eredivisie",
-    "germany",
-    "bundesliga",
-    "norway",
-    "sweden",
-    "belgium",
-)
+from app.utils.primitives import _to_int, _to_float
+from app.utils.match_helpers import _fraction_to_probability, _tournament_name, _team_name, _norm
+
+HIGH_LATE_GOAL_LEAGUES: tuple[str, ...] = ()
 
 
 # ── Time-decay for live confidence ───────────────────────────────────────────
@@ -1025,15 +1017,6 @@ def _side_name(team: dict[str, Any], event: dict[str, Any], side: str) -> str:
     return match_name
 
 
-def _pick(kind: str, selection: str, confidence: float, reason: str) -> dict[str, Any]:
-    return {
-        "type": kind,
-        "selection": selection,
-        "confidence": max(1, min(95, round(confidence))),
-        "reason": reason,
-    }
-
-
 def _event_minute(event: dict[str, Any]) -> int:
     status = event.get("status") or {}
     description = str(status.get("description") or "")
@@ -1051,42 +1034,12 @@ def _sporty_minute(played_seconds: Any) -> int:
 
 
 def _is_high_late_goal_league(name: str | None) -> bool:
-    text = (name or "").lower()
-    return any(token in text for token in HIGH_LATE_GOAL_LEAGUES)
-
-
-def _fraction_to_probability(value: Any) -> float | None:
-    if not value or "/" not in str(value):
-        return None
-    top, bottom = str(value).split("/", 1)
-    numerator = _to_float(top)
-    denominator = _to_float(bottom)
-    if numerator is None or denominator in (None, 0):
-        return None
-    decimal = numerator / denominator + 1
-    return 1 / decimal
-
-
-def _to_int(value: Any, default: int = 0) -> int:
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+        from app.monitoring.self_learner import get_tournament_priority
 
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _tournament_name(event: dict[str, Any]) -> str:
-    """Safely extract tournament name whether it's a string or a dict."""
-    t = event.get("tournament") or ""
-    if isinstance(t, dict):
-        return str(t.get("name") or "")
-    return str(t)
-
+        learned = get_tournament_priority(name or "")
+        return bool(learned.get("known") and int(learned.get("priority", 4)) <= 3)
+    except Exception:
+        return False
 
 

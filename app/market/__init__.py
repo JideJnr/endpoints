@@ -11,37 +11,42 @@ should import directly:
 """
 # noqa: F401  # DEPRECATED shim — see migration_checklist.md
 
-# ── market_intent.py — pure logic, no circular deps ──────────────────────────
-from app.market.market_intent import (  # noqa: F401
-    normalise_market_text,
-    classify_market_intent,
-    parse_total_line,
-    grade_market_intent,
-    selection_key,
-)
+_LAZY_EXPORTS = {
+    # market_intent.py
+    "normalise_market_text": "app.market.market_intent",
+    "classify_market_intent": "app.market.market_intent",
+    "parse_total_line": "app.market.market_intent",
+    "grade_market_intent": "app.market.market_intent",
+    "selection_key": "app.market.market_intent",
+    # regime.py
+    "Regime": "app.market.regime",
+    "TIER_1": "app.market.regime",
+    "TIER_2": "app.market.regime",
+    "TIER_3": "app.market.regime",
+    "TIER_4": "app.market.regime",
+    "get_regime": "app.market.regime",
+    "get_regime_for_doc": "app.market.regime",
+    "passes_regime_gate": "app.market.regime",
+    "apply_regime_stake_cap": "app.market.regime",
+    "regime_summary_for_predictions": "app.market.regime",
+    # season_stage.py
+    "SMALL_LEAGUE_MAX": "app.market.season_stage",
+    "MEDIUM_LEAGUE_MAX": "app.market.season_stage",
+    "classify_table_size": "app.market.season_stage",
+    "detect_season_stage": "app.market.season_stage",
+    "season_aware_table_weight": "app.market.season_stage",
+}
 
-# ── regime.py — pure logic, no circular deps ─────────────────────────────────
-from app.market.regime import (  # noqa: F401
-    Regime,
-    TIER_1,
-    TIER_2,
-    TIER_3,
-    TIER_4,
-    get_regime,
-    get_regime_for_doc,
-    passes_regime_gate,
-    apply_regime_stake_cap,
-    regime_summary_for_predictions,
-)
 
-# ── season_stage.py — pure logic, no circular deps ───────────────────────────
-from app.market.season_stage import (  # noqa: F401
-    SMALL_LEAGUE_MAX,
-    MEDIUM_LEAGUE_MAX,
-    classify_table_size,
-    detect_season_stage,
-    season_aware_table_weight,
-)
+def __getattr__(name: str):
+    module_name = _LAZY_EXPORTS.get(name)
+    if not module_name:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
 
 # ── odds_pattern.py — depends on app.db and app.league_memory (via _init_db) ─
 # Deferred to avoid circular: league_memory → market_intent → market.__init__

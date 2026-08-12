@@ -14,6 +14,8 @@ from app.market.season_stage import detect_season_stage
 from app.utils.time_context import match_time_context
 
 
+from app.utils.primitives import _to_float
+
 def build_contextual_intelligence(
     doc: dict[str, Any],
     prediction: dict[str, Any] | None = None,
@@ -123,7 +125,7 @@ def _match_context(doc: dict[str, Any], time_context: dict[str, Any]) -> dict[st
         tags.append("friendly")
         confidence_reliability = "reduced"
         adjustment -= 6
-    if any(key in text for key in ("cup", "playoff", "play-off", "knockout", "final", "semi-final", "quarter-final", "libertadores", "champions league", "europa league")):
+    if any(key in text for key in ("cup", "playoff", "play-off", "knockout", "final", "semi-final", "quarter-final")):
         tags.append("knockout_or_cup_pressure")
         pressure = "high"
         adjustment -= 2
@@ -691,12 +693,5 @@ def _text(value: Any) -> str:
     if isinstance(value, dict):
         return str(value.get("name") or value.get("slug") or "")
     return str(value or "")
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except Exception:
-        return None
 
 

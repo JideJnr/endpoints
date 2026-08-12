@@ -334,10 +334,9 @@ def _call_provider(model: str, prompt: str, timeout: int) -> str:
 
 # Kept as an internal compatibility alias for existing step tests/call sites.
 def _call_llm(model: str, prompt: str, timeout: int) -> str:
-    from app.ai.ai_router import get_router
+    from app.ai.ai_router import _call_llm as _router_call_llm
     # Step functions pass the model name as a hint for task routing
-    task = "reasoning"
-    return get_router().call_auto(prompt, task=task)
+    return _router_call_llm(model, prompt, timeout=timeout)
 
 
 def _step_h2h(doc: dict, model: str, timeout: int = 20) -> str:

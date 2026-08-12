@@ -699,6 +699,77 @@ def _side_from_selection_and_match(selection: str, match_name: str | None) -> st
     return None
 
 
+def build_pick(
+    kind: str,
+    selection: str,
+    confidence: float,
+    reason: str,
+    *,
+    source: str | None = None,
+    include_market_intent: bool = False,
+) -> dict[str, Any]:
+    """Unified pick-dict factory used across prediction_agent, enriched_prediction, etc."""
+    pick: dict[str, Any] = {
+        "type": kind,
+        "selection": selection,
+        "confidence": max(1, min(95, round(confidence))),
+        "reason": reason,
+    }
+    if include_market_intent:
+        try:
+            from app.market.market_intent import classify_market_intent
+            pick["market_intent"] = classify_market_intent(kind, selection)
+        except Exception:
+            pass
+        pick["family"] = "live" if kind.startswith("live_") else kind
+    if source is not None:
+        pick["source"] = source
+    return pick
+
+
+def build_sporty_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Build the minimal sporty_doc dict used by predict_sporty_match."""
+    return {
+        **doc,
+        "id": doc.get("id") or doc.get("sportybet_id"),
+        "name": doc.get("name") or doc.get("sportybet_name"),
+        "markets": doc.get("markets") or doc.get("sportybet_markets") or [],
+    }
+
+
+def grade_prediction_row(
+    row: Any,
+    final_home: int,
+    final_away: int,
+) -> tuple[str, dict[str, Any]]:
+    """Apply grading_reason + _grade_pick_for_match fallback. Returns (result, grade_info)."""
+    from app.monitoring.prediction_audit import grading_reason as _grading_reason
+    grade_info = _grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
+    result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
+    grade_info["result"] = result
+    return result, grade_info
+
+
+def update_prediction_result(
+    conn: Any,
+    prediction_id: Any,
+    result: str,
+    final_home: int,
+    final_away: int,
+    grade_info: dict[str, Any],
+) -> None:
+    """Execute the standard UPDATE on prediction_history for a graded row."""
+    import json as _json
+    conn.execute(
+        """
+        update prediction_history
+        set result = ?, final_home = ?, final_away = ?, grading_reason_json = ?, graded_at = current_timestamp
+        where id = ?
+        """,
+        (result, final_home, final_away, _json.dumps(grade_info), prediction_id),
+    )
+
+
 def _betbuilder_leg_key(match_id: Any, pick_type: Any, selection: Any) -> str:
     return f"{match_id}|{pick_type}|{selection}"
 

@@ -11,6 +11,8 @@ from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db, get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions
 
 
+from app.utils.primitives import _loads
+
 SNAPSHOT_KEEP_ROWS = 1000
 
 
@@ -496,30 +498,4 @@ def _top_counts(counts: dict[str, int], limit: int = 10) -> list[dict[str, Any]]
     ]
 
 
-def _loads(value: Any, fallback: Any) -> Any:
-    try:
-        return json.loads(value or "")
-    except Exception:
-        return fallback
-
-
-def _record_monitor_activity(result: dict[str, Any]) -> None:
-    try:
-        trend = (result.get("trend") or {}).get("direction")
-        mismatches = (result.get("mismatches") or {}).get("recent_losses")
-        corrections = len(result.get("corrections") or [])
-        record_activity(
-            f"Prediction monitor pass: trend={trend}, losses={mismatches}, corrections={corrections}",
-            job="prediction_monitor",
-            status="ok" if result.get("status") == "ok" else "error",
-            details={
-                "trend": result.get("trend"),
-                "mismatches": result.get("mismatches"),
-                "pipeline": result.get("pipeline"),
-                "corrections": result.get("corrections"),
-                "errors": result.get("errors"),
-            },
-        )
-    except Exception:
-        pass
 

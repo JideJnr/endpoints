@@ -40,6 +40,8 @@ from app.competition.sos import compare_schedules, analyse_schedule
 from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post
 from app.enrichment.web_context import context_for_match, search_league_sentiment, search_match_context
 
+from app.utils.primitives import _to_int, _to_float
+
 router = APIRouter(tags=["platform"])
 
 ENGINES = [
@@ -601,33 +603,35 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
 def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
     """Build a slip from upcoming prediction-engine candidates.
 
-    Two modes:
-      * Default (``consume_stored`` omitted/false) — the legacy Groq/OpenRouter
-        powered builder (``build_ai_betbuilder``) which re-runs the LLM pipeline
-        on candidates.  Kept for manual, on-demand slip building.
-      * ``consume_stored=true`` — the Layer-2 auto-bet *consumer*
-        (``run_auto_bet``): it reads already-produced predictions, applies the
-        research good/bad gate, and builds a booking slip with NO LLM re-run.
-        This is what the automated bettor should use.
+    Use ``mode='llm'`` for LLM-enriched per-match analysis (slower).
+    Default mode is ``'manual'`` — deterministic, no LLM, fast.
     """
-    if payload.get("consume_stored"):
-        from app.auto_bet import run_auto_bet
+    target_odds = float(payload.get("target_odds") or 1.80)
+    max_total_odds = float(payload["max_total_odds"]) if payload.get("max_total_odds") else None
+    stake = int(payload.get("stake") or 100)
+    candidate_limit = int(payload.get("candidate_limit") or 50)
+    request_code = bool(payload.get("request_code"))
 
-        result = run_auto_bet(
-            target_odds=float(payload.get("target_odds") or 1.80),
-            max_total_odds=(float(payload["max_total_odds"]) if payload.get("max_total_odds") else None),
-            stake=int(payload.get("stake") or 100),
-            candidate_limit=int(payload.get("candidate_limit") or 50),
-            request_code=bool(payload.get("request_code")),
+    if payload.get("mode") == "llm":
+        from app.bet_builder.llm_builder import run_llm_bet
+        result = run_llm_bet(
+            target_odds=target_odds,
+            max_total_odds=max_total_odds,
+            stake=stake,
+            candidate_limit=candidate_limit,
+            request_code=request_code,
         )
-        if result.get("status") in ("booking_failed", "synthesis_failed"):
-            raise HTTPException(status_code=503, detail=result)
-        return result
+    else:
+        from app.bet_builder.manual_builder import run_manual_bet
+        result = run_manual_bet(
+            target_odds=target_odds,
+            max_total_odds=max_total_odds,
+            stake=stake,
+            candidate_limit=candidate_limit,
+            request_code=request_code,
+        )
 
-    from app.ai.ai_betbuilder import build_ai_betbuilder
-
-    result = build_ai_betbuilder(payload)
-    if result.get("status") == "error":
+    if result.get("status") in ("booking_failed", "synthesis_failed", "error"):
         raise HTTPException(status_code=503, detail=result)
     return result
 
@@ -1116,23 +1120,6 @@ def _pick_decimal_odds(pick: dict[str, Any]) -> float:
     return _estimate_odds(pick.get("confidence"))
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-# ── Learning endpoints ──────────────────────────────────────────
-
-@router.get("/learning/thresholds")
 def get_learning_thresholds(league: str = "", pick_type: str = "") -> dict[str, Any]:
     """Return learned thresholds for a league/pick_type combination.
 

@@ -14,6 +14,9 @@ from app.storage.db import db_conn
 from app.config.config import get_settings
 from app.match_facts import enrich_match_facts
 
+from app.utils.primitives import _to_int, _to_float
+from app.utils.match_helpers import _tournament_name, _team_name
+
 _client = None
 _db = None
 _settings_cache = None
@@ -502,127 +505,5 @@ def _team(doc: dict, side: str) -> str | None:
     if isinstance(team, dict):
         return team.get("name")
     return team or None
-
-def _tournament_name(doc: dict) -> str | None:
-    t = doc.get("tournament")
-    if isinstance(t, dict):
-        return t.get("name")
-    return t or None
-
-def _to_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-def _latest_prediction(match_id: str) -> dict[str, Any] | None:
-    try:
-        from app.storage.db import DB_PATH
-        from app.storage.league_memory import _init_db
-        _init_db()
-        with db_conn(timeout=30) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "select pick_type, selection, confidence, reason from prediction_history where match_id = ? order by created_at desc limit 1",
-                (match_id,),
-            ).fetchone()
-        if not row:
-            return None
-        return {"type": row["pick_type"], "selection": row["selection"], "confidence": row["confidence"], "reason": row["reason"]}
-    except Exception:
-        return None
-
-
-def _scheduled_event_archive_doc(event: dict[str, Any], *, match_date: str | None = None) -> dict[str, Any] | None:
-    match_id = str(event.get("match_id") or event.get("id") or event.get("_id") or "")
-    if not match_id:
-        return None
-    home_team = event.get("homeTeam") or event.get("home_team") or {}
-    away_team = event.get("awayTeam") or event.get("away_team") or {}
-    tournament = event.get("tournament") or {}
-    score = event.get("score") or {}
-    status = event.get("status") or {}
-    return {
-        "_id": match_id,
-        "match_id": match_id,
-        "match_date": match_date or event.get("match_date"),
-        "name": event.get("name") or _event_name(home_team, away_team),
-        "home_team": _team_name(home_team),
-        "away_team": _team_name(away_team),
-        "home_team_id": _team_id(home_team),
-        "away_team_id": _team_id(away_team),
-        "tournament": tournament.get("name") if isinstance(tournament, dict) else tournament,
-        "score": {
-            "home": _score_value(score, "home"),
-            "away": _score_value(score, "away"),
-        },
-        "period": status.get("description") if isinstance(status, dict) else status,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-        "sofascore_detail": event,
-        "data_sources": {"sofascore": True},
-        "archive_source": "sofascore_scheduled",
-    }
-
-
-def _manual_finished_archive_doc(source: str, match: dict[str, Any]) -> dict[str, Any] | None:
-    match_id = str(match.get("match_id") or match.get("id") or match.get("_id") or "")
-    if not match_id:
-        return None
-    tournament = match.get("tournament") or {}
-    score = match.get("score") or {}
-    home_team = match.get("home_team") or match.get("homeTeam") or {}
-    away_team = match.get("away_team") or match.get("awayTeam") or {}
-    return {
-        "_id": match_id,
-        "match_id": match_id,
-        "match_date": match.get("match_date"),
-        "name": match.get("name") or _event_name(home_team, away_team),
-        "home_team": _team_name(home_team),
-        "away_team": _team_name(away_team),
-        "home_team_id": _team_id(home_team),
-        "away_team_id": _team_id(away_team),
-        "tournament": tournament.get("name") if isinstance(tournament, dict) else tournament,
-        "score": {
-            "home": _score_value(score, "home", fallback=match.get("final_home_goals")),
-            "away": _score_value(score, "away", fallback=match.get("final_away_goals")),
-        },
-        "period": match.get("period") or "FT",
-        "finished_at": match.get("finished_at") or datetime.now(timezone.utc).isoformat(),
-        "archive_source": source,
-        "raw_doc": match,
-    }
-
-
-def _team_name(team: Any) -> str | None:
-    if isinstance(team, dict):
-        return team.get("name")
-    return team or None
-
-
-def _team_id(team: Any) -> str | int | None:
-    if isinstance(team, dict):
-        return team.get("id")
-    return None
-
-
-def _event_name(home_team: Any, away_team: Any) -> str | None:
-    home = _team_name(home_team)
-    away = _team_name(away_team)
-    if home and away:
-        return f"{home} vs {away}"
-    return home or away
-
-
-def _score_value(score: Any, side: str, *, fallback: Any = None) -> int | None:
-    if isinstance(score, dict):
-        value = score.get(side)
-        if value is None:
-            side_block = score.get(side) or {}
-            if isinstance(side_block, dict):
-                value = side_block.get("current") or side_block.get("display")
-        parsed = _to_int(value)
-        if parsed is not None:
-            return parsed
-    return _to_int(fallback)
 
 

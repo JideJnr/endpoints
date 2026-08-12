@@ -20,6 +20,8 @@ from __future__ import annotations
 from typing import Any
 
 
+from app.utils.match_helpers import _tournament_name
+
 def odds_only_prediction(doc: dict[str, Any]) -> dict[str, Any] | None:
     """
     Predict using only 1x2 odds from the match doc.
@@ -117,9 +119,4 @@ def _extract_1x2(doc: dict[str, Any]) -> dict[str, Any]:
     return doc.get("odds_1x2") or {}
 
 
-def _tournament_name(doc: dict[str, Any]) -> str | None:
-    t = doc.get("tournament")
-    if isinstance(t, dict):
-        return t.get("name")
-    return t or None
 

@@ -6,6 +6,8 @@ import re
 from typing import Any
 
 
+from app.utils.primitives import _to_int
+
 EXCLUDED_SIGNAL_NAMES = {
     "learned_signal_adjustment",
     "learned_signal_combination",
@@ -165,8 +167,3 @@ def _clean_token(value: Any) -> str:
     return text.strip("_")
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default

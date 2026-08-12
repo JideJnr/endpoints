@@ -21,7 +21,85 @@ from app.competition.competition_registry import (
 )
 from app.competition.league_strength import league_strength_score
 
+from app.utils.primitives import _loads, _to_int
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Profile cache: avoid rebuilding the same profile multiple times in one
+# observe_match() call or across consecutive calls in a batch.
+# ---------------------------------------------------------------------------
+_PROFILE_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _cache_key(team_key: str, tournament_key: str | None = None) -> str:
+    if tournament_key:
+        return f"{team_key}::{tournament_key}"
+    return team_key
+
+
+def _get_cached_profile(cache_key: str) -> dict[str, Any] | None:
+    return _PROFILE_CACHE.get(cache_key)
+
+
+def _set_cached_profile(cache_key: str, profile: dict[str, Any]) -> None:
+    _PROFILE_CACHE[cache_key] = profile
+
+
+def _clear_profile_cache() -> None:
+    _PROFILE_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Tournament-scoped profile persistence
+# ---------------------------------------------------------------------------
+
+def _get_tournament_profile(conn: sqlite3.Connection, team_key: str, tournament_key: str) -> dict[str, Any] | None:
+    """Load a cached tournament-scoped profile from ai_team_watcher_profiles."""
+    row = conn.execute(
+        """
+        select profile_json, sample_size, updated_at
+        from ai_team_watcher_profiles
+        where team_key = ? and tournament_key = ?
+        """,
+        (team_key, tournament_key),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        profile = json.loads(row["profile_json"]) if isinstance(row["profile_json"], str) else row["profile_json"]
+    except (ValueError, TypeError):
+        profile = {}
+    profile["_cached_sample_size"] = int(row["sample_size"] or 0)
+    profile["_cached_at"] = row["updated_at"]
+    return profile if isinstance(profile, dict) else {}
+
+
+def _cache_tournament_profile(conn: sqlite3.Connection, team_key: str, tournament_key: str, tournament_name: str | None, profile: dict[str, Any]) -> None:
+    """Persist a tournament-scoped profile to ai_team_watcher_profiles."""
+    sample_size = int(profile.get("sample_size") or 0)
+    if sample_size < 3:
+        return  # Don't cache profiles with insufficient data
+    conn.execute(
+        """
+        insert into ai_team_watcher_profiles (team_key, tournament_key, tournament_name, profile_json, sample_size, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        on conflict(team_key, tournament_key) do update set
+            tournament_name = excluded.tournament_name,
+            profile_json = excluded.profile_json,
+            sample_size = excluded.sample_size,
+            updated_at = excluded.updated_at
+        """,
+        (
+            team_key,
+            tournament_key,
+            tournament_name,
+            json.dumps(profile),
+            sample_size,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
 
 
 def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
@@ -114,6 +192,20 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Tournament-scoped profile cache (new table for per-team-per-tournament profiles)
+    conn.execute(
+        """
+        create table if not exists ai_team_watcher_profiles (
+            team_key text not null,
+            tournament_key text not null,
+            tournament_name text,
+            profile_json text not null default '{}',
+            sample_size integer not null default 0,
+            updated_at text not null default current_timestamp,
+            primary key (team_key, tournament_key)
+        )
+        """
+    )
     _ensure_column(conn, "ai_team_watchers", "league_name", "text")
     _ensure_column(conn, "ai_team_watchers", "position", "text")
     _ensure_column(conn, "ai_team_watchers", "sporty_team_id", "text")
@@ -134,6 +226,10 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_ai_team_watchers_sporty_id on ai_team_watchers(sporty_team_id) where sporty_team_id is not null")
     conn.execute("create index if not exists idx_ai_team_watchers_sofa_id on ai_team_watchers(sofascore_team_id) where sofascore_team_id is not null")
     conn.execute("create index if not exists idx_ai_team_watcher_matches_team on ai_team_watcher_matches(team_key, match_date desc)")
+    # Index for tournament-scoped profile lookups
+    conn.execute("create index if not exists idx_ai_tw_profiles_lookup on ai_team_watcher_profiles(team_key, tournament_key)")
+    # Index to speed up name-based fallback in _resolve_watcher_row
+    conn.execute("create index if not exists idx_ai_team_watchers_name on ai_team_watchers(team_name)")
 
 
 def list_watchers(limit: int = 100, league_name: str | None = None) -> dict[str, Any]:
@@ -413,6 +509,16 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                 ),
             )
 
+            # ── Build and cache tournament-scoped profile ────────────────────
+            tournament_profile = None
+            if competition_key:
+                try:
+                    tournament_profile = _build_profile(conn, resolved_key, team, tournament_key=competition_key)
+                    tournament_name = observation.get("league_name") or observation.get("tournament") or competition_entry.get("name") if competition_entry else None
+                    _cache_tournament_profile(conn, resolved_key, competition_key, tournament_name, tournament_profile)
+                except Exception as _exc:
+                    logger.debug("tournament profile cache failed for %s/%s: %s", resolved_key, competition_key, _exc)
+
             # ── Update team-competition stats ────────────────────────────────
             if competition_key:
                 try:
@@ -428,7 +534,12 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                 except Exception as _exc:
                     logger.debug("update_team_competition_stats failed: %s", _exc)
 
-            updated.append({"team_key": resolved_key, "team_name": team["team_name"], "profile": profile})
+            updated.append({
+                "team_key": resolved_key,
+                "team_name": team["team_name"],
+                "profile": profile,
+                "tournament_profile": tournament_profile,
+            })
         conn.commit()  # commit match inserts + profile updates before competition registry calls
 
     # Grade any open TW_Signal predictions for this match and trigger weekly analysis
@@ -529,6 +640,51 @@ def rebuild_all_profiles(limit: int = 5000) -> dict[str, Any]:
             if profile.get("sample_size", 0) == 0:
                 skipped += 1
     return {"status": "success", "total": len(keys), "rebuilt": rebuilt, "skipped": skipped, "errors": errors}
+
+
+def rebuild_tournament_profiles(limit: int = 5000) -> dict[str, Any]:
+    """Rebuild tournament-scoped profiles for all team-tournament combinations.
+
+    Scans ai_team_watcher_matches for unique (team_key, tournament) pairs and
+    rebuilds the corresponding ai_team_watcher_profiles entries.
+    """
+    _init_db()
+    rebuilt = skipped = errors = 0
+    with db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        init_team_watcher_tables(conn)
+        # Find unique team-tournament combinations with at least 3 matches
+        pairs = conn.execute(
+            """
+            select team_key, tournament, count(*) as cnt
+            from ai_team_watcher_matches
+            where tournament is not null and tournament != ''
+            group by team_key, tournament
+            having cnt >= 3
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    for pair in pairs:
+        team_key = pair["team_key"]
+        tournament_key = pair["tournament"]
+        try:
+            with db_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                init_team_watcher_tables(conn)
+                # Resolve team for league_name
+                watcher = _resolve_watcher_row(conn, team_key)
+                team = {"team_name": watcher["team_name"]} if watcher else {}
+                profile = _build_profile(conn, team_key, team=team, tournament_key=tournament_key)
+                tournament_name = pair["tournament"]
+                _cache_tournament_profile(conn, team_key, tournament_key, tournament_name, profile)
+                conn.commit()
+            rebuilt += 1
+        except Exception as exc:
+            logger.debug("rebuild_tournament_profiles failed for %s/%s: %s", team_key, tournament_key, exc)
+            errors += 1
+    return {"status": "success", "total": len(pairs), "rebuilt": rebuilt, "skipped": skipped, "errors": errors}
 
 
 def backfill_from_finished(limit: int = 200) -> dict[str, Any]:
@@ -888,30 +1044,14 @@ def _observation_for_team(doc: dict[str, Any], team: dict[str, Any], analysis: d
     }
 
 
-def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any] | None = None) -> dict[str, Any]:
-    watcher = _resolve_watcher_row(conn, team_key)
-    watcher_profile = _loads(watcher["profile_json"], {}) if watcher else {}
-    rows = conn.execute(
-        """
-        select *
-        from ai_team_watcher_matches
-        where team_key = ?
-        order by match_date desc, created_at desc
-        limit 30
-        """,
-        (team_key,),
-    ).fetchall()
+def _compute_profile_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    """Extract shared profile statistics from match rows.
+
+    This function is used by both _build_profile() and the tournament-scoped
+    profile builder to eliminate code duplication.
+    """
     finished = [row for row in rows if row["goals_for"] is not None and row["goals_against"] is not None]
     sample = len(finished)
-    _opp_strength_scores = [
-        league_strength_score(row["league_name"])["score"]
-        for row in finished
-        if row["league_name"]
-    ]
-    avg_opponent_league_strength = (
-        round(sum(_opp_strength_scores) / len(_opp_strength_scores), 1)
-        if _opp_strength_scores else None
-    )
     wins = sum(1 for row in finished if row["result"] == "win")
     draws = sum(1 for row in finished if row["result"] == "draw")
     losses = sum(1 for row in finished if row["result"] == "loss")
@@ -924,8 +1064,92 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
     ppg = (wins * 3 + draws) / sample if sample else 0.0
     gf_avg = gf / sample if sample else 0.0
     ga_avg = ga / sample if sample else 0.0
-    analyst_score = max(1, min(99, 42 + ppg * 13 + (gf_avg - ga_avg) * 7 + (clean_sheets / sample * 7 if sample else 0)))
     form = "".join("W" if row["result"] == "win" else "D" if row["result"] == "draw" else "L" for row in finished[:8])
+    venue_split = _venue_split(rows)
+    goal_timing = _team_goal_timing(rows)
+    return {
+        "sample": sample,
+        "finished": finished,
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "gf": gf,
+        "ga": ga,
+        "over_25": over_25,
+        "btts": btts,
+        "clean_sheets": clean_sheets,
+        "blanks": blanks,
+        "ppg": ppg,
+        "gf_avg": gf_avg,
+        "ga_avg": ga_avg,
+        "form": form,
+        "venue_split": venue_split,
+        "goal_timing": goal_timing,
+    }
+
+
+def _build_profile(
+    conn: sqlite3.Connection,
+    team_key: str,
+    team: dict[str, Any] | None = None,
+    tournament_key: str | None = None,
+) -> dict[str, Any]:
+    """Build a team profile, optionally scoped to a specific tournament.
+
+    When tournament_key is provided, only matches from that tournament are used.
+    Falls back to the global profile if fewer than 3 tournament matches exist.
+    """
+    # Check cache first
+    cache_key = _cache_key(team_key, tournament_key)
+    cached = _get_cached_profile(cache_key)
+    if cached is not None:
+        return cached
+
+    watcher = _resolve_watcher_row(conn, team_key)
+    watcher_profile = _loads(watcher["profile_json"], {}) if watcher else {}
+
+    # Build tournament-scoped or global query
+    if tournament_key:
+        rows = conn.execute(
+            """
+            select *
+            from ai_team_watcher_matches
+            where team_key = ? and tournament = ?
+            order by match_date desc, created_at desc
+            limit 30
+            """,
+            (team_key, tournament_key),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            select *
+            from ai_team_watcher_matches
+            where team_key = ?
+            order by match_date desc, created_at desc
+            limit 30
+            """,
+            (team_key,),
+        ).fetchall()
+
+    stats = _compute_profile_stats(rows)
+    sample = stats["sample"]
+    finished = stats["finished"]
+
+    # For tournament-scoped profiles, fall back to global if too few matches
+    if tournament_key and sample < 3:
+        return _build_profile(conn, team_key, team=team, tournament_key=None)
+
+    _opp_strength_scores = [
+        league_strength_score(row["league_name"])["score"]
+        for row in finished
+        if row["league_name"]
+    ]
+    avg_opponent_league_strength = (
+        round(sum(_opp_strength_scores) / len(_opp_strength_scores), 1)
+        if _opp_strength_scores else None
+    )
+    analyst_score = max(1, min(99, 42 + stats["ppg"] * 13 + (stats["gf_avg"] - stats["ga_avg"]) * 7 + (stats["clean_sheets"] / sample * 7 if sample else 0)))
     league_name = (
         (team or {}).get("league_name")
         or watcher_profile.get("league_name")
@@ -936,8 +1160,6 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
     table = (team or {}).get("table_json") or watcher_profile.get("table") or _table_from_rows(rows)
     web_context = _loads(watcher["web_context_json"], {}) if watcher else {}
     last_web_context_at = watcher["last_web_context_at"] if watcher else None
-    venue_split = _venue_split(rows)
-    goal_timing = _team_goal_timing(rows)
     if _should_refresh_web_context({"web_context": web_context, "last_web_context_at": last_web_context_at}, sample):
         team_name = (team or {}).get("team_name") or (watcher and watcher["team_name"]) or "team"
         try:
@@ -954,16 +1176,16 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
         position=position,
         profile={
             "sample_size": sample,
-            "record": {"wins": wins, "draws": draws, "losses": losses, "form": form},
+            "record": {"wins": stats["wins"], "draws": stats["draws"], "losses": stats["losses"], "form": form},
             "goals": {
-                "for_avg": round(gf_avg, 2),
-                "against_avg": round(ga_avg, 2),
-                "over_2_5_rate": round(over_25 / sample, 3) if sample else 0,
-                "btts_rate": round(btts / sample, 3) if sample else 0,
-                "clean_sheet_rate": round(clean_sheets / sample, 3) if sample else 0,
-                "blank_rate": round(blanks / sample, 3) if sample else 0,
+                "for_avg": round(stats["gf_avg"], 2),
+                "against_avg": round(stats["ga_avg"], 2),
+                "over_2_5_rate": round(stats["over_25"] / sample, 3) if sample else 0,
+                "btts_rate": round(stats["btts"] / sample, 3) if sample else 0,
+                "clean_sheet_rate": round(stats["clean_sheets"] / sample, 3) if sample else 0,
+                "blank_rate": round(stats["blanks"] / sample, 3) if sample else 0,
             },
-            "preferred_markets": _market_leans(sample, wins, losses, over_25, btts, clean_sheets, blanks),
+            "preferred_markets": _market_leans(sample, stats["wins"], stats["losses"], stats["over_25"], stats["btts"], stats["clean_sheets"], stats["blanks"]),
             "analyst_score": round(analyst_score, 2),
             "trend": "rising" if form[:3].count("W") >= 2 else "falling" if form[:3].count("L") >= 2 else "stable",
             "recent_briefs": [row["brief"] for row in rows[:6] if row["brief"]],
@@ -974,35 +1196,35 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
     )
     strengths: list[str] = []
     risks: list[str] = []
-    if ppg >= 2:
+    if stats["ppg"] >= 2:
         strengths.append("results_consistency")
-    if gf_avg >= 1.6:
+    if stats["gf_avg"] >= 1.6:
         strengths.append("attacking_output")
-    if sample and clean_sheets / sample >= 0.38:
+    if sample and stats["clean_sheets"] / sample >= 0.38:
         strengths.append("defensive_clean_sheets")
-    if ga_avg >= 1.6:
+    if stats["ga_avg"] >= 1.6:
         risks.append("concedes_too_often")
-    if sample and blanks / sample >= 0.35:
+    if sample and stats["blanks"] / sample >= 0.35:
         risks.append("failed_to_score_risk")
-    if ppg <= 1:
+    if stats["ppg"] <= 1:
         risks.append("low_points_return")
-    markets = _market_leans(sample, wins, losses, over_25, btts, clean_sheets, blanks)
-    return {
+    markets = _market_leans(sample, stats["wins"], stats["losses"], stats["over_25"], stats["btts"], stats["clean_sheets"], stats["blanks"])
+    profile = {
         "sample_size": sample,
-        "record": {"wins": wins, "draws": draws, "losses": losses, "form": form},
+        "record": {"wins": stats["wins"], "draws": stats["draws"], "losses": stats["losses"], "form": stats["form"]},
         "goals": {
-            "for_avg": round(gf_avg, 2),
-            "against_avg": round(ga_avg, 2),
-            "over_2_5_rate": round(over_25 / sample, 3) if sample else 0,
-            "btts_rate": round(btts / sample, 3) if sample else 0,
-            "clean_sheet_rate": round(clean_sheets / sample, 3) if sample else 0,
-            "blank_rate": round(blanks / sample, 3) if sample else 0,
+            "for_avg": round(stats["gf_avg"], 2),
+            "against_avg": round(stats["ga_avg"], 2),
+            "over_2_5_rate": round(stats["over_25"] / sample, 3) if sample else 0,
+            "btts_rate": round(stats["btts"] / sample, 3) if sample else 0,
+            "clean_sheet_rate": round(stats["clean_sheets"] / sample, 3) if sample else 0,
+            "blank_rate": round(stats["blanks"] / sample, 3) if sample else 0,
         },
         "strengths": strengths or ["insufficient_clear_strength"],
         "risks": risks or ["no_major_risk_detected"],
         "preferred_markets": markets,
         "analyst_score": round(analyst_score, 2),
-        "trend": "rising" if form[:3].count("W") >= 2 else "falling" if form[:3].count("L") >= 2 else "stable",
+        "trend": "rising" if stats["form"][:3].count("W") >= 2 else "falling" if stats["form"][:3].count("L") >= 2 else "stable",
         "recent_briefs": [row["brief"] for row in rows[:6] if row["brief"]],
         "league_name": league_name,
         "position": position,
@@ -1010,8 +1232,8 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
         "web_context": web_context,
         "overview": overview,
         "last_web_context_at": last_web_context_at,
-        "venue_split": venue_split,
-        "goal_timing": goal_timing,
+        "venue_split": stats["venue_split"],
+        "goal_timing": stats["goal_timing"],
         "avg_opponent_league_strength": avg_opponent_league_strength,
         "prediction_context": {
             "usable": sample >= 3,
@@ -1021,6 +1243,9 @@ def _build_profile(conn: sqlite3.Connection, team_key: str, team: dict[str, Any]
             "risk_signals": risks[:3],
         },
     }
+    # Cache the result
+    _set_cached_profile(cache_key, profile)
+    return profile
 
 
 def _market_leans(sample: int, wins: int, losses: int, over_25: int, btts: int, clean_sheets: int, blanks: int) -> list[dict[str, Any]]:
@@ -1303,417 +1528,6 @@ def _get_finished_or_buffered_match(match_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _loads(value: Any, fallback: Any) -> Any:
-    if value in (None, ""):
-        return fallback
-    try:
-        return json.loads(value) if isinstance(value, str) else value
-    except Exception:
-        return fallback
-
-
-def _team_name(value: Any) -> str:
-    if isinstance(value, dict):
-        return str(value.get("name") or value.get("shortName") or value.get("short_name") or "").strip()
-    return str(value or "").strip()
-
-
-def _slug(value: str) -> str:
-    return "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in value).split())
-
-
-def _to_int(value: Any) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)
-    except Exception:
-        return None
-
-
-def _analysis_summary(analysis: dict[str, Any] | None) -> str:
-    if not isinstance(analysis, dict):
-        return ""
-    for key in ("analysis", "summary", "recommendation", "consensus", "reasoning"):
-        value = analysis.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:500]
-    return ""
-
-
-def _resolve_watcher_row(conn: sqlite3.Connection, identifier: str | None, team: dict[str, Any] | None = None) -> sqlite3.Row | None:
-    if not identifier and not team:
-        return None
-
-    # Fast-path: direct indexed lookups before falling back to full table scan
-    # Priority mirrors _watcher_match_score: team_key(100) > sporty_id(80) > sofa_id(76) > name(60)
-    candidates: list[str | None] = [
-        identifier,
-        (team or {}).get("team_key"),
-    ]
-    for candidate in candidates:
-        if candidate:
-            row = conn.execute(
-                "select * from ai_team_watchers where team_key = ?", (candidate,)
-            ).fetchone()
-            if row:
-                return row
-
-    sporty_id = (team or {}).get("sporty_team_id")
-    if sporty_id:
-        row = conn.execute(
-            "select * from ai_team_watchers where sporty_team_id = ? limit 1", (sporty_id,)
-        ).fetchone()
-        if row:
-            return row
-
-    sofa_id = (team or {}).get("sofascore_team_id")
-    if sofa_id:
-        row = conn.execute(
-            "select * from ai_team_watchers where sofascore_team_id = ? limit 1", (sofa_id,)
-        ).fetchone()
-        if row:
-            return row
-
-    # Fallback: full scoring scan for alias/name matches
-    rows = conn.execute("select * from ai_team_watchers").fetchall()
-    best_row: sqlite3.Row | None = None
-    best_score = 0
-    tokens = _watcher_tokens(team or {}, identifier)
-    for row in rows:
-        score = _watcher_match_score(row, tokens)
-        if score > best_score:
-            best_row = row
-            best_score = score
-    return best_row
-
-
-def _resolve_watcher_key(conn: sqlite3.Connection, team: dict[str, Any]) -> str:
-    row = _resolve_watcher_row(conn, team.get("team_key"), team=team)
-    return row["team_key"] if row else team["team_key"]
-
-
-def _watcher_tokens(team: dict[str, Any], identifier: str | None = None) -> set[str]:
-    tokens: set[str] = set()
-    if identifier:
-        tokens.add(_norm_token(identifier))
-    for key in ("team_key", "sporty_team_id", "sofascore_team_id", "team_name", "league_name", "position"):
-        value = team.get(key)
-        if value not in (None, ""):
-            tokens.add(_norm_token(value))
-    for alias in team.get("aliases") or []:
-        if isinstance(alias, dict):
-            for key in ("id", "provider", "label"):
-                value = alias.get(key)
-                if value not in (None, ""):
-                    tokens.add(_norm_token(value))
-        elif alias not in (None, ""):
-            tokens.add(_norm_token(alias))
-    return {token for token in tokens if token}
-
-
-def _watcher_match_score(row: sqlite3.Row, tokens: set[str]) -> int:
-    row_tokens = {
-        _norm_token(row["team_key"]),
-        _norm_token(row["sporty_team_id"]),
-        _norm_token(row["sofascore_team_id"]),
-        _norm_token(row["team_name"]),
-        _norm_token(row["league_name"]),
-        _norm_token(row["position"]),
-    }
-    for alias in _loads(row["aliases_json"], []):
-        if isinstance(alias, dict):
-            for key in ("id", "provider", "label"):
-                value = alias.get(key)
-                if value not in (None, ""):
-                    row_tokens.add(_norm_token(value))
-        elif alias not in (None, ""):
-            row_tokens.add(_norm_token(alias))
-    if not tokens.intersection(row_tokens):
-        return 0
-    score = 0
-    if _norm_token(row["team_key"]) in tokens:
-        score += 100
-    if _norm_token(row["sporty_team_id"]) in tokens:
-        score += 80
-    if _norm_token(row["sofascore_team_id"]) in tokens:
-        score += 76
-    if _norm_token(row["team_name"]) in tokens:
-        score += 60
-    if tokens.intersection(row_tokens):
-        score += 20
-    return score
-
-
-def _merge_aliases(existing: sqlite3.Row | None, team: dict[str, Any]) -> list[dict[str, Any]]:
-    aliases: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def add(alias: Any) -> None:
-        if isinstance(alias, dict):
-            provider = str(alias.get("provider") or "").strip()
-            alias_id = str(alias.get("id") or "").strip()
-            if not provider or not alias_id:
-                return
-            key = (provider, alias_id)
-            if key in seen:
-                return
-            seen.add(key)
-            item = {"provider": provider, "id": alias_id}
-            if alias.get("label"):
-                item["label"] = alias.get("label")
-            aliases.append(item)
-
-    if existing:
-        for alias in _loads(existing["aliases_json"], []):
-            add(alias)
-        add({"provider": "name", "id": _slug(existing["team_name"]), "label": existing["team_name"]})
-
-    add({"provider": "name", "id": _slug(team.get("team_name") or ""), "label": team.get("team_name")})
-    add({"provider": "sporty", "id": team.get("sporty_team_id") or "", "label": team.get("team_name")})
-    add({"provider": "sofascore", "id": team.get("sofascore_team_id") or "", "label": team.get("team_name")})
-    for alias in team.get("aliases") or []:
-        add(alias)
-    return aliases
-
-
-def _norm_token(value: Any) -> str:
-    return _slug(str(value or "").strip())
-
-
-def _unique_tournament_id_for_doc(doc: dict[str, Any]) -> int | None:
-    """Extract SofaScore unique_tournament_id from a match doc if present."""
-    for source in (
-        doc.get("sofascore_event"),
-        doc.get("sofascore_detail"),
-        doc.get("raw_sofascore_event"),
-    ):
-        if not isinstance(source, dict):
-            continue
-        tournament = source.get("tournament") if isinstance(source.get("tournament"), dict) else {}
-        # Parsed client shape: tournament.id is the unique_tournament_id
-        tid = tournament.get("id")
-        if tid is not None:
-            try:
-                return int(tid)
-            except (TypeError, ValueError):
-                pass
-        # Raw SofaScore shape: tournament.uniqueTournament.id
-        unique = tournament.get("uniqueTournament") if isinstance(tournament.get("uniqueTournament"), dict) else {}
-        tid = unique.get("id")
-        if tid is not None:
-            try:
-                return int(tid)
-            except (TypeError, ValueError):
-                pass
-    return None
-
-
-def _league_name_for_doc(doc: dict[str, Any]) -> str:
-    tournament = doc.get("tournament")
-    if isinstance(tournament, dict):
-        value = tournament.get("name") or tournament.get("shortName") or tournament.get("short_name")
-        if value:
-            return str(value)
-    if doc.get("league_name"):
-        return str(doc.get("league_name"))
-    raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else {}
-    value = raw_sporty.get("tournament")
-    if isinstance(value, dict):
-        return str(value.get("name") or value.get("shortName") or value.get("short_name") or "")
-    return str(value or "").strip()
-
-
-def _league_name_from_rows(rows: list[sqlite3.Row]) -> str:
-    for row in rows:
-        value = row["league_name"] if "league_name" in row.keys() else None
-        if value:
-            return str(value)
-        tournament = row["tournament"] if "tournament" in row.keys() else None
-        if tournament:
-            return str(tournament)
-    return ""
-
-
-def _table_lookup(doc: dict[str, Any]) -> dict[str, Any]:
-    table = doc.get("standings") or doc.get("league_table") or ((doc.get("sofascore_detail") or {}).get("standings") if isinstance(doc.get("sofascore_detail"), dict) else None)
-    return table if isinstance(table, dict) else table or {}
-
-
-def _table_from_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    return []
-
-
-def _team_position(table: Any, team_name: str, sporty_id: Any, sofa_id: Any, return_row: bool = False) -> Any:
-    if not isinstance(table, list):
-        return None
-    for row in table:
-        if not isinstance(row, dict):
-            continue
-        team = row.get("team") if isinstance(row.get("team"), dict) else row.get("team") or {}
-        row_name = _team_name(team)
-        row_id = team.get("id") if isinstance(team, dict) else None
-        if row_id and str(row_id) in {str(sporty_id or ""), str(sofa_id or "")}:
-            return row if return_row else row.get("position")
-        if team_name and row_name and (team_name.lower() in row_name.lower() or row_name.lower() in team_name.lower()):
-            return row if return_row else row.get("position")
-    return None
-
-
-def _position_value(row: Any) -> str | None:
-    if not isinstance(row, dict):
-        return None
-    value = row.get("position")
-    return str(value) if value not in (None, "") else None
-
-
-def _table_gap(team_row: Any, opponent_row: Any) -> int | None:
-    if not isinstance(team_row, dict) or not isinstance(opponent_row, dict):
-        return None
-    try:
-        team_pos = int(team_row.get("position"))
-        opp_pos = int(opponent_row.get("position"))
-        return opp_pos - team_pos
-    except Exception:
-        return None
-
-
-def _team_web_context(team: dict[str, Any], doc: dict[str, Any], team_row: Any, opponent_row: Any) -> dict[str, Any]:
-    team_name = team.get("team_name") or "team"
-    league_name = team.get("league_name") or _league_name_for_doc(doc)
-    position = team.get("position") or _position_value(team_row)
-    watcher_context = team.get("web_context")
-    if isinstance(watcher_context, dict) and watcher_context:
-        return watcher_context
-    return {"team_name": team_name, "league_name": league_name, "position": position}
-
-
-def _should_refresh_web_context(team: dict[str, Any] | sqlite3.Row | None, sample: int = 0) -> bool:
-    if not team:
-        return True
-    if isinstance(team, sqlite3.Row):
-        last = str(team["last_web_context_at"] or "").strip() if "last_web_context_at" in team.keys() else ""
-        has_context = bool(team["web_context_json"]) if "web_context_json" in team.keys() else False
-    else:
-        last = str(team.get("last_web_context_at") or "").strip()
-        has_context = bool(team.get("web_context"))
-    if sample == 0 and not has_context:
-        return True
-    if not last:
-        return not has_context or sample < 3
-    try:
-        ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
-        age = datetime.now(timezone.utc) - ts.astimezone(timezone.utc)
-        return age.total_seconds() >= 60 * 60 * 24 * 3 and sample < 8
-    except Exception:
-        return True
-
-
-def _build_overview(team_name: str, league_name: str | None, position: Any, profile: dict[str, Any], table: Any, web_context: dict[str, Any]) -> dict[str, Any]:
-    record = profile.get("record") or {}
-    goals = profile.get("goals") or {}
-    sample_size = int(profile.get("sample_size") or 0)
-    position_text = f"position {position}" if position not in (None, "") else "an unranked spot"
-    form = str(record.get("form") or "")
-    summary = f"{team_name} are {position_text} in {league_name or 'their league'} with form {form or 'n/a'}."
-    if sample_size == 0:
-        summary = f"{team_name} is a new watch entry in {league_name or 'their league'} and still building a meaningful history."
-    web_summary = ""
-    open_router = web_context.get("open_router_analysis") if isinstance(web_context, dict) else {}
-    if isinstance(open_router, dict):
-        web_summary = str(open_router.get("summary") or open_router.get("analysis") or open_router.get("result") or "").strip()
-    if web_summary:
-        summary = f"{summary} Online context: {web_summary[:280]}"
-    return {
-        "summary": summary[:1000],
-        "team_goal": _infer_team_goal(position, goals, league_name),
-        "table_snapshot": table if isinstance(table, list) else [],
-        "learned_signals": {
-            "strengths": profile.get("strengths") or [],
-            "risks": profile.get("risks") or [],
-            "preferred_markets": (profile.get("preferred_markets") or [])[:4],
-        },
-        "web_summary": web_summary[:500],
-    }
-
-
-def _infer_team_goal(position: Any, goals: dict[str, Any], league_name: str | None) -> str:
-    try:
-        pos = int(position) if position not in (None, "") else None
-    except Exception:
-        pos = None
-    if pos is not None:
-        if pos <= 4:
-            return "challenge at the top of the table"
-        if pos <= 8:
-            return "push for Europe or a strong upper-half finish"
-        if pos >= 16:
-            return "protect league status and avoid relegation trouble"
-    if (goals.get("for_avg") or 0) > (goals.get("against_avg") or 0):
-        return "stay positive and keep scoring pressure on"
-    return f"build stability in {league_name or 'the league'}"
-
-
-def _matchup_context(home: dict[str, Any], away: dict[str, Any], match_doc: dict[str, Any]) -> dict[str, Any]:
-    home_score = _profile_score(home, "home")
-    away_score = _profile_score(away, "away")
-    better = "home" if home_score > away_score else "away" if away_score > home_score else "even"
-    clean_sheet_edge = "home" if _rate(home, "clean_sheet_rate") > _rate(away, "clean_sheet_rate") else "away" if _rate(away, "clean_sheet_rate") > _rate(home, "clean_sheet_rate") else "even"
-    goal_edge = "home" if _rate(home, "for_avg") > _rate(away, "for_avg") else "away" if _rate(away, "for_avg") > _rate(home, "for_avg") else "even"
-    return {
-        "better_team": better,
-        "better_team_reason": _matchup_reason(home, away, better),
-        "clean_sheet_edge": clean_sheet_edge,
-        "goal_edge": goal_edge,
-        "home": {"team_name": home.get("team_name"), "score": home_score, "overview": home.get("overview") or home.get("profile", {}).get("overview")},
-        "away": {"team_name": away.get("team_name"), "score": away_score, "overview": away.get("overview") or away.get("profile", {}).get("overview")},
-        "match": {
-            "match_id": str(match_doc.get("_id") or match_doc.get("sportybet_id") or match_doc.get("match_id") or match_doc.get("id") or ""),
-            "league_name": _league_name_for_doc(match_doc),
-        },
-    }
-
-
-def _profile_score(team: dict[str, Any], side: str | None = None) -> float:
-    profile = team.get("profile") if isinstance(team.get("profile"), dict) else {}
-    if not profile:
-        profile = team.get("profile", {}) if isinstance(team.get("profile"), dict) else {}
-    score = float(profile.get("analyst_score") or 0)
-    record = profile.get("record") or {}
-    goals = profile.get("goals") or {}
-    score += float(record.get("wins") or 0) * 0.8
-    score += float(goals.get("for_avg") or 0) * 1.5
-    score -= float(goals.get("against_avg") or 0) * 1.2
-    venue_split = profile.get("venue_split") if isinstance(profile.get("venue_split"), dict) else {}
-    if side in {"home", "away"} and isinstance(venue_split.get(side), dict):
-        split = venue_split.get(side) or {}
-        score += float(split.get("ppg") or 0) * 3.5
-        score += float(split.get("gf_avg") or 0) * 0.8
-        score -= float(split.get("ga_avg") or 0) * 0.6
-    return score
-
-
-def _rate(team: dict[str, Any], key: str) -> float:
-    profile = team.get("profile") if isinstance(team.get("profile"), dict) else {}
-    goals = profile.get("goals") or {}
-    value = goals.get(key)
-    try:
-        return float(value or 0)
-    except Exception:
-        return 0.0
-
-
-def _matchup_reason(home: dict[str, Any], away: dict[str, Any], better: str) -> str:
-    if better == "even":
-        return "Both teams look evenly matched on the current memory profile."
-    winner = home if better == "home" else away
-    loser = away if better == "home" else home
-    winner_name = winner.get("team_name") or better
-    loser_name = loser.get("team_name") or ("away" if better == "home" else "home")
-    return f"{winner_name} currently carry the stronger memory profile than {loser_name}."
-
-
-# ── Team Watch Signal ─────────────────────────────────────────────────────────
 #
 # Produces a single prediction signal from three sub-signals derived from
 # the team watcher match history:

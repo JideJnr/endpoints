@@ -1,4 +1,4 @@
-# file: c:\Users\Victor\Documents\Personal Workstation\football\predictx\app\data_clients\sportradar_client.py
-# hypothesis_version: 6.135.26
+# file: C:\Users\Victor\Documents\Personal Workstation\football\predictx\app\data_clients\sportradar_client.py
+# hypothesis_version: 6.141.1
 
 [200, 300, 500, '.', '300000', '4', ':', 'Accept', 'Accept-Language', 'Origin', 'Referer', 'SPORTRADAR_S5_BASE', 'User-Agent', '_seasonid', 'attempts', 'available', 'body_preview', 'bytes', 'chrome124', 'client_id', 'content-type', 'content_type', 'data', 'en', 'en-US,en;q=0.9', 'endpoint', 'error', 'fetched_at', 'form', 'h2h', 'has_form', 'has_h2h', 'has_lineups', 'has_payload', 'has_probability', 'has_standings', 'has_statistics', 'headers', 'headtohead', 'impersonate', 'lastmatch', 'lineup', 'match', 'match_id', 'missing_match_id', 'ok', 'probab', 'provider_alias', 'season._id', 'season.id', 'seasonId', 'season_id', 'source', 'sportybet2', 'sr:match:', 'standing', 'standings', 'standings_error', 'stat', 'status', 'summary', 'table', 'timeout', 'top_level_keys', 'url']

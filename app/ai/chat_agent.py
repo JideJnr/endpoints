@@ -12,6 +12,8 @@ from app.ai.prediction_agent import predict_sporty_match
 from app.data_clients.sportybet_client import fetch_live_matches_post
 
 
+from app.utils.primitives import _to_int, _to_float
+
 @dataclass
 class ChatIntent:
     market: str
@@ -422,15 +424,3 @@ def _save_chat_picks(picks: list[dict[str, Any]], pick_type: str, reason: str) -
         })
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None

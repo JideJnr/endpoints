@@ -42,6 +42,8 @@ import json
 import logging
 import re
 from typing import Any
+from urllib import request as urllib_request
+from urllib.error import HTTPError
 
 from app.config.config import get_settings
 
@@ -270,13 +272,13 @@ class AIRouter:
     # ── Provider calls ─────────────────────────────────────────────────────
 
     def _call_openrouter(self, model: str, prompt: str, timeout: int) -> str:
-        from app.ai.llm_agent import _call_llm
+        from app.ai.ai_router import _call_llm
         return _call_llm(model, prompt, timeout=timeout)
 
     @staticmethod
     def _check_openrouter(model: str) -> bool:
         try:
-            from app.ai.llm_agent import is_llm_available
+            from app.ai.ai_router import is_llm_available
             return is_llm_available(model)
         except Exception:
             return False
@@ -317,6 +319,81 @@ def parse_json_safe(raw: str) -> dict[str, Any] | None:
         return parse_json_response(raw)
     except Exception:
         return None
+
+
+# ── Core LLM call (single source of truth) ────────────────────────────────────
+
+
+def _openrouter_url() -> str:
+    settings = get_settings()
+    return settings.openrouter_base_url.rstrip("/")
+
+
+def is_llm_available(model: str | None = None) -> bool:
+    """Check if OpenRouter is reachable (API key is set)."""
+    settings = get_settings()
+    if not settings.openrouter_api_key:
+        return False
+    try:
+        url = _openrouter_url() + "/chat/completions"
+        payload = json.dumps({
+            "model": settings.openrouter_model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "temperature": 0,
+            "max_tokens": 1,
+        }).encode("utf-8")
+        req = urllib_request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {settings.openrouter_api_key}",
+                "HTTP-Referer": "https://predictx.app",
+                "X-Title": "PredictX",
+            },
+            method="POST",
+        )
+        with urllib_request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if model:
+            return True
+        return bool(data.get("choices"))
+    except Exception:
+        return False
+
+
+def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
+    """Call OpenRouter chat completions (OpenAI-compatible)."""
+    settings = get_settings()
+    if not settings.openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
+
+    url = _openrouter_url() + "/chat/completions"
+    payload = json.dumps({
+        "model": settings.openrouter_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }).encode("utf-8")
+    req = urllib_request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "HTTP-Referer": "https://predictx.app",
+            "X-Title": "PredictX",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
+
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────

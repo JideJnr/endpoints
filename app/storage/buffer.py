@@ -42,6 +42,8 @@ from app.utils.match_state import classify_match_state
 from app.utils.normalise import normalise
 from app.market.season_stage import detect_season_stage
 
+from app.utils.match_helpers import _played_seconds as _played_seconds_local
+
 # How many SofaScore detail calls to run in parallel
 ENRICH_WORKERS = 8
 WEB_WORKERS = 10
@@ -454,6 +456,16 @@ def _tournament_priority_for_row(row: sqlite3.Row) -> int:
         tournament = tournament.get("name") or ""
 
     # Quality filters — always deprioritise these regardless of accuracy
+    name = (raw_sporty.get("name") or "").lower()
+    tournament_lower = str(tournament).lower()
+    combined = f"{name} {tournament_lower}".lower()
+
+    if any(x in combined for x in ["reserve", "u20", "u19"]):
+        return 8
+    if "friendly" in combined:
+        return 7
+
+    # Dynamic accuracy-based priority
     try:
         from app.monitoring.self_learner import get_tournament_priority  # noqa: PLC0415
         pref = get_tournament_priority(tournament)
@@ -692,6 +704,50 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
     doc = _sporty_to_summary(json.loads(row["raw_sporty"]))
     doc["match_date"] = row["match_date"]
     return _finalize_buffer_doc(doc, json.loads(row["raw_sporty"]))
+
+
+def bulk_get_buffered_matches(match_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Return buffered docs for many match IDs with one SQLite read.
+
+    The returned mapping includes every requested ID that resolved, plus the
+    stored buffer ID when it differs from the requested ID.
+    """
+    requested = [str(match_id or "") for match_id in match_ids if str(match_id or "")]
+    if not requested:
+        return {}
+    lookup_to_requested: dict[str, list[str]] = {}
+    for requested_id in requested:
+        for lookup_id in _buffer_lookup_ids(requested_id):
+            lookup_to_requested.setdefault(lookup_id, []).append(requested_id)
+
+    _init_db()
+    with _conn() as conn:
+        _init_buffer_table(conn)
+        placeholders = ",".join("?" for _ in lookup_to_requested)
+        rows = conn.execute(
+            f"""
+            select match_id, raw_enriched, raw_sporty, match_date
+            from match_buffer
+            where match_id in ({placeholders})
+            """,
+            tuple(lookup_to_requested.keys()),
+        ).fetchall()
+
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
+        if row["raw_enriched"]:
+            doc = json.loads(row["raw_enriched"])
+            doc = _finalize_buffer_doc(_ensure_country_fields(doc, sporty), sporty)
+        else:
+            doc = _sporty_to_summary(sporty)
+            doc["match_date"] = row["match_date"]
+            doc = _finalize_buffer_doc(doc, sporty)
+        stored_id = str(row["match_id"] or "")
+        result[stored_id] = doc
+        for requested_id in lookup_to_requested.get(stored_id, []):
+            result.setdefault(requested_id, doc)
+    return result
 
 
 def _buffer_lookup_ids(match_id: str) -> list[str]:
@@ -1074,54 +1130,8 @@ def _sofa_live_data(detail: dict[str, Any] | None) -> dict[str, Any]:
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
-
-def _played_seconds_local(value: Any) -> int:
-    try:
-        return int(float(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _track_live_data_availability(match_id: str, doc: dict[str, Any]) -> None:
-    if not classify_match_state(doc).get("is_live") or _played_seconds_local(doc.get("played_seconds")) < 300:
-        return
-    try:
-        from app.utils.live_retry_queue import mark_pending, mark_resolved
-    except Exception:
-        return
-    sporty_id = str(doc.get("sportybet_id") or match_id or "")
-    sofa_id = str(doc.get("sofascore_id") or "")
-    if doc.get("sportybet_id"):
-        if doc.get("live_data_sportybet"):
-            mark_resolved(str(match_id), "sportybet")
-        else:
-            mark_pending(
-                match_id=str(match_id),
-                source="sportybet",
-                sportybet_id=sporty_id,
-                sofascore_id=sofa_id,
-                reason="SportyBet live feed is empty after 5 minutes",
-            )
-    if doc.get("sofascore_id"):
-        if doc.get("live_data_sofascore"):
-            mark_resolved(str(match_id), "sofascore")
-        else:
-            mark_pending(
-                match_id=str(match_id),
-                source="sofascore",
-                sportybet_id=sporty_id,
-                sofascore_id=sofa_id,
-                reason="SofaScore live statistics are empty after 5 minutes",
-            )
-    if (doc.get("sportybet_id") and not doc.get("live_data_sportybet")) or (doc.get("sofascore_id") and not doc.get("live_data_sofascore")):
-        print(
-            "[live-data-warning] "
-            f"sportybet_id={sporty_id} sofascore_id={sofa_id} played_seconds={doc.get('played_seconds')}"
-        )
-
-
 def run_enrichment_worker(
-    batch_size: int = ENRICH_BATCH_SIZE,
+    batch_size: int = 10,
     live_only: bool = False,
     future_only: bool = False,
     exclude_live: bool = False,

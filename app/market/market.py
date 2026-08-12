@@ -12,6 +12,8 @@ from app.storage.league_memory import _init_db
 from app.config.config import get_settings
 
 
+from app.utils.primitives import _to_float
+
 def snapshot_odds(doc: dict[str, Any]) -> bool:
     _init_db()
     settings = get_settings()
@@ -571,87 +573,61 @@ def _odds_row(row: sqlite3.Row) -> dict[str, Any]:
     return {"home": row["home_odds"], "draw": row["draw_odds"], "away": row["away_odds"], "time": row["snapshot_time"]}
 
 
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
+def _get_snapshot_state(conn: sqlite3.Connection, match_id: str, source: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        select last_1x2_sig, last_market_sig, updated_at
+        from odds_snapshot_state
+        where match_id = ? and source = ?
+        """,
+        (str(match_id), str(source)),
+    ).fetchone()
+    if not row:
         return None
+    return {
+        "last_1x2_sig": row[0],
+        "last_market_sig": row[1],
+        "updated_at": row[2],
+    }
 
 
-def _sig_1x2(odds: dict[str, float]) -> str | None:
-    try:
-        home = odds.get("home")
-        draw = odds.get("draw")
-        away = odds.get("away")
-        if home is None and draw is None and away is None:
-            return None
-        payload = "|".join(_sig_num(v) for v in (home, draw, away))
-        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-    except Exception:
+def _sig_1x2(odds: dict[str, Any]) -> str | None:
+    values = [_to_float(odds.get(key)) for key in ("home", "draw", "away")]
+    if not any(value is not None for value in values):
         return None
+    payload = "|".join("" if value is None else f"{value:.4f}" for value in values)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
 def _sig_market_rows(rows: list[dict[str, Any]]) -> str | None:
     if not rows:
         return None
-    try:
-        parts: list[str] = []
-        for row in sorted(
-            rows,
-            key=lambda item: (
-                str(item.get("market_id") or ""),
-                str(item.get("specifier") or ""),
-                str(item.get("selection_id") or ""),
-            ),
-        ):
-            parts.append(
-                "|".join(
-                    [
-                        str(row.get("market_id") or ""),
-                        str(row.get("specifier") or ""),
-                        str(row.get("selection_id") or ""),
-                        _sig_num(row.get("odds")),
-                    ]
+    parts = []
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("source") or ""),
+            str(item.get("market_id") or ""),
+            str(item.get("specifier") or ""),
+            str(item.get("selection_id") or ""),
+            str(item.get("selection_name") or ""),
+        ),
+    ):
+        odds = _to_float(row.get("odds"))
+        parts.append(
+            "|".join(
+                (
+                    str(row.get("source") or ""),
+                    str(row.get("market_id") or ""),
+                    str(row.get("market_name") or ""),
+                    str(row.get("specifier") or ""),
+                    str(row.get("selection_id") or ""),
+                    str(row.get("selection_name") or ""),
+                    "" if odds is None else f"{odds:.4f}",
                 )
             )
-        payload = "\n".join(parts)
-        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-    except Exception:
-        return None
-
-
-def _sig_num(value: Any) -> str:
-    try:
-        if value is None or value == "":
-            return ""
-        num = float(value)
-        return f"{num:.3f}"
-    except Exception:
-        return str(value or "")
-
-
-def _get_snapshot_state(conn: sqlite3.Connection, match_id: str, source: str) -> dict[str, Any] | None:
-    try:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select match_id, source, last_1x2_sig, last_market_sig, updated_at
-            from odds_snapshot_state
-            where match_id = ? and source = ?
-            """,
-            (str(match_id), str(source)),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "match_id": row["match_id"],
-            "source": row["source"],
-            "last_1x2_sig": row["last_1x2_sig"],
-            "last_market_sig": row["last_market_sig"],
-            "updated_at": row["updated_at"],
-        }
-    except Exception:
-        return None
+        )
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
 
 
 def _upsert_snapshot_state(

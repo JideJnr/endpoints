@@ -10,6 +10,8 @@ from app.risk.risk_learner import get_learned_risk_controls, get_learned_risk_co
 from app.risk.validation_gate import evaluate_promotion_gate
 
 
+from app.utils.primitives import _to_float
+
 # ── Static Fallbacks (used when learned data is insufficient) ──────────────────
 # These remain as safety nets but are progressively replaced by learned values.
 
@@ -513,14 +515,6 @@ def _positive_signal_count(signals: list[dict[str, Any]]) -> int:
 
 def _negative_signal_count(signals: list[dict[str, Any]]) -> int:
     return sum(1 for signal in signals if _to_float(signal.get("impact")) and float(signal.get("impact") or 0) < 0)
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except Exception:
-        return None
-
 
 def _record_risk_control_application(
     doc: dict[str, Any],

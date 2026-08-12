@@ -2,20 +2,16 @@ from fastapi import APIRouter, HTTPException
 from app.data_clients.sportybet_client import (
     fetch_match_info,
     fetch_live_and_upcoming_matches_post,
-    fetch_live_matches_post,
     fetch_upcoming_matches_post,
 )
+from app.ai.agent_tools import get_live_matches
 
 router = APIRouter(prefix="/sporty", tags=["sporty"])
 
 
 @router.get("/live")
-def get_live_matches():
-    try:
-        matches = fetch_live_matches_post()
-        return {"status": "success", "count": len(matches), "matches": matches}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+def get_live_matches_route():
+    return get_live_matches()
 
 
 @router.get("/live/all")

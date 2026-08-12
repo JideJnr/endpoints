@@ -5,25 +5,9 @@ from typing import Any
 from app.data_clients.sofascore_client import fetch_standings, fetch_team_history
 
 
-LEAGUE_TIERS = {
-    "premier league": 1,
-    "la liga": 1,
-    "bundesliga": 1,
-    "serie a": 1,
-    "ligue 1": 1,
-    "championship": 2,
-    "la liga 2": 2,
-    "2. bundesliga": 2,
-    "serie b": 2,
-    "ligue 2": 2,
-    "eredivisie": 2,
-    "primeira liga": 2,
-    "league one": 3,
-    "league two": 4,
-    "champions league": 1,
-    "europa league": 2,
-    "conference league": 3,
-}
+from app.utils.primitives import _to_int
+
+LEAGUE_TIERS: dict[str, int] = {}
 
 OPPONENT_WEIGHT = {"top": 3.0, "upper": 2.0, "lower": 1.0, "bottom": 0.5, "unknown": 1.0}
 
@@ -177,11 +161,23 @@ def _opponent_bucket(position: int | None, total_teams: int | None) -> str:
 
 
 def _league_tier(name: str) -> int:
-    text = (name or "").lower()
-    for key, tier in LEAGUE_TIERS.items():
-        if key in text:
-            return tier
-    return 3
+    try:
+        from app.monitoring.self_learner import get_tournament_priority
+
+        learned = get_tournament_priority(name)
+        if not learned.get("known"):
+            return 3
+        priority = int(learned.get("priority", 4))
+    except Exception:
+        return 3
+
+    if priority <= 1:
+        return 1
+    if priority <= 3:
+        return 2
+    if priority <= 5:
+        return 3
+    return 4
 
 
 def _schedule_summary(data: dict[str, Any]) -> dict[str, Any]:
@@ -195,8 +191,3 @@ def _schedule_summary(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default

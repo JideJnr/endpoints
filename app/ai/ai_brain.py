@@ -5,7 +5,10 @@ from typing import Any
 from urllib import error, request
 
 from app.config.config import get_settings
+from app.ai.llm_pipeline import _build_memory_context
 
+
+from app.utils.primitives import _to_int, _to_float
 
 DEFAULT_LLM_MODEL = "llama3.2:3b"
 DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
@@ -72,80 +75,12 @@ def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | No
 
 
 def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
+    """Build a memory block from the self-learner and CLV data.
+
+    Delegates to llm_pipeline._build_memory_context for a single source of truth.
     """
-    Build a memory block from the self-learner and CLV data.
-    This gives the AI brain historical awareness:
-      - Which signals are hot/cold right now
-      - How accurate the system has been in this league
-      - Whether CLV is positive (are we beating the market?)
-      - Auto-tuned model weights
-    """
-    context: dict[str, Any] = {}
-
-    try:
-        from app.monitoring.self_learner import get_signal_weights, get_league_accuracy, get_top_signals, get_learned_weights, get_learning_summary
-        league = prediction.get("league_name") or prediction.get("tournament") or ""
-        if isinstance(league, dict):
-            league = league.get("name") or ""
-
-        # Signal weights for this league
-        signal_weights = get_signal_weights(league)
-        if signal_weights:
-            context["signal_weights"] = signal_weights
-
-        # League accuracy profile
-        league_acc = get_league_accuracy(league)
-        if league_acc.get("known"):
-            context["league_accuracy"] = league_acc
-
-        # Top performing signals globally
-        top_signals = get_top_signals(limit=5)
-        if top_signals:
-            context["top_signals_globally"] = [
-                {"signal": s["signal"], "win_rate": s["win_rate"], "verdict": s["verdict"]}
-                for s in top_signals[:5]
-            ]
-
-        summary = get_learning_summary()
-        cold = summary.get("bottom_signals") or []
-        if cold:
-            context["cold_signals_globally"] = [
-                {"signal": s.get("signal"), "win_rate": s.get("win_rate"), "samples": s.get("samples")}
-                for s in cold[:5]
-            ]
-
-        # Current model weights (auto-tuned)
-        context["model_weights"] = get_learned_weights()
-
-    except Exception:
-        pass
-
-    try:
-        from app.risk.clv import get_clv_summary
-        clv = get_clv_summary(days=14)
-        avg_clv = clv.get("avg_clv_percent")
-        if avg_clv is not None:
-            context["clv_14d"] = {
-                "avg_clv_percent": avg_clv,
-                "edge_quality": clv.get("edge_quality"),
-                "positive_clv_rate": clv.get("positive_clv_rate"),
-            }
-    except Exception:
-        pass
-
-    try:
-        from app.enrichment.confidence_calibrator import get_calibration_table
-        cal = get_calibration_table()
-        if cal:
-            context["calibration"] = [
-                {"band": c.get("band"), "win_rate": c.get("win_rate"), "samples": c.get("samples")}
-                for c in (cal if isinstance(cal, list) else [])
-                if (c.get("samples") or 0) >= 10
-            ][:6]
-    except Exception:
-        pass
-
-    return context
+    from app.ai.llm_pipeline import _build_memory_context as _pipeline_build_memory_context
+    return _pipeline_build_memory_context(prediction)
 
 
 def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -360,20 +295,5 @@ def _as_list(value: Any) -> list[Any]:
 
 def _bounded_int(value: Any, low: int, high: int) -> int:
     return max(low, min(high, _to_int(value, 0)))
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
 
 

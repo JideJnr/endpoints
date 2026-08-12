@@ -43,6 +43,7 @@ from ._helpers import (
     _decorate_betbuilder_selections, _betbuilder_learning_summary,
     _TEAM_HISTORY_CACHE_DAYS,
     _country_from_league, _is_country_like,
+    grade_prediction_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -1122,11 +1123,9 @@ def _latest_leg_grade(conn: sqlite3.Connection, match_id: str, pick_type: str, s
     if score is None:
         return None
     final_home, final_away = score
+    result = _grade_pick_for_match(pick_type, selection, final_home, final_away, None)
     grade_info = grading_reason(pick_type, selection, final_home, final_away)
-    result = grade_info.get("result")
-    if result == "void":
-        result = _grade_pick_for_match(pick_type, selection, final_home, final_away, None)
-        grade_info["result"] = result
+    grade_info["result"] = result
     return {
         "result": str(result or "void"),
         "graded_at": None,

@@ -15,6 +15,8 @@ from urllib.error import HTTPError
 from app.config.config import get_settings
 from app.market.season_stage import detect_season_stage
 
+from app.utils.primitives import _safe_float
+
 logger = logging.getLogger(__name__)
 
 # kept for any external imports
@@ -134,44 +136,12 @@ Return ONLY valid JSON:
 }}"""
 
 
-# ── Core LLM call ──────────────────────────────────────────────────────────────
+# ── Core LLM call (imported from ai_router) ───────────────────────────────────
 
 def is_llm_available(model: str | None = None) -> bool:
     """Check if OpenRouter is configured (API key is set)."""
-    return bool(get_settings().openrouter_api_key)
-
-
-def _call_llm(prompt: str, timeout: int = 30) -> str:
-    """Call OpenRouter chat completions (OpenAI-compatible)."""
-    settings = get_settings()
-    if not settings.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
-    url = settings.openrouter_base_url.rstrip("/") + "/chat/completions"
-    payload = json.dumps({
-        "model": settings.openrouter_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 512,
-    }).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://predictx.app",
-            "X-Title": "PredictX",
-        },
-        method="POST",
-    )
-    try:
-        with urllib_request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    from app.ai.ai_router import is_llm_available as _is_available
+    return _is_available(model)
 
 
 def _parse_safe(raw: str) -> dict[str, Any] | None:
@@ -186,267 +156,102 @@ def _parse_safe(raw: str) -> dict[str, Any] | None:
         return None
 
 
-def _safe_float(v: Any, default: float = 0.0) -> float:
+def _build_memory_context(doc: dict[str, Any]) -> dict[str, Any]:
+    """Build a memory block from the self-learner and CLV data.
+
+    Returns a dict (not a string) so callers can pick the fields they need.
+    Use _format_memory_context() to convert to a prompt string.
+    """
+    context: dict[str, Any] = {}
     try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _run_specialist(prompt: str, timeout: int) -> dict[str, Any]:
-    try:
-        raw = _call_llm(prompt, timeout=timeout)
-        result = _parse_safe(raw)
-        if result:
-            return {"status": "success", "result": result}
-        return {"status": "error", "error": "Failed to parse JSON", "raw": raw[:200]}
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)}
-
-
-# ── Data extractors ────────────────────────────────────────────────────────────
-
-def _extract_form_data(doc: dict[str, Any]) -> dict[str, str]:
-    detail = doc.get("sofascore_detail") or {}
-    home_history = detail.get("home_last_matches") or doc.get("home_last_matches") or []
-    away_history = detail.get("away_last_matches") or doc.get("away_last_matches") or []
-
-    def _wld(history: list, team_id: Any) -> str:
-        finished = [m for m in history if (m.get("status") or {}).get("type") == "finished"][:5]
-        out = []
-        for m in finished:
-            s = m.get("score") or {}
-            h_id = (m.get("home_team") or {}).get("id")
-            is_home = str(h_id) == str(team_id) if h_id else True
-            gf = s.get("home", 0) if is_home else s.get("away", 0)
-            ga = s.get("away", 0) if is_home else s.get("home", 0)
-            try:
-                out.append("W" if int(gf) > int(ga) else "D" if int(gf) == int(ga) else "L")
-            except Exception:
-                out.append("?")
-        return "".join(out) or "N/A"
-
-    home = detail.get("home_team") or doc.get("home_team") or {}
-    away = detail.get("away_team") or doc.get("away_team") or {}
-    return {
-        "home_form": _wld(home_history, home.get("id") if isinstance(home, dict) else None),
-        "away_form": _wld(away_history, away.get("id") if isinstance(away, dict) else None),
-    }
-
-
-def _extract_h2h_data(doc: dict[str, Any]) -> dict[str, Any]:
-    detail = doc.get("sofascore_detail") or {}
-    h2h = detail.get("h2h") or {}
-    td = h2h.get("team_duel") or h2h.get("teamDuel") or {}
-    return {
-        "home_wins": td.get("homeWins", 0),
-        "away_wins": td.get("awayWins", 0),
-        "draws": td.get("draws", 0),
-        "available": bool(td),
-    }
-
-
-def _extract_odds_data(doc: dict[str, Any]) -> dict[str, Any]:
-    markets = doc.get("sportybet_markets") or doc.get("markets") or []
-    home_odds = draw_odds = away_odds = None
-    for mkt in markets:
-        n = (mkt.get("name") or "").lower()
-        if mkt.get("id") == "1" or "1x2" in n or "match result" in n:
-            for s in (mkt.get("selections") or [])[:3]:
-                name = (s.get("name") or "").lower()
-                odds = _safe_float(s.get("odds"))
-                if "home" in name or name == "1":
-                    home_odds = odds
-                elif "draw" in name or name == "x":
-                    draw_odds = odds
-                elif "away" in name or name == "2":
-                    away_odds = odds
-            break
-    return {
-        "home_odds": home_odds, "draw_odds": draw_odds, "away_odds": away_odds,
-        "available": home_odds is not None and away_odds is not None,
-    }
-
-
-def _extract_standings_data(doc: dict[str, Any]) -> dict[str, Any]:
-    detail = doc.get("sofascore_detail") or {}
-    standings = detail.get("standings") or doc.get("standings") or []
-    home = detail.get("home_team") or doc.get("home_team") or {}
-    away = detail.get("away_team") or doc.get("away_team") or {}
-    home_name = (home.get("name") or "") if isinstance(home, dict) else str(home or "")
-    away_name = (away.get("name") or "") if isinstance(away, dict) else str(away or "")
-    home_pos = away_pos = home_pts = away_pts = "?"
-    for row in standings:
-        tn = (row.get("team") or {}).get("name") or ""
-        if home_name and home_name.lower() in tn.lower():
-            home_pos, home_pts = row.get("position", "?"), row.get("points", "?")
-        if away_name and away_name.lower() in tn.lower():
-            away_pos, away_pts = row.get("position", "?"), row.get("points", "?")
-    # Detect season stage so the standings specialist knows whether
-    # standings are reliable or just beginning.
-    season_stage = doc.get("season_stage") or detect_season_stage(standings)
-    return {
-        "home_pos": home_pos, "home_pts": home_pts,
-        "away_pos": away_pos, "away_pts": away_pts,
-        "available": home_pos != "?" and away_pos != "?",
-        "season_stage": season_stage.get("stage") if season_stage else "in_progress",
-        "season_not_started": season_stage.get("season_not_started", False) if season_stage else False,
-        "season_beginning": season_stage.get("season_beginning", False) if season_stage else False,
-        "standings_meaningful": season_stage.get("standings_meaningful", True) if season_stage else True,
-    }
-
-
-def _extract_model_data(doc: dict[str, Any]) -> dict[str, Any]:
-    models = (doc.get("prediction") or {}).get("models") or {}
-
-    def _probs(m: dict[str, Any]) -> dict[str, float]:
-        p = m.get("probabilities") or {}
-        return {
-            "home": _safe_float(p.get("home_win"), 33.3),
-            "draw": _safe_float(p.get("draw"), 33.3),
-            "away": _safe_float(p.get("away_win"), 33.3),
-        }
-
-    poisson = models.get("poisson") or {}
-    dixon = models.get("dixon_coles") or {}
-    elo = models.get("elo") or {}
-    return {
-        "poisson": _probs(poisson), "dixon_coles": _probs(dixon), "elo": _probs(elo),
-        "available": bool(poisson or dixon or elo),
-    }
-
-
-# ── Specialists ────────────────────────────────────────────────────────────────
-
-def run_form_specialist(doc: dict[str, Any]) -> dict[str, Any]:
-    data = _extract_form_data(doc)
-    if data["home_form"] == "N/A" and data["away_form"] == "N/A":
-        return {"status": "skipped", "reason": "No form data"}
-    r = _run_specialist(_FORM_PROMPT.format(**data), _TIMEOUT_SPECIALIST)
-    return {**r, "specialist": "form"} if r.get("status") == "success" else r
-
-
-def run_h2h_specialist(doc: dict[str, Any]) -> dict[str, Any]:
-    data = _extract_h2h_data(doc)
-    if not data["available"]:
-        return {"status": "skipped", "reason": "No H2H data"}
-    r = _run_specialist(_H2H_PROMPT.format(**data), _TIMEOUT_SPECIALIST)
-    return {**r, "specialist": "h2h"} if r.get("status") == "success" else r
-
-
-def run_odds_specialist(doc: dict[str, Any]) -> dict[str, Any]:
-    data = _extract_odds_data(doc)
-    if not data["available"]:
-        return {"status": "skipped", "reason": "No odds data"}
-    r = _run_specialist(_ODDS_PROMPT.format(**data), _TIMEOUT_SPECIALIST)
-    return {**r, "specialist": "odds"} if r.get("status") == "success" else r
-
-
-def run_standings_specialist(doc: dict[str, Any]) -> dict[str, Any]:
-    data = _extract_standings_data(doc)
-    if not data["available"]:
-        return {"status": "skipped", "reason": "No standings data"}
-    # When the season hasn't started, standings are meaningless — skip.
-    if data.get("season_not_started"):
-        return {"status": "skipped", "reason": "Season not started — standings unreliable"}
-    # When the season is just beginning, add a caution note to the prompt.
-    season_note = ""
-    if data.get("season_beginning"):
-        season_note = (
-            "\nNOTE: The season is just beginning. League positions are not yet "
-            "reliable — treat standings as indicative only.\n"
+        from app.monitoring.self_learner import (
+            get_signal_weights,
+            get_league_accuracy,
+            get_top_signals,
+            get_learned_weights,
+            get_learning_summary,
         )
-    prompt = _STANDINGS_PROMPT.format(**data) + season_note
-    r = _run_specialist(prompt, _TIMEOUT_SPECIALIST)
-    return {**r, "specialist": "standings"} if r.get("status") == "success" else r
-
-
-def run_model_specialist(doc: dict[str, Any]) -> dict[str, Any]:
-    data = _extract_model_data(doc)
-    if not data["available"]:
-        return {"status": "skipped", "reason": "No model outputs"}
-    p, d, e = data["poisson"], data["dixon_coles"], data["elo"]
-    prompt = _MODEL_PROMPT.format(
-        p_home=p["home"], p_draw=p["draw"], p_away=p["away"],
-        d_home=d["home"], d_draw=d["draw"], d_away=d["away"],
-        e_home=e["home"], e_draw=e["draw"], e_away=e["away"],
-    )
-    r = _run_specialist(prompt, _TIMEOUT_SPECIALIST)
-    return {**r, "specialist": "models"} if r.get("status") == "success" else r
-
-
-# ── Aggregation + memory ───────────────────────────────────────────────────────
-
-def _aggregate_specialists(results: list[dict[str, Any]]) -> dict[str, Any]:
-    parts: list[str] = []
-    counts: dict[str, int] = {"home": 0, "away": 0, "draw": 0, "neutral": 0}
-    total_conf = n = 0
-    for res in results:
-        if res.get("status") != "success":
-            continue
-        r = res.get("result") or {}
-        adv = r.get("advantage", "neutral")
-        conf = _safe_int(r.get("confidence"), 50)
-        counts[adv] = counts.get(adv, 0) + 1
-        total_conf += conf
-        n += 1
-        parts.append(f"[{res.get('specialist','?').upper()}] {adv.upper()} (conf={conf}%): {r.get('reasoning','')} | {r.get('key_factor','')}")
-    return {
-        "specialist_summary": "\n".join(parts) or "No specialist data available",
-        "consensus_advantage": max(counts, key=counts.get),
-        "avg_confidence": round(total_conf / n) if n else 50,
-        "specialist_count": n,
-        "advantage_breakdown": counts,
-    }
-
-
-def _build_model_summary(doc: dict[str, Any]) -> str:
-    models = (doc.get("prediction") or {}).get("models") or {}
-    parts = []
-    for name, m in models.items():
-        if not m or m.get("error"):
-            continue
-        p = m.get("probabilities") or {}
-        if p:
-            parts.append(
-                f"{name}: home={_safe_float(p.get('home_win'), 33):.1f}% "
-                f"draw={_safe_float(p.get('draw'), 33):.1f}% "
-                f"away={_safe_float(p.get('away_win'), 33):.1f}%"
-            )
-    return "\n".join(parts) or "No model outputs available"
-
-
-def _build_memory_context(doc: dict[str, Any]) -> str:
-    try:
-        from app.monitoring.self_learner import get_signal_weights, get_league_accuracy
-        from app.risk.clv import get_clv_summary
         league = doc.get("tournament") or doc.get("category") or ""
         if isinstance(league, dict):
             league = league.get("name") or ""
-        parts = []
-        weights = get_signal_weights(league)
-        if weights:
-            top = sorted(weights.items(), key=lambda x: x[1], reverse=True)[:3]
-            parts.append(f"Top signals: {', '.join(f'{k}={v:.0%}' for k, v in top)}")
-        acc = get_league_accuracy(league)
-        if acc.get("known"):
-            parts.append(f"League accuracy: {acc.get('win_rate', 0):.0%} ({acc.get('samples', 0)} samples)")
-        clv = get_clv_summary(days=14)
-        if clv.get("avg_clv_percent") is not None:
-            parts.append(f"CLV 14d: {clv['avg_clv_percent']:+.1f}%")
-        return "\n".join(parts) or "No memory context available"
+
+        # Signal weights for this league
+        signal_weights = get_signal_weights(league)
+        if signal_weights:
+            context["signal_weights"] = signal_weights
+
+        # League accuracy profile
+        league_acc = get_league_accuracy(league)
+        if league_acc.get("known"):
+            context["league_accuracy"] = league_acc
+
+        # Top performing signals globally
+        top_signals = get_top_signals(limit=5)
+        if top_signals:
+            context["top_signals_globally"] = [
+                {"signal": s["signal"], "win_rate": s["win_rate"], "verdict": s["verdict"]}
+                for s in top_signals[:5]
+            ]
+
+        summary = get_learning_summary()
+        cold = summary.get("bottom_signals") or []
+        if cold:
+            context["cold_signals_globally"] = [
+                {"signal": s.get("signal"), "win_rate": s.get("win_rate"), "samples": s.get("samples")}
+                for s in cold[:5]
+            ]
+
+        # Current model weights (auto-tuned)
+        context["model_weights"] = get_learned_weights()
+
     except Exception:
-        return "Memory context unavailable"
+        pass
+
+    try:
+        from app.risk.clv import get_clv_summary
+        clv = get_clv_summary(days=14)
+        avg_clv = clv.get("avg_clv_percent")
+        if avg_clv is not None:
+            context["clv_14d"] = {
+                "avg_clv_percent": avg_clv,
+                "edge_quality": clv.get("edge_quality"),
+                "positive_clv_rate": clv.get("positive_clv_rate"),
+            }
+    except Exception:
+        pass
+
+    try:
+        from app.enrichment.confidence_calibrator import get_calibration_table
+        cal = get_calibration_table()
+        if cal:
+            context["calibration"] = [
+                {"band": c.get("band"), "win_rate": c.get("win_rate"), "samples": c.get("samples")}
+                for c in (cal if isinstance(cal, list) else [])
+                if (c.get("samples") or 0) >= 10
+            ][:6]
+    except Exception:
+        pass
+
+    return context
 
 
-# ── Final synthesis + brain review ────────────────────────────────────────────
+def _format_memory_context(context: dict[str, Any]) -> str:
+    """Convert a memory context dict to a human-readable prompt string."""
+    if not context:
+        return "No memory context available"
+    parts = []
+    weights = context.get("signal_weights") or {}
+    if weights:
+        top = sorted(weights.items(), key=lambda x: x[1], reverse=True)[:3]
+        parts.append(f"Top signals: {', '.join(f'{k}={v:.0%}' for k, v in top)}")
+    acc = context.get("league_accuracy") or {}
+    if acc.get("known"):
+        parts.append(f"League accuracy: {acc.get('win_rate', 0):.0%} ({acc.get('samples', 0)} samples)")
+    clv = context.get("clv_14d") or {}
+    if clv.get("avg_clv_percent") is not None:
+        parts.append(f"CLV 14d: {clv['avg_clv_percent']:+.1f}%")
+    return "\n".join(parts) or "No memory context available"
+
 
 def run_final_synthesis(
     doc: dict[str, Any],
@@ -546,7 +351,8 @@ def run_llm_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str
             specialist_results.append({"status": "error", "specialist": name, "error": str(exc)})
 
     model_summary = _build_model_summary(doc)
-    memory_context = _build_memory_context(doc)
+    memory_context_dict = _build_memory_context(doc)
+    memory_context = _format_memory_context(memory_context_dict)
 
     logger.info("[pipeline] running final synthesis")
     final = run_final_synthesis(doc, specialist_results, model_summary, memory_context)

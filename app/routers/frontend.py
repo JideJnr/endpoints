@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from app.utils.match_helpers import _normalise_selection
 from app.storage.db import db_conn
 from app.storage.buffer import (
     get_buffered_matches,
@@ -1068,6 +1069,83 @@ def rebuild_ai_team_watcher_profiles(limit: int = Query(default=5000, ge=1, le=2
     return rebuild_all_profiles(limit=limit)
 
 
+@router.post("/team-watchers/rebuild-tournament-profiles")
+def rebuild_tournament_profiles(limit: int = Query(default=5000, ge=1, le=20000)):
+    """Rebuild tournament-scoped profiles for all team-tournament combinations."""
+    from app.team_watcher.team_watcher import rebuild_tournament_profiles
+
+    return rebuild_tournament_profiles(limit=limit)
+
+
+@router.get("/team-watchers/{team_key:path}/tournaments")
+def get_team_tournaments(team_key: str):
+    """List all tournaments a team has cached profiles for."""
+    import sqlite3
+    from app.team_watcher.team_watcher import _get_tournament_profile, _resolve_watcher_row, init_team_watcher_tables
+    from app.storage.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        conn.row_factory = sqlite3.Row
+        init_team_watcher_tables(conn)
+        # Verify team exists
+        row = _resolve_watcher_row(conn, team_key)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Team not found: {team_key}")
+        # Get all tournament profiles for this team
+        profiles = conn.execute(
+            """
+            select tournament_key, tournament_name, sample_size, updated_at
+            from ai_team_watcher_profiles
+            where team_key = ?
+            order by updated_at desc
+            """,
+            (team_key,),
+        ).fetchall()
+    return {
+        "status": "success",
+        "team_key": team_key,
+        "team_name": row["team_name"],
+        "count": len(profiles),
+        "tournaments": [
+            {
+                "tournament_key": p["tournament_key"],
+                "tournament_name": p["tournament_name"],
+                "sample_size": p["sample_size"],
+                "updated_at": p["updated_at"],
+            }
+            for p in profiles
+        ],
+    }
+
+
+@router.get("/team-watchers/{team_key:path}/tournaments/{tournament_key}")
+def get_team_tournament_profile(team_key: str, tournament_key: str):
+    """Get the tournament-scoped profile for a specific team-tournament combination."""
+    import sqlite3
+    from app.team_watcher.team_watcher import _get_tournament_profile, _resolve_watcher_row, init_team_watcher_tables
+    from app.storage.db import db_conn
+
+    with db_conn(timeout=15) as conn:
+        conn.row_factory = sqlite3.Row
+        init_team_watcher_tables(conn)
+        row = _resolve_watcher_row(conn, team_key)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Team not found: {team_key}")
+        profile = _get_tournament_profile(conn, team_key, tournament_key)
+        if not profile:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No tournament profile found for {team_key} in {tournament_key}",
+            )
+    return {
+        "status": "success",
+        "team_key": team_key,
+        "team_name": row["team_name"],
+        "tournament_key": tournament_key,
+        "profile": profile,
+    }
+
+
 @router.post("/team-watchers/regrade-void")
 def regrade_void_tw_predictions(limit: int = Query(default=2000, ge=1, le=10000)):
     """Regrade all TW predictions that were incorrectly stored as 'void' due
@@ -1566,9 +1644,8 @@ def grade_results(hours_back: int = 24):
     from app.data_clients.sportybet_client import fetch_results
     from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db, grade_overdue_predictions, grade_predictions_for_date, store_local_signal_outcomes
-    from app.storage.league_memory._helpers import _grade_pick_for_match
+    from app.storage.league_memory._helpers import grade_prediction_row, update_prediction_result
     from app.storage.league_memory.queries import _numeric_id
-    from app.monitoring.prediction_audit import grading_reason
     from app.storage.mongo_store import archive_finished_match_from_buffer
     from app.data_clients.sofascore_client import fetch_all_scheduled_events
     import sqlite3
@@ -1615,15 +1692,9 @@ def grade_results(hours_back: int = 24):
             skipped += 1
             continue
         score = result["score"]
-        grade_info = grading_reason(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
-        outcome = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], score["home"], score["away"], row["match_name"])
-        grade_info["result"] = outcome
+        outcome, grade_info = grade_prediction_row(row, score["home"], score["away"])
         with db_conn(timeout=30) as conn:
-            conn.execute(
-                "update prediction_history set result=?, final_home=?, final_away=?, "
-                "grading_reason_json=?, graded_at=current_timestamp where id=?",
-                (outcome, score["home"], score["away"], json.dumps(grade_info), row["id"]),
-            )
+            update_prediction_result(conn, row["id"], outcome, score["home"], score["away"], grade_info)
             conn.commit()
         # Store decision-signal outcomes in local device memory; Mongo is only an optional mirror.
         try:
@@ -2025,55 +2096,6 @@ def get_model_explorer(
             return "away"
         return ""
 
-    def _normalise_selection(selection: str, match_name: str = "", pick_type: str = "") -> str:
-        text = " ".join(str(selection or "").lower().replace("-", " ").split())
-        pick_type = str(pick_type or "").lower()
-        if pick_type == "live_match_winner" or "live winner" in text:
-            side = _side_from_team_selection(selection, match_name)
-            suffix = "_lean" if "lean" in text else ""
-            if side:
-                return f"{side}_live_winner{suffix}"
-            if "draw protection" in text:
-                return "live_draw_protection"
-            return f"live_winner{suffix}"
-        if pick_type == "live_team_to_score" or "next team to score" in text:
-            side = _side_from_team_selection(selection, match_name)
-            if side:
-                return f"{side}_next_team_to_score"
-            return "next_team_to_score"
-        if "or draw protection" in text or "double chance" in text:
-            side = _side_from_team_selection(selection, match_name)
-            if side == "home":
-                return "home_or_draw"
-            if side == "away":
-                return "away_or_draw"
-            return "team_or_draw"
-        aliases = {
-            "home win": "home",
-            "home": "home",
-            "1": "home",
-            "away win": "away",
-            "away": "away",
-            "2": "away",
-            "draw": "draw",
-            "x": "draw",
-            "home or draw": "home_or_draw",
-            "draw or home": "home_or_draw",
-            "1x": "home_or_draw",
-            "away or draw": "away_or_draw",
-            "draw or away": "away_or_draw",
-            "x2": "away_or_draw",
-            "home or away": "home_or_away",
-            "away or home": "home_or_away",
-            "12": "home_or_away",
-            "both teams to score": "btts_yes",
-            "btts yes": "btts_yes",
-            "both teams to score no": "btts_no",
-            "both teams to score - no": "btts_no",
-            "btts no": "btts_no",
-        }
-        return aliases.get(text, text)
-
     def _display_selection(selection: str, match_name: str = "", pick_type: str = "") -> str:
         normal = _normalise_selection(selection, match_name, pick_type)
         labels = {
@@ -2420,11 +2442,12 @@ def predict_single_match(
 
 
 def _first_prediction_pick(prediction: dict[str, Any]) -> dict[str, Any]:
+    from app.bet_builder.core import _best_pick
     picks = prediction.get("picks") or []
-    if isinstance(picks, list) and picks:
-        primary = next((p for p in picks if isinstance(p, dict) and p.get("role") == "primary"), None)
-        return primary or next((p for p in picks if isinstance(p, dict)), {})
-    return {}
+    if not isinstance(picks, list) or not picks:
+        return {}
+    primary = next((p for p in picks if isinstance(p, dict) and p.get("role") == "primary"), None)
+    return primary or _best_pick(picks) or next((p for p in picks if isinstance(p, dict)), {})
 
 
 def _normalise_ai_pipeline_analysis(state: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:

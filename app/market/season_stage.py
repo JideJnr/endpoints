@@ -4,6 +4,8 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 
+from app.utils.primitives import _safe_num
+
 # ── Table size categories ──────────────────────────────────────────────
 
 SMALL_LEAGUE_MAX = 8
@@ -197,14 +199,6 @@ def _table_context(
     if avg_matches < 5:
         return "season_early"
     return "season_in_progress"
-
-
-def _safe_num(value: Any) -> float | int:
-    try:
-        return float(value) if value is not None else 0
-    except (TypeError, ValueError):
-        return 0
-
 
 def season_aware_table_weight(
     position: int,

@@ -5,6 +5,8 @@ from statistics import mean
 from typing import Any
 
 
+from app.utils.primitives import _first_present_key as _first_present, _optional_int, _to_int
+
 LIVE_STAT_NAMES = {
     "ball_possession": ("ball possession", "possession"),
     "shots_on_target": ("shots on target",),
@@ -256,21 +258,3 @@ def _goal_minute_value(goal: dict[str, Any]) -> float:
     return _to_int(goal.get("minute"), 0) + (_to_int(goal.get("added_time"), 0) / 100)
 
 
-def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if isinstance(mapping, dict) and mapping.get(key) is not None:
-            return mapping.get(key)
-    return None
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    return _to_int(value, 0)
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default

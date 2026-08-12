@@ -27,6 +27,7 @@ from app.monitoring.self_learner import (
     get_signal_weights, get_league_accuracy, get_learned_weights,
     get_signal_combination_performance, get_learned_thresholds,
 )
+from app.utils.primitives import _to_int, _to_float
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,30 @@ def init_tw_tables(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (team_key, sub_model)
         )
         """
+    )
+
+    # ------------------------------------------------------------------
+    # Tournament-scoped weight table (per-team, per-tournament, per-model)
+    # ------------------------------------------------------------------
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_watcher_weights_tournament (
+            team_key       TEXT NOT NULL,
+            tournament_key TEXT NOT NULL,
+            sub_model      TEXT NOT NULL,
+            samples        INTEGER NOT NULL DEFAULT 0,
+            wins           INTEGER NOT NULL DEFAULT 0,
+            losses         INTEGER NOT NULL DEFAULT 0,
+            win_rate       REAL,
+            weight_adj     REAL NOT NULL DEFAULT 0.0,
+            last_updated   TEXT NOT NULL DEFAULT current_timestamp,
+            PRIMARY KEY (team_key, tournament_key, sub_model)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tw_weights_tourn "
+        "ON team_watcher_weights_tournament(team_key, tournament_key)"
     )
 
     # ------------------------------------------------------------------
@@ -158,6 +183,51 @@ def _get_profile(conn: sqlite3.Connection, team_key: str) -> dict[str, Any] | No
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers â€” tournament profile loader
+# ---------------------------------------------------------------------------
+
+def _get_tournament_profile(
+    conn: sqlite3.Connection,
+    team_key: str,
+    tournament_key: str,
+) -> dict[str, Any] | None:
+    """Load a tournament-scoped profile from ai_team_watcher_profiles.
+
+    Returns the parsed profile dict, or None if no cached profile exists or
+    the sample size is too small.
+    """
+    if not team_key or not tournament_key:
+        return None
+    try:
+        row = conn.execute(
+            """
+            select profile_json, sample_size
+            from ai_team_watcher_profiles
+            where team_key = ? and tournament_key = ?
+            """,
+            (team_key, tournament_key),
+        ).fetchone()
+        if row is None:
+            return None
+        sample_size = int(row["sample_size"] or 0) if isinstance(row, sqlite3.Row) else int(row[1] or 0)
+        if sample_size < 3:
+            return None
+        profile_raw = row["profile_json"] if isinstance(row, sqlite3.Row) else row[0]
+        if not profile_raw:
+            return None
+        parsed = json.loads(profile_raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as exc:
+        logger.debug(
+            "_get_tournament_profile error team_key=%s tournament=%s: %s",
+            team_key,
+            tournament_key,
+            exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers â€” competition stats loader
 # ---------------------------------------------------------------------------
 
@@ -193,6 +263,8 @@ def _rules_model(
     match_doc: dict[str, Any],
     home_key: str = "",
     away_key: str = "",
+    home_tournament_profile: dict[str, Any] | None = None,
+    away_tournament_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Learned matchup-strength rules model.
 
@@ -280,11 +352,19 @@ def _rules_model(
         norm: float,
         step_delta: float,
         sample: int,
+        tournament_profile: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build a normalised stat block for one side."""
-        goals = profile.get("goals") or {}
-        record = profile.get("record") or {}
-        venue_split = (profile.get("venue_split") or {}).get(venue) or {}
+        """Build a normalised stat block for one side.
+
+        When a tournament-scoped profile is provided, it takes precedence over
+        the global profile because it reflects performance in the exact
+        competition of the upcoming match.
+        """
+        # Tournament profile has the same structure as the global profile
+        effective_profile = tournament_profile or profile
+        goals = effective_profile.get("goals") or {}
+        record = effective_profile.get("record") or {}
+        venue_split = (effective_profile.get("venue_split") or {}).get(venue) or {}
 
         if comp:
             mp = int(comp.get("matches_played") or 1)
@@ -373,8 +453,24 @@ def _rules_model(
             "sample": eff_sample,
         }
 
-    home_stats = _side_stats(hp, home_comp, "home", home_norm, home_step_delta, home_sample)
-    away_stats = _side_stats(ap, away_comp, "away", away_norm, away_step_delta, away_sample)
+    home_stats = _side_stats(
+        hp,
+        home_comp,
+        "home",
+        home_norm,
+        home_step_delta,
+        home_sample,
+        tournament_profile=home_tournament_profile,
+    )
+    away_stats = _side_stats(
+        ap,
+        away_comp,
+        "away",
+        away_norm,
+        away_step_delta,
+        away_sample,
+        tournament_profile=away_tournament_profile,
+    )
 
     # â”€â”€ Matchup strength scores â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Each market gets a home_score and away_score; the gap drives the pick.
@@ -682,6 +778,44 @@ def get_team_weights(team_key: str) -> dict[str, float]:
         return {"rules": 0.0, "ai": 0.0}
 
 
+def get_team_weights_tournament(team_key: str, tournament_key: str) -> dict[str, float]:
+    """Return tournament-specific TW_Weights for a team.
+
+    Returns ``{"rules": weight_adj, "ai": weight_adj}`` from
+    ``team_watcher_weights_tournament`` when available, otherwise an empty
+    dict so the caller can fall back to global weights.
+    """
+    if not team_key or not tournament_key:
+        return {}
+    try:
+        _init_db()
+        with db_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            init_tw_tables(conn)
+            rows = conn.execute(
+                """
+                SELECT sub_model, weight_adj
+                FROM team_watcher_weights_tournament
+                WHERE team_key = ? AND tournament_key = ?
+                """,
+                (team_key, tournament_key),
+            ).fetchall()
+        result: dict[str, float] = {}
+        for row in rows:
+            sub_model = row["sub_model"]
+            if sub_model in ("rules", "ai"):
+                result[sub_model] = float(row["weight_adj"] or 0.0)
+        return result
+    except Exception as exc:
+        logger.debug(
+            "get_team_weights_tournament error team_key=%s tournament=%s: %s",
+            team_key,
+            tournament_key,
+            exc,
+        )
+        return {}
+
+
 def _merge_signal(
     rules_out: dict[str, Any],
     ai_out: dict[str, Any],
@@ -835,7 +969,7 @@ def team_watcher_signal(match_doc: dict[str, Any]) -> dict[str, Any]:
         away_key = _slug(str(away_name_raw).strip()) if away_name_raw else ""
 
         # ------------------------------------------------------------------
-        # Load profiles
+        # Load profiles (global + tournament-scoped)
         # ------------------------------------------------------------------
         _init_db()
         with db_conn() as conn:
@@ -843,6 +977,21 @@ def team_watcher_signal(match_doc: dict[str, Any]) -> dict[str, Any]:
             init_tw_tables(conn)
             home_profile = _get_profile(conn, home_key) if home_key else None
             away_profile = _get_profile(conn, away_key) if away_key else None
+
+            # Try tournament-scoped profiles when competition_key is available
+            raw_sporty = match_doc.get("raw_sporty") if isinstance(match_doc.get("raw_sporty"), dict) else match_doc
+            tournament_raw = match_doc.get("tournament") or raw_sporty.get("tournament") or ""
+            if isinstance(tournament_raw, dict):
+                tournament_raw = tournament_raw.get("name") or ""
+            from app.storage.league_memory import normalize_league  # noqa: PLC0415
+            competition_key = normalize_league(str(tournament_raw)) if tournament_raw else ""
+
+            home_tournament_profile = None
+            away_tournament_profile = None
+            if competition_key and home_key:
+                home_tournament_profile = _get_tournament_profile(conn, home_key, competition_key)
+            if competition_key and away_key:
+                away_tournament_profile = _get_tournament_profile(conn, away_key, competition_key)
 
         # If neither profile exists, bail out
         if home_profile is None and away_profile is None:
@@ -855,12 +1004,24 @@ def team_watcher_signal(match_doc: dict[str, Any]) -> dict[str, Any]:
         # ------------------------------------------------------------------
         # Run sub-models
         # ------------------------------------------------------------------
-        rules_out = _rules_model(home_profile, away_profile, match_doc, home_key=home_key, away_key=away_key)
+        rules_out = _rules_model(
+            home_profile,
+            away_profile,
+            match_doc,
+            home_key=home_key,
+            away_key=away_key,
+            home_tournament_profile=home_tournament_profile,
+            away_tournament_profile=away_tournament_profile,
+        )
         ai_out = _ai_model(home_profile, away_profile, match_doc)
 
         # Determine which team key to use for weights (prefer home if profile exists)
         team_key_for_weights = home_key if home_profile is not None else away_key
         weights = get_team_weights(team_key_for_weights)
+        if competition_key:
+            tournament_weights = get_team_weights_tournament(team_key_for_weights, competition_key)
+            if tournament_weights:
+                weights = {**weights, **tournament_weights}
 
         # ------------------------------------------------------------------
         # Merge into final TW_Signal
@@ -1681,46 +1842,6 @@ def _normalize_league_name(name: str) -> str:
     from app.storage.league_memory import normalize_league
     return normalize_league(name)
 
-
-def _to_int(value: Any) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)
-    except Exception:
-        return None
-
-
-def _note_for_result(result: str, gf: int, ga: int, side: str, profile: dict[str, Any]) -> dict[str, Any] | None:
-    """Generate a result-based performance note."""
-    side_label = "at home" if side == "home" else "away"
-    if result == "win":
-        title = f"Win ({gf}-{ga}) {side_label}"
-        description = f"Secured a {gf}-{ga} victory {side_label}."
-        severity = "positive"
-        note_type = "result"
-    elif result == "loss":
-        title = f"Loss ({gf}-{ga}) {side_label}"
-        description = f"Fell to a {gf}-{ga} defeat {side_label}."
-        severity = "negative"
-        note_type = "result"
-    else:
-        title = f"Draw ({gf}-{ga}) {side_label}"
-        description = f"Shared the spoils in a {gf}-{ga} draw {side_label}."
-        severity = "neutral"
-        note_type = "result"
-
-    context = {
-        "result": result,
-        "goals_for": gf,
-        "goals_against": ga,
-        "side": side,
-        "sample_size": profile.get("sample_size", 0),
-    }
-    return {"note_type": note_type, "title": title, "description": description,
-            "context": context, "severity": severity}
-
-
 def _note_for_expectation(
     team_key: str,
     tw_signal: dict[str, Any] | None,
@@ -2051,4 +2172,80 @@ def regrade_void_predictions(limit: int = 2000) -> dict[str, Any]:
 
     except Exception as exc:
         logger.error("regrade_void_predictions error: %s", exc)
+        return {"status": "error", "reason": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Tournament profile rebuild
+# ---------------------------------------------------------------------------
+
+def rebuild_tournament_profiles(team_key: str, tournament_key: str) -> dict[str, Any]:
+    """Rebuild a tournament-scoped profile for a team in a specific tournament.
+
+    Reads all finished matches for the team in the tournament from
+    ``ai_team_watcher_matches``, computes profile stats using the shared
+    ``_compute_profile_stats()`` helper, and persists the result to
+    ``ai_team_watcher_profiles``.
+
+    Returns ``{"status": "ok", "sample_size": <n>}`` on success, or
+    ``{"status": "skipped", "reason": "insufficient_samples"}`` when fewer
+    than 3 matches are found.
+    """
+    if not team_key or not tournament_key:
+        return {"status": "error", "reason": "missing team_key or tournament_key"}
+
+    try:
+        _init_db()
+        with db_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            init_tw_tables(conn)
+
+            rows = conn.execute(
+                """
+                SELECT
+                    result,
+                    goals_for,
+                    goals_against,
+                    venue,
+                    opponent_key,
+                    opponent_league_strength,
+                    match_date
+                FROM ai_team_watcher_matches
+                WHERE team_key = ?
+                  AND league_name = ?
+                  AND goals_for IS NOT NULL
+                  AND goals_against IS NOT NULL
+                ORDER BY match_date DESC, created_at DESC
+                """,
+                (team_key, tournament_key),
+            ).fetchall()
+
+        sample_size = len(rows)
+        if sample_size < 3:
+            return {"status": "skipped", "reason": "insufficient_samples", "sample_size": sample_size}
+
+        profile_stats = _compute_profile_stats(rows)
+        profile_json = json.dumps(profile_stats)
+
+        _init_db()
+        with db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_team_watcher_profiles
+                    (team_key, tournament_key, profile_json, sample_size, last_updated)
+                VALUES
+                    (?, ?, ?, ?, current_timestamp)
+                ON CONFLICT(team_key, tournament_key) DO UPDATE SET
+                    profile_json  = excluded.profile_json,
+                    sample_size   = excluded.sample_size,
+                    last_updated  = current_timestamp
+                """,
+                (team_key, tournament_key, profile_json, sample_size),
+            )
+
+        logger.debug("rebuild_tournament_profiles team_key=%s tournament=%s sample=%d", team_key, tournament_key, sample_size)
+        return {"status": "ok", "sample_size": sample_size}
+
+    except Exception as exc:
+        logger.error("rebuild_tournament_profiles error team_key=%s tournament=%s: %s", team_key, tournament_key, exc)
         return {"status": "error", "reason": str(exc)}

@@ -34,6 +34,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from app.utils.match_helpers import _normalise_selection
+
 # ── Limits ────────────────────────────────────────────────────────────────────
 
 MAX_PER_DIRECTION  = 4   # max picks with same selection direction (Home/Away/Draw/Over/Under)
@@ -173,48 +175,3 @@ def _annotate(p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalise_selection(sel: str) -> str:
-    """Map selection names to a canonical direction."""
-    s = (sel or "").lower().strip()
-    if s in ("home", "1", "home win"):
-        return "home_win"
-    if s in ("away", "2", "away win"):
-        return "away_win"
-    if s in ("draw", "x"):
-        return "draw"
-    if "over" in s:
-        return "over"
-    if "under" in s:
-        return "under"
-    if "btts" in s or "both teams" in s:
-        return "btts"
-    return s[:20] if s else "other"
-
-
-def _normalise_league(league: str) -> str:
-    """Normalise league name for grouping — strip season/round suffixes."""
-    import re
-    text = (league or "").lower().strip()
-    # Remove season years, round numbers, etc.
-    text = re.sub(r"\b(20\d\d|round|matchday|gw\d+|week\s*\d+)\b", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:40] if text else "unknown"
-
-
-def _start_time(p: dict[str, Any]) -> int | None:
-    """Extract start_time in seconds from a prediction dict."""
-    st = p.get("start_time")
-    if not st:
-        return None
-    try:
-        ts = float(st)
-        if ts > 1e12:
-            ts /= 1000  # ms → seconds
-        return int(ts)
-    except (TypeError, ValueError):
-        return None
-
-
-def _time_window(start_seconds: int) -> int:
-    """Bucket a Unix timestamp into 2-hour windows."""
-    return start_seconds // WINDOW_SECONDS

@@ -8,6 +8,8 @@ from app.config.config import get_settings
 from app.storage.db import DB_PATH, _conn
 
 
+from app.utils.primitives import _to_float
+
 MIN_CALIBRATION_SAMPLES = 30
 MIN_CLV_SAMPLES = 25
 MAX_CALIBRATION_GAP_POINTS = 12.0
@@ -265,10 +267,4 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row["name"] == column for row in conn.execute(f"pragma table_info({table})").fetchall())
 
 
-def _to_float(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except Exception:
-        return None
-    return result if math.isfinite(result) else None
 

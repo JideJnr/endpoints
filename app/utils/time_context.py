@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 from app.utils.match_state import classify_match_state
 
 
+from app.utils.match_helpers import _to_datetime_utc
+
 DEFAULT_LOCAL_TZ = "Africa/Lagos"
 
 COUNTRY_TIMEZONES = {
@@ -136,20 +138,3 @@ def match_time_context(match: dict[str, Any], local_tz: str | None = None) -> di
     return context
 
 
-def _to_datetime_utc(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    try:
-        if isinstance(value, (int, float)):
-            timestamp = float(value)
-            if timestamp > 1e12:
-                timestamp /= 1000
-            elif timestamp > 1e10:
-                timestamp /= 1000
-            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        text = str(value)
-        if text.isdigit():
-            return _to_datetime_utc(int(text))
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None
