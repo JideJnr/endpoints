@@ -263,7 +263,7 @@ class SignalAggregator:
             }
         )
         away_score = sum(
-            score for cat, score in category_scores.items()
+            -score for cat, score in category_scores.items()
             if cat in {
                 "away_form", "away_table", "h2h_away", "away_odds",
                 "away_goal_pressure", "away_defense", "market_steam_away",
@@ -295,6 +295,8 @@ class SignalAggregator:
             )
             away_boost = min(0.15, total_strength * 0.1)
             away_prob = min(0.85, away_baseline + away_boost)
+            draw_prob = max(0.10, (1 - away_prob) * 0.40)
+            home_prob = max(0.05, 1 - away_prob - draw_prob)
         elif all_favor_home and home_score > 0:
             # Home win % varies with signal mix
             total_strength = sum(
@@ -304,6 +306,7 @@ class SignalAggregator:
             home_prob = min(0.85, 0.50 + total_strength * 0.15)
             away_prob = (1 - home_prob) * 0.65
             away_prob = max(0.05, away_prob)
+            draw_prob = max(0.05, 1 - home_prob - away_prob)
         else:
             # Mixed signals — home win % varies with signal balance
             total_abs = abs(home_score) + abs(away_score) + abs(neutral_score)

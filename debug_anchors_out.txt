@@ -1,0 +1,21 @@
+
+=== ai_betbuilder.py ===
+  Top-level defs: def enriched_match_analysis, def similarity_gate, def build_ai_betbuilder, def synthesize_sure_picks, def _run_openrouter_enriched, def _analysis_doc, def _similar_matches, def _best_engine_pick, def _best_pick_from_doc, def _odds_dimension
+
+=== competition_special.py ===
+  Top-level defs: def apply_known_competition_context, def _normalise_competition_name, def list_top_competitions, def _catalogue_default, def init_competition_tables, def get_competition_settings, def update_competition_settings, def sync_competition_fixtures, def list_competition_buffer, def competition_status, def list_team_watchers, def get_team_watcher, def enrich_predict_competition, def ensure_competition_main_buffer, def run_competition_special_cycle
+
+=== system_supervisor.py ===
+  Top-level defs: def run_system_supervisor, def latest_supervisor_snapshots, def _supervisor_audit, def _persist_supervisor_snapshot, def _record_supervisor_activity, def _init_supervisor_table, def _snapshot_row, def _snapshot_summary
+
+=== agent.py ===
+  Top-level defs: def get_memory_leagues, def get_memory_league, def get_memory_snapshots, def get_memory_duplicates, def post_memory_maintenance, def post_memory_observation, def post_sofascore_memory_observation, def post_sporty_live_memory_observation, def get_sporty_live_predictions, def get_sporty_upcoming_predictions, def get_sporty_all_predictions, def get_sofascore_predictions, def get_sofascore_event_prediction, def get_value_bets, def get_performance_analytics
+
+=== mongo_store.py ===
+  Top-level defs: def _get_settings, def is_configured, def _get_db, def init_mongo, def archive_finished_match_from_buffer, def list_finished_matches, def get_finished_match, def get_finished_match_by_sofascore_id, def get_team_finished_matches, def store_signal_outcomes, def get_signal_stats, def prune_old_finished_matches, def mongo_status, def flush_buffer_to_mongo, def cleanup_buffer
+
+=== team_watcher_engine.py ===
+  Top-level defs: def init_tw_tables, def _get_profile, def _get_tournament_profile, def _get_competition_stats, def _rules_model, def _build_venue_context, def _ai_model, def get_team_weights, def get_team_weights_tournament, def _merge_signal, def team_watcher_signal, def record_tw_prediction, def _resolve_outcome_from_result, def _grade_tw_selection, def grade_tw_predictions
+
+=== portfolio.py ===
+  Top-level defs: def filter_correlated, def portfolio_summary, def _annotate

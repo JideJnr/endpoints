@@ -13,6 +13,8 @@ from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_
 from app.data_clients.sportradar_client import fetch_match_intelligence
 from app.utils.time_context import match_time_context
 from app.enrichment.web_context import search_league_sentiment, search_match_context
+from app.enrichment.match_enrichment import _is_live_doc, _is_finished_doc
+from app.storage.buffer import _extract_1x2, _data_sources
 
 
 class MatchEnrichmentError(Exception):
@@ -353,40 +355,6 @@ def _sporty_detail(sporty: dict[str, Any], sportybet_id: str, markets: list[dict
     }
 
 
-def _data_sources(
-    sofa: dict[str, Any] | None,
-    detail: dict[str, Any] | None,
-    sporty: dict[str, Any],
-    markets: list[dict[str, Any]],
-    *,
-    fresh: bool = True,
-    sportradar: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return {
-        "sportybet": {
-            "available": True,
-            "detail": True,
-            "fresh": fresh,
-            "markets": bool(markets),
-            "market_count": len(markets),
-            "live_clock": bool(classify_match_state(sporty).get("is_live")),
-        },
-        "sofascore": {
-            "available": bool(sofa or detail),
-            "matched": bool(sofa),
-            "detail": bool(detail),
-            "statistics": bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics")),
-            "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
-        },
-        "sportradar": {
-            "available": bool((sportradar or {}).get("available")),
-            "detail": bool((sportradar or {}).get("match")),
-            "standings": bool((sportradar or {}).get("standings")),
-            "error": (sportradar or {}).get("error") or (sportradar or {}).get("standings_error"),
-        },
-    }
-
-
 def _candidate_score(event: dict[str, Any] | None, doc: dict[str, Any]) -> float:
     if not event:
         return 0.0
@@ -422,19 +390,6 @@ def _is_live_doc(doc: dict[str, Any]) -> bool:
 def _is_finished_doc(doc: dict[str, Any]) -> bool:
     state = classify_match_state(doc)
     return bool(doc.get("is_finished") or state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
-
-
-def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    for market in markets:
-        name = str(market.get("name") or "").lower()
-        if market.get("id") == "1" or "1x2" in name or name == "match result":
-            odds = {selection.get("name"): selection.get("odds") for selection in market.get("selections", [])}
-            return {
-                "home": odds.get("Home") or odds.get("1"),
-                "draw": odds.get("Draw") or odds.get("X"),
-                "away": odds.get("Away") or odds.get("2"),
-            }
-    return {}
 
 
 def _home_team(doc: dict[str, Any]) -> str:

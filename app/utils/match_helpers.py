@@ -17,6 +17,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from app.utils.primitives import _to_float
+
 
 # ── Team / tournament name extraction ────────────────────────────────────────
 

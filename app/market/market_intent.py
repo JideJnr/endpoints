@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.storage.league_memory._helpers import _side_from_selection_and_match
+
 
 def normalise_market_text(value: Any) -> str:
     return " ".join(str(value or "").lower().replace("-", " ").split())
@@ -228,25 +230,5 @@ def _side_from_text(text: str) -> str | None:
         return "away"
     if stripped in {"draw", "x"} or "draw protection" in stripped:
         return "draw"
-    return None
-
-
-def _side_from_selection_and_match(selection: str, match_name: str | None) -> str | None:
-    if not match_name or " vs " not in match_name:
-        return None
-    home_name, away_name = [part.strip().lower() for part in match_name.split(" vs ", 1)]
-    sel = str(selection or "").lower()
-    if home_name and home_name in sel:
-        return "home"
-    if away_name and away_name in sel:
-        return "away"
-    home_tokens = [part for part in re.split(r"\W+", home_name) if len(part) >= 4]
-    away_tokens = [part for part in re.split(r"\W+", away_name) if len(part) >= 4]
-    home_hits = sum(1 for token in home_tokens if token in sel)
-    away_hits = sum(1 for token in away_tokens if token in sel)
-    if home_hits > away_hits:
-        return "home"
-    if away_hits > home_hits:
-        return "away"
     return None
 

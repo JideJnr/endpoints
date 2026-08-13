@@ -15,6 +15,8 @@ from app.utils.time_context import match_time_context
 
 
 from app.utils.primitives import _to_float
+from app.competition.competition_special import _parse_datetime
+from app.enrichment.contextual_intelligence import _impact
 
 def build_contextual_intelligence(
     doc: dict[str, Any],
@@ -672,17 +674,6 @@ def _impact(signal: dict[str, Any]) -> float:
         return float(signal.get("impact") or 0)
     except Exception:
         return 0.0
-
-
-def _parse_datetime(value: Any) -> datetime:
-    if not value:
-        return _now()
-    text = str(value).replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(text)
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except Exception:
-        return _now()
 
 
 def _now() -> datetime:

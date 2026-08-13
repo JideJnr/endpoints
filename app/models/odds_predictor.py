@@ -21,6 +21,7 @@ from typing import Any
 
 
 from app.utils.match_helpers import _tournament_name
+from app.storage.buffer import _extract_1x2
 
 def odds_only_prediction(doc: dict[str, Any]) -> dict[str, Any] | None:
     """
@@ -102,21 +103,6 @@ def odds_only_prediction(doc: dict[str, Any]) -> dict[str, Any] | None:
         "true_probabilities": true_probs,
         "market_move": move,
     }
-
-
-def _extract_1x2(doc: dict[str, Any]) -> dict[str, Any]:
-    # Try sportybet_markets first
-    for market in (doc.get("sportybet_markets") or doc.get("markets") or []):
-        name = (market.get("name") or "").lower()
-        if market.get("id") == "1" or "1x2" in name or name == "match result":
-            sels = {s.get("name"): s.get("odds") for s in market.get("selections", [])}
-            return {
-                "home": sels.get("Home") or sels.get("1"),
-                "draw": sels.get("Draw") or sels.get("X"),
-                "away": sels.get("Away") or sels.get("2"),
-            }
-    # Fallback to odds_1x2 summary field
-    return doc.get("odds_1x2") or {}
 
 
 

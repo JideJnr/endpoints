@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.storage.db import DB_PATH
+from app.storage.db import _ensure_column
 from app.storage.league_memory import _init_db
 from app.storage.db import db_conn
 from app.utils.match_state import classify_match_state
@@ -62,6 +63,15 @@ TOP_30_COMPETITIONS: tuple[dict[str, Any], ...] = (
     {"key": "colombia-primera-a", "name": "Categoría Primera A", "unique_tournament_id": 11539},
 )
 _CATALOGUE_BY_KEY = {entry["key"]: entry for entry in TOP_30_COMPETITIONS}
+
+
+
+def _name_quality_score(name: str) -> float:
+    """Rough quality proxy for a team name — longer names score higher."""
+    n = str(name or '').strip()
+    if not n:
+        return 0.5
+    return min(1.0, 0.4 + len(n) / 40)
 
 
 def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
@@ -661,8 +671,20 @@ def run_enabled_competition_cycles(limit: int = 31) -> dict[str, Any]:
     The competition_analysis pipeline toggle controls the separate weekly AI analysis job.
     """
     enabled = [item for item in list_top_competitions() if item.get("enabled")][:max(1, limit)]
-    results = [run_competition_special_cycle(item["key"]) for item in enabled]
-    return {"status": "success", "processed": len(results), "enabled": len(enabled), "competitions": results}
+    due = [item for item in enabled if _competition_cycle_due(item)]
+    results = []
+    for item in due:
+        result = run_competition_special_cycle(item["key"])
+        if result.get("status") == "success":
+            _mark_competition_cycle(item["key"])
+        results.append(result)
+    return {
+        "status": "success",
+        "processed": len(results),
+        "enabled": len(enabled),
+        "skipped_not_due": len(enabled) - len(due),
+        "competitions": results,
+    }
 
 
 def refresh_competition_context(key: str = "world-cup-2026", limit: int = 12) -> dict[str, Any]:
@@ -1279,6 +1301,54 @@ def _event_match_date(event: dict[str, Any], fallback: str) -> str:
         return datetime.fromtimestamp(float(event.get("start_timestamp")), tz=timezone.utc).date().isoformat()
     except Exception:
         return fallback
+
+
+def _competition_cycle_due(settings: dict[str, Any]) -> bool:
+    metadata = settings.get("metadata") if isinstance(settings.get("metadata"), dict) else {}
+    last_run = _parse_datetime(metadata.get("last_cycle_at"))
+    if last_run is None:
+        return True
+    key = str(settings.get("key") or "")
+    cadence = 5 * 60 if key == DEFAULT_WORLD_CUP["key"] else 15 * 60
+    return (datetime.now(timezone.utc) - last_run).total_seconds() >= cadence
+
+
+def _mark_competition_cycle(key: str) -> None:
+    settings = get_competition_settings(key)
+    metadata = settings.get("metadata") if isinstance(settings.get("metadata"), dict) else {}
+    metadata["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        init_competition_tables(conn)
+        conn.execute(
+            """
+            update competition_special_settings
+            set metadata_json = ?, updated_at = ?
+            where key = ?
+            """,
+            (json.dumps(metadata), datetime.now(timezone.utc).isoformat(), key),
+        )
+        conn.commit()
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _prefixed_match_id(key: str, match_id: Any) -> str:
+    prefix = f"competition:{key}:"
+    value = str(match_id or "").strip()
+    if value.startswith(prefix) or value.startswith("competition:"):
+        return value
+    return f"{prefix}{value}"
 
 
 def _match_importance_context(key: str, event: dict[str, Any]) -> dict[str, Any]:
@@ -2219,12 +2289,6 @@ def competition_dashboard_summary(buffer_limit: int = 200) -> dict[str, Any]:
         "errors": errors,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-
-
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-    columns = {row[1] for row in conn.execute(f"pragma table_info({table})").fetchall()}
-    if column not in columns:
-        conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
 

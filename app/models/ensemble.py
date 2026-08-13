@@ -5,23 +5,18 @@ from typing import Any
 
 
 # Hardcoded fallback weights — overridden by learned weights when enough data exists
-_BASE_WEIGHTS = {
-    "dixon_coles": 0.25,
-    "elo": 0.20,
-    "poisson": 0.15,
-    "rules": 0.15,
-    "llm": 0.25,
-}
+_BASE_WEIGHTS: dict[str, float] = {}
 
 # Module-level cache so we don't hit SQLite on every prediction
 _cached_weights: dict[str, float] | None = None
+_weights_are_learned: bool = False
 _cache_hits = 0
 _CACHE_REFRESH_EVERY = 50  # refresh learned weights every N predictions
 
 
 def _get_weights() -> dict[str, float]:
-    """Return learned weights if available, else hardcoded defaults."""
-    global _cached_weights, _cache_hits
+    """Return learned weights from graded history."""
+    global _cached_weights, _weights_are_learned, _cache_hits
     _cache_hits += 1
     if _cached_weights is None or _cache_hits % _CACHE_REFRESH_EVERY == 0:
         try:
@@ -29,10 +24,12 @@ def _get_weights() -> dict[str, float]:
             learned = get_learned_weights()
             if learned:
                 _cached_weights = learned
+                _weights_are_learned = True
                 return _cached_weights
         except Exception:
             pass
-        _cached_weights = dict(_BASE_WEIGHTS)
+        _cached_weights = {}
+        _weights_are_learned = False
     return _cached_weights
 
 
@@ -81,9 +78,11 @@ def compute_ensemble_diversity(
     rules_prob = max(0, min(100, rules_confidence))
     pick = str(rules_pick or "").lower()
     if "home" in pick:
-        model_probs["rules"] = {"home_win": rules_prob, "draw": 10, "away_win": 100 - rules_prob}
+        _de = max(5, 30 - abs(rules_prob - 50) * 0.4)
+        model_probs["rules"] = {"home_win": rules_prob, "draw": _de, "away_win": max(0, 100 - rules_prob - _de)}
     elif "away" in pick:
-        model_probs["rules"] = {"home_win": 100 - rules_prob, "draw": 10, "away_win": rules_prob}
+        _de = max(5, 30 - abs(rules_prob - 50) * 0.4)
+        model_probs["rules"] = {"home_win": max(0, 100 - rules_prob - _de), "draw": _de, "away_win": rules_prob}
     elif "draw" in pick:
         model_probs["rules"] = {"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}
     
@@ -112,7 +111,7 @@ def compute_ensemble_diversity(
         avg_probs[outcome] /= len(model_probs)
     
     majority_outcome = max(avg_probs, key=avg_probs.get)
-    majority_prob = avg_probs[majority_outcome]
+    # majority_prob used for diversity_score calculation below
     
     supporting = []
     opposing = []
@@ -175,7 +174,7 @@ def ensemble_prediction(
         total_weight += weight
 
     if dixon and dixon.get("probabilities"):
-        _add(dixon["probabilities"], weights.get("dixon_coles", 0.30))
+        _add(dixon["probabilities"], weights.get("dixon_coles", 0.0))
         models_used.append("dixon_coles")
     if elo:
         draw_estimate = max(5, 30 - abs(float(elo["home_win_probability"]) - 50) * 0.4)
@@ -185,27 +184,29 @@ def ensemble_prediction(
                 "draw": draw_estimate,
                 "away_win": elo["away_win_probability"],
             },
-            weights.get("elo", 0.25),
+            weights.get("elo", 0.0),
         )
         models_used.append("elo")
     if poisson and poisson.get("probabilities"):
-        _add(poisson["probabilities"], weights.get("poisson", 0.15))
+        _add(poisson["probabilities"], weights.get("poisson", 0.0))
         models_used.append("poisson")
 
     rules_prob = max(0, min(100, rules_confidence))
     pick = str(rules_pick or "").lower()
     if "home" in pick:
-        _add({"home_win": rules_prob, "draw": 10, "away_win": 100 - rules_prob}, weights.get("rules", 0.20))
+        _de2 = max(5, 30 - abs(rules_prob - 50) * 0.4)
+        _add({"home_win": rules_prob, "draw": _de2, "away_win": max(0, 100 - rules_prob - _de2)}, weights.get("rules", 0.0))
         models_used.append("rules")
     elif "away" in pick:
-        _add({"home_win": 100 - rules_prob, "draw": 10, "away_win": rules_prob}, weights.get("rules", 0.20))
+        _de2 = max(5, 30 - abs(rules_prob - 50) * 0.4)
+        _add({"home_win": max(0, 100 - rules_prob - _de2), "draw": _de2, "away_win": rules_prob}, weights.get("rules", 0.0))
         models_used.append("rules")
     elif "draw" in pick:
-        _add({"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}, weights.get("rules", 0.20))
+        _add({"home_win": (100 - rules_prob) / 2, "draw": rules_prob, "away_win": (100 - rules_prob) / 2}, weights.get("rules", 0.0))
         models_used.append("rules")
 
     if llm and llm.get("probabilities"):
-        _add(llm["probabilities"], weights.get("llm", 0.10))
+        _add(llm["probabilities"], weights.get("llm", 0.0))
         models_used.append("llm")
 
     if total_weight == 0:
@@ -226,7 +227,7 @@ def ensemble_prediction(
 
     best = max(scores, key=scores.get)
     confidence = round(scores[best], 1)
-    weights_source = "learned" if _cached_weights and _cached_weights != _BASE_WEIGHTS else "default"
+    weights_source = "learned" if _weights_are_learned else "default"
     if models_used == ["rules"]:
         weights_source = "rules_only"
         confidence = max(50, confidence - 10)

@@ -49,7 +49,7 @@ def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_signal_combination_outcomes_table(conn: sqlite3.Connection) -> None:
-    """Create the learned signal-combination outcome table and indexes."""
+    """Create the ``signal_combination_outcomes`` table and indexes if they don't exist."""
     conn.execute(
         """
         create table if not exists signal_combination_outcomes (
@@ -67,14 +67,18 @@ def _ensure_signal_combination_outcomes_table(conn: sqlite3.Connection) -> None:
             selection text,
             confidence integer,
             prediction_mode text,
-            live_context_json text not null default '{}',
+            live_context_json text,
             recorded_at text not null default current_timestamp,
             unique (match_id, pick_type, selection, combination_key)
         )
         """
     )
-    conn.execute("create index if not exists idx_signal_combos_key on signal_combination_outcomes(combination_key, result)")
-    conn.execute("create index if not exists idx_signal_combos_scope on signal_combination_outcomes(country, tournament, pick_type, result)")
+    conn.execute(
+        "create index if not exists idx_sco_combo_key on signal_combination_outcomes(combination_key)"
+    )
+    conn.execute(
+        "create index if not exists idx_sco_scope on signal_combination_outcomes(tournament, country, pick_type, result)"
+    )
 
 
 def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:

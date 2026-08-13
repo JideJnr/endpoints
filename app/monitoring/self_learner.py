@@ -30,13 +30,11 @@ Usage:
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
 from app.storage.db import db_conn
-from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 from app.storage.league_memory._helpers import _get_passed_models
 
@@ -409,7 +407,6 @@ def run_learning_cycle() -> dict[str, Any]:
             performance_factor = 0.5 + (win_rate - 0.50) * 2.0
             learned = round(base * (1 - BLEND_WEIGHT) + base * performance_factor * BLEND_WEIGHT, 4)
             learned = max(0.05, min(0.50, learned))
-            source = "models_json" if use_direct else "signal_heuristic"
             conn.execute("""
                 insert into learned_model_weights
                     (model_name, base_weight, learned_weight, samples, win_rate, last_updated)
@@ -439,6 +436,7 @@ def run_learning_cycle() -> dict[str, Any]:
         # ── 7. Grade specialist contributions ─────────────────────────
         specialist_updates = _grade_specialists_from_history(rows)
 
+
         # -- 8. Signal combination memory -----------------------------------------
         combination_updates = _learn_signal_combinations(conn, rows)
 
@@ -446,6 +444,11 @@ def run_learning_cycle() -> dict[str, Any]:
         threshold_updates = _learn_thresholds(conn, rows)
 
         conn.commit()
+        try:
+            from app.monitoring.learned_parameters import clear_learned_parameter_cache
+            clear_learned_parameter_cache()
+        except Exception:
+            pass
 
     pref_updates = pref_result.get("updates", 0) if isinstance(pref_result, dict) else 0
     print(
@@ -522,8 +525,15 @@ def get_signal_weights(league: str | None = None, pick_type: str | None = None) 
 def get_learned_weights() -> dict[str, float]:
     """
     Return auto-tuned ensemble model weights.
-    Falls back to hardcoded defaults if not enough data yet.
+    Returns an empty dict when no historical weights have been learned yet.
     """
+    try:
+        from app.monitoring.learned_parameters import get_learned_ensemble_weights
+        learned = get_learned_ensemble_weights()
+        if learned:
+            return learned
+    except Exception:
+        pass
     _init_db()
     with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
@@ -533,10 +543,12 @@ def get_learned_weights() -> dict[str, float]:
         ).fetchall()
 
     if not rows:
-        # Return hardcoded defaults
-        return {"dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15, "rules": 0.20, "llm": 0.10}
+        return {}
 
-    weights = {row["model_name"]: float(row["learned_weight"]) for row in rows}
+    weights = {
+        ("llm" if row["model_name"] == "openrouter" else row["model_name"]): float(row["learned_weight"])
+        for row in rows
+    }
     # Normalise so weights sum to 1.0
     total = sum(weights.values())
     if total > 0:
@@ -623,7 +635,7 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
                 "win_rate":         round(float(row["win_rate"] or 0) * 100, 1),
                 "avg_confidence":   round(float(row["avg_confidence"] or 0), 1),
                 "calibration_gap":  round(float(row["calibration_gap"] or 0) * 100, 1),
-                "verdict":          _calibration_verdict(row["calibration_gap"]),
+                "verdict":          _calibration_verdict(float(row["calibration_gap"] or 0)),
             }
             for row in rows
         ],
@@ -836,7 +848,7 @@ def _learn_signal_combinations(conn: sqlite3.Connection, rows: list) -> int:
     wins/losses per (key, league_key, pick_type, selection).
     Requires >= 5 samples before writing a row.
     """
-    from app.signal_combinations import build_signal_combination, live_context_from_prediction  # noqa: PLC0415
+    from app.signal_combinations import build_signal_combination  # noqa: PLC0415
 
     stats: dict[tuple, dict] = {}
     for row in rows:
@@ -1096,8 +1108,8 @@ def _decision_signals_for_row(row: sqlite3.Row) -> list[dict[str, Any]]:
     if not signals:
         return []
 
-    audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
-    context = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)
+    audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)  # type: ignore[arg-type]
+    context = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)  # type: ignore[arg-type]
     pick_type = str(row["pick_type"] or "").lower()
     selection = str(row["selection"] or "").lower()
     allowed = _market_signal_names(pick_type, selection, context)
@@ -1341,3 +1353,63 @@ def get_learned_thresholds(
         "samples":           int(row["samples"]),
         "source":            source,
     }
+
+
+def _calibration_verdict(gap: float | None) -> str:
+    """Classify a calibration gap into a human-readable verdict."""
+    if gap is None:
+        return "unknown"
+    g = float(gap)
+    if g > 0.10:
+        return "underconfident"
+    if g < -0.10:
+        return "overconfident"
+    return "well_calibrated"
+
+
+def _safe_json_object(value: Any) -> dict[str, Any]:
+    """Parse a JSON string into a dict; return {} on any failure."""
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        import json as _json
+        result = _json.loads(value)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _incorporate_ai_analysis(conn: sqlite3.Connection, rows: list) -> int:
+    """Stub: incorporate AI analysis feedback. Returns count of updates."""
+    return 0
+
+
+def _incorporate_user_behavior(conn: sqlite3.Connection, rows: list) -> int:
+    """Stub: incorporate user behavior signals. Returns count of updates."""
+    return 0
+
+
+def _grade_specialists_from_history(rows: list) -> int:
+    """Grade specialist contributions from graded prediction history."""
+    credited = 0
+    try:
+        from app.ai.ai_prediction_pipeline import grade_specialist_contributions
+        for row in rows:
+            audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
+            reasoning = audit.get("reasoning_context") if isinstance(audit, dict) else {}
+            if not reasoning:
+                continue
+            result = str(row["result"] or "")
+            league = str(row["league_name"] or "")
+            pick_type = str(row["pick_type"] or "")
+            try:
+                credited += grade_specialist_contributions(
+                    reasoning, result, league=league, pick_type=pick_type
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return credited

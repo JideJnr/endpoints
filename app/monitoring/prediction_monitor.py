@@ -397,6 +397,12 @@ def _safe_call(name: str, fn, errors: list[str]) -> Any:
         return {}
 
 
+
+def _record_monitor_activity(result: dict) -> None:
+    """No-op stub — activity recording is handled by _persist_monitor_snapshot."""
+    pass
+
+
 def _persist_monitor_snapshot(result: dict[str, Any]) -> None:
     try:
         _init_db()

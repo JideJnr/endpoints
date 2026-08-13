@@ -131,9 +131,12 @@ def record_match_result_once(source: str, event: dict[str, Any]) -> dict[str, An
     return {"updated": True, "match_id": match_id, **result}
 
 
-def elo_prediction(home_id: str, away_id: str) -> dict[str, Any]:
+def elo_prediction(home_id: str, away_id: str, doc: dict[str, Any] | None = None) -> dict[str, Any]:
     home_elo = get_elo(home_id)
     away_elo = get_elo(away_id)
+    context = _elo_doc_context(doc)
+    home_elo += float(context.get("home_adjustment") or 0)
+    away_elo += float(context.get("away_adjustment") or 0)
     home_expected = 1 / (1 + 10 ** ((away_elo - home_elo) / 400))
     away_expected = 1 - home_expected
     try:
@@ -155,4 +158,19 @@ def elo_prediction(home_id: str, away_id: str) -> dict[str, Any]:
         "away_win_probability": round(away_expected * 100, 1),
         "elo_diff": round(home_elo - away_elo),
         "home_advantage_elo": HOME_ADVANTAGE_ELO,
+        "context": context,
+    }
+
+
+def _elo_doc_context(doc: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(doc, dict):
+        return {"source": "elo_table", "home_adjustment": 0, "away_adjustment": 0}
+    has_standings = bool((doc.get("sofascore_detail") or {}).get("standings") if isinstance(doc.get("sofascore_detail"), dict) else doc.get("standings"))
+    has_markets = bool(doc.get("odds_1x2") or doc.get("sportybet_markets") or doc.get("markets"))
+    return {
+        "source": "enriched_doc",
+        "home_adjustment": 5 if has_standings else 0,
+        "away_adjustment": 0,
+        "has_standings": has_standings,
+        "has_markets": has_markets,
     }

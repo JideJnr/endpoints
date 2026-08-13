@@ -9,7 +9,7 @@ This domain contains all AI and LLM-powered logic. It manages provider routing (
 | Module | Responsibility |
 |---|---|
 | `ai_brain.py` | Top-level AI orchestrator — selects provider, dispatches prediction requests, aggregates responses |
-| `groq_agent.py` | Groq API client and prompt execution wrapper |
+| `llm_agent.py` | LLM API client and prompt execution wrapper (formerly `groq_agent.py`) |
 | `ollama_agent.py` | Ollama local-model client and prompt execution wrapper |
 | `ollama_pipeline.py` | Multi-step pipeline that chains Ollama model calls for complex predictions |
 | `ollama_model_manager.py` | Manages Ollama model availability, pulls, and health checks |

@@ -61,6 +61,21 @@ class Settings:
     risk_manager_bootstrap_confidence_ceiling: int
     clear_winner_probability_gap: float
     llm_pipeline_enabled: bool
+    # Category 3 — externalised hardcoded constants
+    ensemble_weight_dixon_coles: float
+    ensemble_weight_elo: float
+    ensemble_weight_poisson: float
+    ensemble_weight_rules: float
+    ensemble_weight_llm: float
+    regime_tier1_min_confidence: int
+    regime_tier2_min_confidence: int
+    regime_tier3_min_confidence: int
+    regime_tier4_min_confidence: int
+    pick_generator_fallback_away_confidence: float
+    pick_generator_fallback_home_confidence: float
+    calibrator_moderate_threshold: float
+    calibrator_severe_threshold: float
+    poisson_league_avg_goals: float
 
 
 _cached_settings: Settings | None = None
@@ -113,6 +128,21 @@ def get_settings() -> Settings:
         risk_manager_bootstrap_confidence_ceiling=_int_env("RISK_MANAGER_BOOTSTRAP_CONFIDENCE_CEILING", 78),
         clear_winner_probability_gap=float(os.getenv("CLEAR_WINNER_PROBABILITY_GAP", "12")),
         llm_pipeline_enabled=_bool_env("PREDICTX_LLM_PIPELINE_ENABLED", True),
+        # Category 3 — externalised hardcoded constants
+        ensemble_weight_dixon_coles=float(os.getenv("PREDICTX_ENSEMBLE_WEIGHT_DIXON_COLES", "0.30")),
+        ensemble_weight_elo=float(os.getenv("PREDICTX_ENSEMBLE_WEIGHT_ELO", "0.25")),
+        ensemble_weight_poisson=float(os.getenv("PREDICTX_ENSEMBLE_WEIGHT_POISSON", "0.15")),
+        ensemble_weight_rules=float(os.getenv("PREDICTX_ENSEMBLE_WEIGHT_RULES", "0.20")),
+        ensemble_weight_llm=float(os.getenv("PREDICTX_ENSEMBLE_WEIGHT_LLM", "0.10")),
+        regime_tier1_min_confidence=_int_env("PREDICTX_REGIME_TIER1_MIN_CONFIDENCE", 78),
+        regime_tier2_min_confidence=_int_env("PREDICTX_REGIME_TIER2_MIN_CONFIDENCE", 72),
+        regime_tier3_min_confidence=_int_env("PREDICTX_REGIME_TIER3_MIN_CONFIDENCE", 68),
+        regime_tier4_min_confidence=_int_env("PREDICTX_REGIME_TIER4_MIN_CONFIDENCE", 82),
+        pick_generator_fallback_away_confidence=float(os.getenv("PREDICTX_PICK_GENERATOR_FALLBACK_AWAY_CONFIDENCE", "0.54")),
+        pick_generator_fallback_home_confidence=float(os.getenv("PREDICTX_PICK_GENERATOR_FALLBACK_HOME_CONFIDENCE", "0.50")),
+        calibrator_moderate_threshold=float(os.getenv("PREDICTX_CALIBRATOR_MODERATE_THRESHOLD", "10.0")),
+        calibrator_severe_threshold=float(os.getenv("PREDICTX_CALIBRATOR_SEVERE_THRESHOLD", "20.0")),
+        poisson_league_avg_goals=float(os.getenv("PREDICTX_POISSON_LEAGUE_AVG_GOALS", "1.3")),
     )
     return _cached_settings
 

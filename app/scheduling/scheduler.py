@@ -22,7 +22,7 @@ import threading
 from datetime import date as dt, datetime, timedelta, timezone
 from typing import Any
 
-from app.storage.db import db_conn
+from app.storage.db import db_conn, _conn
 from app.data_clients.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
 from app.storage.buffer import (
     ingest_matches,
@@ -35,6 +35,8 @@ from app.utils.activity_log import record_activity
 from app.ai.ai_prediction_pipeline import job_ai_prediction_queue
 from app.competition.competition_analyser import job_competition_analysis
 from app.market.season_stage import detect_season_stage
+from app.competition.competition_special import _parse_datetime
+from app.storage.db import _init_db
 
 
 _scheduler = None
@@ -57,6 +59,8 @@ SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "live_priority_toggle": {"label": "Live priority lane", "default": 60, "min": 30, "max": 300, "pipeline_id": "live_priority_mode"},
     "unified_upcoming": {"label": "Unified upcoming pipeline", "default": 300, "min": 60, "max": 600, "pipeline_id": "unified_upcoming"},
     "unified_live": {"label": "Unified live pipeline", "default": 60, "min": 30, "max": 300, "pipeline_id": "unified_live"},
+    "competition_special": {"label": "Competition special lane", "default": 300, "min": 60, "max": 3600, "pipeline_id": None},
+    "competition_analysis": {"label": "Competition analysis job", "default": 86400, "min": 3600, "max": 86400 * 7, "pipeline_id": "competition_analysis"},
     "regenerate_research_stats": {"label": "Research stats regeneration", "default": 86400, "min": 3600, "max": 86400 * 7, "pipeline_id": None},
 }
 _DB_WRITE_JOB_IDS = {
@@ -1544,6 +1548,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=300,
+        next_run_time=now + timedelta(seconds=90),
     )
 
     # future enrichment — every 1 hour, enriches fixtures beyond tomorrow
@@ -1556,6 +1561,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=30,
+        next_run_time=now + timedelta(seconds=20),
     )
 
     # SofaScore-only pipeline — every 5 min, only runs when toggle is enabled
@@ -1568,6 +1574,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=120,
+        next_run_time=now + timedelta(seconds=105),
     )
 
     scheduler.add_job(
@@ -1579,6 +1586,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=600,
+        next_run_time=now + timedelta(minutes=4),
     )
 
     # flush to mongo — every 2 min
@@ -1591,6 +1599,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=120,
+        next_run_time=now + timedelta(seconds=30),
     )
 
     # archive finished — every 15 min
@@ -1639,6 +1648,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=300,
+        next_run_time=now + timedelta(minutes=6),
     )
 
     scheduler.add_job(
@@ -1650,11 +1660,12 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=600,
+        next_run_time=now + timedelta(seconds=60),
     )
 
     scheduler.add_job(
         _safe(job_competition_special),
-        IntervalTrigger(minutes=5),
+        IntervalTrigger(seconds=_scheduler_interval("competition_special")),
         id="competition_special",
         name="Continuous competition special lane (World Cup)",
         replace_existing=True,
@@ -1666,13 +1677,14 @@ def start_scheduler():
 
     scheduler.add_job(
         _safe(job_competition_analysis),
-        IntervalTrigger(seconds=86400),
+        IntervalTrigger(seconds=_scheduler_interval("competition_analysis")),
         id="competition_analysis",
         name="Post-matchday competition analysis (Ollama)",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+        next_run_time=now + timedelta(minutes=20),
     )
 
     scheduler.add_job(
@@ -1684,6 +1696,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=240,
+        next_run_time=now + timedelta(seconds=35),
     )
 
     scheduler.add_job(
@@ -1695,6 +1708,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=90,
+        next_run_time=now + timedelta(seconds=25),
     )
 
     scheduler.add_job(
@@ -1706,6 +1720,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=900,
+        next_run_time=now + timedelta(minutes=8),
     )
 
     # regenerate research_stats — daily at 03:00 server time
@@ -1718,6 +1733,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+        next_run_time=now + timedelta(minutes=30),
     )
 
     # prune old MongoDB finished matches — weekly
@@ -1730,6 +1746,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+        next_run_time=now + timedelta(minutes=45),
     )
 
     # keep-alive ping — every 10 min to prevent Render free tier sleep
@@ -1742,6 +1759,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
+        next_run_time=now + timedelta(minutes=5),
     )
 
     scheduler.start()
@@ -1995,18 +2013,6 @@ def _seconds_since_supervisor_deep_audit() -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - when).total_seconds())
 
 
-def _parse_datetime(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
 def _summarise_guardian_result(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         return {"value": result}
@@ -2164,5 +2170,29 @@ def _group_matches_by_local_date(matches: list[dict[str, Any]]) -> dict[str, lis
     for match in matches:
         groups.setdefault(_match_local_date(match), []).append(match)
     return groups
+
+
+def _league_name_for_doc(doc: dict[str, Any] | None) -> str:
+    """Best-effort league/tournament label for scheduler-built documents."""
+    doc = doc or {}
+    for key in ("tournament", "league", "league_name", "competition", "category"):
+        value = doc.get(key)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("slug") or value.get("id")
+        if value not in (None, ""):
+            return str(value)
+
+    for parent_key in ("sofascore_event", "raw_sofascore_event", "sofascore_detail", "raw_sporty"):
+        parent = doc.get(parent_key)
+        if not isinstance(parent, dict):
+            continue
+        for key in ("tournament", "league", "competition", "category"):
+            value = parent.get(key)
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("slug") or value.get("id")
+            if value not in (None, ""):
+                return str(value)
+
+    return "Unknown"
 
 

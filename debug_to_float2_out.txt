@@ -1,0 +1,2 @@
+predict_sofascore_event OK: ['match_id', 'name', 'source', 'status', 'minute', 'score', 'tournament', 'teams', 'features', 'signals', 'picks', 'time_decay_applied', 'time_decay_multiplier']
+predict_sporty_match OK: ['match_id', 'name', 'source', 'period', 'minute', 'score', 'tournament', 'category', 'signals', 'picks', 'time_decay_applied', 'time_decay_multiplier']

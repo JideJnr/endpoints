@@ -69,18 +69,18 @@ def get_regime(tournament: str | None, category: str | None = None) -> Regime:
 
         learned = get_tournament_priority(tournament or category or "")
         if not learned.get("known"):
-            return TIER_3
+            return _tier(3)
         priority = int(learned.get("priority", 4))
     except Exception:
-        return TIER_3
+        return _tier(3)
 
     if priority <= 1:
-        return TIER_1
+        return _tier(1)
     if priority <= 3:
-        return TIER_2
+        return _tier(2)
     if priority <= 5:
-        return TIER_3
-    return TIER_4
+        return _tier(3)
+    return _tier(4)
 
 
 def get_regime_for_doc(doc: dict[str, Any]) -> Regime:
@@ -93,7 +93,31 @@ def get_regime_for_doc(doc: dict[str, Any]) -> Regime:
 
 
 def _tier(n: int) -> Regime:
-    return {1: TIER_1, 2: TIER_2, 3: TIER_3, 4: TIER_4}[n]
+    base = {1: TIER_1, 2: TIER_2, 3: TIER_3, 4: TIER_4}[n]
+    try:
+        from app.monitoring.learned_parameters import get_market_regime_params
+        params = get_market_regime_params().get(n) or {}
+    except Exception:
+        params = {}
+    if not params.get("min_confidence"):
+        return Regime(
+            tier=base.tier,
+            name=base.name,
+            min_confidence=101,
+            edge_threshold=1.0,
+            clv_min_samples=0,
+            stake_cap=0.0,
+            description=f"{base.description}; insufficient graded history for learned thresholds",
+        )
+    return Regime(
+        tier=base.tier,
+        name=base.name,
+        min_confidence=int(params["min_confidence"]),
+        edge_threshold=float(params.get("edge_threshold") or 0.0),
+        clv_min_samples=int(params.get("clv_min_samples") or 0),
+        stake_cap=float(params.get("stake_cap") or 0.0),
+        description=f"{base.description}; thresholds learned from {params.get('samples', 0)} graded picks",
+    )
 
 
 def passes_regime_gate(

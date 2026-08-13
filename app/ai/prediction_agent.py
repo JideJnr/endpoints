@@ -20,6 +20,22 @@ from app.utils.match_helpers import _fraction_to_probability, _tournament_name, 
 
 HIGH_LATE_GOAL_LEAGUES: tuple[str, ...] = ()
 
+import logging as _logging
+_pa_logger = _logging.getLogger(__name__)
+if not HIGH_LATE_GOAL_LEAGUES:
+    _pa_logger.warning(
+        "HIGH_LATE_GOAL_LEAGUES is empty -- late-goal boost logic will not activate "
+        "until leagues are populated via get_tournament_priority()."
+    )
+
+import logging as _logging
+_pa_logger = _logging.getLogger(__name__)
+if not HIGH_LATE_GOAL_LEAGUES:
+    _pa_logger.warning(
+        "HIGH_LATE_GOAL_LEAGUES is empty -- late-goal boost logic will not activate "
+        "until leagues are populated via get_tournament_priority()."
+    )
+
 
 # ── Time-decay for live confidence ───────────────────────────────────────────
 #

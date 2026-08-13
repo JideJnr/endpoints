@@ -13,7 +13,6 @@ import math
 import re
 import sqlite3
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from typing import Any
 
@@ -36,7 +35,7 @@ from app.utils.match_helpers import _normalise_selection
 # ---------------------------------------------------------------------------
 
 def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
-    """Return upcoming, unstarted, research-gated prediction candidates."""
+    """Return upcoming, unstarted, research-gated stored prediction candidates."""
     today = date.today()
     tomorrow = today + timedelta(days=1)
     allowed_dates = {today.isoformat(), tomorrow.isoformat()}
@@ -93,13 +92,6 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
         for row, _pick, _odds in prefiltered
     ]
     match_ids = [match_id for match_id in dict.fromkeys(match_ids) if match_id]
-    if match_ids:
-        try:
-            from app.storage.buffer import refresh_sporty_match_state
-            with ThreadPoolExecutor(max_workers=min(5, len(match_ids))) as pool:
-                list(pool.map(_safe_refresh_sporty_match_state, match_ids))
-        except Exception:
-            pass
 
     try:
         from app.storage.buffer import bulk_get_buffered_matches
@@ -324,14 +316,6 @@ def pick_decimal_odds(pick: dict[str, Any] | None) -> float | None:
     return None
 
 
-def _safe_refresh_sporty_match_state(match_id: str) -> None:
-    try:
-        from app.storage.buffer import refresh_sporty_match_state
-        refresh_sporty_match_state(match_id)
-    except Exception:
-        pass
-
-
 def _pick_buffer_decimal_odds(pick: dict[str, Any], buf_doc: dict[str, Any]) -> float | None:
     markets = buf_doc.get("sportybet_markets") or buf_doc.get("markets") or []
     if not markets:
@@ -362,17 +346,16 @@ def _recent_ungraded_prediction_rows(allowed_dates: set[str], limit: int) -> lis
                 select ph.id, ph.source, ph.match_id, ph.match_name, ph.league_name, ph.country_name,
                        ph.pick_type, ph.selection, ph.confidence, ph.reason, ph.signals_json,
                        ph.picks_json, ph.created_at, ph.result, ph.graded_at,
-                       coalesce(mb.match_date, fb.match_date, date(ph.created_at)) as match_date,
-                       coalesce(mb.start_time, fb.start_time) as start_time,
+                       coalesce(mb.match_date, date(ph.created_at)) as match_date,
+                       mb.start_time as start_time,
                        coalesce(mb.is_live, 0) as is_live,
                        coalesce(mb.is_finished, 0) as is_finished
                 from prediction_history ph
                 left join match_buffer mb on mb.match_id = ph.match_id
-                left join future_match_buffer fb on fb.match_id = ph.match_id
                 where ph.created_at >= datetime('now', '-72 hours')
                   and ph.graded_at is null
                   and ph.pick_type != 'no_bet'
-                  and coalesce(mb.match_date, fb.match_date, date(ph.created_at)) in (?, ?)
+                  and coalesce(mb.match_date, date(ph.created_at)) in (?, ?)
                 order by datetime(ph.created_at) desc, ph.id desc
                 limit ?
                 """,

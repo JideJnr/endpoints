@@ -206,6 +206,17 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        create table if not exists ai_team_watcher_observation_guard (
+            match_id text not null,
+            stage text not null,
+            analysis_sig text,
+            observed_at text not null default current_timestamp,
+            primary key (match_id, stage)
+        )
+        """
+    )
     _ensure_column(conn, "ai_team_watchers", "league_name", "text")
     _ensure_column(conn, "ai_team_watchers", "position", "text")
     _ensure_column(conn, "ai_team_watchers", "sporty_team_id", "text")
@@ -228,6 +239,7 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_ai_team_watcher_matches_team on ai_team_watcher_matches(team_key, match_date desc)")
     # Index for tournament-scoped profile lookups
     conn.execute("create index if not exists idx_ai_tw_profiles_lookup on ai_team_watcher_profiles(team_key, tournament_key)")
+    conn.execute("create index if not exists idx_ai_tw_observation_guard_observed on ai_team_watcher_observation_guard(observed_at)")
     # Index to speed up name-based fallback in _resolve_watcher_row
     conn.execute("create index if not exists idx_ai_team_watchers_name on ai_team_watchers(team_name)")
 
@@ -402,6 +414,18 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
         conn.row_factory = sqlite3.Row
         init_team_watcher_tables(conn)
         init_competition_registry_tables(conn)
+        stage = _observation_stage(match_doc, analysis)
+        analysis_sig = _analysis_signature(analysis)
+        guard = conn.execute(
+            """
+            select analysis_sig
+            from ai_team_watcher_observation_guard
+            where match_id = ? and stage = ?
+            """,
+            (match_id, stage),
+        ).fetchone()
+        if guard and str(guard["analysis_sig"] or "") == analysis_sig:
+            return {"status": "skipped", "reason": "already_observed", "match_id": match_id, "stage": stage}
 
         # ── Auto-verify / auto-create the competition ────────────────────────
         competition_name = _league_name_for_doc(match_doc)
@@ -540,6 +564,16 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                 "profile": profile,
                 "tournament_profile": tournament_profile,
             })
+        conn.execute(
+            """
+            insert into ai_team_watcher_observation_guard (match_id, stage, analysis_sig, observed_at)
+            values (?, ?, ?, ?)
+            on conflict(match_id, stage) do update set
+                analysis_sig = excluded.analysis_sig,
+                observed_at = excluded.observed_at
+            """,
+            (match_id, stage, analysis_sig, datetime.now(timezone.utc).isoformat()),
+        )
         conn.commit()  # commit match inserts + profile updates before competition registry calls
 
     # Grade any open TW_Signal predictions for this match and trigger weekly analysis
@@ -585,6 +619,25 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
         logger.debug("monitor_team_performance skipped for match_id=%s: %s", match_id, _exc)
 
     return {"status": "success", "match_id": match_id, "updated": updated}
+
+
+def _observation_stage(match_doc: dict[str, Any], analysis: dict[str, Any] | None = None) -> str:
+    if analysis:
+        return "analysis"
+    if match_doc.get("ai_analysis") or match_doc.get("ai_analysis_ollama"):
+        return "analysis"
+    if match_doc.get("sofascore_detail") or match_doc.get("sofascore_event"):
+        return "enriched"
+    return "ingest"
+
+
+def _analysis_signature(analysis: dict[str, Any] | None) -> str:
+    if not analysis:
+        return ""
+    try:
+        return json.dumps(analysis, sort_keys=True, default=str)[:1000]
+    except Exception:
+        return str(analysis)[:1000]
 
 
 def observe_finished_match_by_id(match_id: str, analysis: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1547,6 +1600,202 @@ def _get_finished_or_buffered_match(match_id: str) -> dict[str, Any] | None:
 #
 # Impact is bounded ±8 and feeds directly into home_power in predict_sofascore_event.
 
+
+def _slug(name: str) -> str:
+    """Convert a team name to a URL-safe slug key."""
+    import re as _re
+    return _re.sub(r'[^a-z0-9]+', '-', str(name or '').lower().strip()).strip('-')
+
+
+def _team_name(team: object) -> str:
+    """Extract team name from a string or dict."""
+    if isinstance(team, dict):
+        return str(team.get('name') or team.get('team_name') or '')
+    return str(team or '')
+
+
+def _league_name_for_doc(doc: dict) -> str:
+    """Extract league/tournament name from a match document."""
+    t = doc.get('tournament') or doc.get('league_name') or ''
+    if isinstance(t, dict):
+        return str(t.get('name') or '')
+    return str(t or '')
+
+
+def _league_name_from_rows(rows: list) -> str:
+    """Infer league name from a list of match rows."""
+    for row in rows or []:
+        name = row['league_name'] if 'league_name' in row.keys() else None
+        if name:
+            return str(name)
+    return ''
+
+
+def _unique_tournament_id_for_doc(doc: dict) -> str | None:
+    """Extract a unique tournament ID from a match document."""
+    detail = doc.get('sofascore_detail') or {}
+    t = detail.get('tournament') or doc.get('tournament') or {}
+    if isinstance(t, dict):
+        return str(t.get('uniqueTournamentId') or t.get('id') or '') or None
+    return None
+
+
+def _resolve_watcher_key(conn, team: dict) -> str | None:
+    """Find an existing watcher key for a team by alias matching."""
+    team_key = str(team.get('team_key') or '')
+    if not team_key:
+        return None
+    row = conn.execute(
+        "SELECT team_key FROM ai_team_watcher WHERE team_key = ? LIMIT 1",
+        (team_key,)
+    ).fetchone()
+    return row['team_key'] if row else None
+
+
+def _resolve_watcher_row(conn, team_key: str) -> object | None:
+    """Fetch the watcher row for a given team key."""
+    if not team_key:
+        return None
+    return conn.execute(
+        "SELECT * FROM ai_team_watcher WHERE team_key = ? LIMIT 1",
+        (str(team_key),)
+    ).fetchone()
+
+
+def _merge_aliases(existing: object | None, team: dict) -> list:
+    """Merge new aliases into the existing alias list."""
+    import json as _json
+    existing_aliases = []
+    if existing:
+        try:
+            existing_aliases = _json.loads(existing['aliases_json'] or '[]')
+        except Exception:
+            pass
+    new_aliases = team.get('aliases') or []
+    seen = {(a.get('provider'), a.get('id')) for a in existing_aliases}
+    for alias in new_aliases:
+        key = (alias.get('provider'), alias.get('id'))
+        if key not in seen:
+            existing_aliases.append(alias)
+            seen.add(key)
+    return existing_aliases
+
+
+def _table_lookup(doc: dict) -> dict:
+    """Build a name->row lookup from standings in the document."""
+    detail = doc.get('sofascore_detail') or {}
+    standings = detail.get('standings') or doc.get('standings') or []
+    table: dict = {}
+    for group in standings if isinstance(standings, list) else []:
+        rows = group.get('rows') or [] if isinstance(group, dict) else []
+        for row in rows:
+            name = str((row.get('team') or {}).get('name') or row.get('team_name') or '')
+            if name:
+                table[name.lower()] = row
+    return table
+
+
+def _team_position(table_map: dict, name: str, sporty_id, sofa_id, *, return_row: bool = False):
+    """Look up a team's position from the standings table map."""
+    if not table_map or not name:
+        return None if return_row else None
+    key = str(name or '').lower().strip()
+    row = table_map.get(key)
+    if row is None:
+        # fuzzy: try partial match
+        for k, v in table_map.items():
+            if key in k or k in key:
+                row = v
+                break
+    if return_row:
+        return row
+    return int((row or {}).get('position') or 0) or None
+
+
+def _position_value(row: object | None) -> int | None:
+    """Extract position integer from a standings row."""
+    if row is None:
+        return None
+    try:
+        return int(row['position'] or 0) or None
+    except Exception:
+        return None
+
+
+def _table_gap(team_row: object | None, opponent_row: object | None) -> int | None:
+    """Return the position gap between two teams in the standings."""
+    t = _position_value(team_row)
+    o = _position_value(opponent_row)
+    if t is None or o is None:
+        return None
+    return o - t
+
+
+def _table_from_rows(rows: list) -> dict | None:
+    """Build a minimal table dict from match rows."""
+    if not rows:
+        return None
+    return {'rows': list(rows)}
+
+
+def _matchup_context(home: dict, away: dict, doc: dict) -> dict:
+    """Build a brief matchup context dict from home/away team data."""
+    return {
+        'home_position': home.get('team_position'),
+        'away_position': away.get('team_position'),
+        'table_gap': (
+            (away.get('team_position') or 0) - (home.get('team_position') or 0)
+            if home.get('team_position') and away.get('team_position') else None
+        ),
+    }
+
+
+def _analysis_summary(analysis: dict | None) -> str:
+    """Return a short text summary from an analysis dict."""
+    if not analysis:
+        return ''
+    return str(analysis.get('summary') or analysis.get('note') or '')
+
+
+def _team_web_context(team: dict, doc: dict, team_row, opponent_row) -> dict:
+    """Build web context dict for a team signal."""
+    return {
+        'team_name': team.get('team_name'),
+        'team_position': _position_value(team_row),
+        'opponent_position': _position_value(opponent_row),
+        'table_gap': _table_gap(team_row, opponent_row),
+        'league_name': _league_name_for_doc(doc),
+    }
+
+
+def _should_refresh_web_context(watcher: dict, sample: int) -> bool:
+    """Return True when the web context is stale or missing."""
+    from datetime import datetime, timezone
+    web_context = watcher.get('web_context') or {}
+    last_at = watcher.get('last_web_context_at')
+    if not web_context or not last_at:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(last_at).replace('Z', '+00:00')).astimezone(timezone.utc)
+        age_hours = (datetime.now(tz=timezone.utc) - dt).total_seconds() / 3600
+        return age_hours > (6 if sample >= 5 else 24)
+    except Exception:
+        return True
+
+
+def _build_overview(
+    team_name: str,
+    league_name: str,
+    **kwargs,
+) -> dict:
+    """Build a team overview dict from available data."""
+    return {
+        'team_name': team_name,
+        'league_name': league_name,
+        **{k: v for k, v in kwargs.items() if v is not None},
+    }
+
+
 def team_watch_signal(match_doc: dict[str, Any]) -> dict[str, Any] | None:
     """
     Compute a team-watch-derived prediction signal for a match.
@@ -1857,5 +2106,7 @@ def _active_signal_names(match_doc: dict[str, Any]) -> set[str]:
         return set()
     signals = prediction.get("signals") or []
     return {str(s.get("name") or "") for s in signals if isinstance(s, dict) and s.get("name")}
+
+
 
 

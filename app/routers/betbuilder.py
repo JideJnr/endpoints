@@ -3,11 +3,11 @@ Bet Builder Router
 ==================
 Two clearly separated endpoints:
 
-  POST /betbuilder/manual   — deterministic, no LLM, fast
-  POST /betbuilder/llm      — LLM-enriched per match, slower
+  POST /betbuilder/manual   - deterministic stored-pick builder
+  POST /betbuilder/llm      - stored picks plus optional slip synthesis
 
-Both share the same request/response contract so the frontend can swap
-between them without any schema changes.
+Both endpoints consume predictions already produced by unified upcoming/live.
+They do not generate per-match predictions.
 """
 from __future__ import annotations
 
@@ -32,9 +32,9 @@ def manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
     """
     Deterministic bet builder.
 
-    Reads stored predictions, applies the research filter gate, scores and
-    ranks picks using conviction scoring, and builds a SportyBet booking slip.
-    No LLM calls — fast and always available.
+    Reads stored unified predictions, applies the research filter gate, scores
+    and ranks picks using conviction scoring, and builds a SportyBet booking
+    slip. No LLM calls.
     """
     from app.bet_builder.manual_builder import run_manual_bet
 
@@ -50,11 +50,11 @@ def manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
 @router.post("/llm")
 def llm_bet(body: BetBuilderRequest) -> dict[str, Any]:
     """
-    LLM-powered bet builder.
+    LLM-assisted bet builder.
 
-    Enriches each candidate with a per-match OpenRouter/Groq analysis, then
-    ranks using conviction scoring with an optional LLM synthesis pass.
-    Slower than /manual but uses live LLM reasoning per match.
+    Reads stored unified predictions, applies the research filter gate, scores
+    them, and optionally uses the LLM only to choose the combined slip. It does
+    not generate per-match predictions.
     """
     from app.bet_builder.llm_builder import run_llm_bet
 

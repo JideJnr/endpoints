@@ -13,11 +13,10 @@ Key features:
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
-from app.enrichment.signal_aggregator import SignalAggregator, calculate_win_probabilities, score_pick_direction
-from app.models.probability_learner import ProbabilityLearner, get_learned_probabilities
+from app.enrichment.signal_aggregator import calculate_win_probabilities, score_pick_direction
+from app.models.probability_learner import ProbabilityLearner
 
 
 # ── Confidence thresholds ──────────────────────────────────
@@ -127,20 +126,6 @@ class PickGenerator:
             d for d in ["home", "draw", "away"]
             if d != primary_direction
         ]
-        secondary_scored = sorted(
-            [score_pick_direction(
-                home_scored["home_prob"],
-                home_scored["away_prob"],
-                home_scored["draw_prob"],
-                confidence,
-                odds.get("home", 1.0),
-                odds.get("draw", 1.0),
-                odds.get("away", 1.0),
-            ) for _ in secondary_directions],
-            key=lambda x: x["score"],
-            reverse=True,
-        )
-
         for sec in secondary_directions[:1]:
             sec_scored = score_pick_direction(
                 home_scored["home_prob"],

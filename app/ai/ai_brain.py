@@ -6,6 +6,7 @@ from urllib import error, request
 
 from app.config.config import get_settings
 from app.ai.llm_pipeline import _build_memory_context
+from app.config.config import _hf_token
 
 
 from app.utils.primitives import _to_int, _to_float
@@ -73,14 +74,6 @@ def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | No
             context["ai_team_watchers"] = ai_watchers
     return context
 
-
-def _build_memory_context(prediction: dict[str, Any]) -> dict[str, Any]:
-    """Build a memory block from the self-learner and CLV data.
-
-    Delegates to llm_pipeline._build_memory_context for a single source of truth.
-    """
-    from app.ai.llm_pipeline import _build_memory_context as _pipeline_build_memory_context
-    return _pipeline_build_memory_context(prediction)
 
 
 def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -259,12 +252,6 @@ def _review_result(provider: str, model: str, parsed: dict[str, Any]) -> dict[st
         "risks": _as_list(parsed.get("risks")),
         "reasons": _as_list(parsed.get("reasons")),
     }
-
-
-def _hf_token() -> str | None:
-    import os
-
-    return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

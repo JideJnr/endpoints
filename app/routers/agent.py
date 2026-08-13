@@ -25,6 +25,15 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 @router.get("/memory/leagues")
+
+def _is_finished_doc(doc: dict) -> bool:
+    """Return True when the match document represents a finished match."""
+    period = str(doc.get('period') or '').lower()
+    status = doc.get('status') or {}
+    status_type = str((status.get('type') if isinstance(status, dict) else status) or '').lower()
+    return period in {'ft', 'finished', 'ended', 'aet', 'ap'} or status_type in {'finished', 'ended'}
+
+
 def get_memory_leagues():
     return {"status": "success", **get_league_memory()}
 

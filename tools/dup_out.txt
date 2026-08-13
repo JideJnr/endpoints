@@ -1,0 +1,65 @@
+
+_context_source (canonical: app/models/poisson.py)
+  NOT FOUND: _context_source in app\models\dixon_coles.py
+
+_is_live_doc (canonical: app/enrichment/match_enrichment.py)
+  NOT FOUND: _is_live_doc in app\routers\frontend.py
+
+_is_finished_doc (canonical: app/enrichment/match_enrichment.py)
+  NOT FOUND: _is_finished_doc in app\routers\frontend.py
+
+_is_not_started_period (canonical: app/storage/buffer.py)
+  NOT FOUND: _is_not_started_period in app\enrichment\enriched_prediction.py
+
+_date_from_start_time (canonical: app/storage/buffer.py)
+  NOT FOUND: _date_from_start_time in app\utils\mobile_bridge.py
+
+_safe_call (canonical: app/monitoring/prediction_monitor.py)
+  NOT FOUND: _safe_call in app\monitoring\system_supervisor.py
+
+_band (canonical: app/competition/competition_special.py)
+  NOT FOUND: _band in app\team_watcher\team_watcher.py
+
+_impact (canonical: app/enrichment/contextual_intelligence.py)
+  NOT FOUND: _impact in app\monitoring\prediction_audit.py
+
+_fetch_web (canonical: app/storage/buffer.py)
+  NOT FOUND: _fetch_web in app\enrichment\enrichment.py
+
+_ensure_column (canonical: app/storage/db.py)
+  NOT FOUND: _ensure_column in app\competition\competition_special.py
+
+_ensure_signal_outcomes_table (canonical: app/storage/league_memory/schema.py)
+  NOT FOUND: _ensure_signal_outcomes_table in app\storage\league_memory\crud.py
+
+_ensure_signal_combination_outcomes_table (canonical: app/storage/db.py)
+  NOT FOUND: _ensure_signal_combination_outcomes_table in app\storage\league_memory\schema.py
+
+_side_from_selection_and_match (canonical: app/storage/league_memory/_helpers.py)
+  NOT FOUND: _side_from_selection_and_match in app\market\market_intent.py
+
+_side_from_team_selection (canonical: app/utils/match_helpers.py)
+  NOT FOUND: _side_from_team_selection in app\routers\frontend.py
+
+_match_sides (canonical: app/utils/match_helpers.py)
+  NOT FOUND: _match_sides in app\routers\frontend.py
+
+_extract_1x2 (canonical: app/storage/buffer.py)
+  NOT FOUND: _extract_1x2 in app\enrichment\match_enrichment.py
+  NOT FOUND: _extract_1x2 in app\models\odds_predictor.py
+  NOT FOUND: _extract_1x2 in app\monitoring\prediction_audit.py
+  NOT FOUND: _extract_1x2 in app\routers\frontend.py
+
+_data_sources (canonical: app/storage/buffer.py)
+  NOT FOUND: _data_sources in app\enrichment\enrichment.py
+  NOT FOUND: _data_sources in app\enrichment\match_enrichment.py
+
+_hf_token (canonical: app/config/config.py)
+  NOT FOUND: _hf_token in app\ai\ai_brain.py
+  NOT FOUND: _hf_token in app\enrichment\enrichment.py
+
+_parse_datetime (canonical: app/competition/competition_special.py)
+  NOT FOUND: _parse_datetime in app\enrichment\contextual_intelligence.py
+  NOT FOUND: _parse_datetime in app\scheduling\scheduler.py
+
+DONE

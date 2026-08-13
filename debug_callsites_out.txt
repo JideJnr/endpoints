@@ -1,0 +1,205 @@
+
+==================================================
+ai_betbuilder.py
+
+  --- _total_goals call sites ---
+      116:     team_terms = [t for t in (_team_name(doc, "home"), _team_name(doc, "away")) if len(t) >= 4]
+      117:     scored = [i for i in candidates if float(i.get("similarity_score") or 0) >= 0.40]
+  >>> 118:     totals = [t for t in (_total_goals(i.get("final_score")) for i in scored) if t is not None]
+      119:     avg_total = sum(totals) / len(totals) if totals else None
+      120: 
+      124:         if target_implied and _odds_dimension(target_implied, item.get("odds")):
+      125:             dimensions.append("odds")
+  >>> 126:         total = _total_goals(item.get("final_score"))
+      127:         if avg_total is not None and total is not None and abs(total - avg_total) <= 1:
+      128:             dimensions.append("score_pattern")
+
+==================================================
+competition_special.py
+
+  --- _name_quality_score call sites ---
+      1831:         points += 3 if own > opp else 1 if own == opp else 0
+      1832:         opponent = away if is_home else home
+  >>> 1833:         opponent_quality += _name_quality_score(str(opponent.get("name") or ""))
+      1834:     ppg = points / sample if sample else 0.0
+      1835:     gd_per_match = goal_diff / sample if sample else 0.0
+
+==================================================
+prediction_monitor.py
+
+  --- _record_monitor_activity call sites ---
+      84:     }
+      85:     _persist_monitor_snapshot(result)
+  >>> 86:     _record_monitor_activity(result)
+      87:     return result
+      88: 
+
+==================================================
+system_supervisor.py
+
+  --- _age_seconds call sites ---
+      161:     stuck_jobs = [
+      162:         job for job in jobs
+  >>> 163:         if job.get("status") == "running" and _age_seconds(job.get("heartbeat_at")) > 900
+      164:     ]
+      165:     job_by_id = {str(job.get("job_id") or ""): job for job in jobs}
+      172:         {
+      173:             "job_id": job_id,
+  >>> 174:             "age_seconds": round(_age_seconds((job_by_id.get(job_id) or {}).get("heartbeat_at")), 1),
+      175:             "status": (job_by_id.get(job_id) or {}).get("status"),
+      176:             "heartbeat_at": (job_by_id.get(job_id) or {}).get("heartbeat_at"),
+      177:         }
+      178:         for job_id, limit in core_stale_limits.items()
+  >>> 179:         if _age_seconds((job_by_id.get(job_id) or {}).get("heartbeat_at")) > limit
+      180:     ]
+      181:     return {
+
+==================================================
+agent.py
+
+  --- _is_finished_doc call sites ---
+      179:     docs = [
+      180:         doc for doc in docs
+  >>> 181:         if not _is_finished_doc(doc)
+      182:     ]
+      183: 
+
+==================================================
+scheduler.py
+
+  --- _ApschedulerShutdownNoiseFilter call sites ---
+      106: 
+      107: 
+  >>> 108: class _ApschedulerShutdownNoiseFilter(logging.Filter):
+      109:     def filter(self, record: logging.LogRecord) -> bool:
+      110:         message = record.getMessage()
+      119: 
+      120: 
+  >>> 121: logging.getLogger("apscheduler.scheduler").addFilter(_ApschedulerShutdownNoiseFilter())
+      122: 
+      123: 
+
+  --- _conn call sites ---
+      398:         from app.storage.league_memory import _init_db
+      399:         _init_db()
+  >>> 400:         with db_conn(timeout=10) as conn:
+      401:             _ensure_scheduler_interval_table(conn)
+      402:             row = conn.execute("select interval_seconds from scheduler_intervals where job_id = ?", (job_id,)).fetchone()
+      449:     _init_db()
+      450:     applied: list[dict[str, Any]] = []
+  >>> 451:     with db_conn(timeout=30) as conn:
+      452:         _ensure_scheduler_interval_table(conn)
+      453:         for job_id, raw_value in intervals.items():
+      524: 
+      525:     _init_db()
+  >>> 526:     with db_conn(timeout=30) as conn:
+      527:         _init_buffer_table(conn)
+      528:         pending = conn.execute(
+      811:     from app.storage.buffer import _init_buffer_table
+      812: 
+  >>> 813:     with _conn() as conn:
+      814:         _init_buffer_table(conn)
+      815:         rows = conn.execute(
+      1202:         from app.storage.db import db_conn
+      1203: 
+  >>> 1204:         with db_conn() as conn:
+      1205:             total = conn.execute(
+      1206:                 "SELECT count(*) as cnt FROM prediction_history WHERE result IN ('win', 'loss')"
+      1229:         rows_skipped = 0
+      1230: 
+  >>> 1231:         with db_conn() as conn:
+      1232:             for dim in dimensions:
+      1233:                 min_samples = MIN_LEAGUE_SAMPLES if dim == "league" else MIN_COUNTRY_SAMPLES if dim == "country" else MIN_PICK_TYPE_SAMPLES
+      1969: 
+      1970:         _init_db()
+  >>> 1971:         with db_conn(timeout=10) as conn:
+      1972:             _init_job_table(conn)
+      1973:             row = conn.execute(
+      1992: 
+      1993:         _init_db()
+  >>> 1994:         with db_conn(timeout=10) as conn:
+      1995:             _init_supervisor_table(conn)
+      1996:             row = conn.execute(
+
+==================================================
+db.py
+
+  --- _is_sqlite_lock call sites ---
+      123:         return int(row[0] if row else 0) >= 6
+      124:     except sqlite3.OperationalError as exc:
+  >>> 125:         if _is_sqlite_lock(exc):
+      126:             return True
+      127:         return False
+      795:             _DB_SCHEMA_READY = True
+      796:         except sqlite3.OperationalError as exc:
+  >>> 797:             if _is_sqlite_lock(exc) and DB_PATH.exists():
+      798:                 # Runtime callers should not fail just because another worker is
+      799:                 # writing. The schema is created at process startup; retry on the
+
+==================================================
+mongo_store.py
+
+  --- _RowCountStub call sites ---
+      415:         )
+      416:         if settings.disable_pruning:
+  >>> 417:             r4 = _RowCountStub()
+      418:             r5 = _RowCountStub()
+      419:         else:
+      416:         if settings.disable_pruning:
+      417:             r4 = _RowCountStub()
+  >>> 418:             r5 = _RowCountStub()
+      419:         else:
+      420:             # Delete ghost matches — kick-off passed 2+ hours ago, still not started
+
+  --- _latest_prediction call sites ---
+
+==================================================
+team_watcher_engine.py
+
+  --- _compute_profile_stats call sites ---
+      2194:     Reads all finished matches for the team in the tournament from
+      2195:     ``ai_team_watcher_matches``, computes profile stats using the shared
+  >>> 2196:     ``_compute_profile_stats()`` helper, and persists the result to
+      2197:     ``ai_team_watcher_profiles``.
+      2198: 
+      2234:             return {"status": "skipped", "reason": "insufficient_samples", "sample_size": sample_size}
+      2235: 
+  >>> 2236:         profile_stats = _compute_profile_stats(rows)
+      2237:         profile_json = json.dumps(profile_stats)
+      2238: 
+
+  --- _note_for_result call sites ---
+      1776:             # â”€â”€ 3. Generate typed notes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      1777:             # 3a. Result note
+  >>> 1778:             result_note = _note_for_result(actual_result, own_goals, opp_goals, side, profile)
+      1779:             if result_note:
+      1780:                 notes.append(result_note)
+
+==================================================
+portfolio.py
+
+  --- _normalise_league call sites ---
+      138:         sel  = _normalise_selection(pick.get("selection") or "")
+      139:         direction_dist[sel] += 1
+  >>> 140:         league = _normalise_league(p.get("league_name") or p.get("tournament") or "")
+      141:         league_dist[league] += 1
+      142: 
+      162:     sel  = pick.get("selection") or ""
+      163:     direction = _normalise_selection(sel)
+  >>> 164:     league    = _normalise_league(p.get("league_name") or p.get("tournament") or "")
+      165:     start     = _start_time(p)
+      166:     window    = _time_window(start) if start else None
+
+  --- _start_time call sites ---
+      163:     direction = _normalise_selection(sel)
+      164:     league    = _normalise_league(p.get("league_name") or p.get("tournament") or "")
+  >>> 165:     start     = _start_time(p)
+      166:     window    = _time_window(start) if start else None
+      167: 
+
+  --- _time_window call sites ---
+      164:     league    = _normalise_league(p.get("league_name") or p.get("tournament") or "")
+      165:     start     = _start_time(p)
+  >>> 166:     window    = _time_window(start) if start else None
+      167: 
+      168:     return {

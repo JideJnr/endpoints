@@ -273,7 +273,13 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
 
     # ── Hard block checks (return on first match) ────────────────────
     if pick_type == "match_result":
-        return {"blocked": True, "reason": "research_block:match_result_61pct_loss", "trust_boost": 0, "evidence": {"matched_value": "match_result"}}
+        try:
+            learned = _get_learned_thresholds(league_key, pick_type)
+            min_conf = learned.get("min_confidence", 72.0)
+        except Exception:
+            min_conf = 72.0
+        if confidence < min_conf:
+            return {"blocked": True, "reason": f"research_block:match_result_below_learned_{int(min_conf)}", "trust_boost": 0, "evidence": {"matched_value": confidence, "learned_threshold": min_conf}}
 
     # Use learned min_confidence if available
     try:
@@ -341,7 +347,14 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
             matched_value = league_key
 
     # 2.5 Confidence 60-66 band → noisy band
-    if 60 <= confidence <= 66:
+    # Use learned thresholds when available; fall back to static 60-66
+    try:
+        _nb_thresh = _get_learned_thresholds(league_key, pick_type)
+        _nb_lo = int(_nb_thresh.get("noisy_band_lo", 60))
+        _nb_hi = int(_nb_thresh.get("noisy_band_hi", 66))
+    except Exception:
+        _nb_lo, _nb_hi = 60, 66
+    if _nb_lo <= confidence <= _nb_hi:
         caution_conditions.append("noisy_band")
         is_noisy_band = True
         if matched_value is None:
@@ -483,7 +496,13 @@ def _research_filter_candidate(
 
     # Hard block checks (same order as evaluate_pick)
     if pick_type == "match_result":
-        return False
+        try:
+            learned = _get_learned_thresholds(league_key, pick_type)
+            min_conf = learned.get("min_confidence", 72.0)
+        except Exception:
+            min_conf = 72.0
+        if confidence < min_conf:
+            return False
 
     # Use learned min_confidence if available
     try:
@@ -491,8 +510,6 @@ def _research_filter_candidate(
         min_conf = learned.get("min_confidence", 50.0)
     except Exception:
         min_conf = 50.0
-    if confidence < min_conf:
-        return False
     for dimension, key in (
         ("odds_bucket", _odds_bucket("draw_odds", draw_odds)),
         ("odds_bucket", _odds_bucket("favorite_odds", favorite_odds)),
@@ -509,6 +526,24 @@ def _research_filter_candidate(
     if country and country in dynamic["block_countries"]:
         return False
 
+    published_confidence = confidence + _research_filter_trust_boost(
+        pick,
+        pick_type=pick_type,
+        selection=selection,
+        country=country,
+        dynamic=dynamic,
+        home_odds=home_odds,
+        draw_odds=draw_odds,
+        favorite_odds=favorite_odds,
+    )
+    try:
+        conf_cap = learned.get("confidence_cap", PUBLISHED_CONFIDENCE_CAP)
+    except Exception:
+        conf_cap = PUBLISHED_CONFIDENCE_CAP
+    published_confidence = min(published_confidence, int(conf_cap))
+    if published_confidence < min_conf:
+        return False
+
     # Caution checks (block only for first matched condition that results in block)
     low_conf_selection = _dynamic_market_block(
         dimension="selection_confidence_band",
@@ -519,7 +554,12 @@ def _research_filter_candidate(
         return False
 
     # noisy_band + caution_context escalation
-    is_noisy_band = 60 <= confidence <= 66
+    try:
+        _nb2 = _get_learned_thresholds(league_key, pick_type)
+        _nb_lo2, _nb_hi2 = int(_nb2.get("noisy_band_lo", 60)), int(_nb2.get("noisy_band_hi", 66))
+    except Exception:
+        _nb_lo2, _nb_hi2 = 60, 66
+    is_noisy_band = _nb_lo2 <= confidence <= _nb_hi2
     caution_count = 0
     if str(pick.get("favorite_side") or "").lower() == "draw":
         caution_count += 1
@@ -533,6 +573,49 @@ def _research_filter_candidate(
         return False
 
     return True
+
+
+def _research_filter_trust_boost(
+    pick: dict[str, Any],
+    *,
+    pick_type: str,
+    selection: str,
+    country: str,
+    dynamic: dict[str, frozenset[str]],
+    home_odds: float,
+    draw_odds: float,
+    favorite_odds: float,
+) -> float:
+    try:
+        learned_boosts = _get_learned_trust_boosts(pick_type)
+    except Exception:
+        learned_boosts = {}
+    trust_boost = 0.0
+    if selection == "Home or Away" and "home_or_away" in learned_boosts:
+        trust_boost += learned_boosts["home_or_away"]
+    if pick_type == "live_total_goals" and "live_total_goals" in learned_boosts:
+        trust_boost += learned_boosts["live_total_goals"]
+    if str(pick.get("source") or "") == "sportybet_market_signal" and "sportybet_market_signal" in learned_boosts:
+        trust_boost += learned_boosts["sportybet_market_signal"]
+    if 1.30 <= home_odds <= 1.69 and "home_odds_130_169" in learned_boosts:
+        trust_boost += learned_boosts["home_odds_130_169"]
+    if draw_odds >= 3.00 and "draw_odds_3_plus" in learned_boosts:
+        trust_boost += learned_boosts["draw_odds_3_plus"]
+    if 1.50 <= favorite_odds <= 1.69 and "favorite_odds_150_169" in learned_boosts:
+        trust_boost += learned_boosts["favorite_odds_150_169"]
+    away_odds = float(pick.get("away_odds") or 0)
+    if 1.70 <= away_odds <= 1.99 and "away_odds_170_199" in learned_boosts:
+        trust_boost += learned_boosts["away_odds_170_199"]
+    if country and country in dynamic["trust_countries"] and "trust_country" in learned_boosts:
+        trust_boost += learned_boosts["trust_country"]
+    if int(pick.get("confidence") or 0) == 74 and "confidence_74" in learned_boosts:
+        trust_boost += learned_boosts["confidence_74"]
+    try:
+        learned = _get_learned_thresholds("", pick_type)
+        trust_cap = learned.get("trust_boost_cap", TRUST_BOOST_CAP)
+    except Exception:
+        trust_cap = TRUST_BOOST_CAP
+    return min(trust_boost, float(trust_cap))
 
 
 # ── get_research_context_for_prompt() ──────────────────────────

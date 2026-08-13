@@ -9,11 +9,8 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
-from urllib import request as urllib_request
-from urllib.error import HTTPError
 
 from app.config.config import get_settings
-from app.market.season_stage import detect_season_stage
 
 from app.utils.primitives import _safe_float
 
@@ -253,6 +250,146 @@ def _format_memory_context(context: dict[str, Any]) -> str:
     return "\n".join(parts) or "No memory context available"
 
 
+def _call_llm(prompt: str, timeout: int = 30) -> str:
+    """Route through AIRouter — single call site for all pipeline LLM calls."""
+    from app.ai.ai_router import _call_llm as _router_call_llm
+    return _router_call_llm("openrouter", prompt, timeout=timeout)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _aggregate_specialists(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarise specialist results into a prompt-ready string."""
+    lines: list[str] = []
+    votes: dict[str, int] = {"home": 0, "away": 0, "neutral": 0, "draw": 0}
+    for r in results:
+        name = r.get("specialist") or r.get("name") or "unknown"
+        adv = str(r.get("advantage") or r.get("status") or "neutral").lower()
+        conf = r.get("confidence") or 0
+        reason = r.get("reasoning") or r.get("error") or ""
+        lines.append(f"- {name}: {adv} ({conf}%) — {reason}")
+        if adv in votes:
+            votes[adv] += 1
+    return {
+        "specialist_summary": "\n".join(lines) or "No specialist data",
+        "votes": votes,
+    }
+
+
+def _build_model_summary(doc: dict[str, Any]) -> str:
+    """Build a one-line summary of statistical model outputs from the doc."""
+    parts: list[str] = []
+    poisson = doc.get("poisson") or {}
+    if poisson.get("probabilities"):
+        p = poisson["probabilities"]
+        parts.append(f"Poisson: H={p.get('home_win',0):.0f}% D={p.get('draw',0):.0f}% A={p.get('away_win',0):.0f}%")
+    dixon = doc.get("dixon_coles") or {}
+    if dixon.get("probabilities"):
+        d = dixon["probabilities"]
+        parts.append(f"Dixon: H={d.get('home_win',0):.0f}% D={d.get('draw',0):.0f}% A={d.get('away_win',0):.0f}%")
+    elo = doc.get("elo") or {}
+    if elo.get("home_win_probability"):
+        parts.append(f"ELO: H={elo.get('home_win_probability',0):.0f}% A={elo.get('away_win_probability',0):.0f}%")
+    return "; ".join(parts) or "No model outputs"
+
+
+def run_form_specialist(doc: dict[str, Any]) -> dict[str, Any]:
+    home_form = [m.get("result", "?") for m in (doc.get("home_last_matches") or [])[:5]]
+    away_form = [m.get("result", "?") for m in (doc.get("away_last_matches") or [])[:5]]
+    prompt = _FORM_PROMPT.format(
+        home_form=", ".join(home_form) or "N/A",
+        away_form=", ".join(away_form) or "N/A",
+    )
+    try:
+        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        result = _parse_safe(raw) or {}
+        result["specialist"] = "form"
+        return result
+    except Exception as exc:
+        return {"specialist": "form", "status": "error", "error": str(exc)}
+
+
+def run_h2h_specialist(doc: dict[str, Any]) -> dict[str, Any]:
+    h2h = doc.get("h2h") or {}
+    duel = h2h.get("teamDuel") or h2h.get("team_duel") or {}
+    prompt = _H2H_PROMPT.format(
+        home_wins=duel.get("homeWins", 0),
+        away_wins=duel.get("awayWins", 0),
+        draws=duel.get("draws", 0),
+    )
+    try:
+        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        result = _parse_safe(raw) or {}
+        result["specialist"] = "h2h"
+        return result
+    except Exception as exc:
+        return {"specialist": "h2h", "status": "error", "error": str(exc)}
+
+
+def run_odds_specialist(doc: dict[str, Any]) -> dict[str, Any]:
+    odds = doc.get("odds_1x2") or {}
+    prompt = _ODDS_PROMPT.format(
+        home_odds=odds.get("home", "N/A"),
+        draw_odds=odds.get("draw", "N/A"),
+        away_odds=odds.get("away", "N/A"),
+    )
+    try:
+        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        result = _parse_safe(raw) or {}
+        result["specialist"] = "odds"
+        return result
+    except Exception as exc:
+        return {"specialist": "odds", "status": "error", "error": str(exc)}
+
+
+def run_standings_specialist(doc: dict[str, Any]) -> dict[str, Any]:
+    standings = doc.get("standings") or []
+    home_row = next((r for r in standings if "home" in str(r.get("team") or "").lower()), {})
+    away_row = next((r for r in standings if "away" in str(r.get("team") or "").lower()), {})
+    prompt = _STANDINGS_PROMPT.format(
+        home_pos=home_row.get("position", "N/A"),
+        home_pts=home_row.get("points", "N/A"),
+        away_pos=away_row.get("position", "N/A"),
+        away_pts=away_row.get("points", "N/A"),
+    )
+    try:
+        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        result = _parse_safe(raw) or {}
+        result["specialist"] = "standings"
+        return result
+    except Exception as exc:
+        return {"specialist": "standings", "status": "error", "error": str(exc)}
+
+
+def run_model_specialist(doc: dict[str, Any]) -> dict[str, Any]:
+    poisson = (doc.get("poisson") or {}).get("probabilities") or {}
+    dixon = (doc.get("dixon_coles") or {}).get("probabilities") or {}
+    elo = doc.get("elo") or {}
+    prompt = _MODEL_PROMPT.format(
+        p_home=float(poisson.get("home_win") or 33),
+        p_draw=float(poisson.get("draw") or 33),
+        p_away=float(poisson.get("away_win") or 33),
+        d_home=float(dixon.get("home_win") or 33),
+        d_draw=float(dixon.get("draw") or 33),
+        d_away=float(dixon.get("away_win") or 33),
+        e_home=float(elo.get("home_win_probability") or 33),
+        e_draw=float(max(5, 30 - abs(float(elo.get("home_win_probability") or 33) - 50) * 0.4)),
+        e_away=float(elo.get("away_win_probability") or 33),
+    )
+    try:
+        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        result = _parse_safe(raw) or {}
+        result["specialist"] = "models"
+        return result
+    except Exception as exc:
+        return {"specialist": "models", "status": "error", "error": str(exc)}
+
+
 def run_final_synthesis(
     doc: dict[str, Any],
     specialist_results: list[dict[str, Any]],
@@ -268,7 +405,7 @@ def run_final_synthesis(
         memory_context=memory_context or "No memory context",
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_FINAL)
+        raw = _call_llm(prompt, timeout=_TIMEOUT_FINAL)  # noqa: F821
         result = _parse_safe(raw)
         if not result:
             return {"status": "error", "message": "Failed to parse synthesis JSON", "raw": raw[:200]}
@@ -317,7 +454,7 @@ def run_brain_review(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[st
             "provider": "openrouter",
             "model": get_settings().openrouter_model,
             "verdict": result.get("verdict"),
-            "confidence_adjustment": _safe_int(result.get("confidence_adjustment"), 0),
+            "confidence_adjustment": _safe_int(result.get("confidence_adjustment"), 0),  # noqa: F821
             "risks": result.get("risks") or [],
             "reasons": result.get("reasons") or [],
         }

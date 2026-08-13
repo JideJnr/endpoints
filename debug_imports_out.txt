@@ -1,0 +1,111 @@
+
+=== match_helpers.py ===
+1: """
+2: match_helpers.py
+3: ~~~~~~~~~~~~~~~~
+4: Consolidated match-data helper functions.
+5: 
+6: Single source of truth for:
+7:   - _team_name, _tournament_name
+8:   - _normalise_selection
+9:   - _fraction_to_probability
+10:   - _norm, _played_seconds, _to_datetime_utc
+11: 
+12: All modules should import from here instead of defining local copies.
+13: """
+14: from __future__ import annotations
+15: 
+16: import re
+17: from datetime import datetime, timezone
+18: from typing import Any
+19: 
+20: 
+21: # ── Team / tournament name extraction ────────────────────────────────────────
+22: 
+23: 
+24: def _team_name(match: dict[str, Any], side: str) -> str | None:
+25:     """Extract a team name from *match* for *side* (``"home"`` / ``"away"``).
+26: 
+27:     Handles both ``{home_team: "Arsenal"}`` and
+28:     ``{home_team: {"name": "Arsenal", "id": 1}}`` shapes.
+29:     """
+30:     team = match.get(f"{side}_team")
+31:     if isinstance(team, dict):
+32:         return team.get("name")
+33:     return team
+34: 
+35: 
+36: def _tournament_name(doc: dict[str, Any]) -> str | None:
+37:     """Safely extract tournament name whether it's a string or a dict."""
+38:     t = doc.get("tournament")
+39:     if isinstance(t, dict):
+40:         return t.get("name")
+41:     return t
+42: 
+43: 
+44: # ── Selection normalisation ───────────────────────────────────────────────────
+45: 
+46: 
+47: def _normalise_selection(selection: str, match_name: str = "", pick_type: str = "") -> str:
+48:     """Map selection names to a canonical direction string.
+49: 
+50:     Handles live-match-winner, double-chance, goals, BTTS, and plain
+--- _to_float lines ---
+127:     numerator = _to_float(top)
+128:     denominator = _to_float(bottom)
+
+=== crud.py ===
+1: """
+2: league_memory.crud
+3: ~~~~~~~~~~~~~~~~~~
+4: Direct SQLite read / write operations for the league memory store.
+5: Higher-level analytical queries live in queries.py.
+6: """
+7: from __future__ import annotations
+8: 
+9: import re
+10: import os
+11: import sqlite3
+12: import json
+13: import logging
+14: from datetime import datetime, timezone
+15: from pathlib import Path
+16: from typing import Any
+17: 
+18: from app.storage.db import (
+19:     DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db,
+20:     _init_db, _init_db_unlocked, _ensure_column, _is_sqlite_lock,
+21:     _DB_SCHEMA_READY, _DB_SCHEMA_LOCK, _run_schema_migrations,
+22:     _run_legacy_backfills, _existing_schema_can_be_trusted,
+23:     _ensure_prediction_history_columns,
+24: )
+25: from app.config.config import get_settings
+26: from app.match_facts import enrich_match_facts
+27: from app.signal_combinations import build_signal_combination, live_context_from_prediction
+28: from app.market.market_intent import classify_market_intent, grade_market_intent
+29: from app.monitoring.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
+30: from app.competition.competition_registry import init_competition_registry_tables, ensure_competition
+31: from ._helpers import (
+32:     normalize_league, _league_from_match, _country_from_match, _team_name,
+33:     _match_fingerprint, _match_minute, _minute_bucket, _bucket_bounds,
+34:     _score_state, _red_card_state, _favorite_from_match,
+35:     _to_int, _to_float, _safe_json, _safe_float,
+36:     _memory_row, _match_row, _snapshot_row, _prediction_row, _decision_row,
+37:     _snapshot_memory_row, _get_passed_models, _standings_from_matches,
+38:     _match_1x2_odds_profile, _normalise_start_seconds, _datetime_to_seconds,
+39:     _date_from_start, _sofa_ids_from_raw,
+40:     _same_team, _close_match_row, _team_form_from_rows,
+41:     _grade_pick_for_match, _grade_pick, _side_from_selection_and_match,
+42:     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
+43:     _decorate_betbuilder_selections, _betbuilder_learning_summary,
+44:     _TEAM_HISTORY_CACHE_DAYS,
+45:     _country_from_league, _is_country_like,
+46:     grade_prediction_row,
+47: )
+48: 
+49: logger = logging.getLogger(__name__)
+50: 
+--- _to_float lines ---
+35:     _to_int, _to_float, _safe_json, _safe_float,
+627:             _to_float(signal.get("impact")) if isinstance(signal, dict) else None,
+1180:         odds = _to_float(selection.get("odds") or selection.get("decimal_odds"))

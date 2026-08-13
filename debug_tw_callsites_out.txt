@@ -1,0 +1,144 @@
+
+==================================================
+team_watcher.py
+
+  --- _analysis_summary (1 calls) ---
+      1054:     opponent = opponent_name
+  >>> 1055:     analysis_text = _analysis_summary(analysis)
+      1056:     score_text = f"{own}-{opp}" if own is not None and opp is not None else "score unavailable"
+      1057:     brief = f"{team['team_name']} {result or 'played'} vs {opponent or 'opponent'} ({side}, {score_text})."
+
+  --- _build_overview (1 calls) ---
+      1225:                 web_context = {"error": str(exc), "query": team_name}
+  >>> 1226:     overview = _build_overview(
+      1227:         team_name=(team or {}).get("team_name") or (watcher and watcher["team_name"]) or "Team",
+      1228:         league_name=league_name,
+
+  --- _league_name_for_doc (3 calls) ---
+      430:         # ── Auto-verify / auto-create the competition ────────────────────────
+  >>> 431:         competition_name = _league_name_for_doc(match_doc)
+      432:         competition_entry = ensure_competition(
+      433:             conn,
+      1005:     sofa_away = _sofa_team("away_team", "awayTeam")
+  >>> 1006:     league_name = _league_name_for_doc(doc)
+      1007:     table_map = _table_lookup(doc)
+      1008:     sides = [
+
+  --- _league_name_from_rows (1 calls) ---
+      1209:         or (watcher and watcher["league_name"])
+  >>> 1210:         or _league_name_from_rows(rows)
+      1211:     )
+      1212:     position = (team or {}).get("position") or watcher_profile.get("position") or (watcher and watcher["position"])
+
+  --- _matchup_context (1 calls) ---
+      914:         if all(side in out for side in ("home", "away")):
+  >>> 915:             out["matchup"] = _matchup_context(out.get("home") or {}, out.get("away") or {}, match_doc)
+      916:     return out
+      917: 
+
+  --- _merge_aliases (1 calls) ---
+      937:     existing = _resolve_watcher_row(conn, team["team_key"]) or (_resolve_watcher_row(conn, resolved_key) if resolved_key else None)
+  >>> 938:     aliases = _merge_aliases(existing, team)
+      939:     db_key = resolved_key or team["team_key"]
+      940:     if existing:
+
+  --- _position_value (2 calls) ---
+      1072:         "league_name": team.get("league_name") or _league_name_for_doc(doc),
+  >>> 1073:         "team_position": _position_value(team_row),
+      1074:         "opponent_position": _position_value(opponent_row),
+      1075:         "table_gap": _table_gap(team_row, opponent_row),
+      1073:         "team_position": _position_value(team_row),
+  >>> 1074:         "opponent_position": _position_value(opponent_row),
+      1075:         "table_gap": _table_gap(team_row, opponent_row),
+      1076:         "goals_for": own,
+
+  --- _resolve_watcher_key (1 calls) ---
+      441:         for team in teams:
+  >>> 442:             resolved_key = _resolve_watcher_key(conn, team)
+      443:             _upsert_watcher(conn, team, resolved_key=resolved_key)
+      444:             observation = _observation_for_team(match_doc, team, analysis)
+
+  --- _resolve_watcher_row (6 calls) ---
+      275:         init_team_watcher_tables(conn)
+  >>> 276:         row = _resolve_watcher_row(conn, team_key)
+      277:         resolved_key = row["team_key"] if row else team_key
+      278:         matches = conn.execute(
+      729:                 # Resolve team for league_name
+  >>> 730:                 watcher = _resolve_watcher_row(conn, team_key)
+      731:                 team = {"team_name": watcher["team_name"]} if watcher else {}
+      732:                 profile = _build_profile(conn, team_key, team=team, tournament_key=tournament_key)
+
+  --- _should_refresh_web_context (1 calls) ---
+      1215:     last_web_context_at = watcher["last_web_context_at"] if watcher else None
+  >>> 1216:     if _should_refresh_web_context({"web_context": web_context, "last_web_context_at": last_web_context_at}, sample):
+      1217:         team_name = (team or {}).get("team_name") or (watcher and watcher["team_name"]) or "team"
+      1218:         try:
+
+  --- _slug (2 calls) ---
+      1017:         sofascore_team_id = str(sofa_id or "").strip() or None
+  >>> 1018:         team_key = _slug(team_name or sporty_team_id or sofascore_team_id or "")
+      1019:         if not team_key or not team_name:
+      1020:             continue
+      1020:             continue
+  >>> 1021:         aliases = [{"provider": "name", "id": _slug(team_name), "label": team_name}]
+      1022:         if sporty_team_id:
+      1023:             aliases.append({"provider": "sporty", "id": sporty_team_id})
+
+  --- _table_from_rows (1 calls) ---
+      1212:     position = (team or {}).get("position") or watcher_profile.get("position") or (watcher and watcher["position"])
+  >>> 1213:     table = (team or {}).get("table_json") or watcher_profile.get("table") or _table_from_rows(rows)
+      1214:     web_context = _loads(watcher["web_context_json"], {}) if watcher else {}
+      1215:     last_web_context_at = watcher["last_web_context_at"] if watcher else None
+
+  --- _table_gap (1 calls) ---
+      1074:         "opponent_position": _position_value(opponent_row),
+  >>> 1075:         "table_gap": _table_gap(team_row, opponent_row),
+      1076:         "goals_for": own,
+      1077:         "goals_against": opp,
+
+  --- _table_lookup (2 calls) ---
+      1006:     league_name = _league_name_for_doc(doc)
+  >>> 1007:     table_map = _table_lookup(doc)
+      1008:     sides = [
+      1009:         ("home", raw_sporty.get("home_team") or doc.get("home_team"), sporty_ids.get("home"), sofa_home),
+      1045:     match_state = classify_match_state(doc)
+  >>> 1046:     table_map = _table_lookup(doc)
+      1047:     opponent_name = _team_name(raw_sporty.get(f"{opponent_side}_team") or doc.get(f"{opponent_side}_team"))
+      1048:     opponent_row = _team_position(table_map, opponent_name, None, None, return_row=True)
+
+  --- _team_name (4 calls) ---
+      861:         raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else doc
+  >>> 862:         home_name = _team_name(raw_sporty.get("home_team") or doc.get("home_team") or "").lower().strip()
+      863:         away_name = _team_name(raw_sporty.get("away_team") or doc.get("away_team") or "").lower().strip()
+      864:         if not (home_name in missing_keys or away_name in missing_keys):
+      862:         home_name = _team_name(raw_sporty.get("home_team") or doc.get("home_team") or "").lower().strip()
+  >>> 863:         away_name = _team_name(raw_sporty.get("away_team") or doc.get("away_team") or "").lower().strip()
+      864:         if not (home_name in missing_keys or away_name in missing_keys):
+      865:             continue
+
+  --- _team_position (3 calls) ---
+      1025:             aliases.append({"provider": "sofascore", "id": sofascore_team_id})
+  >>> 1026:         team_position = _team_position(table_map, team_name, sporty_id, sofa_id)
+      1027:         teams.append({
+      1028:             "side": side,
+      1047:     opponent_name = _team_name(raw_sporty.get(f"{opponent_side}_team") or doc.get(f"{opponent_side}_team"))
+  >>> 1048:     opponent_row = _team_position(table_map, opponent_name, None, None, return_row=True)
+      1049:     team_row = _team_position(table_map, team["team_name"], None, None, return_row=True)
+      1050:     score = doc.get("score") if isinstance(doc.get("score"), dict) else raw_sporty.get("score") or {}
+
+  --- _team_web_context (1 calls) ---
+      1064:         time_context = {}
+  >>> 1065:     web_context = _team_web_context(team, doc, team_row, opponent_row)
+      1066:     return {
+      1067:         "match_date": doc.get("match_date"),
+
+  --- _unique_tournament_id_for_doc (1 calls) ---
+      436:             country=str(match_doc.get("country_name") or ""),
+  >>> 437:             unique_tournament_id=_unique_tournament_id_for_doc(match_doc),
+      438:         )
+      439:         competition_key = competition_entry.get("key", "") if competition_entry else ""
+
+==================================================
+mongo_store.py
+
+  _latest_prediction: no call sites found

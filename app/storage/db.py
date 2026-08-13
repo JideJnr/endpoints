@@ -67,6 +67,12 @@ def db_conn(timeout: int = DEFAULT_TIMEOUT_SECONDS) -> Iterator[sqlite3.Connecti
         yield conn
 
 
+def _is_sqlite_lock(exc: Exception) -> bool:
+    """Return True when *exc* is a SQLite database-locked / busy error."""
+    msg = str(exc).lower()
+    return 'database is locked' in msg or 'unable to open' in msg or 'disk i/o error' in msg
+
+
 @contextmanager
 def _conn(timeout: int = DEFAULT_TIMEOUT_SECONDS) -> Iterator[sqlite3.Connection]:
     """Backward-compatible alias for modules that already use app-level DB contexts."""

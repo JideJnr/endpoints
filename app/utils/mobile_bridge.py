@@ -8,6 +8,7 @@ from typing import Any
 
 from app.storage.db import connect_db, db_conn
 from app.storage.league_memory import _init_db
+from app.storage.buffer import _date_from_start_time
 
 
 def init_mobile_bridge_db(conn: sqlite3.Connection | None = None) -> None:
@@ -277,16 +278,6 @@ def _packet_id(packet: dict[str, Any], source: str) -> str:
     }
     raw = json.dumps(basis, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _date_from_start_time(value: Any) -> str:
-    try:
-        ts = float(value)
-        if ts > 1e12:
-            ts /= 1000
-        return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-    except Exception:
-        return datetime.now(timezone.utc).date().isoformat()
 
 
 def _json_or_none(value: Any) -> Any:

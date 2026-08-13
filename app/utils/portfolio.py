@@ -155,6 +155,44 @@ def portfolio_summary(predictions: list[dict[str, Any]]) -> dict[str, Any]:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
+def _normalise_league(name: str) -> str:
+    """Normalise a league/tournament name to a consistent key."""
+    return str(name or '').lower().strip().replace('-', ' ')
+
+
+def _start_time(pick: dict) -> float | None:
+    """Extract match start time as a unix timestamp from a pick record."""
+    for key in ('match_date', 'start_time', 'kickoff', 'created_at'):
+        val = pick.get(key)
+        if not val:
+            continue
+        try:
+            if isinstance(val, (int, float)):
+                return float(val)
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(str(val).replace('Z', '+00:00')).astimezone(timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return None
+
+
+def _time_window(timestamp: float) -> str:
+    """Bucket a unix timestamp into a coarse time window label."""
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        hour = dt.hour
+        if hour < 12:
+            return 'morning'
+        if hour < 17:
+            return 'afternoon'
+        return 'evening'
+    except Exception:
+        return 'unknown'
+
+
 def _annotate(p: dict[str, Any]) -> dict[str, Any]:
     """Add internal _fields used for grouping."""
     pick = p.get("best_pick") or {}

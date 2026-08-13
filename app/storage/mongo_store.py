@@ -14,12 +14,18 @@ from app.storage.db import db_conn
 from app.config.config import get_settings
 from app.match_facts import enrich_match_facts
 
-from app.utils.primitives import _to_int, _to_float
-from app.utils.match_helpers import _tournament_name, _team_name
+from app.utils.primitives import _to_int
+from app.utils.match_helpers import _tournament_name
 
 _client = None
 _db = None
 _settings_cache = None
+
+
+
+class _RowCountStub:
+    """Stub returned when pruning is disabled — behaves like a zero-row result."""
+    rowcount = 0
 
 
 def _get_settings():
@@ -74,7 +80,6 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
     if not is_configured():
         return False
 
-    from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db
     from app.market.market import get_movement
 
@@ -102,7 +107,7 @@ def archive_finished_match_from_buffer(match_id: str) -> bool:
         odds_close = snapshots[-1].get("odds_1x2") if snapshots else None
 
         # top prediction pick
-        prediction = _latest_prediction(match_id)
+        prediction = _latest_prediction_for_match(match_id)
 
         # Extract team IDs from sofascore_detail for model training
         detail = doc.get("sofascore_detail") or {}
@@ -360,9 +365,7 @@ def flush_buffer_to_mongo(match_date: str | None = None) -> dict[str, Any]:
     return {"status": "skipped", "reason": "only finished matches are stored in mongo"}
 
 def cleanup_buffer() -> dict[str, Any]:
-    from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db
-    from datetime import datetime, timezone
     settings = _get_settings()
     _init_db()
 
@@ -506,4 +509,90 @@ def _team(doc: dict, side: str) -> str | None:
         return team.get("name")
     return team or None
 
+
+def _latest_prediction_for_match(match_id: str) -> dict[str, Any] | None:
+    """Return the most recent prediction for a match from prediction_history."""
+    try:
+        with db_conn(timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                select pick_type, selection, confidence, source, created_at
+                from prediction_history
+                where match_id = ?
+                order by datetime(created_at) desc, id desc
+                limit 1
+                """,
+                (str(match_id),),
+            ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+    except Exception:
+        return None
+
+
+def _scheduled_event_archive_doc(
+    event: dict[str, Any],
+    match_date: str | None = None,
+) -> dict[str, Any] | None:
+    """Build an archive document from a SofaScore scheduled event."""
+    event_id = str(event.get("id") or "")
+    if not event_id:
+        return None
+    status = event.get("status") or {}
+    home_score = event.get("homeScore") or {}
+    away_score = event.get("awayScore") or {}
+    home_team = event.get("homeTeam") or event.get("home_team") or {}
+    away_team = event.get("awayTeam") or event.get("away_team") or {}
+    tournament = event.get("tournament") or {}
+    return {
+        "_id": f"sofascore:{event_id}",
+        "match_id": f"sofascore:{event_id}",
+        "match_date": match_date or "",
+        "name": event.get("name") or f"{home_team.get('name','')} vs {away_team.get('name','')}",
+        "home_team": home_team.get("name") if isinstance(home_team, dict) else str(home_team),
+        "away_team": away_team.get("name") if isinstance(away_team, dict) else str(away_team),
+        "home_team_id": str(home_team.get("id") or "") if isinstance(home_team, dict) else None,
+        "away_team_id": str(away_team.get("id") or "") if isinstance(away_team, dict) else None,
+        "tournament": tournament.get("name") if isinstance(tournament, dict) else str(tournament),
+        "score": {
+            "home": home_score.get("current") if isinstance(home_score, dict) else None,
+            "away": away_score.get("current") if isinstance(away_score, dict) else None,
+        },
+        "period": (status.get("description") or status.get("type") or "FT") if isinstance(status, dict) else "FT",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "sofascore_detail": event,
+        "data_sources": {},
+        "raw_sporty": {},
+        "sportybet_markets": [],
+    }
+
+
+def _manual_finished_archive_doc(
+    source: str,
+    match: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build an archive document from a manually supplied finished match."""
+    match_id = str(match.get("match_id") or match.get("id") or match.get("sportybet_id") or "")
+    if not match_id:
+        return None
+    score = match.get("score") or {}
+    return {
+        "_id": match_id,
+        "match_id": match_id,
+        "match_date": match.get("match_date") or "",
+        "name": match.get("name") or match.get("sportybet_name") or "",
+        "home_team": match.get("home_team") or "",
+        "away_team": match.get("away_team") or "",
+        "tournament": match.get("tournament") or "",
+        "score": score,
+        "period": match.get("period") or "FT",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "sofascore_detail": match.get("sofascore_detail") or {},
+        "data_sources": match.get("data_sources") or {},
+        "raw_sporty": match.get("raw_sporty") or {},
+        "sportybet_markets": match.get("sportybet_markets") or match.get("markets") or [],
+    }
 

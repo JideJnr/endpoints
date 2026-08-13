@@ -55,10 +55,14 @@ class TestResearchFilterBasics(unittest.TestCase):
 class TestEvaluatePickBlock(unittest.TestCase):
     """Tests for hard-block checks in evaluate_pick()."""
 
-    def test_match_result_blocked(self):
+    def test_match_result_allowed_above_learned_threshold(self):
         result = evaluate_pick({"type": "match_result", "confidence": 80})
+        self.assertFalse(result["blocked"])
+
+    def test_match_result_below_learned_threshold_blocked(self):
+        result = evaluate_pick({"type": "match_result", "confidence": 45})
         self.assertTrue(result["blocked"])
-        self.assertEqual(result["reason"], "research_block:match_result_61pct_loss")
+        self.assertIn("match_result_below_learned", result["reason"])
 
     def test_confidence_below_learned_threshold_blocked(self):
         """Confidence below learned threshold (default 50) should be blocked."""
@@ -257,8 +261,11 @@ class TestEvaluatePickCaution(unittest.TestCase):
 class TestResearchFilterCandidate(unittest.TestCase):
     """Tests for _research_filter_candidate()."""
 
-    def test_match_result_excluded(self):
-        self.assertFalse(_research_filter_candidate({"type": "match_result", "confidence": 80}))
+    def test_match_result_included_above_learned_threshold(self):
+        self.assertTrue(_research_filter_candidate({"type": "match_result", "confidence": 80}))
+
+    def test_match_result_excluded_below_learned_threshold(self):
+        self.assertFalse(_research_filter_candidate({"type": "match_result", "confidence": 45}))
 
     def test_low_confidence_excluded(self):
         """Confidence below learned threshold (default 50) should be excluded."""

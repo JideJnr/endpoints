@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from app.storage.db import DB_PATH, _conn
@@ -26,6 +27,7 @@ from app.storage.league_memory._helpers import build_pick, build_sporty_doc
 
 # ── Imports from extracted sub-modules ───────────────────────────────────────
 from app.enrichment.signal_aggregator import (  # noqa: F401
+    calculate_win_probabilities as _calculate_signal_probabilities,
     global_signal_stats as _global_signal_stats,
     prefetch_signal_stats as _prefetch_signal_stats,
     reset_signal_stats_cache as _reset_signal_stats_batch_cache,
@@ -36,6 +38,7 @@ from app.enrichment.confidence_calibrator import (  # noqa: F401
     cap_market_confidence as _cap_market_confidence,
 )
 from app.utils.primitives import _to_float, _to_int
+from app.storage.buffer import _is_not_started_period
 from app.utils.match_helpers import _team_name, _played_seconds
 
 
@@ -109,6 +112,53 @@ def _apply_feature_importance(signals: list[dict[str, Any]], league: str = "") -
     return signals
 
 
+def _aggregator_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert internal signal shape into SignalAggregator input shape."""
+    converted: list[dict[str, Any]] = []
+    for signal in signals or []:
+        name = str(signal.get("name") or signal.get("signal_name") or "")
+        if not name or name == "signal_aggregator":
+            continue
+        value = signal.get("impact")
+        if value is None:
+            value = signal.get("value") or signal.get("signal_value") or 0
+        converted.append({
+            "name": name,
+            "value": value,
+            "source": signal.get("source") or "enriched_prediction",
+        })
+    return converted
+
+
+def _signal_aggregator_overall_impact(context: dict[str, Any]) -> int:
+    if not context:
+        return 0
+    confidence = float(context.get("confidence") or 0)
+    home = float(context.get("home_prob") or 0)
+    away = float(context.get("away_prob") or 0)
+    draw = float(context.get("draw_prob") or 0)
+    spread = max(home, away, draw) - min(home, away, draw)
+    return max(-4, min(4, round(spread * confidence * 10)))
+
+
+def _signal_aggregator_pick_adjustment(pick: dict[str, Any], context: dict[str, Any]) -> int:
+    if not context:
+        return 0
+    selection = str(pick.get("selection") or "").lower()
+    probability = None
+    if "home" in selection and "away" not in selection:
+        probability = context.get("home_prob")
+    elif "away" in selection:
+        probability = context.get("away_prob")
+    elif "draw" in selection:
+        probability = context.get("draw_prob")
+    if probability is None:
+        return 0
+    confidence = float(context.get("confidence") or 0)
+    edge = float(probability or 0) - 0.45
+    return max(-4, min(4, round(edge * confidence * 20)))
+
+
 NOISY_SUPPORT_SIGNALS = {
     "goal_pressure",
     "dixon_coles_model",
@@ -133,20 +183,6 @@ BACKGROUND_CONTEXT_SIGNALS = {
 }
 
 RISK_SIGNALS = {"risk_management", "red_card_state"}
-
-
-def _is_not_started_period(period: Any) -> bool:
-    if not period:
-        return True
-    return str(period).lower().strip().replace("_", " ") in {
-        "",
-        "not start",
-        "not started",
-        "notstart",
-        "notstarted",
-        "scheduled",
-        "ns",
-    }
 
 
 def _is_live_period(period: Any) -> bool:
@@ -198,6 +234,44 @@ def _readiness_score(missing: list[str]) -> int:
     total_required = 8
     present = max(0, total_required - len(set(missing)))
     return round(100 * present / total_required)
+
+
+
+def _provider_state(doc: dict[str, Any]) -> str:
+    source = str(doc.get("data_source") or "").strip().lower()
+    if source in {"sportybet", "sofascore", "both"}:
+        return source
+    sources = doc.get("data_sources") or {}
+    sporty = sources.get("sportybet") if isinstance(sources, dict) else {}
+    sofa = sources.get("sofascore") if isinstance(sources, dict) else {}
+    sporty_available = bool((sporty or {}).get("available") or doc.get("sportybet_detail") or doc.get("raw_sporty"))
+    sofa_available = bool((sofa or {}).get("available") or doc.get("sofascore_detail") or doc.get("sofascore_id"))
+    if sporty_available and sofa_available:
+        return "both"
+    if sofa_available:
+        return "sofascore"
+    return "sportybet" if sporty_available else "both"
+
+
+def _live_data_sources(doc: dict[str, Any], detail: dict[str, Any] | None = None) -> list[str]:
+    sources: list[str] = []
+    sporty_live = doc.get("live_data_sportybet") or {}
+    sofa_live = doc.get("live_data_sofascore") or {}
+    detail = detail or doc.get("sofascore_detail") or {}
+    from app.utils.match_helpers import _played_seconds as _ps
+    if sporty_live or (doc.get("sportybet_markets") and _ps(doc.get("played_seconds")) >= 300):
+        sources.append("sportybet")
+    if sofa_live or detail.get("statistics") or detail.get("match_statistics"):
+        sources.append("sofascore")
+    return sources
+
+
+def _live_stats_source(doc: dict[str, Any], live_sources: list[str]) -> str:
+    if "sofascore" in live_sources:
+        return "sofascore_api"
+    if "sportybet" in live_sources:
+        return "sportybet_api"
+    return "prematch_fallback" if doc.get("sofascore_id") else "none"
 
 
 def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
@@ -253,7 +327,8 @@ def prediction_readiness(doc: dict[str, Any]) -> dict[str, Any]:
 def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     """Run every available model against the richest document we have for a match."""
     _reset_signal_stats_batch_cache()  # reset per-prediction batch cache
-    readiness = prediction_readiness(doc)
+    readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
+    doc["prediction_readiness"] = readiness
     if not readiness["ready"]:
         raise ValueError(f"Prediction deferred until full signal is ready: {', '.join(readiness['missing'])}")
     detail = doc.get("sofascore_detail") or {}
@@ -284,19 +359,28 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         rules.setdefault("signals", []).append(venue_signal)
     poisson = dixon = elo = None
     if home_id and away_id:
-        try:
-            poisson = run_poisson(int(home_id), int(away_id))
-        except Exception as exc:
-            poisson = {"error": str(exc)}
-        try:
-            dixon = run_dixon_coles(int(home_id), int(away_id))
-        except Exception as exc:
-            dixon = {"error": str(exc)}
-        try:
-            elo = elo_prediction(str(home_id), str(away_id))
-            elo = _contextual_elo_prediction(doc, elo)
-        except Exception as exc:
-            elo = {"error": str(exc)}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {
+                "poisson": pool.submit(run_poisson, int(home_id), int(away_id), doc=doc),
+                "dixon": pool.submit(run_dixon_coles, int(home_id), int(away_id), doc=doc),
+                "elo": pool.submit(elo_prediction, str(home_id), str(away_id), doc=doc),
+            }
+            for model_name, future in futures.items():
+                try:
+                    result = future.result()
+                    if model_name == "poisson":
+                        poisson = result
+                    elif model_name == "dixon":
+                        dixon = result
+                    else:
+                        elo = _contextual_elo_prediction(doc, result)
+                except Exception as exc:
+                    if model_name == "poisson":
+                        poisson = {"error": str(exc)}
+                    elif model_name == "dixon":
+                        dixon = {"error": str(exc)}
+                    else:
+                        elo = {"error": str(exc)}
 
     best_pick = (rules.get("picks") or [{}])[0]
     ensemble = ensemble_prediction(
@@ -459,21 +543,11 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         tw_signal = None
         has_tw_pick = False
 
-    # ── Team Watch signal (opponent tier, goal timing, signal combo history) ──
+    # Team Watch signal (opponent tier, goal timing, signal combo history)
     try:
         from app.team_watcher.team_watcher import team_watch_signal as _tw_watch_signal
         tw_watch = _tw_watch_signal(doc)
         if tw_watch and (tw_watch.get("value") or {}).get("available"):
-            signals.append(tw_watch)
-    except Exception as exc:
-        from app.utils.health_counters import record_health_event
-        record_health_event("enriched_prediction", "team_watch_signal_error", exc)
-
-    # ── Team Watch signal (opponent tier, goal timing, signal combo history) ──
-    try:
-        from app.team_watcher.team_watcher import team_watch_signal as _tw_watch_signal
-        tw_watch = _tw_watch_signal(doc)
-        if tw_watch and tw_watch.get("value", {}).get("available"):
             signals.append(tw_watch)
     except Exception as exc:
         from app.utils.health_counters import record_health_event
@@ -592,7 +666,10 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             if outcome_key in sel_lower:
                 ensemble_p = op
                 break
-        floor_applied = ensemble_p >= _DOMINANT_OUTCOME_THRESHOLD and raw < _CONFIDENCE_FLOOR
+        # Only apply floor when pick has not yet been through calibration
+        # (calibration may intentionally reduce confidence for poor bands)
+        already_calibrated = isinstance(pick.get("calibration"), dict) and pick["calibration"].get("calibrated")
+        floor_applied = ensemble_p >= _DOMINANT_OUTCOME_THRESHOLD and raw < _CONFIDENCE_FLOOR and not already_calibrated
         if floor_applied:
             pick["confidence"] = _CONFIDENCE_FLOOR
         pick["confidence_floor_applied"] = floor_applied
@@ -608,6 +685,24 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         from app.utils.health_counters import record_health_event
         record_health_event("feature_importance_error", str(exc))
 
+    signal_aggregator_context: dict[str, Any] = {}
+    try:
+        _agg_league = doc.get("tournament") or doc.get("category") or "__global__"
+        if isinstance(_agg_league, dict):
+            _agg_league = _agg_league.get("name") or "__global__"
+        signal_aggregator_context = _calculate_signal_probabilities(
+            _aggregator_signals(signals),
+            league_key=str(_agg_league or "__global__"),
+        )
+        signals.append({
+            "name": "signal_aggregator",
+            "value": signal_aggregator_context,
+            "impact": _signal_aggregator_overall_impact(signal_aggregator_context),
+        })
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("enriched_prediction", "signal_aggregator_failed", exc)
+
     # ── Calibration: adjust confidence based on historical win rates ──────────
     try:
         from app.enrichment.confidence_calibrator import calibrate_confidence, stake_multiplier
@@ -622,6 +717,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             memory = weighted_prediction_memory(doc, pick.get("type"), pick.get("selection"))
             memory_adj = int(memory.get("confidence_adjustment") or 0)
             pick_learned_adj = _learned_signal_adjustment_for_pick(doc, signals, pick.get("type"))
+            aggregator_adj = _signal_aggregator_pick_adjustment(pick, signal_aggregator_context)
             combo_memory = {}
             combo_adj = 0
             try:
@@ -638,7 +734,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 combo_memory = {}
             # Apply pattern and market movement adjustment on top.
-            cal_conf = min(99, max(1, cal["adjusted_confidence"] + pattern_adj + market_adj + memory_adj + database_adj + grade_adj + pick_learned_adj + combo_adj))
+            _raw_adj = pattern_adj + market_adj + memory_adj + database_adj + grade_adj + pick_learned_adj + combo_adj + aggregator_adj
+            _raw_adj = max(-15, min(15, _raw_adj))  # cumulative cap prevents additive drift
+            cal_conf = min(99, max(1, cal["adjusted_confidence"] + _raw_adj))
             # Apply regime tier penalty (Tier 4 gets -5)
             tier_penalty = {1: 0, 2: 0, 3: 0, 4: -5}.get(regime.tier, 0)
             cal_conf = min(99, max(1, cal_conf + tier_penalty))
@@ -705,6 +803,8 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "regime_stake_cap":  regime.stake_cap,
                 "memory_weighting":   memory,
                 "learned_signal_adjustment": pick_learned_adj,
+                "signal_aggregator": signal_aggregator_context,
+                "signal_aggregator_adjustment": aggregator_adj,
                 "learned_signal_combination": combo_memory,
                 "learned_signal_combination_adjustment": combo_adj,
                 "confidence_floor_applied": bool(pick.get("confidence_floor_applied")),
@@ -4259,6 +4359,40 @@ def _finished_memory_adjustment(ensemble: dict[str, Any], memory: dict[str, Any]
 
 
 # based entry point for callers that prefer object-oriented composition.
+
+
+def _regime_info(doc: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from app.market.regime import get_regime_for_doc
+        r = get_regime_for_doc(doc)
+        return {
+            "tier":           r.tier,
+            "name":           r.name,
+            "min_confidence": r.min_confidence,
+            "edge_threshold": r.edge_threshold,
+            "stake_cap":      r.stake_cap,
+            "description":    r.description,
+        }
+    except Exception:
+        return {}
+
+
+def _detail_country(detail: dict[str, Any]) -> str | None:
+    tournament = detail.get("tournament") or {}
+    if isinstance(tournament, dict):
+        category = tournament.get("category") or {}
+        if isinstance(category, dict) and category.get("name"):
+            return str(category.get("name"))
+    return None
+
+
+def _probability_unit(value: Any) -> float | None:
+    number = _to_float(value)
+    if number is None:
+        return None
+    probability = number / 100 if number > 1 else number
+    return max(0.0, min(1.0, probability))
+
 
 class EnrichedPrediction:
     """Orchestration entry point for the enriched prediction pipeline.

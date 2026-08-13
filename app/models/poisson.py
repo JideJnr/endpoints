@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 from app.storage.db import db_conn
@@ -11,11 +12,13 @@ from app.utils.primitives import _to_int
 
 MAX_GOALS = 7
 HOME_ADVANTAGE = 1.0
+_TEAM_STATS_CACHE_TTL = 300
+_TEAM_STATS_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 
 
-def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[str, Any]:
-    home_stats = _team_stats(home_team_id, last_n)
-    away_stats = _team_stats(away_team_id, last_n)
+def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10, doc: dict[str, Any] | None = None) -> dict[str, Any]:
+    home_stats = _team_stats(home_team_id, last_n, doc=doc, side="home")
+    away_stats = _team_stats(away_team_id, last_n, doc=doc, side="away")
 
     home_advantage = _learned_home_advantage_multiplier()
     home_lambda = home_stats["scored"] * home_advantage * (away_stats["conceded"] / 1.3)
@@ -61,6 +64,7 @@ def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[
         "home_lambda": round(home_lambda, 3),
         "away_lambda": round(away_lambda, 3),
         "home_advantage_multiplier": home_advantage,
+        "context_source": _context_source(home_stats, away_stats),
         "home_stats": home_stats,
         "away_stats": away_stats,
         "probabilities": probabilities,
@@ -72,8 +76,24 @@ def run_poisson(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[
     }
 
 
-def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
+def _team_stats(
+    team_id: int,
+    last_n: int,
+    *,
+    doc: dict[str, Any] | None = None,
+    side: str | None = None,
+) -> dict[str, Any]:
     """Build scoring/conceding averages from SofaScore history + MongoDB finished matches."""
+    cache_key = _team_stats_cache_key(team_id, last_n, doc=doc, side=side)
+    cached = _get_cached_team_stats(cache_key)
+    if cached:
+        return dict(cached)
+
+    doc_stats = _team_stats_from_doc(team_id, last_n, doc=doc, side=side)
+    if doc_stats:
+        _set_cached_team_stats(cache_key, doc_stats)
+        return doc_stats
+
     # 1. SofaScore API history (live/recent)
     try:
         events = fetch_team_history(team_id).get("events", [])
@@ -103,7 +123,9 @@ def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
     all_finished = all_finished[:last_n]
 
     if not all_finished:
-        return {"scored": 1.4, "conceded": 1.2, "matches": 0}
+        result = {"scored": 1.4, "conceded": 1.2, "matches": 0, "source": "model_fetch"}
+        _set_cached_team_stats(cache_key, result)
+        return result
 
     scored = conceded = 0
     for event in all_finished:
@@ -114,7 +136,120 @@ def _team_stats(team_id: int, last_n: int) -> dict[str, Any]:
         conceded += _to_int(score.get("away" if is_home else "home"), 0)
 
     count = len(all_finished)
+    result = {"scored": round(scored / count, 3), "conceded": round(conceded / count, 3), "matches": count, "source": "model_fetch"}
+    _set_cached_team_stats(cache_key, result)
+    return result
+
+
+def _team_stats_cache_key(
+    team_id: int,
+    last_n: int,
+    *,
+    doc: dict[str, Any] | None,
+    side: str | None,
+) -> tuple[Any, ...]:
+    if isinstance(doc, dict) and side in {"home", "away"}:
+        return ("doc", str(team_id), int(last_n), side, _doc_history_signature(doc, side))
+    return ("fetch", str(team_id), int(last_n))
+
+
+def _get_cached_team_stats(cache_key: tuple[Any, ...]) -> dict[str, Any] | None:
+    item = _TEAM_STATS_CACHE.get(cache_key)
+    if not item:
+        return None
+    cached_at, value = item
+    if time.time() - cached_at > _TEAM_STATS_CACHE_TTL:
+        _TEAM_STATS_CACHE.pop(cache_key, None)
+        return None
+    return value
+
+
+def _set_cached_team_stats(cache_key: tuple[Any, ...], value: dict[str, Any]) -> None:
+    if len(_TEAM_STATS_CACHE) > 512:
+        _TEAM_STATS_CACHE.clear()
+    _TEAM_STATS_CACHE[cache_key] = (time.time(), dict(value))
+
+
+def _doc_history_signature(doc: dict[str, Any], side: str) -> tuple[Any, ...]:
+    detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else doc
+    events = detail.get(f"{side}_last_matches") or doc.get(f"{side}_last_matches") or []
+    signature = []
+    for event in events[:10] if isinstance(events, list) else []:
+        score = event.get("score") if isinstance(event, dict) else {}
+        signature.append((
+            event.get("id") if isinstance(event, dict) else None,
+            (score or {}).get("home"),
+            (score or {}).get("away"),
+            ((event.get("status") or {}).get("type") if isinstance(event, dict) else None),
+        ))
+    return tuple(signature)
+
+
+def _team_stats_from_doc(
+    team_id: int,
+    last_n: int,
+    *,
+    doc: dict[str, Any] | None,
+    side: str | None,
+) -> dict[str, Any] | None:
+    if not isinstance(doc, dict):
+        return None
+    detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else doc
+    history_key = f"{side}_last_matches" if side in {"home", "away"} else ""
+    events = detail.get(history_key) if history_key else None
+    if not events and side in {"home", "away"}:
+        events = doc.get(history_key)
+    if not isinstance(events, list):
+        return None
+    stats = _stats_from_events(team_id, events, last_n)
+    if not stats:
+        return None
+    stats["source"] = "enriched_doc"
+    stats["has_standings"] = bool(detail.get("standings") or doc.get("standings"))
+    stats["has_markets"] = bool(doc.get("sportybet_markets") or doc.get("markets"))
+    stats["has_web_context"] = bool(doc.get("web_context"))
+    return stats
+
+
+def _stats_from_events(team_id: int, events: list[dict[str, Any]], last_n: int) -> dict[str, Any] | None:
+    finished = [event for event in events if (event.get("status") or {}).get("type") == "finished"][:last_n]
+    if not finished:
+        return None
+    scored = conceded = count = 0
+    for event in finished:
+        score = event.get("score") or {}
+        home_team = event.get("home_team") if isinstance(event.get("home_team"), dict) else event.get("homeTeam") if isinstance(event.get("homeTeam"), dict) else {}
+        away_team = event.get("away_team") if isinstance(event.get("away_team"), dict) else event.get("awayTeam") if isinstance(event.get("awayTeam"), dict) else {}
+        home_id = home_team.get("id")
+        away_id = away_team.get("id")
+        is_home = str(home_id) == str(team_id)
+        is_away = str(away_id) == str(team_id)
+        if not is_home and not is_away:
+            continue
+        home_score = _score_value(score.get("home"))
+        away_score = _score_value(score.get("away"))
+        if home_score is None or away_score is None:
+            continue
+        scored += home_score if is_home else away_score
+        conceded += away_score if is_home else home_score
+        count += 1
+    if not count:
+        return None
     return {"scored": round(scored / count, 3), "conceded": round(conceded / count, 3), "matches": count}
+
+
+def _score_value(value: Any) -> int | None:
+    if isinstance(value, dict):
+        value = value.get("current") if value.get("current") is not None else value.get("display")
+    return _to_int(value, None)
+
+
+def _context_source(home_stats: dict[str, Any], away_stats: dict[str, Any]) -> str:
+    if home_stats.get("source") == "enriched_doc" and away_stats.get("source") == "enriched_doc":
+        return "enriched_doc"
+    if home_stats.get("source") == "enriched_doc" or away_stats.get("source") == "enriched_doc":
+        return "mixed"
+    return "model_fetch"
 
 
 def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:

@@ -417,6 +417,7 @@ def post_betbuilder_book(payload: dict[str, Any] = Body(...)):
             selections,
             stake=stake,
             loading_share_code=payload.get("loadingShareCode"),
+            force_refresh=False,
         )
         return request_share_code(booking_payload)
     except ValueError as exc:
@@ -427,7 +428,7 @@ def post_betbuilder_book(payload: dict[str, Any] = Body(...)):
 
 @router.post("/betbuilder/book-smart")
 def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
-    """Book a slip, automatically dropping unavailable legs and re-asking Maya for replacements."""
+    """Book a slip, automatically dropping unavailable legs."""
     from app.data_clients.sportybet_booking import build_booking_payload, request_share_code
 
     selections: list[dict[str, Any]] = list(payload.get("selections") or [])
@@ -439,13 +440,17 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
     replaced: list[dict[str, Any]] = []
     remaining = list(selections)
 
-    # Try to book; on each unavailable-leg error strip that leg and optionally
-    # ask Maya for a fresh pick on the same match before retrying.
+    # Try to book; on each unavailable-leg error strip that leg before retrying.
     for _attempt in range(len(selections) + 1):
         if not remaining:
             break
         try:
-            booking_payload = build_booking_payload(remaining, stake=stake, loading_share_code=payload.get("loadingShareCode"))
+            booking_payload = build_booking_payload(
+                remaining,
+                stake=stake,
+                loading_share_code=payload.get("loadingShareCode"),
+                force_refresh=False,
+            )
             result = request_share_code(booking_payload)
             return {
                 **result,
@@ -468,28 +473,8 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
             if not bad:
                 raise HTTPException(status_code=400, detail=msg)
 
-            # Try Maya for a fresh pick on this match
-            match_id = str(bad.get("sportybet_id") or bad.get("match_id") or "")
-            from app.data_clients.sportybet_booking import _resolve_sportybet_id
-            match_id = _resolve_sportybet_id(match_id)
-            maya_pick: dict[str, Any] | None = None
-            if match_id:
-                try:
-                    from app.ai.ai_betbuilder import enriched_match_analysis
-                    analysis = enriched_match_analysis(match_id, force_refresh=True)
-                    rec = analysis.get("openrouter_recommendation") or analysis.get("recommendation")
-                    pick_type = (analysis.get("prediction_engine_pick") or {}).get("type") or "match_result"
-                    if rec and analysis.get("status") == "success":
-                        maya_pick = {**bad, "selection": rec, "type": pick_type}
-                except Exception:
-                    pass
-
             remaining = [s for s in remaining if s is not bad]
-            if maya_pick and maya_pick.get("selection") != bad.get("selection"):
-                remaining.append(maya_pick)
-                replaced.append({"original": bad, "replacement": maya_pick, "reason": msg})
-            else:
-                dropped.append({**bad, "reason": msg})
+            dropped.append({**bad, "reason": msg})
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -498,7 +483,12 @@ def post_betbuilder_book_smart(payload: dict[str, Any] = Body(...)):
 
     # Final attempt with whatever survived
     try:
-        booking_payload = build_booking_payload(remaining, stake=stake, loading_share_code=payload.get("loadingShareCode"))
+        booking_payload = build_booking_payload(
+            remaining,
+            stake=stake,
+            loading_share_code=payload.get("loadingShareCode"),
+            force_refresh=False,
+        )
         result = request_share_code(booking_payload)
         return {**result, "dropped": dropped, "replaced": replaced, "final_selections": remaining}
     except ValueError as exc:
@@ -603,7 +593,7 @@ def post_sure_picks_synthesis(payload: dict[str, Any] = Body(...)):
 def post_auto_betbuilder(payload: dict[str, Any] = Body(...)):
     """Build a slip from upcoming prediction-engine candidates.
 
-    Use ``mode='llm'`` for LLM-enriched per-match analysis (slower).
+    Use ``mode='llm'`` for slip-level LLM synthesis over stored predictions.
     Default mode is ``'manual'`` — deterministic, no LLM, fast.
     """
     target_odds = float(payload.get("target_odds") or 1.80)

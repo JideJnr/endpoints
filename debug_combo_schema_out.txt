@@ -1,0 +1,168 @@
+
+--- line 41 ---
+39: )
+40: from .crud import _sofascore_ids_for_predictions, store_local_signal_outcomes, _aggregate_resolved_snapshots, _safe_mark_buffer_finished, _ensure_signal_outcomes_table, _backfill_local_signal_outcomes_from_history
+41: from .schema import _ensure_signal_combination_outcomes_table
+42: 
+43: def get_league_memory(league: str | None = None) -> dict[str, Any]:
+44:     _init_db()
+45:     with _conn(timeout=15) as conn:
+46:         if league:
+47:             key = normalize_league(league)
+48:             row = conn.execute(
+49:                 """
+50:                 select
+51:                     league_key,
+52:                     max(league_name) as league_name,
+53:                     count(*) as samples,
+54:                     sum(case when had_late_goal = 1 then 1 else 0 end) as late_goals,
+55:                     avg(had_late_goal) as late_goal_rate
+56:                 from late_goal_snapshots
+57:                 where league_key = ? and had_late_goal is not null
+58:                 group by league_key
+59:                 """,
+60:                 (key,),
+
+--- line 652 ---
+650:         return 0
+651:     with _conn() as conn:
+652:         _ensure_signal_combination_outcomes_table(conn)
+653:         conn.execute(
+654:             """
+655:             insert into signal_combination_outcomes (
+656:                 combination_key, combination_json, signal_names_json,
+657:                 match_id, match_name, tournament, country, match_date,
+658:                 result, pick_type, selection, confidence, prediction_mode,
+659:                 live_context_json
+660:             )
+661:             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+662:             on conflict(match_id, pick_type, selection, combination_key) do update set
+663:                 combination_json = excluded.combination_json,
+664:                 signal_names_json = excluded.signal_names_json,
+665:                 match_name = excluded.match_name,
+666:                 tournament = excluded.tournament,
+667:                 country = excluded.country,
+668:                 match_date = excluded.match_date,
+669:                 result = excluded.result,
+670:                 confidence = excluded.confidence,
+671:                 prediction_mode = excluded.prediction_mode,
+
+--- line 655 ---
+653:         conn.execute(
+654:             """
+655:             insert into signal_combination_outcomes (
+656:                 combination_key, combination_json, signal_names_json,
+657:                 match_id, match_name, tournament, country, match_date,
+658:                 result, pick_type, selection, confidence, prediction_mode,
+659:                 live_context_json
+660:             )
+661:             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+662:             on conflict(match_id, pick_type, selection, combination_key) do update set
+663:                 combination_json = excluded.combination_json,
+664:                 signal_names_json = excluded.signal_names_json,
+665:                 match_name = excluded.match_name,
+666:                 tournament = excluded.tournament,
+667:                 country = excluded.country,
+668:                 match_date = excluded.match_date,
+669:                 result = excluded.result,
+670:                 confidence = excluded.confidence,
+671:                 prediction_mode = excluded.prediction_mode,
+672:                 live_context_json = excluded.live_context_json,
+673:                 recorded_at = current_timestamp
+674:             """,
+
+--- line 1666 ---
+1664:     country = _country_from_match(match, league)
+1665:     with _conn() as conn:
+1666:         _ensure_signal_combination_outcomes_table(conn)
+1667:         scopes = [
+1668:             ("exact", "combination_key = ? and pick_type = ?", (combo["key"], pick_type), 0.70),
+1669:             ("tournament", "combination_key = ? and pick_type = ? and tournament = ?", (combo["key"], pick_type, league), 0.20),
+1670:             ("country", "combination_key = ? and pick_type = ? and country = ?", (combo["key"], pick_type, country), 0.10),
+1671:         ]
+1672:         rows = [_combination_scope_stats(conn, where, params, label, weight) for label, where, params, weight in scopes]
+1673:     usable = [row for row in rows if row["samples"] > 0]
+1674:     if not usable:
+1675:         return {"samples": 0, "win_rate": None, "adjustment": 0, "combination": combo, "scope": "none"}
+1676:     weighted = 0.0
+1677:     weight_total = 0.0
+1678:     samples = 0
+1679:     for row in usable:
+1680:         sample_factor = min(1.0, row["samples"] / 20)
+1681:         weight = row["weight"] * sample_factor
+1682:         weighted += row["win_rate"] * weight
+1683:         weight_total += weight
+1684:         samples += row["samples"]
+1685:     win_rate = weighted / weight_total if weight_total else None
+
+--- line 1702 ---
+1700:     _init_db()
+1701:     with _conn() as conn:
+1702:         _ensure_signal_combination_outcomes_table(conn)
+1703:         rows = conn.execute(
+1704:             """
+1705:             select combination_key,
+1706:                    max(combination_json) as combination_json,
+1707:                    max(signal_names_json) as signal_names_json,
+1708:                    pick_type,
+1709:                    count(*) as total,
+1710:                    sum(case when result = 'win' then 1 else 0 end) as wins,
+1711:                    sum(case when result = 'loss' then 1 else 0 end) as losses,
+1712:                    avg(confidence) as avg_confidence
+1713:             from signal_combination_outcomes
+1714:             where result in ('win', 'loss')
+1715:             group by combination_key, pick_type
+1716:             having count(*) >= ?
+1717:             order by (1.0 * wins / nullif(total, 0)) desc, total desc
+1718:             limit ?
+1719:             """,
+1720:             (max(1, int(min_samples or 3)), max(1, int(limit or 50))),
+1721:         ).fetchall()
+
+--- line 1713 ---
+1711:                    sum(case when result = 'loss' then 1 else 0 end) as losses,
+1712:                    avg(confidence) as avg_confidence
+1713:             from signal_combination_outcomes
+1714:             where result in ('win', 'loss')
+1715:             group by combination_key, pick_type
+1716:             having count(*) >= ?
+1717:             order by (1.0 * wins / nullif(total, 0)) desc, total desc
+1718:             limit ?
+1719:             """,
+1720:             (max(1, int(min_samples or 3)), max(1, int(limit or 50))),
+1721:         ).fetchall()
+1722:     return {
+1723:         "configured": True,
+1724:         "storage": "device",
+1725:         "min_samples": min_samples,
+1726:         "combinations": [
+1727:             {
+1728:                 "combination_key": row["combination_key"],
+1729:                 "combination": _safe_json(row["combination_json"], {}),
+1730:                 "signals": _safe_json(row["signal_names_json"], []),
+1731:                 "pick_type": row["pick_type"],
+1732:                 "total": row["total"],
+
+--- line 1755 ---
+1753:                sum(case when result = 'win' then 1 else 0 end) as wins,
+1754:                sum(case when result = 'loss' then 1 else 0 end) as losses
+1755:         from signal_combination_outcomes
+1756:         where result in ('win', 'loss') and {where}
+1757:         """,
+1758:         params,
+1759:     ).fetchone()
+1760:     samples = int(row["samples"] or 0) if row else 0
+1761:     wins = int(row["wins"] or 0) if row else 0
+1762:     losses = int(row["losses"] or 0) if row else 0
+1763:     return {
+1764:         "scope": label,
+1765:         "samples": samples,
+1766:         "wins": wins,
+1767:         "losses": losses,
+1768:         "win_rate": wins / samples if samples else 0.0,
+1769:         "weight": weight,
+1770:     }
+1771: 
+1772: 
+1773: def betbuilder_pick_memory(
+1774:     pick_type: str | None,

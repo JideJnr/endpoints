@@ -54,18 +54,17 @@ def _safe_odds_profile() -> dict[str, float]:
     }
 
 
-# ── Property 1: match_result total block ──────────────────
+# ── Property 1: match_result learned threshold ──────────────────
 
 @given(pick=st.fixed_dictionaries({
     "type": st.just("match_result"),
     "confidence": st.integers(min_value=0, max_value=100),
 }))
 @settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
-def test_property_1_match_result_blocked(pick):
-    # Feature: research-driven-predictor-improvements, Property 1: match_result total block
+def test_property_1_match_result_uses_learned_threshold(pick):
+    # Feature: research-driven-predictor-improvements, Property 1: match_result learned threshold
     result = evaluate_pick(pick)
-    assert result["blocked"] is True
-    assert result["reason"].startswith("research_block:match_result")
+    assert result["blocked"] is (pick["confidence"] < 50)
 
 
 # ── Property 2: low confidence block ──────────────────────

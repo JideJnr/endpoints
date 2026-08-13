@@ -253,6 +253,18 @@ def _best_pick_from_doc(doc: dict[str, Any]) -> dict[str, Any] | None:
 # Geometry / text helpers (used by similarity_gate)
 # ---------------------------------------------------------------------------
 
+
+def _total_goals(score: str | None) -> float | None:
+    """Parse a score string like '2-1' and return total goals."""
+    if not score or '-' not in str(score):
+        return None
+    parts = str(score).split('-', 1)
+    try:
+        return float(parts[0]) + float(parts[1])
+    except (ValueError, TypeError):
+        return None
+
+
 def _odds_dimension(
     target_implied: tuple[float, float, float], odds: Any
 ) -> bool:

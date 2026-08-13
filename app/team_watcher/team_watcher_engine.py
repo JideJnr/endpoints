@@ -36,6 +36,55 @@ logger = logging.getLogger(__name__)
 # Schema initialisation
 # ---------------------------------------------------------------------------
 
+
+def _compute_profile_stats(rows: list) -> dict:
+    """Compute win/draw/loss/goal stats from a list of match rows."""
+    wins = draws = losses = 0
+    goals_for = goals_against = 0
+    for row in rows or []:
+        try:
+            own = int(row['own_goals'] or 0)
+            opp = int(row['opp_goals'] or 0)
+        except Exception:
+            continue
+        goals_for += own
+        goals_against += opp
+        if own > opp:
+            wins += 1
+        elif own == opp:
+            draws += 1
+        else:
+            losses += 1
+    sample = wins + draws + losses
+    return {
+        'sample_size': sample,
+        'wins': wins,
+        'draws': draws,
+        'losses': losses,
+        'win_rate': round(wins / sample, 3) if sample else 0.0,
+        'draw_rate': round(draws / sample, 3) if sample else 0.0,
+        'loss_rate': round(losses / sample, 3) if sample else 0.0,
+        'avg_goals_for': round(goals_for / sample, 2) if sample else 0.0,
+        'avg_goals_against': round(goals_against / sample, 2) if sample else 0.0,
+        'avg_goals_total': round((goals_for + goals_against) / sample, 2) if sample else 0.0,
+    }
+
+
+def _note_for_result(result: str | None, own_goals: int, opp_goals: int, side: str, profile: dict) -> str | None:
+    """Generate a short human-readable note for a match result."""
+    if not result:
+        return None
+    score = f'{own_goals}-{opp_goals}'
+    side_label = str(side or 'team').capitalize()
+    if result == 'win':
+        return f'{side_label} won {score}'
+    if result == 'loss':
+        return f'{side_label} lost {score}'
+    if result == 'draw':
+        return f'Draw {score}'
+    return None
+
+
 def init_tw_tables(conn: sqlite3.Connection) -> None:
     """
     Safe idempotent schema creation.
@@ -292,6 +341,11 @@ def _rules_model(
         return {"pick_type": "no_bet", "reason": "insufficient_sample",
                 "sample_size": {"home": home_sample, "away": away_sample}}
 
+    # Asymmetry penalty: when one side has thin data, reduce credibility
+    # for match_result picks (goals/BTTS depend on combined tendencies so
+    # they are less affected by one-sided thin history).
+    _asymmetry_penalty = abs(home_sample - away_sample) > 5 and (home_sample < 3 or away_sample < 3)
+
     # â”€â”€ League strength context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     raw_sporty = match_doc.get("raw_sporty") if isinstance(match_doc.get("raw_sporty"), dict) else match_doc
     tournament = match_doc.get("tournament") or raw_sporty.get("tournament") or ""
@@ -489,7 +543,10 @@ def _rules_model(
 
     # Draw detection: scores are close AND both draw_rates are elevated
     avg_draw_rate = (home_stats["draw_rate"] + away_stats["draw_rate"]) / 2
-    draw_score = avg_draw_rate * 0.6 + (1.0 - abs(result_gap) * 4) * 0.4
+    # Clamp gap contribution to [0, 1] so draw_score never goes negative
+    # for moderately mismatched teams (result_gap > 0.25)
+    _gap_factor = max(0.0, 1.0 - abs(result_gap) * 4)
+    draw_score = avg_draw_rate * 0.6 + _gap_factor * 0.4
     draw_score = max(0.0, draw_score)
 
     # Goals markets: average of both sides' tendencies
@@ -505,7 +562,8 @@ def _rules_model(
     candidates: list[tuple[str, str, float]] = []  # (pick_type, selection, score)
 
     # Match result â€” need a meaningful gap
-    if abs(result_gap) >= 0.06 and min_cred >= 0.25:
+    # Skip match_result when data is asymmetric (one side < 3 samples)
+    if abs(result_gap) >= 0.06 and min_cred >= 0.25 and not _asymmetry_penalty:
         if result_gap > 0:
             candidates.append(("match_result", "home_win", home_result_score))
         else:

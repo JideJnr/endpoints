@@ -1,0 +1,7 @@
+OK: app\ai\ai_betbuilder.py
+OK: app\competition\competition_special.py
+OK: app\monitoring\system_supervisor.py
+OK: app\routers\agent.py
+OK: app\storage\mongo_store.py
+OK: app\team_watcher\team_watcher_engine.py
+OK: app\utils\portfolio.py

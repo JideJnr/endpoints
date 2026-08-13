@@ -1,0 +1,10 @@
+ANCHOR NOT FOUND in app\ai\ai_betbuilder.py: 'class AIBetBuilder'
+ANCHOR NOT FOUND in app\competition\competition_special.py: 'def history_league_strength('
+OK: app\monitoring\prediction_monitor.py
+ANCHOR NOT FOUND in app\monitoring\system_supervisor.py: 'def supervise_jobs('
+ANCHOR NOT FOUND in app\routers\agent.py: 'def _estimate_odds('
+OK: app\storage\db.py
+ANCHOR NOT FOUND in app\storage\mongo_store.py: 'class MongoStore'
+ANCHOR NOT FOUND in app\team_watcher\team_watcher_engine.py: 'def rebuild_team_profile('
+ANCHOR NOT FOUND in app\utils\portfolio.py: 'def _pick_dimension('
+OK: app\team_watcher\team_watcher.py

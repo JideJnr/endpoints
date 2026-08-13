@@ -110,6 +110,7 @@ def apply_prediction_state(
     try:
         resolved_match_id = str(match_id or doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
+        doc["prediction_readiness"] = readiness
         prediction_mode = _prediction_mode_from_readiness(readiness)
         if resolved_match_id and not allow_repeat:
             cooldown_minutes = 3 if prediction_mode == "live" else 180
@@ -170,6 +171,7 @@ def apply_prediction_state(
         }
     except Exception as exc:
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
+        doc["prediction_readiness"] = readiness
         message = f"Prediction failed: {exc}"
         doc["prediction"] = None
         doc["prediction_error"] = message

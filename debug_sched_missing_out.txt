@@ -1,0 +1,28 @@
+
+--- with _conn( line 813 ---
+    811:     from app.storage.buffer import _init_buffer_table
+    812: 
+>>> 813:     with _conn() as conn:
+    814:         _init_buffer_table(conn)
+    815:         rows = conn.execute(
+
+--- _parse_datetime( line 1942 ---
+    1940:     if pending <= 0:
+    1941:         return False
+>>> 1942:     last_enriched = _parse_datetime(stats.get("last_enriched_at"))
+    1943:     if last_enriched is None:
+    1944:         return True
+
+--- _parse_datetime( line 1981 ---
+    1979:     if not row:
+    1980:         return None
+>>> 1981:     when = _parse_datetime(row[0] or row[1])
+    1982:     if not when:
+    1983:         return None
+
+--- _parse_datetime( line 2008 ---
+    2006:     if not row:
+    2007:         return None
+>>> 2008:     when = _parse_datetime(row[0])
+    2009:     if not when:
+    2010:         return None

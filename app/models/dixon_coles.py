@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.models.poisson import _apply_bias_corrections, _learned_home_advantage_multiplier, _poisson_prob, _team_stats
+from app.models.poisson import _context_source
 
 
 MAX_GOALS = 7
@@ -23,9 +24,9 @@ def _tau(home_goals: int, away_goals: int, mu: float, lam: float, rho: float) ->
     return 1.0
 
 
-def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> dict[str, Any]:
-    home_stats = _team_stats(home_team_id, last_n)
-    away_stats = _team_stats(away_team_id, last_n)
+def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10, doc: dict[str, Any] | None = None) -> dict[str, Any]:
+    home_stats = _team_stats(home_team_id, last_n, doc=doc, side="home")
+    away_stats = _team_stats(away_team_id, last_n, doc=doc, side="away")
 
     home_advantage = _learned_home_advantage_multiplier()
     mu = home_stats["scored"] * home_advantage * (away_stats["conceded"] / 1.3)
@@ -70,6 +71,7 @@ def run_dixon_coles(home_team_id: int, away_team_id: int, last_n: int = 10) -> d
         "home_lambda": round(mu, 3),
         "away_lambda": round(lam, 3),
         "home_advantage_multiplier": home_advantage,
+        "context_source": _context_source(home_stats, away_stats),
         "home_stats": home_stats,
         "away_stats": away_stats,
         "probabilities": {

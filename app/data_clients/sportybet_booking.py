@@ -39,6 +39,7 @@ def build_booking_payload(
     *,
     stake: int,
     loading_share_code: str | None = None,
+    force_refresh: bool = True,
 ) -> dict[str, Any]:
     """Resolve builder selections against current SportyBet market data."""
     if not selections:
@@ -46,7 +47,7 @@ def build_booking_payload(
     if stake <= 0:
         raise ValueError("stake must be a positive integer in the provider's smallest unit")
 
-    legs = [_resolve_leg(selection, stake) for selection in selections]
+    legs = [_resolve_leg(selection, stake, force_refresh=force_refresh) for selection in selections]
     return {
         "selections": legs,
         "loadingShareCode": loading_share_code,
@@ -84,12 +85,13 @@ def request_share_code(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "share_code_created", "share_code": code, "booking_payload": payload}
 
 
-def _resolve_leg(selection: dict[str, Any], stake: int) -> dict[str, Any]:
+def _resolve_leg(selection: dict[str, Any], stake: int, *, force_refresh: bool = True) -> dict[str, Any]:
     raw_id = str(selection.get("sportybet_id") or selection.get("eventId") or selection.get("match_id") or "")
     if not raw_id or raw_id.startswith("sofa:") or raw_id.startswith("competition:"):
         raise ValueError(f"Match {raw_id!r} has no SportyBet event ID — cannot book")
     event_id = _resolve_sportybet_id(raw_id)
-    refresh_sporty_match_state(event_id)
+    if force_refresh:
+        refresh_sporty_match_state(event_id)
     doc = get_buffered_match(event_id) or {}
     markets = doc.get("sportybet_markets") or doc.get("markets") or []
     if not markets:

@@ -15,8 +15,28 @@ from app.storage.mongo_store import cleanup_buffer
 
 
 from app.utils.primitives import _loads
+from app.monitoring.prediction_monitor import _safe_call
 
 SNAPSHOT_KEEP_ROWS = 1000
+
+
+
+def _age_seconds(timestamp) -> float:
+    """Return seconds elapsed since *timestamp* (ISO string or unix epoch)."""
+    if not timestamp:
+        return 0.0
+    from datetime import datetime, timezone
+    try:
+        if isinstance(timestamp, (int, float)):
+            ts = float(timestamp)
+            if ts > 1e10:
+                ts /= 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00')).astimezone(timezone.utc)
+        return max(0.0, (datetime.now(tz=timezone.utc) - dt).total_seconds())
+    except Exception:
+        return 0.0
 
 
 def run_system_supervisor(*, auto_correct: bool = True, deep_audit: bool = False) -> dict[str, Any]:
@@ -193,14 +213,6 @@ def _supervisor_audit(*, deep: bool = False) -> dict[str, Any]:
         },
         "samples": {"stuck_jobs": stuck_jobs[:20], "stale_core_jobs": stale_core_jobs[:20]},
     }
-
-
-def _safe_call(name: str, fn, errors: list[str]) -> Any:
-    try:
-        return fn()
-    except Exception as exc:
-        errors.append(f"{name}: {exc}")
-        return {}
 
 
 def _persist_supervisor_snapshot(result: dict[str, Any]) -> None:

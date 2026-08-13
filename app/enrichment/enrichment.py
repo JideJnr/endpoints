@@ -20,6 +20,8 @@ from app.data_clients.sportradar_client import fetch_match_intelligence
 from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post
 from app.utils.time_context import match_time_context
 from app.enrichment.web_context import search_league_sentiment, search_match_context
+from app.storage.buffer import _data_sources
+from app.config.config import _hf_token
 
 
 FUZZY_THRESHOLD = 0.75
@@ -140,19 +142,18 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     # Web search is optional and slow — skip it for unmatched matches entirely
     web_contexts: dict[int, dict] = {}
 
+    # Only run web search for matched matches (has sofa detail = worth enriching)
+    needs_web = [(i, sporty) for i, (sporty, _, _) in enumerate(matched_pairs)]
+
     def _fetch_web(idx: int, sporty: dict) -> tuple[int, dict]:
         try:
-            ctx = search_match_context(
+            return idx, search_match_context(
                 sporty.get("home_team") or "",
                 sporty.get("away_team") or "",
                 sporty.get("tournament") or "",
             )
-            return idx, ctx
         except Exception:
             return idx, {"query": "", "snippets": [], "scraped": []}
-
-    # Only run web search for matched matches (has sofa detail = worth enriching)
-    needs_web = [(i, sporty) for i, (sporty, _, _) in enumerate(matched_pairs)]
 
     with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
         futures = {pool.submit(_fetch_web, i, sporty): i for i, sporty in needs_web}
@@ -266,13 +267,6 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
 
 # ── HuggingFace LLM fallback matching ────────────────────────────────────────
 
-def _hf_token() -> str | None:
-    return (
-        os.getenv("HF_TOKEN")
-        or os.getenv("HUGGINGFACE_HUB_TOKEN")
-        or os.getenv("HUGGING_FACE_HUB_TOKEN")
-    )
-
 
 def _sporty_detail_doc(sporty: dict[str, Any] | None) -> dict[str, Any]:
     if not sporty:
@@ -297,37 +291,6 @@ def _sporty_detail_doc(sporty: dict[str, Any] | None) -> dict[str, Any]:
         "market_count": len(markets),
         "raw_event": sporty.get("raw_event"),
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _data_sources(
-    sofa: dict[str, Any] | None,
-    detail: dict[str, Any] | None,
-    sporty: dict[str, Any] | None,
-    sportradar: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    markets = (sporty or {}).get("markets") or []
-    return {
-        "sportybet": {
-            "available": bool(sporty),
-            "detail": bool(sporty),
-            "fresh": True,
-            "markets": bool(markets),
-            "market_count": len(markets),
-        },
-        "sofascore": {
-            "available": bool(sofa or detail),
-            "matched": bool(sofa),
-            "detail": bool(detail),
-            "statistics": bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics")),
-            "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
-        },
-        "sportradar": {
-            "available": bool((sportradar or {}).get("available")),
-            "detail": bool((sportradar or {}).get("match")),
-            "standings": bool((sportradar or {}).get("standings")),
-            "error": (sportradar or {}).get("error") or (sportradar or {}).get("standings_error"),
-        },
     }
 
 

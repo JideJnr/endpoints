@@ -6,6 +6,8 @@ from typing import Any
 from app.market.market_intent import classify_market_intent, grade_market_intent
 from app.utils.match_state import classify_match_state
 from app.utils.time_context import match_time_context
+from app.storage.buffer import _extract_1x2
+from app.enrichment.contextual_intelligence import _impact
 
 
 AUDIT_VERSION = "prediction_audit_v1"
@@ -167,24 +169,6 @@ def _odds_snapshot(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[str,
     }
 
 
-def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    for market in markets:
-        name = str(market.get("name") or "").lower()
-        if str(market.get("id") or "") == "1" or "1x2" in name or "match result" in name:
-            out: dict[str, Any] = {}
-            for selection in market.get("selections") or []:
-                label = str(selection.get("name") or selection.get("desc") or "").lower()
-                odds = selection.get("odds")
-                if label in {"home", "1"}:
-                    out["home"] = odds
-                elif label in {"draw", "x"}:
-                    out["draw"] = odds
-                elif label in {"away", "2"}:
-                    out["away"] = odds
-            return out
-    return {}
-
-
 def _signal_summary(signal: dict[str, Any]) -> dict[str, Any]:
     value = signal.get("value")
     return {
@@ -194,13 +178,6 @@ def _signal_summary(signal: dict[str, Any]) -> dict[str, Any]:
         "selection": value.get("selection") if isinstance(value, dict) else None,
         "value": _trim(value),
     }
-
-
-def _impact(signal: dict[str, Any]) -> float:
-    try:
-        return float(signal.get("impact") or 0)
-    except Exception:
-        return 0.0
 
 
 def _rejected_signals_from(signals: list[dict[str, Any]], picks: list[dict[str, Any]]) -> list[dict[str, Any]]:

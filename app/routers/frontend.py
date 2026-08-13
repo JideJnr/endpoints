@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from app.utils.match_helpers import _normalise_selection
 from app.storage.db import db_conn
 from app.storage.buffer import (
+    _extract_1x2,
     get_buffered_matches,
     get_buffered_match,
     get_live_buffered_matches,
@@ -20,6 +21,7 @@ from app.storage.buffer import (
 from app.storage.league_memory import list_prediction_history
 from app.market.market import get_movement
 from app.utils.match_state import classify_match_state
+from app.enrichment.match_enrichment import _is_live_doc, _is_finished_doc
 from app.scheduling.scheduler import scheduler_status
 
 try:
@@ -2077,25 +2079,6 @@ def get_model_explorer(
             "".join(ch.lower() if ch.isalnum() else " " for ch in str(value or "")).split()
         )
 
-    def _match_sides(match_name: str) -> tuple[str, str]:
-        raw = str(match_name or "")
-        if " vs " in raw:
-            home, away = raw.split(" vs ", 1)
-        elif " v " in raw:
-            home, away = raw.split(" v ", 1)
-        else:
-            return "", ""
-        return _norm_text(home), _norm_text(away)
-
-    def _side_from_team_selection(selection: str, match_name: str) -> str:
-        text = _norm_text(selection)
-        home, away = _match_sides(match_name)
-        if home and home in text:
-            return "home"
-        if away and away in text:
-            return "away"
-        return ""
-
     def _display_selection(selection: str, match_name: str = "", pick_type: str = "") -> str:
         normal = _normalise_selection(selection, match_name, pick_type)
         labels = {
@@ -2564,8 +2547,8 @@ def get_all_ai_analyses(sportybet_id: str):
         "overall_consensus": overall_consensus,
         "consensus_reached": overall_consensus is not None,
         "provider_count": len(providers),
-        "llm_consensus": llm_analysis_2.get("consensus") if llm_analysis_2 else None,
-        "llm_consensus_reached": (llm_analysis_2 or {}).get("consensus_reached", False),
+        "llm_consensus": llm_analysis_secondary.get("consensus") if llm_analysis_secondary else None,
+        "llm_consensus_reached": (llm_analysis_secondary or {}).get("consensus_reached", False),
     }
 
 
@@ -3099,15 +3082,6 @@ def _scoreline(score: dict[str, Any]) -> str | None:
     return f"{home}-{away}"
 
 
-def _is_live_doc(doc: dict[str, Any]) -> bool:
-    return bool(classify_match_state(doc).get("is_live"))
-
-
-def _is_finished_doc(doc: dict[str, Any]) -> bool:
-    state = classify_match_state(doc)
-    return bool(doc.get("is_finished") or state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
-
-
 def _sort_start(value: Any) -> int:
     try:
         number = int(value)
@@ -3120,12 +3094,6 @@ def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
     from app.utils.match_view import match_summary
 
     return match_summary(doc)
-
-
-def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    from app.utils.match_view import extract_1x2
-
-    return extract_1x2(markets)
 
 
 def _home_team(doc: dict[str, Any]) -> str:
@@ -3377,4 +3345,7 @@ def get_brain_health():
 
 
 
+
+# TEST
+# TEST
 

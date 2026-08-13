@@ -2048,6 +2048,28 @@ def _data_sources(
     }
 
 
+def _track_live_data_availability(match_id: str, doc: dict[str, Any]) -> dict[str, Any]:
+    """Attach a compact provider availability audit without blocking enrichment."""
+    try:
+        sources = doc.get("data_sources") if isinstance(doc.get("data_sources"), dict) else {}
+        sporty_source = sources.get("sportybet") if isinstance(sources.get("sportybet"), dict) else {}
+        sofa_source = sources.get("sofascore") if isinstance(sources.get("sofascore"), dict) else {}
+        live_sporty = doc.get("live_data_sportybet") if isinstance(doc.get("live_data_sportybet"), dict) else {}
+        live_sofa = doc.get("live_data_sofascore") if isinstance(doc.get("live_data_sofascore"), dict) else {}
+        audit = {
+            "match_id": str(match_id or doc.get("match_id") or doc.get("sportybet_id") or ""),
+            "sportybet_live": bool(live_sporty),
+            "sofascore_live": bool(live_sofa),
+            "sofascore_detail": bool(sofa_source.get("detail")),
+            "sportybet_markets": bool(sporty_source.get("markets")) or bool(doc.get("markets") or doc.get("sportybet_markets")),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        doc["live_data_availability"] = audit
+        return audit
+    except Exception:
+        return {"match_id": str(match_id or ""), "status": "unavailable"}
+
+
 def _provider_state_from_doc(doc: dict[str, Any]) -> str:
     source = str(doc.get("data_source") or "").strip().lower()
     if source in {"sportybet", "sofascore", "both"}:
