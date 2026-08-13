@@ -13,8 +13,9 @@ from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_
 from app.data_clients.sportradar_client import fetch_match_intelligence
 from app.utils.time_context import match_time_context
 from app.enrichment.web_context import search_league_sentiment, search_match_context
-from app.enrichment.match_enrichment import _is_live_doc, _is_finished_doc
-from app.storage.buffer import _extract_1x2, _data_sources
+from app.storage.buffer import _data_sources
+from app.utils.doc_helpers import _is_finished_doc, _is_live_doc
+from app.utils.match_helpers import _extract_1x2
 
 
 class MatchEnrichmentError(Exception):
@@ -381,15 +382,6 @@ def _candidate_score(event: dict[str, Any] | None, doc: dict[str, Any]) -> float
         home = SequenceMatcher(None, str((event.get("home_team") or {}).get("name") or "").lower(), str(_home_team(doc) or "").lower()).ratio()
         away = SequenceMatcher(None, str((event.get("away_team") or {}).get("name") or "").lower(), str(_away_team(doc) or "").lower()).ratio()
         return round(max(direct, (home + away) / 2), 3)
-
-
-def _is_live_doc(doc: dict[str, Any]) -> bool:
-    return bool(classify_match_state(doc).get("is_live"))
-
-
-def _is_finished_doc(doc: dict[str, Any]) -> bool:
-    state = classify_match_state(doc)
-    return bool(doc.get("is_finished") or state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
 
 
 def _home_team(doc: dict[str, Any]) -> str:

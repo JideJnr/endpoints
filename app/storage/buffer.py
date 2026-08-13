@@ -35,14 +35,16 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from app.storage.db import DB_PATH, _conn
-from app.storage.league_memory import _init_db
+from app.storage.db import _init_db
 from app.market.market import snapshot_odds
 from app.match_facts import enrich_match_facts, normalize_live_statistics
 from app.utils.match_state import classify_match_state
 from app.utils.normalise import normalise
 from app.market.season_stage import detect_season_stage
 
-from app.utils.match_helpers import _played_seconds as _played_seconds_local
+from app.utils.doc_helpers import _data_sources, _date_from_start_time, _is_not_started_period
+from app.utils.match_helpers import _extract_1x2, _played_seconds as _played_seconds_local
+from app.utils.web_helpers import _fetch_web as _fetch_web_context
 
 # How many SofaScore detail calls to run in parallel
 ENRICH_WORKERS = 8
@@ -1359,23 +1361,12 @@ def run_enrichment_worker(
             idx, sportradar = future.result()
             sportradar_details[idx] = sportradar
 
-    # Fetch web context for every SportyBet match; SofaScore matching is not required.
-    def _fetch_web(idx: int, sporty: dict) -> tuple[int, dict]:
-        try:
-            return idx, search_match_context(
-                sporty.get("home_team") or "",
-                sporty.get("away_team") or "",
-                sporty.get("tournament") or "",
-            )
-        except Exception:
-            return idx, {"query": "", "snippets": [], "scraped": []}
-
     web_contexts: dict[int, dict] = {}
     if fetch_web_context:
         needs_web = [(i, item["sporty"]) for i, (item, _, _) in enumerate(pairs)]
 
         with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
-            futures = {pool.submit(_fetch_web, i, sporty): i for i, sporty in needs_web}
+            futures = {pool.submit(_fetch_web_context, i, sporty): i for i, sporty in needs_web}
             for future in as_completed(futures):
                 idx, ctx = future.result()
                 web_contexts[idx] = ctx
@@ -2005,49 +1996,6 @@ def _sporty_detail_doc(sporty: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _data_sources(
-    sofa: dict[str, Any] | None,
-    detail: dict[str, Any] | None,
-    sporty: dict[str, Any] | None,
-    sportradar: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    markets = (sporty or {}).get("markets") or []
-    sporty_live = (sporty or {}).get("live_data_sportybet") or {}
-    sofa_live = (detail or {}).get("live_data_sofascore") or {}
-    sofa_has_stats = bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics") or sofa_live)
-    return {
-        "sportybet": {
-            "available": bool(sporty),
-            "detail": bool(sporty),
-            "markets": bool(markets),
-            "has_markets": bool(markets),
-            "market_count": len(markets),
-            "live_clock": bool(classify_match_state(sporty or {}).get("is_live")),
-            "has_live_clock": bool(classify_match_state(sporty or {}).get("is_live")),
-            "live_data_available": bool(sporty_live),
-            "live_data_fetched_at": (sporty_live or {}).get("fetched_at"),
-        },
-        "sofascore": {
-            "available": bool(sofa or detail),
-            "matched": bool(sofa),
-            "detail": bool(detail),
-            "has_detail": bool(detail),
-            "statistics": sofa_has_stats,
-            "has_statistics": sofa_has_stats,
-            "history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
-            "has_history": bool((detail or {}).get("home_last_matches") or (detail or {}).get("away_last_matches")),
-            "live_data_available": bool(sofa_live or sofa_has_stats),
-            "live_data_fetched_at": (sofa_live or {}).get("fetched_at"),
-        },
-        "sportradar": {
-            "available": bool((sportradar or {}).get("available")),
-            "detail": bool((sportradar or {}).get("match")),
-            "standings": bool((sportradar or {}).get("standings")),
-            "error": (sportradar or {}).get("error") or (sportradar or {}).get("standings_error"),
-        },
-    }
-
-
 def _track_live_data_availability(match_id: str, doc: dict[str, Any]) -> dict[str, Any]:
     """Attach a compact provider availability audit without blocking enrichment."""
     try:
@@ -2226,16 +2174,6 @@ def _mark_missing_from_sporty(match_id: str) -> None:
         conn.commit()
 
 
-def _date_from_start_time(start_time: Any) -> str:
-    try:
-        ts = float(start_time)
-        if ts > 1e12:
-            ts /= 1000
-        return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-    except Exception:
-        return date_cls.today().isoformat()
-
-
 def _lifecycle_state(doc: dict[str, Any]) -> dict[str, Any]:
     state = classify_match_state(doc)
     is_live = bool(state.get("is_live"))
@@ -2259,38 +2197,11 @@ def _lifecycle_state(doc: dict[str, Any]) -> dict[str, Any]:
     return {"current": current, "state": state.get("state"), "match_state": state, "stages": stages, "missing": missing}
 
 
-def _extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    for market in markets:
-        name = str(market.get("name") or "").lower()
-        if market.get("id") == "1" or "1x2" in name:
-            odds = {s.get("name"): s.get("odds") for s in market.get("selections", [])}
-            return {
-                "home": odds.get("Home") or odds.get("1"),
-                "draw": odds.get("Draw") or odds.get("X"),
-                "away": odds.get("Away") or odds.get("2"),
-            }
-    return {}
-
-
 def _is_finished_period(period: str | None) -> bool:
     if not period:
         return False
     p = str(period or "").lower().strip()
     return p in ("ft", "finished", "ended", "aet", "ap", "full time", "after penalties", "after extra time")
-
-
-def _is_not_started_period(period: str | None) -> bool:
-    if not period:
-        return True
-    return str(period or "").lower().strip().replace("_", " ") in {
-        "",
-        "not start",
-        "not started",
-        "notstart",
-        "notstarted",
-        "scheduled",
-        "ns",
-    }
 
 
 def _is_live_period(period: str | None) -> bool:

@@ -497,10 +497,6 @@ def save_finished_match(source: str, match: dict[str, Any]) -> bool:
     return True
 
 
-class _RowCountStub:
-    rowcount = 0
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _team(doc: dict, side: str) -> str | None:

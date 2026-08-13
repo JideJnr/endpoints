@@ -7,7 +7,7 @@ from typing import Any
 from app.storage.db import db_conn
 from app.enrichment.confidence_calibrator import calibrate_confidence
 from app.storage.db import DB_PATH
-from app.storage.league_memory import _init_db
+from app.storage.db import _init_db
 from app.market.market_intent import classify_market_intent
 from app.utils.match_state import classify_match_state
 from app.market.season_stage import detect_season_stage
@@ -16,7 +16,7 @@ from app.utils.time_context import match_time_context
 
 from app.utils.primitives import _to_float
 from app.competition.competition_special import _parse_datetime
-from app.enrichment.contextual_intelligence import _impact
+from app.utils.doc_helpers import _impact
 
 def build_contextual_intelligence(
     doc: dict[str, Any],
@@ -667,13 +667,6 @@ def _web_text(doc: dict[str, Any]) -> str:
                 if val is not None:
                     values.append(f"{key}: {val}%")
     return " ".join(values)
-
-
-def _impact(signal: dict[str, Any]) -> float:
-    try:
-        return float(signal.get("impact") or 0)
-    except Exception:
-        return 0.0
 
 
 def _now() -> datetime:

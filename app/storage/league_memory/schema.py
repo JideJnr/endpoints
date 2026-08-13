@@ -18,7 +18,7 @@ import sqlite3
 
 # Re-export the primary DB initialiser so callers within the package
 # (and external shims) can import it from here.
-from app.storage.db import _init_db as _init_db  # noqa: F401, PLC0414
+from app.storage.db import _ensure_signal_combination_outcomes_table, _init_db as _init_db  # noqa: F401, PLC0414
 
 
 def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
@@ -46,39 +46,6 @@ def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute("create index if not exists idx_signal_outcomes_signal on signal_outcomes(signal_name)")
     conn.execute("create index if not exists idx_signal_outcomes_scope on signal_outcomes(country, tournament, result)")
-
-
-def _ensure_signal_combination_outcomes_table(conn: sqlite3.Connection) -> None:
-    """Create the ``signal_combination_outcomes`` table and indexes if they don't exist."""
-    conn.execute(
-        """
-        create table if not exists signal_combination_outcomes (
-            id integer primary key autoincrement,
-            combination_key text not null,
-            combination_json text not null default '{}',
-            signal_names_json text not null default '[]',
-            match_id text not null,
-            match_name text,
-            tournament text,
-            country text,
-            match_date text,
-            result text not null,
-            pick_type text,
-            selection text,
-            confidence integer,
-            prediction_mode text,
-            live_context_json text,
-            recorded_at text not null default current_timestamp,
-            unique (match_id, pick_type, selection, combination_key)
-        )
-        """
-    )
-    conn.execute(
-        "create index if not exists idx_sco_combo_key on signal_combination_outcomes(combination_key)"
-    )
-    conn.execute(
-        "create index if not exists idx_sco_scope on signal_combination_outcomes(tournament, country, pick_type, result)"
-    )
 
 
 def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:

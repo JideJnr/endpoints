@@ -21,6 +21,7 @@ from app.competition.competition_registry import (
 )
 from app.competition.league_strength import league_strength_score
 
+from app.utils.doc_helpers import _band
 from app.utils.primitives import _loads, _to_int
 
 logger = logging.getLogger(__name__)
@@ -1340,19 +1341,16 @@ def _extract_goal_timing_from_doc(doc: dict[str, Any]) -> dict[str, Any]:
         return {}
     goal_minutes.sort()
 
-    def _band(lo: int, hi: int) -> int:
-        return sum(1 for m in goal_minutes if lo <= m <= hi)
-
     intervals = [float(goal_minutes[i] - goal_minutes[i - 1]) for i in range(1, len(goal_minutes))]
     return {
         "total_goals": len(goal_minutes),
         "first_half_goals": sum(1 for m in goal_minutes if m <= 45),
         "second_half_goals": sum(1 for m in goal_minutes if m > 45),
-        "band_1_10": _band(1, 10), "band_11_20": _band(11, 20),
-        "band_21_30": _band(21, 30), "band_31_40": _band(31, 40),
-        "band_41_45": _band(41, 45), "band_46_55": _band(46, 55),
-        "band_56_65": _band(56, 65), "band_66_75": _band(66, 75),
-        "band_76_85": _band(76, 85), "band_86_90": _band(86, 90),
+        "band_1_10": _band(goal_minutes, 1, 10), "band_11_20": _band(goal_minutes, 11, 20),
+        "band_21_30": _band(goal_minutes, 21, 30), "band_31_40": _band(goal_minutes, 31, 40),
+        "band_41_45": _band(goal_minutes, 41, 45), "band_46_55": _band(goal_minutes, 46, 55),
+        "band_56_65": _band(goal_minutes, 56, 65), "band_66_75": _band(goal_minutes, 66, 75),
+        "band_76_85": _band(goal_minutes, 76, 85), "band_86_90": _band(goal_minutes, 86, 90),
         "first_goal_minute": goal_minutes[0],
         "avg_interval_minutes": round(sum(intervals) / len(intervals), 2) if intervals else None,
         "goal_minutes": goal_minutes,

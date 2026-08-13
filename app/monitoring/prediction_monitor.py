@@ -11,6 +11,7 @@ from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db, get_grading_metrics, grade_betbuilder_history, grade_overdue_predictions
 
 
+from app.utils.doc_helpers import _safe_call
 from app.utils.primitives import _loads
 
 SNAPSHOT_KEEP_ROWS = 1000
@@ -387,15 +388,6 @@ def _memory_maintenance() -> dict[str, Any]:
     from app.storage.league_memory import run_memory_maintenance
 
     return run_memory_maintenance(raw_retention_days=30, odds_retention_days=60)
-
-
-def _safe_call(name: str, fn, errors: list[str]) -> Any:
-    try:
-        return fn()
-    except Exception as exc:
-        errors.append(f"{name}: {exc}")
-        return {}
-
 
 
 def _record_monitor_activity(result: dict) -> None:

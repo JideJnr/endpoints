@@ -8,6 +8,7 @@ from app.storage.db import db_conn
 from app.data_clients.sofascore_client import fetch_team_history
 
 
+from app.utils.doc_helpers import _context_source
 from app.utils.primitives import _to_int
 
 MAX_GOALS = 7
@@ -242,14 +243,6 @@ def _score_value(value: Any) -> int | None:
     if isinstance(value, dict):
         value = value.get("current") if value.get("current") is not None else value.get("display")
     return _to_int(value, None)
-
-
-def _context_source(home_stats: dict[str, Any], away_stats: dict[str, Any]) -> str:
-    if home_stats.get("source") == "enriched_doc" and away_stats.get("source") == "enriched_doc":
-        return "enriched_doc"
-    if home_stats.get("source") == "enriched_doc" or away_stats.get("source") == "enriched_doc":
-        return "mixed"
-    return "model_fetch"
 
 
 def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:

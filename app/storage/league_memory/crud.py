@@ -28,8 +28,8 @@ from app.signal_combinations import build_signal_combination, live_context_from_
 from app.market.market_intent import classify_market_intent, grade_market_intent
 from app.monitoring.prediction_audit import build_pick_audit, build_prediction_audit, grading_reason
 from app.competition.competition_registry import init_competition_registry_tables, ensure_competition
+from .schema import _ensure_signal_outcomes_table
 from ._helpers import (
-    _ensure_signal_outcomes_table,
     normalize_league, _league_from_match, _country_from_match, _team_name,
     _match_fingerprint, _match_minute, _minute_bucket, _bucket_bounds,
     _score_state, _red_card_state, _favorite_from_match,

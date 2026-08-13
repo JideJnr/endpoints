@@ -9,45 +9,45 @@ Tasks are ordered to minimise risk: test infrastructure first, then each defect 
 ## Task List
 
 - [ ] 1 Set up test infrastructure for all four defect categories
-  - [~] 1.1 Create `tests/test_circular_imports.py` with the import-graph exploration tests (parametrised over all 18 cycle pairs)
-  - [~] 1.2 Create `tests/test_duplicate_functions.py` with the AST-based definition-count tests (parametrised over the 19 true-duplicate entries)
-  - [~] 1.3 Create `tests/test_hardcoded_constants.py` with the `Settings` attribute and default-value tests
-  - [~] 1.4 Create `tests/test_explicit_imports.py` with the `py_compile` and `pyflakes` subprocess tests for all 16 affected files
-  - [~] 1.5 Run the full test suite baseline (`pytest tests/` with `--tb=short`) and record which tests fail — these are the "red" tests the fix must turn green
+  - [ ] 1.1 Create `tests/test_circular_imports.py` with the import-graph exploration tests (parametrised over all 18 cycle pairs)
+  - [ ] 1.2 Create `tests/test_duplicate_functions.py` with the AST-based definition-count tests (parametrised over the 19 true-duplicate entries)
+  - [ ] 1.3 Create `tests/test_hardcoded_constants.py` with the `Settings` attribute and default-value tests
+  - [ ] 1.4 Create `tests/test_explicit_imports.py` with the `py_compile` and `pyflakes` subprocess tests for all 16 affected files
+  - [ ] 1.5 Run the full test suite baseline (`pytest tests/` with `--tb=short`) and record which tests fail — these are the "red" tests the fix must turn green
 
 - [ ] 2 Fix Category 4 — Syntax error and missing explicit imports (unblocks AI package)
-  - [~] 2.1 Verify `app/ai/llm_agent.py` (renamed from `groq_agent.py`) compiles cleanly; confirm the syntax error is resolved
-  - [~] 2.2 Run `python -m py_compile app/ai/llm_agent.py` and assert exit code 0
-  - [~] 2.3 Run `python -m pyflakes app/ai/llm_agent.py` and fix any remaining undefined names
-  - [~] 2.4 Run the full audit tool (`_check_imports.py` or `pyflakes app/`) to produce the definitive list of 15 files with missing explicit imports
-  - [~] 2.5 For each file in the 15-file list: add explicit `from app.x.y import name` statements; verify with `py_compile` and `pyflakes`
-  - [~] 2.6 Re-run `tests/test_explicit_imports.py` — all tests in this file must pass before proceeding
+  - [ ] 2.1 Verify `app/ai/llm_agent.py` (renamed from `groq_agent.py`) compiles cleanly; confirm the syntax error is resolved
+  - [ ] 2.2 Run `python -m py_compile app/ai/llm_agent.py` and assert exit code 0
+  - [ ] 2.3 Run `python -m pyflakes app/ai/llm_agent.py` and fix any remaining undefined names
+  - [ ] 2.4 Run the full audit tool (`_check_imports.py` or `pyflakes app/`) to produce the definitive list of 15 files with missing explicit imports
+  - [ ] 2.5 For each file in the 15-file list: add explicit `from app.x.y import name` statements; verify with `py_compile` and `pyflakes`
+  - [ ] 2.6 Re-run `tests/test_explicit_imports.py` — all tests in this file must pass before proceeding
 
 - [ ] 3 Fix Category 1 — Break all 18 circular import cycles
-  - [~] 3.1 Audit `app/storage/buffer.py` for any module-level imports of `app.monitoring.self_learner`, `app.storage.mongo_store`, `app.ai.*`, or `app.utils.prediction_flow`; convert each to a lazy import inside the calling function
-  - [~] 3.2 Audit `app/storage/mongo_store.py` for module-level imports of `app.storage.buffer`; convert `from app.storage.buffer import _archive_finished_locally` (in `cleanup_buffer`) to a function-scope import if not already
-  - [~] 3.3 Audit `app/utils/prediction_flow.py` for module-level imports of `app.ai.ai_brain`, `app.ai.ai_router`, `app.ai.ai_prediction_pipeline`, `app.monitoring.self_learner`; convert any found to lazy imports
-  - [~] 3.4 Audit `app/ai/ai_brain.py` — confirm all imports of `app.ai.ai_router` are already function-scope; fix any that are not
-  - [~] 3.5 Audit `app/ai/ai_prediction_pipeline.py` — confirm all imports of `app.ai.ai_router`, `app.storage.buffer`, `app.storage.mongo_store`, `app.monitoring.self_learner` are function-scope; fix any that are not
-  - [~] 3.6 Audit `app/monitoring/self_learner.py` — confirm it has no module-level back-imports to `ai.*`, `storage.buffer`, `storage.mongo_store`, or `utils.prediction_flow`
-  - [~] 3.7 Write and run a cycle-detection script (`tools/check_cycles.py`) that imports each of the 6 hub modules in a clean process and asserts clean import; parametrize over all 18 pairs
-  - [~] 3.8 Re-run `tests/test_circular_imports.py` — all 18 cycle tests must pass
+  - [ ] 3.1 Audit `app/storage/buffer.py` for any module-level imports of `app.monitoring.self_learner`, `app.storage.mongo_store`, `app.ai.*`, or `app.utils.prediction_flow`; convert each to a lazy import inside the calling function
+  - [ ] 3.2 Audit `app/storage/mongo_store.py` for module-level imports of `app.storage.buffer`; convert `from app.storage.buffer import _archive_finished_locally` (in `cleanup_buffer`) to a function-scope import if not already
+  - [ ] 3.3 Audit `app/utils/prediction_flow.py` for module-level imports of `app.ai.ai_brain`, `app.ai.ai_router`, `app.ai.ai_prediction_pipeline`, `app.monitoring.self_learner`; convert any found to lazy imports
+  - [ ] 3.4 Audit `app/ai/ai_brain.py` — confirm all imports of `app.ai.ai_router` are already function-scope; fix any that are not
+  - [ ] 3.5 Audit `app/ai/ai_prediction_pipeline.py` — confirm all imports of `app.ai.ai_router`, `app.storage.buffer`, `app.storage.mongo_store`, `app.monitoring.self_learner` are function-scope; fix any that are not
+  - [ ] 3.6 Audit `app/monitoring/self_learner.py` — confirm it has no module-level back-imports to `ai.*`, `storage.buffer`, `storage.mongo_store`, or `utils.prediction_flow`
+  - [ ] 3.7 Write and run a cycle-detection script (`tools/check_cycles.py`) that imports each of the 6 hub modules in a clean process and asserts clean import; parametrize over all 18 pairs
+  - [ ] 3.8 Re-run `tests/test_circular_imports.py` — all 18 cycle tests must pass
 
 - [ ] 4 Fix Category 2 — Consolidate true-duplicate functions (19 functions)
-  - [~] 4.1 Identify all files containing each of the 19 true-duplicate functions using the AST scan from task 1.2
-  - [~] 4.2 Create `app/utils/doc_helpers.py` as the canonical home for document-inspection helpers (`_context_source`, `_is_live_doc`, `_is_finished_doc`, `_is_not_started_period`, `_date_from_start_time`, `_safe_call`, `_band`, `_impact`) that have no existing canonical home
-  - [~] 4.3 Create `app/utils/web_helpers.py` as the canonical home for `_fetch_web`
-  - [~] 4.4 Add `_ensure_column`, `_ensure_signal_outcomes_table`, `_ensure_signal_combination_outcomes_table` to `app/storage/db.py` if not already present
-  - [~] 4.5 Add `_side_from_selection_and_match`, `_side_from_team_selection`, `_match_sides` to `app/utils/match_helpers.py` if not already present
-  - [~] 4.6 For each non-canonical file that defines one of the 19 true-duplicate functions: delete the local definition and add the canonical import at the top of the file
-  - [~] 4.7 Run `pytest` to confirm no regressions from step 4.6; fix any import errors that arise
-  - [~] 4.8 Re-run `tests/test_duplicate_functions.py` — all 19 tests must report `count_definitions == 1`
+  - [ ] 4.1 Identify all files containing each of the 19 true-duplicate functions using the AST scan from task 1.2
+  - [ ] 4.2 Create `app/utils/doc_helpers.py` as the canonical home for document-inspection helpers (`_context_source`, `_is_live_doc`, `_is_finished_doc`, `_is_not_started_period`, `_date_from_start_time`, `_safe_call`, `_band`, `_impact`) that have no existing canonical home
+  - [ ] 4.3 Create `app/utils/web_helpers.py` as the canonical home for `_fetch_web`
+  - [ ] 4.4 Add `_ensure_column`, `_ensure_signal_outcomes_table`, `_ensure_signal_combination_outcomes_table` to `app/storage/db.py` if not already present
+  - [ ] 4.5 Add `_side_from_selection_and_match`, `_side_from_team_selection`, `_match_sides` to `app/utils/match_helpers.py` if not already present
+  - [ ] 4.6 For each non-canonical file that defines one of the 19 true-duplicate functions: delete the local definition and add the canonical import at the top of the file
+  - [ ] 4.7 Run `pytest` to confirm no regressions from step 4.6; fix any import errors that arise
+  - [ ] 4.8 Re-run `tests/test_duplicate_functions.py` — all 19 tests must report `count_definitions == 1`
 
 - [ ] 5 Fix Category 2 — Rationalise near-duplicate function families (7 families)
-  - [~] 5.1 Consolidate `_hf_token` — remove local definitions from `ai_brain.py` and any other file that defines it; update all callers to `from app.config.config import _hf_token`
-  - [~] 5.2 Consolidate `_extract_1x2` — create a single parameterised implementation in `app/utils/match_helpers.py` with a `strict: bool = False` parameter; update all 4 call sites
-  - [~] 5.3 Consolidate `_data_sources` — create canonical implementation in `app/utils/doc_helpers.py` with `include_meta: bool = True`; update all 3 call sites
-  - [~] 5.4 Confirm `_minute_bucket`, `_score_state`, `_snapshot_row` canonical homes in `app/storage/league_memory/_helpers.py`; delete any copies elsewhere and update imports
+  - [ ] 5.1 Consolidate `_hf_token` — remove local definitions from `ai_brain.py` and any other file that defines it; update all callers to `from app.config.config import _hf_token`
+  - [ ] 5.2 Consolidate `_extract_1x2` — create a single parameterised implementation in `app/utils/match_helpers.py` with a `strict: bool = False` parameter; update all 4 call sites
+  - [ ] 5.3 Consolidate `_data_sources` — create canonical implementation in `app/utils/doc_helpers.py` with `include_meta: bool = True`; update all 3 call sites
+  - [ ] 5.4 Confirm `_minute_bucket`, `_score_state`, `_snapshot_row` canonical homes in `app/storage/league_memory/_helpers.py`; delete any copies elsewhere and update imports
   - [ ] 5.5 Consolidate `_parse_datetime` — create parameterised canonical in `app/utils/primitives.py` with `tz_aware: bool = True`; update all 3 call sites
   - [ ] 5.6 Run `pytest` to confirm no regressions; re-run `tests/test_duplicate_functions.py`
 

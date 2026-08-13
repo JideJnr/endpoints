@@ -134,6 +134,19 @@ def _fraction_to_probability(value: Any) -> float | None:
     return 1 / decimal
 
 
+def _extract_1x2(markets: list[dict[str, Any]], *, strict: bool = False) -> dict[str, Any]:
+    for market in markets or []:
+        name = str(market.get("name") or "").lower()
+        if market.get("id") == "1" or "1x2" in name or (not strict and "match result" in name):
+            odds = {selection.get("name"): selection.get("odds") for selection in market.get("selections", [])}
+            return {
+                "home": odds.get("Home") or odds.get("1"),
+                "draw": odds.get("Draw") or odds.get("X"),
+                "away": odds.get("Away") or odds.get("2"),
+            }
+    return {}
+
+
 # ── String / time helpers ─────────────────────────────────────────────────────
 
 

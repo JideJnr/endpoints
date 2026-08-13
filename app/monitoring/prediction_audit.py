@@ -6,8 +6,8 @@ from typing import Any
 from app.market.market_intent import classify_market_intent, grade_market_intent
 from app.utils.match_state import classify_match_state
 from app.utils.time_context import match_time_context
-from app.storage.buffer import _extract_1x2
-from app.enrichment.contextual_intelligence import _impact
+from app.utils.doc_helpers import _impact
+from app.utils.match_helpers import _extract_1x2
 
 
 AUDIT_VERSION = "prediction_audit_v1"

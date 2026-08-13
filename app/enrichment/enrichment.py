@@ -10,7 +10,6 @@ from difflib import SequenceMatcher
 from typing import Any
 from urllib import error, request
 
-from app.storage.league_memory import store_enriched_matches
 from app.market.market import snapshot_odds
 from app.utils.normalise import normalise
 from app.utils.match_state import classify_match_state
@@ -22,6 +21,7 @@ from app.utils.time_context import match_time_context
 from app.enrichment.web_context import search_league_sentiment, search_match_context
 from app.storage.buffer import _data_sources
 from app.config.config import _hf_token
+from app.utils.web_helpers import _fetch_web as _fetch_web_context
 
 
 FUZZY_THRESHOLD = 0.75
@@ -145,18 +145,8 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
     # Only run web search for matched matches (has sofa detail = worth enriching)
     needs_web = [(i, sporty) for i, (sporty, _, _) in enumerate(matched_pairs)]
 
-    def _fetch_web(idx: int, sporty: dict) -> tuple[int, dict]:
-        try:
-            return idx, search_match_context(
-                sporty.get("home_team") or "",
-                sporty.get("away_team") or "",
-                sporty.get("tournament") or "",
-            )
-        except Exception:
-            return idx, {"query": "", "snippets": [], "scraped": []}
-
     with ThreadPoolExecutor(max_workers=WEB_WORKERS) as pool:
-        futures = {pool.submit(_fetch_web, i, sporty): i for i, sporty in needs_web}
+        futures = {pool.submit(_fetch_web_context, i, sporty): i for i, sporty in needs_web}
         for future in as_completed(futures):
             idx, ctx = future.result()
             web_contexts[idx] = ctx
@@ -248,6 +238,8 @@ def run_enrichment(match_date: str | None = None, force: bool = False, limit: in
         }
         documents.append(doc)
         snapshot_odds(doc)
+
+    from app.storage.league_memory import store_enriched_matches
 
     stored = store_enriched_matches(documents)
     print(f"[enrichment] stored={stored} for {target_date}")

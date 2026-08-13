@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.storage.db import db_conn
-from app.storage.league_memory import _init_db
+from app.storage.db import _init_db
 from app.storage.league_memory._helpers import _get_passed_models
 
 from app.utils.primitives import _safe_json

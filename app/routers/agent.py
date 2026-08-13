@@ -20,20 +20,12 @@ from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_
 from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post, fetch_upcoming_matches_post
 
 from app.utils.primitives import _to_int, _to_float
+from app.utils.doc_helpers import _is_finished_doc
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 @router.get("/memory/leagues")
-
-def _is_finished_doc(doc: dict) -> bool:
-    """Return True when the match document represents a finished match."""
-    period = str(doc.get('period') or '').lower()
-    status = doc.get('status') or {}
-    status_type = str((status.get('type') if isinstance(status, dict) else status) or '').lower()
-    return period in {'ft', 'finished', 'ended', 'aet', 'ap'} or status_type in {'finished', 'ended'}
-
-
 def get_memory_leagues():
     return {"status": "success", **get_league_memory()}
 
