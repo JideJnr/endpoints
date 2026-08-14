@@ -48,12 +48,15 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
 
     now_ts = time.time()
     prefiltered: list[tuple[dict[str, Any], dict[str, Any], float | None]] = []
+    _filter_stats: dict[str, int] = {}
 
     for row in rows:
         if row.get("is_finished") or str(row.get("result") or "").lower() in {"cancelled", "finished"}:
+            _filter_stats["finished"] = _filter_stats.get("finished", 0) + 1
             continue
         match_date = str(row.get("match_date") or "")[:10]
         if match_date and match_date not in allowed_dates:
+            _filter_stats["wrong_date"] = _filter_stats.get("wrong_date", 0) + 1
             continue
         start_time = row.get("start_time")
         if start_time:
@@ -62,16 +65,20 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
                 if kick_ts > 1e12:
                     kick_ts /= 1000
                 if kick_ts < now_ts:
+                    _filter_stats["started"] = _filter_stats.get("started", 0) + 1
                     continue
             except (TypeError, ValueError):
                 pass
         if row.get("is_live") or str(row.get("period") or "").lower() in {"h1", "h2", "et", "live", "ht"}:
+            _filter_stats["live"] = _filter_stats.get("live", 0) + 1
             continue
         pick = row.get("best_pick") or _best_pick(row.get("picks") or [])
         if not pick:
+            _filter_stats["no_pick"] = _filter_stats.get("no_pick", 0) + 1
             continue
         stored_odds = pick_decimal_odds(pick)
         if stored_odds is not None and stored_odds < 1.30:
+            _filter_stats["low_odds"] = _filter_stats.get("low_odds", 0) + 1
             continue
 
         try:
@@ -81,9 +88,12 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
                 league_key = _normalise_league_key(str(row["tournament"]))
             odds_profile = extract_odds_profile(row)
             if not _research_filter_candidate(pick, odds_profile, country, league_key):
+                _filter_stats["research_filter"] = _filter_stats.get("research_filter", 0) + 1
                 continue
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("upcoming_prediction_candidates: research filter error for %s: %s", row.get("match_id"), exc)
+            _filter_stats["research_error"] = _filter_stats.get("research_error", 0) + 1
+            continue
 
         prefiltered.append((row, pick, stored_odds))
 
@@ -107,20 +117,25 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
             try:
                 buf_doc = buffer_map.get(match_id)
                 if not buf_doc:
-                    continue
-                markets = buf_doc.get("sportybet_markets") or buf_doc.get("markets") or []
-                if not markets:
+                    _filter_stats["no_buffer"] = _filter_stats.get("no_buffer", 0) + 1
                     continue
                 if buf_doc.get("is_finished") or buf_doc.get("is_live"):
+                    _filter_stats["buffer_live"] = _filter_stats.get("buffer_live", 0) + 1
                     continue
                 resolved_odds = stored_odds or _pick_buffer_decimal_odds(pick, buf_doc)
                 if resolved_odds is None or resolved_odds < 1.30:
+                    _filter_stats["buffer_odds"] = _filter_stats.get("buffer_odds", 0) + 1
                     continue
                 pick = {**pick, "odds": resolved_odds}
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("upcoming_prediction_candidates: buffer error for %s: %s", match_id, exc)
+                _filter_stats["buffer_error"] = _filter_stats.get("buffer_error", 0) + 1
+                continue
 
         candidates.append({**row, "best_pick": pick})
+
+    if not candidates and _filter_stats:
+        logger.info("upcoming_prediction_candidates: filter stats: %s", _filter_stats)
 
     candidates.sort(
         key=lambda r: int((r.get("best_pick") or {}).get("confidence") or 0),

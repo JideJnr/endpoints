@@ -6,7 +6,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from app.storage.db import DB_PATH, _conn
+from app.storage.db import DB_PATH, _conn, db_conn
 from app.storage.league_memory import _init_db
 
 from app.models.dixon_coles import run_dixon_coles
@@ -391,12 +391,19 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         str(best_pick.get("selection") or best_pick.get("pick") or ""),
     )
 
+    # ── Team prediction history signals ───────────────────────────────────────
+    # Emit risk/boost signals based on each team's historical prediction
+    # accuracy in this competition (queried from team_competitions).
+    # These are appended to the signals list later, after it is initialised.
+    _team_hist_signals = _team_history_signals(doc, detail)
+
     value_bets = _value_bets(
         doc,
         dixon if dixon and not dixon.get("error") else poisson,
         ensemble,
     )
     signals = list(rules.get("signals") or [])
+    signals.extend(_team_hist_signals)
     signals.extend(_source_quality_signals(doc, readiness))
     if _provider_state(doc) == "sofascore" and not (doc.get("sportybet_markets") or doc.get("markets")):
         signals.append({"name": "no_odds_data", "value": True, "impact": -2})
@@ -748,8 +755,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             # bidirectional at pick confidence level.
             #
             #  win_rate < 50%  →  penalty:  -(50 - wr) / 5   (max -10)
-            #  win_rate > 65%  →  boost:    +(wr - 65) / 5   (max +8)
+            #  win_rate > 65%  →  boost:    +(wr - 65) / 5   (max +10)
             #  50% ≤ wr ≤ 65%  →  no adjustment (neutral band)
+            MAX_LEAGUE_ADJUSTMENT = 10
             try:
                 from app.monitoring.self_learner import get_league_accuracy
                 _league_key = doc.get("tournament") or doc.get("category") or ""
@@ -766,11 +774,11 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                                 if _wr < 50.0:
                                     # Underperforming league — reduce confidence
                                     _league_adj = -round((50.0 - _wr) / 5)
-                                    _league_adj = max(-10, _league_adj)
+                                    _league_adj = max(-MAX_LEAGUE_ADJUSTMENT, _league_adj)
                                 elif _wr > 65.0:
                                     # Outperforming league — boost confidence
                                     _league_adj = round((_wr - 65.0) / 5)
-                                    _league_adj = min(8, _league_adj)
+                                    _league_adj = min(MAX_LEAGUE_ADJUSTMENT, _league_adj)
                             if _league_adj != 0:
                                 cal_conf = min(99, max(1, cal_conf + _league_adj))
                                 pick.setdefault("calibration", {})
@@ -978,6 +986,93 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     return prediction
 
 
+def _compute_h2h_signals(detail: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derive H2H dominance signals from SofaScore ``last_meetings`` data.
+
+    Takes up to 10 most recent entries from ``detail["last_meetings"]`` and
+    computes home/away/draw dominance based on actual scorelines, correctly
+    accounting for which team was the home side in each historical meeting.
+
+    Returns one signal dict or an empty list.  Returns ``[]`` on any error so
+    the caller is never interrupted.
+
+    Signal names: ``h2h_home``, ``h2h_away``, ``h2h_draw``
+    Source tag:   ``"sofascore_last_meetings"``
+
+    Requirements: R13.1, R13.2, R13.3, R13.4, R13.5, R13.7
+    """
+    try:
+        meetings = (detail.get("last_meetings") or [])[:10]
+        if len(meetings) < 3:
+            return []
+
+        home_id = str((detail.get("home_team") or detail.get("homeTeam") or {}).get("id") or "")
+
+        home_wins = 0
+        away_wins = 0
+        draws = 0
+
+        for m in meetings:
+            h_score = (m.get("homeScore") or {}).get("current")
+            a_score = (m.get("awayScore") or {}).get("current")
+            if h_score is None or a_score is None:
+                continue
+            try:
+                h_score = int(h_score)
+                a_score = int(a_score)
+            except (TypeError, ValueError):
+                continue
+            # Determine whether the meeting's home team is the current home team
+            meeting_home_id = str((m.get("homeTeam") or {}).get("id") or "")
+            current_home_is_meeting_home = (meeting_home_id == home_id)
+
+            if h_score > a_score:
+                # Meeting home team won
+                if current_home_is_meeting_home:
+                    home_wins += 1
+                else:
+                    away_wins += 1
+            elif h_score < a_score:
+                # Meeting away team won
+                if current_home_is_meeting_home:
+                    away_wins += 1
+                else:
+                    home_wins += 1
+            else:
+                draws += 1
+
+        total = home_wins + draws + away_wins
+        if total < 3:
+            return []
+
+        home_ratio = home_wins / total
+        away_ratio = away_wins / total
+
+        if home_wins > away_wins and home_ratio >= 0.5:
+            return [{
+                "name": "h2h_home",
+                "value": round(home_ratio, 2),
+                "impact": round(home_ratio * 4),
+                "source": "sofascore_last_meetings",
+            }]
+        elif away_wins > home_wins and away_ratio >= 0.5:
+            return [{
+                "name": "h2h_away",
+                "value": round(away_ratio, 2),
+                "impact": round(away_ratio * 4),
+                "source": "sofascore_last_meetings",
+            }]
+        else:
+            return [{
+                "name": "h2h_draw",
+                "value": round(draws / total, 2),
+                "impact": 1,
+                "source": "sofascore_last_meetings",
+            }]
+    except Exception:
+        return []
+
+
 def _rules_prediction(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
     if detail:
         try:
@@ -990,11 +1085,87 @@ def _rules_prediction(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str, 
                     "status": {**status, "type": "notstarted", "description": "Not started"},
                     "played_seconds": None,
                 }
-            return predict_sofascore_event(
+            result = predict_sofascore_event(
                 rules_detail,
                 rules_detail.get("home_last_matches") or [],
                 rules_detail.get("away_last_matches") or [],
             )
+            # Inject H2H signals derived from SofaScore last_meetings (R13).
+            # Before appending each computed signal, check whether an existing
+            # signal with the same name and equal or higher abs(impact) already
+            # exists — if so, discard the computed one (R13.6).
+            h2h_computed = _compute_h2h_signals(rules_detail)
+            if h2h_computed:
+                existing_signals = result.get("signals") or []
+                for computed_sig in h2h_computed:
+                    sig_name = computed_sig.get("name")
+                    computed_impact = abs(computed_sig.get("impact") or 0)
+                    already_covered = any(
+                        s.get("name") == sig_name and abs(s.get("impact") or 0) >= computed_impact
+                        for s in existing_signals
+                    )
+                    if not already_covered:
+                        existing_signals.append(computed_sig)
+                result["signals"] = existing_signals
+
+            # Competition round analysis injection (R14.4–R14.7).
+            # If competition_round_analysis is present on the doc, extract form
+            # insight and optionally emit a competition_momentum signal.
+            # audit["competition_context_applied"] = True whenever the key is
+            # present, regardless of whether a momentum signal is emitted.
+            try:
+                import json as _json
+                cra = doc.get("competition_round_analysis")
+                if cra:
+                    audit = result.setdefault("audit", {})
+                    audit["competition_context_applied"] = True
+                    analysis_text = cra.get("analysis_text") or "{}"
+                    try:
+                        cra_data = _json.loads(analysis_text)
+                    except Exception:
+                        cra_data = {}
+                    top_table = cra_data.get("top_table") or []
+                    # The top_table entries may be dicts with a "team" key or
+                    # plain strings — normalise both.
+                    top_teams = []
+                    for entry in top_table[:2]:
+                        if isinstance(entry, dict):
+                            top_teams.append(str(entry.get("team") or "").lower())
+                        else:
+                            top_teams.append(str(entry).lower())
+                    if top_teams:
+                        home_name = str(
+                            (rules_detail.get("home_team") or {}).get("name") or ""
+                        ).lower()
+                        away_name = str(
+                            (rules_detail.get("away_team") or {}).get("name") or ""
+                        ).lower()
+                        home_in_top = home_name and any(
+                            home_name in t or t in home_name for t in top_teams
+                        )
+                        away_in_top = away_name and any(
+                            away_name in t or t in away_name for t in top_teams
+                        )
+                        # Emit a momentum signal only when exactly one team has a
+                        # clear form advantage in the top 2.
+                        if home_in_top and not away_in_top:
+                            signals_list = result.setdefault("signals", [])
+                            signals_list.append({
+                                "name": "competition_momentum",
+                                "value": {"direction": "home", "source": "competition_round_analysis"},
+                                "impact": 1,
+                            })
+                        elif away_in_top and not home_in_top:
+                            signals_list = result.setdefault("signals", [])
+                            signals_list.append({
+                                "name": "competition_momentum",
+                                "value": {"direction": "away", "source": "competition_round_analysis"},
+                                "impact": 1,
+                            })
+            except Exception:
+                pass
+
+            return result
         except Exception as exc:
             from app.utils.health_counters import record_health_event
             record_health_event("enriched_prediction", "rules_prediction_failed", exc)
@@ -4375,6 +4546,106 @@ def _regime_info(doc: dict[str, Any]) -> dict[str, Any]:
         }
     except Exception:
         return {}
+
+
+def _normalise_team_key(name: str) -> str:
+    """Normalise a team name to a stable dash-separated lowercase key.
+
+    Matches the convention used when recording team_competitions rows:
+    non-alphanumeric characters are replaced with spaces, then joined
+    with dashes after stripping.
+    """
+    return "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in str(name or "")).split())
+
+
+def _team_history_signals(doc: dict[str, Any], detail: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return team prediction history signals derived from the ``team_competitions`` table.
+
+    For each team (home and away) the function queries ``team_competitions`` for
+    the current competition and emits one of the following signals when the team
+    has at least 10 recorded predictions:
+
+    * ``team_prediction_history_risk``  (impact = -3) — accuracy < 40 %
+    * ``team_prediction_history_boost`` (impact = +2) — accuracy >= 60 %
+
+    No signal is emitted when fewer than 10 predictions are available or when
+    accuracy falls in the neutral 40–60 % range.
+
+    Any DB error (including the table not existing) is swallowed and an empty
+    list is returned so that the calling code is never interrupted.
+
+    Requirements: R11.1, R11.2, R11.3, R11.4, R11.5, R11.6
+    """
+    signals: list[dict[str, Any]] = []
+    try:
+        home_team = detail.get("home_team") or detail.get("homeTeam") or {}
+        away_team = detail.get("away_team") or detail.get("awayTeam") or {}
+        home_name = (home_team.get("name") or "") if isinstance(home_team, dict) else ""
+        away_name = (away_team.get("name") or "") if isinstance(away_team, dict) else ""
+        home_key = _normalise_team_key(home_name)
+        away_key = _normalise_team_key(away_name)
+
+        # Derive competition key using the same normaliser used when the rows
+        # were written — normalize_league from league_memory.
+        from app.storage.league_memory import normalize_league  # avoid circular imports
+        tournament_raw = doc.get("tournament") or ""
+        if isinstance(tournament_raw, dict):
+            tournament_raw = tournament_raw.get("name") or ""
+        comp_key = normalize_league(str(tournament_raw))
+
+        _init_db()
+        with db_conn(timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            for team_key, side, team_name in [
+                (home_key, "home", home_name),
+                (away_key, "away", away_name),
+            ]:
+                if not team_key or not comp_key:
+                    continue
+                row = conn.execute(
+                    "SELECT prediction_total, prediction_correct "
+                    "FROM team_competitions "
+                    "WHERE team_key = ? AND competition_key = ? LIMIT 1",
+                    (team_key, comp_key),
+                ).fetchone()
+                if not row:
+                    continue
+                total = int(row["prediction_total"] or 0)
+                if total < 10:
+                    continue
+                correct = int(row["prediction_correct"] or 0)
+                accuracy = correct / total
+                if accuracy < 0.40:
+                    signals.append({
+                        "name": "team_prediction_history_risk",
+                        "value": {
+                            "team": team_name,
+                            "team_key": team_key,
+                            "side": side,
+                            "accuracy": round(accuracy, 4),
+                            "prediction_total": total,
+                            "prediction_correct": correct,
+                        },
+                        "impact": -3,
+                        "role": "risk_signal",
+                    })
+                elif accuracy >= 0.60:
+                    signals.append({
+                        "name": "team_prediction_history_boost",
+                        "value": {
+                            "team": team_name,
+                            "team_key": team_key,
+                            "side": side,
+                            "accuracy": round(accuracy, 4),
+                            "prediction_total": total,
+                            "prediction_correct": correct,
+                        },
+                        "impact": 2,
+                        "role": "decision_driver",
+                    })
+    except Exception:
+        pass
+    return signals
 
 
 def _detail_country(detail: dict[str, Any]) -> str | None:

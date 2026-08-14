@@ -92,7 +92,7 @@ def run_manual_bet(
     if not candidates:
         return {
             "status": "no_candidates",
-            "message": "No stored predictions passed the research filter",
+            "message": "No upcoming ungraded predictions available for today/tomorrow that pass all filters (date, time, live status, odds, research gate, buffer data).",
             "mode": "manual",
             "candidates_considered": 0,
             "selections": [],

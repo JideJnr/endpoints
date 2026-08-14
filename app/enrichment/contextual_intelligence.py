@@ -18,6 +18,42 @@ from app.utils.primitives import _to_float
 from app.competition.competition_special import _parse_datetime
 from app.utils.doc_helpers import _impact
 
+_LINEUP_KEYS = ("lineups", "starting_xi", "confirmed_lineups", "home_lineup", "away_lineup")
+
+
+def _norm_key(value: Any) -> str:
+    return str(value or "").lower().strip().replace(" ", "_")[:60]
+
+
+def _has_lineup_data(doc: dict[str, Any]) -> bool:
+    if any(doc.get(key) for key in _LINEUP_KEYS):
+        return True
+    detail = doc.get("sofascore_detail") or {}
+    return any(detail.get(key) for key in ("lineups", "starting_xi", "confirmed_lineups"))
+
+
+def _learned_penalty_for_tag(tag: str, league_key: str) -> float | None:
+    try:
+        _init_db()
+        with db_conn(timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            for key in (league_key, "__global__"):
+                row = conn.execute("""
+                    select penalty_override
+                    from context_penalty_adjustments
+                    where context_tag = ? and league_key = ? and samples >= 10
+                """, (tag, key)).fetchone()
+                if row:
+                    return float(row["penalty_override"])
+    except Exception:
+        return None
+    return None
+
+
+def _context_penalty(tag: str, league_key: str, fallback: float) -> float:
+    learned = _learned_penalty_for_tag(tag, league_key)
+    return fallback if learned is None else learned
+
 def build_contextual_intelligence(
     doc: dict[str, Any],
     prediction: dict[str, Any] | None = None,
@@ -118,6 +154,7 @@ def _match_context(doc: dict[str, Any], time_context: dict[str, Any]) -> dict[st
     name = _text(doc.get("sportybet_name") or doc.get("name"))
     web_text = _web_text(doc)
     text = f"{tournament} {category} {name} {web_text}".lower()
+    league_key = _norm_key(tournament or category)
     tags: list[str] = []
     pressure = "normal"
     confidence_reliability = "normal"
@@ -126,43 +163,43 @@ def _match_context(doc: dict[str, Any], time_context: dict[str, Any]) -> dict[st
     if any(key in text for key in ("friendly", "club friendly", "international friendly")):
         tags.append("friendly")
         confidence_reliability = "reduced"
-        adjustment -= 6
+        adjustment += _context_penalty("friendly", league_key, -6)
     if any(key in text for key in ("cup", "playoff", "play-off", "knockout", "final", "semi-final", "quarter-final")):
         tags.append("knockout_or_cup_pressure")
         pressure = "high"
-        adjustment -= 2
+        adjustment += _context_penalty("knockout_or_cup_pressure", league_key, -2)
     if any(key in text for key in ("derby", "rivalry", "rivals")):
         tags.append("derby_or_rivalry")
         pressure = "high"
-        adjustment -= 4
+        adjustment += _context_penalty("derby_or_rivalry", league_key, -4)
     if any(key in text for key in ("relegation", "survival", "drop zone")):
         tags.append("relegation_pressure")
         pressure = "high"
         # Don't apply a flat penalty — form trajectory signals carry the real weight.
         # A team in a relegation battle that is improving vs strong opponents is
         # different from one losing to everyone. Apply a small base penalty only.
-        adjustment -= 1
+        adjustment += _context_penalty("relegation_pressure", league_key, -1)
     if any(key in text for key in ("title race", "title decider", "must win", "promotion")):
         tags.append("title_or_promotion_pressure")
         pressure = "high"
-        adjustment -= 2
+        adjustment += _context_penalty("title_or_promotion_pressure", league_key, -2)
     if any(key in text for key in ("dead rubber", "meaningless", "nothing to play")):
         tags.append("low_motivation")
         confidence_reliability = "reduced"
-        adjustment -= 5
+        adjustment += _context_penalty("low_motivation", league_key, -5)
     if any(key in text for key in ("revenge", "rematch", "previous meeting")):
         tags.append("revenge_or_rematch")
-        adjustment -= 1
+        adjustment += _context_penalty("revenge_or_rematch", league_key, -1)
     if any(key in text for key in ("rotation", "rest players", "rested", "squad rotation")):
         tags.append("rotation_likelihood")
-        adjustment -= 4
+        adjustment += _context_penalty("rotation_likelihood", league_key, -4)
     if any(key in text for key in ("rain", "storm", "wind", "snow", "weather")):
         tags.append("weather_watch")
-        adjustment -= 2
+        adjustment += _context_penalty("weather_watch", league_key, -2)
     minutes = _to_float(time_context.get("minutes_until_kickoff"))
-    if minutes is not None and 0 <= minutes <= 90 and not doc.get("lineups") and not (doc.get("sofascore_detail") or {}).get("lineups"):
+    if minutes is not None and 0 <= minutes <= 90 and not _has_lineup_data(doc):
         tags.append("lineup_window")
-        adjustment -= 2
+        adjustment += _context_penalty("lineup_window", league_key, -2)
 
     # Season stage awareness: when the season hasn't started or is just
     # beginning, standings are unreliable.  Reduce confidence and flag it.
@@ -173,11 +210,11 @@ def _match_context(doc: dict[str, Any], time_context: dict[str, Any]) -> dict[st
         if stage == "not_started":
             tags.append("season_not_started")
             confidence_reliability = "reduced"
-            adjustment -= 5
+            adjustment += _context_penalty("season_not_started", league_key, -5)
         elif stage == "beginning":
             tags.append("season_beginning")
             confidence_reliability = "reduced"
-            adjustment -= 3
+            adjustment += _context_penalty("season_beginning", league_key, -3)
 
     return {
         "tags": tags or ["standard_fixture"],

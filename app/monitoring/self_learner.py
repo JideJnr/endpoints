@@ -31,7 +31,7 @@ Usage:
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.storage.db import db_conn
@@ -71,6 +71,8 @@ UNIQUE_GRADED_HISTORY = """
 """
 
 MIN_SAMPLES = 15          # minimum graded predictions before trusting a signal
+MIN_LEAGUE_SAMPLES = 5
+MIN_COMBINATION_SAMPLES = 12
 BLEND_WEIGHT = 0.45       # how much learned accuracy pulls the raw signal weight
                           # 0 = no adjustment, 1 = fully replace with learned rate
 DECAY_FACTOR = 0.92       # older data matters less — applied per 30-day window
@@ -188,6 +190,118 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
             last_updated    text not null default current_timestamp
         )
     """)
+    conn.execute("""
+        create table if not exists ai_analysis_feedback (
+            id INTEGER primary key autoincrement,
+            match_id TEXT not null,
+            competition_key TEXT not null,
+            analysis_correct INTEGER not null default 0,
+            analysis_confidence_direction TEXT,
+            actual_result TEXT,
+            created_at TEXT not null default current_timestamp,
+            unique(match_id, competition_key)
+        )
+    """)
+    conn.execute("create index if not exists idx_ai_analysis_feedback_competition on ai_analysis_feedback(competition_key)")
+    conn.execute("""
+        create table if not exists user_behavior_outcomes (
+            id INTEGER primary key autoincrement,
+            match_id TEXT not null,
+            pick_type TEXT not null,
+            user_agreed INTEGER not null default 0,
+            result TEXT not null,
+            created_at TEXT not null default current_timestamp,
+            unique(match_id, pick_type)
+        )
+    """)
+    conn.execute("""
+        create table if not exists system_events (
+            id INTEGER primary key autoincrement,
+            event_type TEXT not null,
+            league_key TEXT,
+            pick_type TEXT,
+            detail_json TEXT,
+            created_at TEXT not null default current_timestamp
+        )
+    """)
+    conn.execute("create index if not exists idx_system_events_type_created on system_events(event_type, created_at desc)")
+    conn.execute("""
+        create table if not exists league_outcome_distribution (
+            league_key TEXT primary key,
+            home_rate REAL not null default 0.45,
+            draw_rate REAL not null default 0.30,
+            away_rate REAL not null default 0.25,
+            samples INTEGER not null default 0,
+            last_updated TEXT not null default current_timestamp
+        )
+    """)
+    conn.execute("""
+        create table if not exists context_penalty_adjustments (
+            context_tag TEXT not null,
+            league_key TEXT not null default '__global__',
+            penalty_override REAL,
+            samples INTEGER not null default 0,
+            win_rate REAL,
+            last_updated TEXT not null default current_timestamp,
+            primary key (context_tag, league_key)
+        )
+    """)
+    conn.execute("""
+        create table if not exists signal_outcomes (
+            id INTEGER primary key autoincrement,
+            signal_name TEXT not null,
+            match_id TEXT not null,
+            tournament TEXT,
+            country TEXT,
+            result TEXT,
+            created_at TEXT,
+            unique(signal_name, match_id)
+        )
+    """)
+    # AI analysis quality feedback — used to calibrate the LLM model weight (R1)
+    conn.execute("""
+        create table if not exists ai_analysis_feedback (
+            id                          integer primary key autoincrement,
+            match_id                    text not null,
+            competition_key             text not null,
+            analysis_correct            integer not null default 0,
+            analysis_confidence_direction text,
+            actual_result               text,
+            created_at                  text not null default current_timestamp,
+            unique (match_id, competition_key)
+        )
+    """)
+    conn.execute("""
+        create index if not exists idx_ai_analysis_feedback_competition_key
+        on ai_analysis_feedback (competition_key)
+    """)
+    # User pick-agreement outcomes — used to calibrate user_pick_signal impact (R2)
+    conn.execute("""
+        create table if not exists user_behavior_outcomes (
+            id          integer primary key autoincrement,
+            match_id    text not null,
+            pick_type   text not null,
+            user_agreed integer not null default 0,
+            result      text not null,
+            created_at  text not null default current_timestamp,
+            unique (match_id, pick_type)
+        )
+    """)
+    # System-health events — drift alerts, recovery events, etc. (R4)
+    conn.execute("""
+        create table if not exists system_events (
+            id          integer primary key autoincrement,
+            event_type  text not null,
+            league_key  text,
+            pick_type   text,
+            detail_json text,
+            created_at  text not null default current_timestamp
+        )
+    """)
+    conn.execute("""
+        create index if not exists idx_system_events_type_created
+        on system_events (event_type, created_at desc)
+    """)
 
 
 # ── Main learning cycle ───────────────────────────────────────────────────────
@@ -216,6 +330,7 @@ def run_learning_cycle() -> dict[str, Any]:
     if not rows:
         return {"status": "no_graded_data", "signal_updates": 0, "league_updates": 0}
 
+    now_ref = datetime.now(timezone.utc)
     # ── 1. Aggregate signal win rates ─────────────────────────────────────────
     signal_stats: dict[tuple[str, str], dict] = {}
     signal_pick_stats: dict[tuple[str, str, str], dict] = {}
@@ -231,12 +346,12 @@ def run_learning_cycle() -> dict[str, Any]:
             if not name:
                 continue
             # Global bucket
-            _tally(signal_stats, (name, "__global__"), result)
-            _tally(signal_pick_stats, (name, "__global__", pick_type), result)
+            _tally(signal_stats, (name, "__global__"), result, row=row, now=now_ref)
+            _tally(signal_pick_stats, (name, "__global__", pick_type), result, row=row, now=now_ref)
             # League-specific bucket
             if league_key:
-                _tally(signal_stats, (name, league_key), result)
-                _tally(signal_pick_stats, (name, league_key, pick_type), result)
+                _tally(signal_stats, (name, league_key), result, row=row, now=now_ref)
+                _tally(signal_pick_stats, (name, league_key, pick_type), result, row=row, now=now_ref)
 
     # ── 2. Aggregate league accuracy ──────────────────────────────────────────
     league_stats: dict[tuple[str, str], dict] = {}  # (league_key, pick_type) → stats
@@ -317,7 +432,7 @@ def run_learning_cycle() -> dict[str, Any]:
             losses = stats["losses"]
             if samples < MIN_SAMPLES:
                 continue
-            win_rate = wins / samples
+            win_rate = stats.get("weighted_wins", wins) / stats.get("weighted_total", samples)
             # weight_adj: positive = boost this signal, negative = suppress it
             # Neutral is 0.50 win rate → adj = 0
             weight_adj = round((win_rate - 0.50) * 2.0, 3)  # range ≈ -1.0 to +1.0
@@ -343,7 +458,7 @@ def run_learning_cycle() -> dict[str, Any]:
             losses = stats["losses"]
             if samples < MIN_SAMPLES:
                 continue
-            win_rate = wins / samples
+            win_rate = stats.get("weighted_wins", wins) / stats.get("weighted_total", samples)
             weight_adj = round((win_rate - 0.50) * 2.0, 3)
             conn.execute("""
                 insert into signal_pick_weights
@@ -359,6 +474,8 @@ def run_learning_cycle() -> dict[str, Any]:
             """, (signal_name, league_key, pick_type, samples, wins, losses,
                   round(win_rate, 4), weight_adj, now))
             signal_updates += 1
+
+        signal_updates += _populate_country_signal_weights(conn, rows, now_ref)
 
         # League accuracy
         for (league_key, pick_type), stats in league_stats.items():
@@ -423,6 +540,11 @@ def run_learning_cycle() -> dict[str, Any]:
         bias_updates = _learn_bias_corrections(conn, rows)
 
         conn.commit()
+        try:
+            from app.monitoring.learned_parameters import clear_learned_parameter_cache
+            clear_learned_parameter_cache()
+        except Exception:
+            pass
 
         # -- 4. Tournament preferences for enrichment priority ------------------
         pref_result = update_tournament_preferences()
@@ -442,6 +564,10 @@ def run_learning_cycle() -> dict[str, Any]:
 
         # -- 9. Learned thresholds ------------------------------------------------
         threshold_updates = _learn_thresholds(conn, rows)
+        outcome_distribution_updates = _populate_league_outcome_distribution(conn, rows)
+        context_penalty_updates = _learn_context_penalties(conn, rows)
+        drift_events = _detect_and_handle_drift(conn, rows)
+        signal_outcome_backfills = _backfill_signal_outcomes(conn, rows)
 
         conn.commit()
         try:
@@ -462,7 +588,8 @@ def run_learning_cycle() -> dict[str, Any]:
         f"{specialist_updates} specialist credits | "
         f"{combination_updates} combination patterns | "
         f"{threshold_updates} learned thresholds | "
-        f"{pref_updates} tournament preferences"
+        f"{pref_updates} tournament preferences | "
+        f"{drift_events} drift events"
     )
     return {
         "status": "ok",
@@ -477,12 +604,20 @@ def run_learning_cycle() -> dict[str, Any]:
         "combination_updates": combination_updates,
         "threshold_updates": threshold_updates,
         "tournament_preference_updates": pref_updates,
+        "drift_events": drift_events,
+        "league_outcome_distribution_updates": outcome_distribution_updates,
+        "context_penalty_updates": context_penalty_updates,
+        "signal_outcome_backfills": signal_outcome_backfills,
     }
 
 
 # ── Read-back helpers used by prediction pipeline ─────────────────────────────
 
-def get_signal_weights(league: str | None = None, pick_type: str | None = None) -> dict[str, float]:
+def get_signal_weights(
+    league: str | None = None,
+    pick_type: str | None = None,
+    country: str | None = None,
+) -> dict[str, float]:
     """
     Return a dict of signal_name → weight_adj for the given league.
     Falls back to global weights if no league-specific data exists.
@@ -494,25 +629,39 @@ def get_signal_weights(league: str | None = None, pick_type: str | None = None) 
         conn.row_factory = sqlite3.Row
 
         league_key = _norm_league(league or "")
+        country_key = _norm_league(country or "")
+        fallback_keys = [league_key]
+        if country_key and country_key != league_key:
+            fallback_keys.append(country_key)
+        fallback_keys.append("__global__")
+        placeholders = ",".join("?" * len(fallback_keys))
         if pick_type:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 select signal_name, weight_adj, league_key, samples
                 from signal_pick_weights
-                where league_key in (?, '__global__')
+                where league_key in ({placeholders})
                   and pick_type = ?
                   and samples >= ?
-                order by case when league_key = ? then 0 else 1 end
-            """, (league_key, pick_type, MIN_SAMPLES, league_key)).fetchall()
+                order by case league_key
+                    when ? then 0
+                    when ? then 1
+                    else 2
+                end
+            """, (*fallback_keys, pick_type, MIN_SAMPLES, league_key, country_key)).fetchall()
         else:
             rows = []
         if not rows:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 select signal_name, weight_adj, league_key, samples
                 from signal_weights
-                where league_key in (?, '__global__')
+                where league_key in ({placeholders})
                   and samples >= ?
-                order by case when league_key = ? then 0 else 1 end
-            """, (league_key, MIN_SAMPLES, league_key)).fetchall()
+                order by case league_key
+                    when ? then 0
+                    when ? then 1
+                    else 2
+                end
+            """, (*fallback_keys, MIN_SAMPLES, league_key, country_key)).fetchall()
 
     weights: dict[str, float] = {}
     for row in rows:
@@ -846,7 +995,7 @@ def _learn_signal_combinations(conn: sqlite3.Connection, rows: list) -> int:
     Uses build_signal_combination() from signal_combinations.py to produce
     a stable 16-char key for each prediction's signal set, then tallies
     wins/losses per (key, league_key, pick_type, selection).
-    Requires >= 5 samples before writing a row.
+    Requires enough samples before writing a row.
     """
     from app.signal_combinations import build_signal_combination  # noqa: PLC0415
 
@@ -882,7 +1031,7 @@ def _learn_signal_combinations(conn: sqlite3.Connection, rows: list) -> int:
     now = datetime.now(timezone.utc).isoformat()
     written = 0
     for (ckey, lk, pt, sel), s in stats.items():
-        if s["samples"] < 5:
+        if s["samples"] < MIN_COMBINATION_SAMPLES:
             continue
         wr = s["wins"] / s["samples"]
         avg_conf = s["conf_sum"] / s["samples"]
@@ -900,6 +1049,43 @@ def _learn_signal_combinations(conn: sqlite3.Connection, rows: list) -> int:
                 last_updated   = excluded.last_updated
         """, (ckey, lk, pt, sel, s["samples"], s["wins"], s["losses"],
               round(wr, 4), round(avg_conf, 2), now))
+        written += 1
+    return written
+
+
+def _populate_country_signal_weights(conn: sqlite3.Connection, rows: list, now: datetime) -> int:
+    stats: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        country_key = _norm_league(row["country_name"] or "")
+        if not country_key:
+            continue
+        for signal in _decision_signals_for_row(row):
+            name = str(signal.get("name") or "")
+            if not name:
+                continue
+            _tally(stats, (name, country_key), row["result"], row=row, now=now)
+    written = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for (signal_name, country_key), bucket in stats.items():
+        samples = int(bucket["samples"])
+        if samples < MIN_LEAGUE_SAMPLES:
+            continue
+        wins = int(bucket["wins"])
+        losses = int(bucket["losses"])
+        win_rate = bucket.get("weighted_wins", wins) / bucket.get("weighted_total", samples)
+        weight_adj = round((win_rate - 0.50) * 2.0, 3)
+        conn.execute("""
+            insert into signal_weights
+                (signal_name, league_key, samples, wins, losses, win_rate, weight_adj, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(signal_name, league_key) do update set
+                samples = excluded.samples,
+                wins = excluded.wins,
+                losses = excluded.losses,
+                win_rate = excluded.win_rate,
+                weight_adj = excluded.weight_adj,
+                last_updated = excluded.last_updated
+        """, (signal_name, country_key, samples, wins, losses, round(win_rate, 4), weight_adj, now_iso))
         written += 1
     return written
 
@@ -944,7 +1130,9 @@ def _learn_bias_corrections(conn: sqlite3.Connection, rows: list) -> int:
         flagged = int(overconfidence >= 0.08 or (losses / samples) >= 0.58)
         multiplier = 1.0
         if flagged:
-            multiplier = max(0.72, round(1.0 - min(0.28, overconfidence * 0.9), 4))
+            loss_rate = losses / samples
+            multiplier_floor = _dynamic_bias_multiplier_floor(loss_rate)
+            multiplier = max(multiplier_floor, round(1.0 - min(0.28, overconfidence * 0.9), 4))
         conn.execute("""
             insert into model_bias_corrections
                 (bias_key, samples, wins, losses, win_rate,
@@ -1086,12 +1274,74 @@ def _learn_thresholds(conn: sqlite3.Connection, rows: list) -> int:
 
 
 
-def _tally(stats: dict, key: tuple, result: str) -> None:
+def _decay_weight(created_at: str, now: datetime) -> float:
+    try:
+        row_dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if row_dt.tzinfo is None:
+            row_dt = row_dt.replace(tzinfo=timezone.utc)
+        age_days = max(0, (now - row_dt.astimezone(timezone.utc)).days)
+        return DECAY_FACTOR ** (age_days / 7.0)
+    except Exception:
+        return 1.0
+
+
+def _row_weight(row: Any, now: datetime) -> float:
+    confidence = 50.0
+    try:
+        value = row["confidence"] if hasattr(row, "keys") and "confidence" in row.keys() else row.get("confidence")
+        confidence = float(value if value is not None else 50.0)
+    except Exception:
+        confidence = 50.0
+    confidence_weight = max(0.0, min(1.0, confidence / 100.0))
+    try:
+        created_at = row["created_at"] if hasattr(row, "keys") and "created_at" in row.keys() else row.get("created_at")
+    except Exception:
+        created_at = None
+    return _decay_weight(str(created_at or ""), now) * confidence_weight
+
+
+def _dynamic_bias_multiplier_floor(loss_rate: float) -> float:
+    return max(0.72, 1.0 - (loss_rate - 0.50) * 1.4)
+
+
+def _priority_for_win_rate(samples: int, win_rate: float) -> int:
+    if samples >= 10 and win_rate >= 0.60:
+        return 0
+    if samples >= 5 and win_rate >= 0.55:
+        return 1
+    if samples >= 5 and win_rate >= 0.50:
+        return 2
+    if samples >= 5 and win_rate >= 0.45:
+        return 3
+    if samples < 5:
+        return 4
+    if win_rate >= 0.40:
+        return 5
+    if win_rate >= 0.35:
+        return 6
+    return 7
+
+
+def _selection_side(selection: Any) -> str:
+    text = str(selection or "").lower()
+    if "draw" in text or text in {"x", "tie"}:
+        return "draw"
+    if "away" in text or text in {"2", "away_win"}:
+        return "away"
+    if "home" in text or text in {"1", "home_win"}:
+        return "home"
+    return ""
+
+
+def _tally(stats: dict, key: tuple, result: str, row: Any | None = None, now: datetime | None = None) -> None:
     if key not in stats:
-        stats[key] = {"samples": 0, "wins": 0, "losses": 0}
+        stats[key] = {"samples": 0, "wins": 0, "losses": 0, "weighted_wins": 0.0, "weighted_total": 0.0}
+    weight = _row_weight(row, now or datetime.now(timezone.utc)) if row is not None else 1.0
     stats[key]["samples"] += 1
+    stats[key]["weighted_total"] += weight
     if result == "win":
         stats[key]["wins"] += 1
+        stats[key]["weighted_wins"] += weight
     else:
         stats[key]["losses"] += 1
 
@@ -1381,14 +1631,377 @@ def _safe_json_object(value: Any) -> dict[str, Any]:
         return {}
 
 
+def _json_dumps(value: Any) -> str:
+    try:
+        import json as _json
+        return _json.dumps(value, sort_keys=True)
+    except Exception:
+        return "{}"
+
+
 def _incorporate_ai_analysis(conn: sqlite3.Connection, rows: list) -> int:
-    """Stub: incorporate AI analysis feedback. Returns count of updates."""
-    return 0
+    """
+    Compare AI competition-analysis predictions against actual outcomes and
+    write results to `ai_analysis_feedback`.  When enough rows accumulate,
+    update the 'llm' row in `learned_model_weights` using the standard blend
+    formula.
+
+    Returns the count of rows inserted into `ai_analysis_feedback`.
+    Requirements: R1.1–R1.7
+    """
+    import json as _json
+    import logging
+
+    log = logging.getLogger(__name__)
+    upserted = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for row in rows:
+        competition_key = _norm_league(row["league_name"] or "")
+        if not competition_key:
+            continue
+
+        # Extract round_name from audit_json if available (informational only)
+        audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
+
+        # Query the most recent competition_analysis row within 30 days
+        try:
+            analysis_row = conn.execute(
+                """
+                SELECT analysis_text
+                FROM competition_analysis
+                WHERE competition_key = ?
+                  AND datetime(created_at) >= datetime('now', '-30 days')
+                ORDER BY datetime(created_at) DESC
+                LIMIT 1
+                """,
+                (competition_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # competition_analysis table doesn't exist yet
+            return 0
+
+        if not analysis_row:
+            continue
+
+        # Parse analysis_text to extract top_table
+        try:
+            analysis_data = _json.loads(analysis_row[0] or "{}")
+        except Exception:
+            continue
+
+        top_table = analysis_data.get("top_table") or []
+        if not top_table:
+            continue
+
+        # Derive the AI's confidence direction from rank-1 team
+        try:
+            top_entry = top_table[0]
+            top_team_name = str(top_entry.get("team") or "").lower()
+        except (IndexError, AttributeError):
+            continue
+
+        # Determine home / away team names from the row's audit or signals
+        home_name = str(audit.get("home_team") or audit.get("home") or "").lower()
+        away_name = str(audit.get("away_team") or audit.get("away") or "").lower()
+
+        if home_name and (home_name in top_team_name or top_team_name in home_name):
+            analysis_confidence_direction = "home"
+        elif away_name and (away_name in top_team_name or top_team_name in away_name):
+            analysis_confidence_direction = "away"
+        else:
+            # Can't determine direction — skip
+            continue
+
+        # Compare direction against actual selection/result
+        selection = str(row["selection"] or "").lower()
+        actual_result = str(row["result"] or "")
+
+        # analysis_correct = 1 when the AI direction matches the winning selection
+        analysis_correct = 1 if (
+            actual_result == "win"
+            and analysis_confidence_direction in selection
+        ) else 0
+
+        match_id = str(row["match_id"] or "")
+
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO ai_analysis_feedback
+                    (match_id, competition_key, analysis_correct,
+                     analysis_confidence_direction, actual_result, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(match_id, competition_key) DO NOTHING
+                """,
+                (
+                    match_id,
+                    competition_key,
+                    analysis_correct,
+                    analysis_confidence_direction,
+                    actual_result,
+                    now,
+                ),
+            )
+            upserted += cursor.rowcount
+        except Exception:
+            log.debug(
+                "[self_learner] ai_analysis_feedback upsert failed for match_id=%s", match_id
+            )
+            continue
+
+    # When enough feedback rows exist, update the LLM model weight
+    try:
+        stats = conn.execute(
+            "SELECT COUNT(*) as cnt, SUM(analysis_correct) as correct FROM ai_analysis_feedback"
+        ).fetchone()
+        total_cnt = stats[0] if stats else 0
+        correct_cnt = stats[1] if stats and stats[1] is not None else 0
+
+        if total_cnt >= 10:
+            ai_win_rate = correct_cnt / total_cnt
+            base = 0.10  # base weight for 'llm' (matches _BASE_WEIGHTS R9)
+            performance_factor = 0.5 + (ai_win_rate - 0.50) * 2.0
+            learned = round(base * (1 - BLEND_WEIGHT) + base * performance_factor * BLEND_WEIGHT, 4)
+            learned = max(0.05, min(0.50, learned))
+            conn.execute(
+                """
+                INSERT INTO learned_model_weights
+                    (model_name, base_weight, learned_weight, samples, win_rate, last_updated)
+                VALUES ('llm', ?, ?, ?, ?, ?)
+                ON CONFLICT(model_name) DO UPDATE SET
+                    base_weight    = excluded.base_weight,
+                    learned_weight = excluded.learned_weight,
+                    samples        = excluded.samples,
+                    win_rate       = excluded.win_rate,
+                    last_updated   = excluded.last_updated
+                """,
+                (base, learned, total_cnt, round(ai_win_rate, 4), now),
+            )
+    except Exception:
+        log.debug("[self_learner] failed to update llm model weight from ai_analysis_feedback")
+
+    return upserted
 
 
 def _incorporate_user_behavior(conn: sqlite3.Connection, rows: list) -> int:
-    """Stub: incorporate user behavior signals. Returns count of updates."""
-    return 0
+    """Incorporate explicit user-pick signals into calibration memory."""
+    written = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        for signal in _safe_json(row["signals_json"], []):
+            if signal.get("name") != "user_pick_signal":
+                continue
+            try:
+                impact = float(signal.get("impact") or signal.get("value") or 0)
+            except Exception:
+                impact = 0.0
+            cur = conn.execute("""
+                insert into user_behavior_outcomes
+                    (match_id, pick_type, user_agreed, result, created_at)
+                values (?, ?, ?, ?, ?)
+                on conflict(match_id, pick_type) do nothing
+            """, (
+                str(row["match_id"] or ""),
+                str(row["pick_type"] or "unknown"),
+                1 if impact > 0 else 0,
+                str(row["result"] or ""),
+                now,
+            ))
+            written += int(cur.rowcount > 0)
+    for agreed, model_name in ((1, "user_behavior_calibration"), (0, "user_behavior_disagree_calibration")):
+        stats = conn.execute("""
+            select count(*) as samples,
+                   sum(case when result = 'win' then 1 else 0 end) as wins
+            from user_behavior_outcomes
+            where user_agreed = ?
+        """, (agreed,)).fetchone()
+        samples = int(stats[0] or 0)
+        wins = int(stats[1] or 0)
+        if samples < 15:
+            continue
+        win_rate = wins / samples
+        learned = round((win_rate - 0.5) * 8, 1) if agreed else round((0.5 - win_rate) * 4, 1)
+        learned = max(0, min(6, learned)) if agreed else max(-4, min(0, learned))
+        conn.execute("""
+            insert into learned_model_weights
+                (model_name, base_weight, learned_weight, samples, win_rate, last_updated)
+            values (?, 0, ?, ?, ?, ?)
+            on conflict(model_name) do update set
+                learned_weight = excluded.learned_weight,
+                samples = excluded.samples,
+                win_rate = excluded.win_rate,
+                last_updated = excluded.last_updated
+        """, (model_name, learned, samples, round(win_rate, 4), now))
+    return written
+
+
+def _populate_league_outcome_distribution(conn: sqlite3.Connection, rows: list) -> int:
+    buckets: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if str(row["pick_type"] or "") != "match_result":
+            continue
+        league_key = _norm_league(row["league_name"] or "")
+        side = _selection_side(row["selection"])
+        if not league_key or side not in {"home", "draw", "away"}:
+            continue
+        bucket = buckets.setdefault(league_key, {"home": 0, "draw": 0, "away": 0, "samples": 0})
+        bucket[side] += 1
+        bucket["samples"] += 1
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for league_key, bucket in buckets.items():
+        samples = bucket["samples"]
+        if samples < 20:
+            continue
+        conn.execute("""
+            insert into league_outcome_distribution
+                (league_key, home_rate, draw_rate, away_rate, samples, last_updated)
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(league_key) do update set
+                home_rate = excluded.home_rate,
+                draw_rate = excluded.draw_rate,
+                away_rate = excluded.away_rate,
+                samples = excluded.samples,
+                last_updated = excluded.last_updated
+        """, (
+            league_key,
+            round(bucket["home"] / samples, 4),
+            round(bucket["draw"] / samples, 4),
+            round(bucket["away"] / samples, 4),
+            samples,
+            now,
+        ))
+        written += 1
+    return written
+
+
+def _learn_context_penalties(conn: sqlite3.Connection, rows: list) -> int:
+    buckets: dict[tuple[str, str], dict[str, int]] = {}
+    for row in rows:
+        context = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)
+        match_context = context.get("match_context") if isinstance(context, dict) else {}
+        tags = match_context.get("tags") if isinstance(match_context, dict) else []
+        if not isinstance(tags, list):
+            continue
+        league_key = _norm_league(row["league_name"] or "") or "__global__"
+        for tag in tags:
+            key = (str(tag), league_key)
+            bucket = buckets.setdefault(key, {"samples": 0, "wins": 0})
+            bucket["samples"] += 1
+            if row["result"] == "win":
+                bucket["wins"] += 1
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for (tag, league_key), bucket in buckets.items():
+        samples = bucket["samples"]
+        if samples < 10:
+            continue
+        win_rate = bucket["wins"] / samples
+        override = max(-10, min(4, round((0.5 - win_rate) * 12, 1)))
+        conn.execute("""
+            insert into context_penalty_adjustments
+                (context_tag, league_key, penalty_override, samples, win_rate, last_updated)
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(context_tag, league_key) do update set
+                penalty_override = excluded.penalty_override,
+                samples = excluded.samples,
+                win_rate = excluded.win_rate,
+                last_updated = excluded.last_updated
+        """, (tag, league_key, override, samples, round(win_rate, 4), now))
+        written += 1
+    return written
+
+
+def _detect_and_handle_drift(conn: sqlite3.Connection, rows: list) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    buckets: dict[tuple[str, str], dict[str, int]] = {}
+    for row in rows:
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if created.astimezone(timezone.utc) < cutoff:
+            continue
+        league_key = _norm_league(row["league_name"] or "")
+        pick_type = str(row["pick_type"] or "unknown")
+        if not league_key:
+            continue
+        bucket = buckets.setdefault((league_key, pick_type), {"samples": 0, "wins": 0})
+        bucket["samples"] += 1
+        if row["result"] == "win":
+            bucket["wins"] += 1
+    now = datetime.now(timezone.utc).isoformat()
+    events = 0
+    for (league_key, pick_type), bucket in buckets.items():
+        samples = bucket["samples"]
+        if samples < 10:
+            continue
+        win_rate = bucket["wins"] / samples
+        current = conn.execute("select priority from tournament_preferences where league_key = ?", (league_key,)).fetchone()
+        priority = int(current[0]) if current else 4
+        if win_rate < 0.40:
+            conn.execute("""
+                insert into tournament_preferences (league_key, priority, samples, win_rate, last_updated)
+                values (?, 7, ?, ?, ?)
+                on conflict(league_key) do update set
+                    priority     = 7,
+                    last_updated = excluded.last_updated
+            """, (league_key, samples, round(win_rate, 4), now))
+            detail = {"win_rate": round(win_rate, 4), "samples": samples, "days_window": 7, "action": "priority_set_to_7"}
+            conn.execute("""
+                insert into system_events(event_type, league_key, pick_type, detail_json, created_at)
+                values ('drift_detected', ?, ?, ?, ?)
+            """, (league_key, pick_type, _json_dumps(detail), now))
+            events += 1
+        elif priority == 7 and win_rate >= 0.45:
+            new_priority = _priority_for_win_rate(samples, win_rate)
+            conn.execute("update tournament_preferences set priority = ?, win_rate = ?, samples = ?, last_updated = ? where league_key = ?", (new_priority, round(win_rate, 4), samples, now, league_key))
+            detail = {"win_rate": round(win_rate, 4), "samples": samples, "days_window": 7, "action": f"priority_set_to_{new_priority}"}
+            conn.execute("""
+                insert into system_events(event_type, league_key, pick_type, detail_json, created_at)
+                values ('drift_recovery', ?, ?, ?, ?)
+            """, (league_key, pick_type, _json_dumps(detail), now))
+            events += 1
+    if events:
+        try:
+            from app.monitoring.learned_parameters import clear_learned_parameter_cache
+            clear_learned_parameter_cache()
+        except Exception:
+            pass
+    return events
+
+
+def _backfill_signal_outcomes(conn: sqlite3.Connection, rows: list) -> int:
+    written = 0
+    for row in rows:
+        match_id = str(row["match_id"] or "")
+        if not match_id:
+            continue
+        exists = conn.execute("select 1 from signal_outcomes where match_id = ? limit 1", (match_id,)).fetchone()
+        if exists:
+            continue
+        for signal in _decision_signals_for_row(row):
+            name = str(signal.get("name") or signal.get("signal_name") or "")
+            if not name:
+                continue
+            cur = conn.execute("""
+                insert into signal_outcomes
+                    (signal_name, match_id, tournament, country, result, created_at)
+                values (?, ?, ?, ?, ?, ?)
+                on conflict(signal_name, match_id) do nothing
+            """, (
+                name,
+                match_id,
+                row["league_name"],
+                row["country_name"],
+                row["result"],
+                row["created_at"],
+            ))
+            written += int(cur.rowcount > 0)
+    return written
 
 
 def _grade_specialists_from_history(rows: list) -> int:

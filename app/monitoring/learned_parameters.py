@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from functools import lru_cache
 from statistics import median
 from typing import Any
@@ -40,8 +41,13 @@ _GRADED_SQL = """
     where rn = 1
 """
 
+_GRADED_ROWS_CACHE: tuple[dict[str, Any], ...] | None = None
+_GRADED_ROWS_FETCHED_AT: float = 0.0
+_GRADED_ROWS_TTL: int = 3600
+
 
 def clear_learned_parameter_cache() -> None:
+    global _GRADED_ROWS_CACHE, _GRADED_ROWS_FETCHED_AT
     get_learned_ensemble_weights.cache_clear()
     get_market_regime_params.cache_clear()
     get_pick_generator_thresholds.cache_clear()
@@ -51,17 +57,24 @@ def clear_learned_parameter_cache() -> None:
     get_frontend_engine_params.cache_clear()
     get_frontend_api_limits.cache_clear()
     get_engine_learning_limits.cache_clear()
+    _GRADED_ROWS_CACHE = None
+    _GRADED_ROWS_FETCHED_AT = 0.0
 
 
-@lru_cache(maxsize=1)
 def _graded_rows() -> tuple[dict[str, Any], ...]:
+    global _GRADED_ROWS_CACHE, _GRADED_ROWS_FETCHED_AT
+    now = time.monotonic()
+    if _GRADED_ROWS_CACHE is not None and now - _GRADED_ROWS_FETCHED_AT < _GRADED_ROWS_TTL:
+        return _GRADED_ROWS_CACHE
     _init_db()
     try:
         with db_conn(timeout=30) as conn:
             conn.row_factory = sqlite3.Row
-            return tuple(dict(row) for row in conn.execute(_GRADED_SQL).fetchall())
+            _GRADED_ROWS_CACHE = tuple(dict(row) for row in conn.execute(_GRADED_SQL).fetchall())
     except Exception:
-        return ()
+        _GRADED_ROWS_CACHE = ()
+    _GRADED_ROWS_FETCHED_AT = now
+    return _GRADED_ROWS_CACHE
 
 
 @lru_cache(maxsize=1)

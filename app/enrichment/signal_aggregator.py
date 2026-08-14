@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,7 @@ from typing import Any
 from app.storage.db import db_conn, DB_PATH, _conn, _init_db
 from app.storage.league_memory import _init_db as lm_init_db
 
+log = logging.getLogger(__name__)
 
 # ── Signal categories ──────────────────────────────────────────
 
@@ -112,6 +114,20 @@ def _category_for_signal(name: str) -> str:
     for category, keywords in SIGNAL_CATEGORIES.items():
         if name in keywords:
             return category
+    has_away = "away" in name
+    has_home = "home" in name and not has_away
+    if has_away or has_home:
+        prefix = "away" if has_away else "home"
+        if any(key in name for key in ("form", "recent_history", "team_watcher", "wd", "last")):
+            return f"{prefix}_form"
+        if any(key in name for key in ("table", "standing", "position", "league_strength")):
+            return f"{prefix}_table"
+        if any(key in name for key in ("goal", "attack", "scoring", "pressure")):
+            return f"{prefix}_goal_pressure"
+        if any(key in name for key in ("odds", "market", "steam")):
+            return f"{prefix}_odds"
+        if any(key in name for key in ("defense", "conceding", "clean")):
+            return f"{prefix}_defense"
     if "h2h" in name:
         return "h2h_home"
     if "team_watcher" in name or "recent_history" in name or "form" in name:
@@ -123,6 +139,64 @@ def _category_for_signal(name: str) -> str:
     if "goal" in name:
         return "home_goal_pressure"
     return "unknown"
+
+
+def _get_base_probs(league_key: str) -> tuple[float, float, float, str]:
+    try:
+        _init_db()
+        with db_conn(timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("""
+                select home_rate, draw_rate, away_rate
+                from league_outcome_distribution
+                where league_key = ? and samples >= 20
+            """, (league_key,)).fetchone()
+            if row:
+                return float(row["home_rate"]), float(row["draw_rate"]), float(row["away_rate"]), "learned"
+            row = conn.execute("""
+                select avg(home_rate) as home_rate, avg(draw_rate) as draw_rate, avg(away_rate) as away_rate
+                from league_outcome_distribution
+                where samples >= 20
+            """).fetchone()
+            if row and row["home_rate"] is not None:
+                return float(row["home_rate"]), float(row["draw_rate"]), float(row["away_rate"]), "global_fallback"
+    except Exception:
+        pass
+    return 0.45, 0.30, 0.25, "static_fallback"
+
+
+def _get_away_baseline(league_key: str) -> float:
+    """Return the away-win baseline probability for a given league.
+
+    Lookup order:
+    1. league_outcome_distribution for the specific league (samples >= 20)
+    2. Global average away_rate across all rows with samples >= 20
+    3. Hardcoded constant 0.54
+    """
+    try:
+        _init_db()
+        with db_conn(timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            # Step 1: league-specific row
+            row = conn.execute("""
+                SELECT away_rate
+                FROM league_outcome_distribution
+                WHERE league_key = ? AND samples >= 20
+            """, (league_key,)).fetchone()
+            if row is not None:
+                return float(row["away_rate"])
+            # Step 2: global average
+            row = conn.execute("""
+                SELECT AVG(away_rate) AS avg_away
+                FROM league_outcome_distribution
+                WHERE samples >= 20
+            """).fetchone()
+            if row is not None and row["avg_away"] is not None:
+                return float(row["avg_away"])
+    except Exception:
+        pass
+    # Step 3: hardcoded default
+    return 0.54
 
 
 # ── Signal aggregator ──────────────────────────────────────────
@@ -158,6 +232,7 @@ class SignalAggregator:
         self._signal_weights: dict[str, float] = {}
         self._signal_memory: dict[str, dict[str, Any]] = {}
         self._learned_baseline = False
+        self._dropped_duplicates = 0
 
     def add_signal(self, name: str, value: Any, source: str = "unknown") -> None:
         """Add a raw signal to the aggregator."""
@@ -166,7 +241,19 @@ class SignalAggregator:
         self.signals.append(normalized)
 
     def add_signals(self, signals: list[dict[str, Any]]) -> None:
-        """Add multiple signals at once."""
+        """Add multiple signals at once, deduplicating cross-source signals per category.
+
+        Deduplication is cross-source only (R3.5): when two or more signals share
+        the same resolved category but come from *different* sources, only the
+        source whose strongest representative has the highest abs(strength) is
+        retained — all signals from that source are kept, all signals from the
+        other sources are discarded.
+
+        Signals that share the same category AND the same source are always kept
+        (same-source duplicates are intentional and should accumulate normally).
+        """
+        # Step 1: normalize every incoming signal and group by resolved category.
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for sig in signals:
             name = sig.get("name") or sig.get("signal_name") or ""
             value = sig.get("impact")
@@ -175,7 +262,43 @@ class SignalAggregator:
             if value is None:
                 value = 0
             source = sig.get("source", "unknown")
-            self.add_signal(name, value, source)
+            normalized = normalize_signal(name, value)
+            normalized["source"] = source
+            grouped[str(normalized.get("category") or "unknown")].append(normalized)
+
+        # Step 2: for each category decide which signals to keep.
+        for category, entries in grouped.items():
+            # Bucket by source.
+            by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for entry in entries:
+                by_source[str(entry.get("source") or "unknown")].append(entry)
+
+            # Only one source present — no cross-source conflict, keep all.
+            if len(by_source) <= 1:
+                self.signals.extend(entries)
+                continue
+
+            # Multiple sources — find the winning source: the one whose strongest
+            # signal (by abs strength) beats the strongest from every other source.
+            def _best_strength(source_entries: list[dict[str, Any]]) -> float:
+                return max(abs(float(e.get("strength") or 0)) for e in source_entries)
+
+            winning_source = max(by_source, key=lambda s: _best_strength(by_source[s]))
+            winning_name = by_source[winning_source][0].get("signal_name") or winning_source
+
+            # Keep all signals from the winning source; discard all others.
+            for source_name, source_entries in by_source.items():
+                if source_name == winning_source:
+                    self.signals.extend(source_entries)
+                else:
+                    dropped_count = len(source_entries)
+                    self._dropped_duplicates += dropped_count
+                    log.debug(
+                        "[signal_aggregator] dedup: category=%s dropped=%s kept=%s",
+                        category,
+                        source_name,
+                        winning_name,
+                    )
 
     def set_signal_weights(self, weights: dict[str, float]) -> None:
         """Set custom weights for signal categories.
@@ -343,6 +466,7 @@ class SignalAggregator:
         """
         if not self.signals:
             return self._default_probabilities()
+        base_probs_source = "static_fallback"
 
         # Calculate weighted signal scores
         category_scores: dict[str, float] = defaultdict(float)
@@ -393,7 +517,7 @@ class SignalAggregator:
 
         if all_favor_away and away_score > 0:
             # Baseline: away wins 54% when all signals favor away
-            away_baseline = 0.54
+            away_baseline = _get_away_baseline(self.league_key)
             # Scale based on signal strength
             total_strength = sum(
                 abs(sig.get("strength", 0.5)) for sig in self.signals
@@ -424,10 +548,10 @@ class SignalAggregator:
             neutral_ratio = abs(neutral_score) / total_abs
 
             # Home win probability varies with signal mix
-            # Base: 45% home, 30% draw, 25% away (slight home advantage)
-            home_prob = 0.45 + home_ratio * 0.25 - away_ratio * 0.10
-            away_prob = 0.25 + away_ratio * 0.25 - home_ratio * 0.10
-            draw_prob = 0.30 + neutral_ratio * 0.10 - abs(home_ratio - away_ratio) * 0.05
+            base_home, base_draw, base_away, base_probs_source = _get_base_probs(self.league_key)
+            home_prob = base_home + home_ratio * 0.25 - away_ratio * 0.10
+            away_prob = base_away + away_ratio * 0.25 - home_ratio * 0.10
+            draw_prob = base_draw + neutral_ratio * 0.10 - abs(home_ratio - away_ratio) * 0.05
 
             # Clamp probabilities
             home_prob = max(0.05, min(0.85, home_prob))
@@ -443,9 +567,10 @@ class SignalAggregator:
 
             # Apply away baseline when all signals favor away
             if all_favor_away:
-                away_prob = max(away_prob, 0.54)
+                away_baseline = _get_away_baseline(self.league_key)
+                away_prob = max(away_prob, away_baseline)
                 # Redistribute
-                excess = away_prob - 0.54
+                excess = away_prob - away_baseline
                 home_prob = max(0.05, home_prob - excess * 0.5)
                 draw_prob = max(0.05, draw_prob - excess * 0.5)
                 # Renormalize
@@ -490,6 +615,8 @@ class SignalAggregator:
             "neutral_score": round(neutral_score, 4),
             "learned_signal_memory": self._signal_memory,
             "learned_signal_combination": combo_memory,
+            "dropped_duplicate_count": self._dropped_duplicates,
+            "base_probs_source": base_probs_source,
         }
 
     def _combination_memory(self, home_prob: float, draw_prob: float, away_prob: float) -> dict[str, Any]:
@@ -582,6 +709,19 @@ class SignalAggregator:
             + sample_factor * 0.2
             + learned_boost
         )
+        try:
+            with db_conn(timeout=5) as conn:
+                row = conn.execute(
+                    "select priority from tournament_preferences where league_key = ?",
+                    (self.league_key,),
+                ).fetchone()
+                priority = int(row[0]) if row else 4
+                if priority in (0, 1):
+                    confidence += 0.05
+                elif priority in (6, 7):
+                    confidence -= 0.10
+        except Exception:
+            pass
 
         return max(0.1, min(0.95, confidence))
 
@@ -598,6 +738,8 @@ class SignalAggregator:
             "home_score": 0,
             "away_score": 0,
             "neutral_score": 0,
+            "dropped_duplicate_count": self._dropped_duplicates,
+            "base_probs_source": "static_fallback",
         }
 
 
@@ -709,6 +851,12 @@ def prefetch_signal_stats(signal_names: list[str]) -> None:
     if not signal_names:
         return
     try:
+        if len(_SIGNAL_STATS_BATCH_CACHE) >= 1000:
+            log.warning(
+                "[signal_aggregator] cache overflow: clearing %d entries before writing new batch",
+                len(_SIGNAL_STATS_BATCH_CACHE),
+            )
+            _SIGNAL_STATS_BATCH_CACHE.clear()
         from app.storage.db import _conn
         from app.storage.league_memory import _init_db
         _init_db()
@@ -777,12 +925,20 @@ def global_signal_stats(signal_name: str) -> dict[str, Any]:
     samples = int((row or [0])[0] or 0)
     wins = int((row or [0, 0])[1] or 0)
     losses = int((row or [0, 0, 0])[2] or 0)
-    return {
+    stats = {
         "samples": samples,
         "wins": wins,
         "losses": losses,
         "win_rate": round(wins / samples * 100, 1) if samples else None,
     }
+    if len(_SIGNAL_STATS_BATCH_CACHE) >= 1000:
+        log.warning(
+            "[signal_aggregator] cache overflow: clearing %d entries before writing new batch",
+            len(_SIGNAL_STATS_BATCH_CACHE),
+        )
+        _SIGNAL_STATS_BATCH_CACHE.clear()
+    _SIGNAL_STATS_BATCH_CACHE[signal_name] = stats
+    return stats
 
 
 def signal_value(signals: list[dict[str, Any]], name: str) -> float:

@@ -1214,41 +1214,59 @@ def job_regenerate_research_stats() -> dict[str, Any]:
             return {"status": "skipped", "reason": "insufficient_data", "total_graded": total_graded}
 
         dimensions = [
-            "pick_type",
-            "selection",
-            "confidence_band",
-            "country",
-            "league",
-            "source",
-            "odds_bucket_home",
-            "odds_bucket_draw",
-            "odds_bucket_away",
-            "odds_bucket_fav",
-            "favorite_side",
+            ("pick_type", "pick_type", MIN_PICK_TYPE_SAMPLES),
+            ("selection", "selection", MIN_PICK_TYPE_SAMPLES),
+            ("confidence_band", None, MIN_PICK_TYPE_SAMPLES),
+            ("country", "country_name", MIN_COUNTRY_SAMPLES),
+            ("league", "league_name", MIN_LEAGUE_SAMPLES),
+            ("source", "source", MIN_PICK_TYPE_SAMPLES),
         ]
 
         rows_written = 0
         rows_skipped = 0
 
         with db_conn() as conn:
-            for dim in dimensions:
-                min_samples = MIN_LEAGUE_SAMPLES if dim == "league" else MIN_COUNTRY_SAMPLES if dim == "country" else MIN_PICK_TYPE_SAMPLES
-                rows = conn.execute(
-                    f"""
-                    SELECT
-                        {dim} as key,
-                        sum(case when result = 'win' then 1 else 0 end) as wins,
-                        sum(case when result = 'loss' then 1 else 0 end) as losses,
-                        count(*) as total
-                    FROM prediction_history
-                    WHERE result IN ('win', 'loss')
-                      AND {dim} IS NOT NULL
-                      AND {dim} != ''
-                    GROUP BY {dim}
-                    HAVING count(*) >= ?
-                    """,
-                    (min_samples,),
-                ).fetchall()
+            for dim_name, dim_column, min_samples in dimensions:
+                if dim_column:
+                    rows = conn.execute(
+                        f"""
+                        SELECT
+                            {dim_column} as key,
+                            sum(case when result = 'win' then 1 else 0 end) as wins,
+                            sum(case when result = 'loss' then 1 else 0 end) as losses,
+                            count(*) as total
+                        FROM prediction_history
+                        WHERE result IN ('win', 'loss')
+                          AND {dim_column} IS NOT NULL
+                          AND {dim_column} != ''
+                        GROUP BY {dim_column}
+                        HAVING count(*) >= ?
+                        """,
+                        (min_samples,),
+                    ).fetchall()
+                elif dim_name == "confidence_band":
+                    rows = conn.execute(
+                        """
+                        SELECT
+                            case
+                                when confidence >= 80 then '80+'
+                                when confidence >= 70 then '70-79'
+                                when confidence >= 60 then '60-69'
+                                else '50-59'
+                            end as key,
+                            sum(case when result = 'win' then 1 else 0 end) as wins,
+                            sum(case when result = 'loss' then 1 else 0 end) as losses,
+                            count(*) as total
+                        FROM prediction_history
+                        WHERE result IN ('win', 'loss')
+                          AND confidence IS NOT NULL
+                        GROUP BY key
+                        HAVING count(*) >= ?
+                        """,
+                        (min_samples,),
+                    ).fetchall()
+                else:
+                    continue
 
                 for row in rows:
                     key = str(row["key"] or "")
@@ -1263,7 +1281,7 @@ def job_regenerate_research_stats() -> dict[str, Any]:
                             (dimension, key, wins, losses, total, win_rate, loss_rate, min_samples, updated_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                         """,
-                        (dim, key, wins, losses, total, round(win_rate, 6), round(loss_rate, 6), min_samples),
+                        (dim_name, key, wins, losses, total, round(win_rate, 6), round(loss_rate, 6), min_samples),
                     )
                     rows_written += 1
 

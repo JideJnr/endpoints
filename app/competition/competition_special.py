@@ -130,6 +130,26 @@ def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
     doc["ai_team_watchers"] = intelligence.get("ai_team_watchers")
     doc["team_strength_context"] = intelligence.get("team_strength")
     doc["table_context"] = intelligence.get("table")
+
+    # Attach recent competition round analysis if available (R14.1–R14.3).
+    # Uses a lazy import to avoid circular import issues at module init time.
+    try:
+        from app.competition.competition_analyser import (
+            get_latest_analysis,
+            init_competition_analysis_table,
+        )
+        with db_conn(timeout=5) as conn:
+            init_competition_analysis_table(conn)
+            analysis = get_latest_analysis(key, conn)
+        if analysis:
+            generated_at = _parse_datetime(analysis.get("generated_at"))
+            if generated_at is not None:
+                age_days = (datetime.now(timezone.utc) - generated_at).days
+                if age_days <= 7:
+                    doc["competition_round_analysis"] = analysis
+    except Exception:
+        pass
+
     return doc
 
 

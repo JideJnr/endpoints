@@ -122,7 +122,7 @@ def run_llm_bet(
     if not candidates:
         return {
             "status": "no_candidates",
-            "message": "No current prediction-engine candidates are available",
+            "message": "No upcoming ungraded predictions available for today/tomorrow that pass all filters (date, time, live status, odds, research gate, buffer data).",
             "mode": "llm",
             "candidate_count": 0,
         }

@@ -5,7 +5,13 @@ from typing import Any
 
 
 # Hardcoded fallback weights — overridden by learned weights when enough data exists
-_BASE_WEIGHTS: dict[str, float] = {}
+_BASE_WEIGHTS: dict[str, float] = {
+    "dixon_coles": 0.30,
+    "elo": 0.25,
+    "poisson": 0.15,
+    "rules": 0.20,
+    "llm": 0.10,
+}
 
 # Module-level cache so we don't hit SQLite on every prediction
 _cached_weights: dict[str, float] | None = None
@@ -28,7 +34,7 @@ def _get_weights() -> dict[str, float]:
                 return _cached_weights
         except Exception:
             pass
-        _cached_weights = {}
+        _cached_weights = dict(_BASE_WEIGHTS)
         _weights_are_learned = False
     return _cached_weights
 
