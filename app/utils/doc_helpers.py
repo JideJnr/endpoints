@@ -82,12 +82,18 @@ def _data_sources(
     sofa: dict[str, Any] | None = None,
     detail: dict[str, Any] | None = None,
     sporty: dict[str, Any] | None = None,
-    sportradar: dict[str, Any] | None = None,
+    markets_or_sportradar: Any = None,
     *,
+    sportradar: dict[str, Any] | None = None,
     fresh: bool = True,
     include_meta: bool = True,
 ) -> dict[str, Any]:
-    markets = (sporty or {}).get("markets") or []
+    if isinstance(markets_or_sportradar, list):
+        markets = markets_or_sportradar
+    else:
+        markets = (sporty or {}).get("markets") or []
+        if sportradar is None and isinstance(markets_or_sportradar, dict):
+            sportradar = markets_or_sportradar
     sporty_live = (sporty or {}).get("live_data_sportybet") or {}
     sofa_live = (detail or {}).get("live_data_sofascore") or {}
     sofa_has_stats = bool((detail or {}).get("statistics") or (detail or {}).get("match_statistics") or sofa_live)

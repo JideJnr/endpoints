@@ -1,1 +1,0 @@
-c:\Users\Victor\Documents\Personal Workstation\football\.venv\Scripts\python.exe: No module named pyflakes

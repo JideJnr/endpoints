@@ -1230,7 +1230,7 @@ def _build_profile(
         position=position,
         profile={
             "sample_size": sample,
-            "record": {"wins": stats["wins"], "draws": stats["draws"], "losses": stats["losses"], "form": form},
+            "record": {"wins": stats["wins"], "draws": stats["draws"], "losses": stats["losses"], "form": stats["form"]},
             "goals": {
                 "for_avg": round(stats["gf_avg"], 2),
                 "against_avg": round(stats["ga_avg"], 2),
@@ -1241,9 +1241,9 @@ def _build_profile(
             },
             "preferred_markets": _market_leans(sample, stats["wins"], stats["losses"], stats["over_25"], stats["btts"], stats["clean_sheets"], stats["blanks"]),
             "analyst_score": round(analyst_score, 2),
-            "trend": "rising" if form[:3].count("W") >= 2 else "falling" if form[:3].count("L") >= 2 else "stable",
+            "trend": "rising" if stats["form"][:3].count("W") >= 2 else "falling" if stats["form"][:3].count("L") >= 2 else "stable",
             "recent_briefs": [row["brief"] for row in rows[:6] if row["brief"]],
-            "venue_split": venue_split,
+            "venue_split": stats["venue_split"],
         },
         table=table,
         web_context=web_context,
@@ -1644,20 +1644,39 @@ def _resolve_watcher_key(conn, team: dict) -> str | None:
     if not team_key:
         return None
     row = conn.execute(
-        "SELECT team_key FROM ai_team_watcher WHERE team_key = ? LIMIT 1",
+        "SELECT team_key FROM ai_team_watchers WHERE team_key = ? LIMIT 1",
         (team_key,)
     ).fetchone()
     return row['team_key'] if row else None
 
 
-def _resolve_watcher_row(conn, team_key: str) -> object | None:
-    """Fetch the watcher row for a given team key."""
+def _resolve_watcher_row(conn, team_key: str, team: dict | None = None) -> object | None:
+    """Fetch the watcher row for a given team key, with provider-ID fallback."""
     if not team_key:
         return None
-    return conn.execute(
-        "SELECT * FROM ai_team_watcher WHERE team_key = ? LIMIT 1",
+    row = conn.execute(
+        "SELECT * FROM ai_team_watchers WHERE team_key = ? LIMIT 1",
         (str(team_key),)
     ).fetchone()
+    if row or not team:
+        return row
+    sporty_id = team.get("sporty_team_id")
+    if sporty_id:
+        row = conn.execute(
+            "SELECT * FROM ai_team_watchers WHERE sporty_team_id = ? LIMIT 1",
+            (str(sporty_id),),
+        ).fetchone()
+        if row:
+            return row
+    sofa_id = team.get("sofascore_team_id")
+    if sofa_id:
+        row = conn.execute(
+            "SELECT * FROM ai_team_watchers WHERE sofascore_team_id = ? LIMIT 1",
+            (str(sofa_id),),
+        ).fetchone()
+        if row:
+            return row
+    return None
 
 
 def _merge_aliases(existing: object | None, team: dict) -> list:

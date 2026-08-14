@@ -75,7 +75,13 @@ class PickGenerator:
             List of pick dicts sorted by confidence score (descending)
         """
         # Step 1: Calculate probabilities from signals
-        prob_result = calculate_win_probabilities(signals, self.league_key)
+        match_context = {"tournament": league_name or self.league_key, "league_name": league_name or self.league_key}
+        prob_result = calculate_win_probabilities(
+            signals,
+            self.league_key,
+            match_context=match_context,
+            pick_type=self.pick_type,
+        )
 
         # Step 2: Get learned probabilities if available
         learned = self._learner.get_learned_probabilities(
@@ -118,6 +124,10 @@ class PickGenerator:
                 league_name=league_name,
                 signal_scores=prob_result.get("signal_scores", {}),
                 learned=learned is not None,
+                learning_context={
+                    "signals": prob_result.get("learned_signal_memory") or {},
+                    "combination": prob_result.get("learned_signal_combination") or {},
+                },
             )
             picks.append(pick)
 
@@ -210,6 +220,7 @@ class PickGenerator:
         signal_scores: dict[str, float],
         learned: bool = False,
         secondary: bool = False,
+        learning_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a pick dict from the scored direction."""
         selection_map = {
@@ -230,6 +241,7 @@ class PickGenerator:
             "league_name": league_name,
             "signal_scores": signal_scores,
             "learned": learned,
+            "learning_context": learning_context or {},
             "secondary": secondary,
             "source": "signal_aggregator",
         }
@@ -250,6 +262,10 @@ class PickGenerator:
         3. Otherwise, return a no_bet pick
         """
         picks = []
+        learning_context = {
+            "signals": prob_result.get("learned_signal_memory") or {},
+            "combination": prob_result.get("learned_signal_combination") or {},
+        }
 
         # Fallback 1: Away win when all signals favor away (54% baseline)
         if prob_result.get("all_signals_favor_away") and prob_result.get("away_prob", 0) >= 0.54:
@@ -265,6 +281,7 @@ class PickGenerator:
                     league_name=league_name,
                     signal_scores=prob_result.get("signal_scores", {}),
                     learned=False,
+                    learning_context=learning_context,
                 ))
 
         # Fallback 2: Home win when all signals favor home
@@ -281,6 +298,7 @@ class PickGenerator:
                     league_name=league_name,
                     signal_scores=prob_result.get("signal_scores", {}),
                     learned=False,
+                    learning_context=learning_context,
                 ))
 
         # Fallback 3: Value bet — high odds with proven win history
@@ -303,6 +321,7 @@ class PickGenerator:
                     league_name=league_name,
                     signal_scores=prob_result.get("signal_scores", {}),
                     learned=False,
+                    learning_context=learning_context,
                 ))
 
         # Fallback 4: No bet if nothing qualifies
@@ -319,6 +338,7 @@ class PickGenerator:
                 "league_name": league_name,
                 "signal_scores": prob_result.get("signal_scores", {}),
                 "learned": False,
+                "learning_context": learning_context,
                 "secondary": False,
                 "source": "fallback_no_bet",
                 "reason": "No signal pattern meets confidence threshold",

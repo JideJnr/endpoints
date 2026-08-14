@@ -1,1 +1,0 @@
-['_tau', 'run_dixon_coles']

@@ -112,6 +112,16 @@ def _category_for_signal(name: str) -> str:
     for category, keywords in SIGNAL_CATEGORIES.items():
         if name in keywords:
             return category
+    if "h2h" in name:
+        return "h2h_home"
+    if "team_watcher" in name or "recent_history" in name or "form" in name:
+        return "home_form"
+    if "league_strength" in name or "table" in name or "standing" in name:
+        return "home_table"
+    if "odds" in name or "market" in name:
+        return "home_odds"
+    if "goal" in name:
+        return "home_goal_pressure"
     return "unknown"
 
 
@@ -129,10 +139,24 @@ class SignalAggregator:
     - signal_scores: individual signal contributions
     """
 
-    def __init__(self, league_key: str = "__global__"):
+    def __init__(
+        self,
+        league_key: str = "__global__",
+        match_context: dict[str, Any] | None = None,
+        pick_type: str = "match_result",
+        selection: str | None = None,
+        prediction_mode: str | None = None,
+        live_context: dict[str, Any] | None = None,
+    ):
         self.league_key = league_key
+        self.match_context = match_context or {"tournament": league_key}
+        self.pick_type = pick_type
+        self.selection = selection
+        self.prediction_mode = prediction_mode
+        self.live_context = live_context
         self.signals: list[dict[str, Any]] = []
         self._signal_weights: dict[str, float] = {}
+        self._signal_memory: dict[str, dict[str, Any]] = {}
         self._learned_baseline = False
 
     def add_signal(self, name: str, value: Any, source: str = "unknown") -> None:
@@ -145,7 +169,11 @@ class SignalAggregator:
         """Add multiple signals at once."""
         for sig in signals:
             name = sig.get("name") or sig.get("signal_name") or ""
-            value = sig.get("value") or sig.get("signal_value") or 0
+            value = sig.get("impact")
+            if value is None:
+                value = sig.get("value") if sig.get("value") is not None else sig.get("signal_value")
+            if value is None:
+                value = 0
             source = sig.get("source", "unknown")
             self.add_signal(name, value, source)
 
@@ -185,7 +213,85 @@ class SignalAggregator:
         except Exception:
             pass
 
+        self._load_outcome_weights()
+
         self._learned_baseline = True
+
+    def _load_outcome_weights(self) -> None:
+        """Learn direct signal weights from graded signal outcomes.
+
+        Scope order is tournament, country, then global. The adjustment is small
+        and sample-gated so a noisy signal cannot dominate the base model.
+        """
+        names = sorted({str(sig.get("signal_name") or "") for sig in self.signals if sig.get("signal_name")})
+        if not names:
+            return
+        league = str((self.match_context or {}).get("tournament") or self.league_key or "")
+        country = str((self.match_context or {}).get("country") or (self.match_context or {}).get("category") or "")
+        try:
+            placeholders = ",".join("?" * len(names))
+            with db_conn(timeout=10) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    f"""
+                    select signal_name,
+                           case
+                               when lower(coalesce(tournament, '')) = lower(?) then 'tournament'
+                               when lower(coalesce(country, '')) = lower(?) then 'country'
+                               else 'global'
+                           end as scope,
+                           count(*) as samples,
+                           sum(case when result = 'win' then 1 else 0 end) as wins,
+                           sum(case when result = 'loss' then 1 else 0 end) as losses
+                    from signal_outcomes
+                    where result in ('win', 'loss')
+                      and signal_name in ({placeholders})
+                      and (
+                          lower(coalesce(tournament, '')) = lower(?)
+                          or lower(coalesce(country, '')) = lower(?)
+                          or 1 = 1
+                      )
+                    group by signal_name, scope
+                    """,
+                    [league, country, *names, league, country],
+                ).fetchall()
+        except Exception:
+            return
+        scope_weight = {"tournament": 1.0, "country": 0.65, "global": 0.35}
+        by_name: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in rows:
+            by_name[str(row["signal_name"] or "")].append(row)
+        for name, name_rows in by_name.items():
+            weighted = 0.0
+            total_weight = 0.0
+            samples = 0
+            wins = 0
+            losses = 0
+            for row in name_rows:
+                row_samples = int(row["samples"] or 0)
+                if row_samples <= 0:
+                    continue
+                sample_weight = min(1.0, row_samples / 20)
+                weight = scope_weight.get(str(row["scope"] or "global"), 0.35) * sample_weight
+                row_wins = int(row["wins"] or 0)
+                win_rate = row_wins / row_samples
+                weighted += win_rate * weight
+                total_weight += weight
+                samples += row_samples
+                wins += row_wins
+                losses += int(row["losses"] or 0)
+            if not total_weight or samples < 3:
+                continue
+            learned_rate = weighted / total_weight
+            adjustment = max(-0.12, min(0.12, (learned_rate - 0.52) * 0.45))
+            self._signal_weights[name] = self._signal_weights.get(name, 0.0) + adjustment
+            self._signal_memory[name] = {
+                "samples": samples,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round(learned_rate * 100, 1),
+                "weight_adjustment": round(adjustment, 4),
+            }
 
     def _get_category_weight(self, category: str) -> float:
         """Get the weight for a signal category, using learned weights if available."""
@@ -351,6 +457,23 @@ class SignalAggregator:
 
         # Calculate confidence
         confidence = self._calculate_confidence(category_scores, category_strengths)
+        combo_memory = self._combination_memory(home_prob, draw_prob, away_prob)
+        combo_adjustment = float(combo_memory.get("probability_adjustment") or 0.0)
+        if combo_adjustment:
+            best = max(
+                {"home": home_prob, "draw": draw_prob, "away": away_prob},
+                key={"home": home_prob, "draw": draw_prob, "away": away_prob}.get,
+            )
+            if best == "home":
+                home_prob = min(0.90, home_prob + combo_adjustment)
+            elif best == "away":
+                away_prob = min(0.90, away_prob + combo_adjustment)
+            else:
+                draw_prob = min(0.55, draw_prob + combo_adjustment)
+            total = home_prob + draw_prob + away_prob
+            if total > 0:
+                home_prob, draw_prob, away_prob = home_prob / total, draw_prob / total, away_prob / total
+            confidence = max(0.1, min(0.95, confidence + abs(combo_adjustment) * 0.8))
 
         return {
             "home_prob": round(home_prob, 4),
@@ -365,7 +488,37 @@ class SignalAggregator:
             "home_score": round(home_score, 4),
             "away_score": round(away_score, 4),
             "neutral_score": round(neutral_score, 4),
+            "learned_signal_memory": self._signal_memory,
+            "learned_signal_combination": combo_memory,
         }
+
+    def _combination_memory(self, home_prob: float, draw_prob: float, away_prob: float) -> dict[str, Any]:
+        selection = self.selection
+        if not selection:
+            best = max(
+                {"home": home_prob, "draw": draw_prob, "away": away_prob},
+                key={"home": home_prob, "draw": draw_prob, "away": away_prob}.get,
+            )
+            selection = {"home": "Home", "draw": "Draw", "away": "Away"}[best]
+        try:
+            from app.storage.league_memory import weighted_signal_combination_memory
+
+            memory = weighted_signal_combination_memory(
+                self.match_context,
+                self.signals,
+                self.pick_type,
+                selection,
+                prediction_mode=self.prediction_mode,
+                live_context=self.live_context,
+            )
+        except Exception:
+            return {"samples": 0, "win_rate": None, "adjustment": 0, "probability_adjustment": 0.0}
+        samples = int(memory.get("samples") or 0)
+        adjustment = int(memory.get("adjustment") or 0)
+        memory["probability_adjustment"] = 0.0
+        if samples >= 3 and adjustment:
+            memory["probability_adjustment"] = max(-0.08, min(0.08, adjustment / 100))
+        return memory
 
     def _calculate_confidence(
         self,
@@ -453,9 +606,21 @@ class SignalAggregator:
 def calculate_win_probabilities(
     signals: list[dict[str, Any]],
     league_key: str = "__global__",
+    match_context: dict[str, Any] | None = None,
+    pick_type: str = "match_result",
+    selection: str | None = None,
+    prediction_mode: str | None = None,
+    live_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convenience function to calculate win probabilities from a list of signals."""
-    aggregator = SignalAggregator(league_key=league_key)
+    aggregator = SignalAggregator(
+        league_key=league_key,
+        match_context=match_context,
+        pick_type=pick_type,
+        selection=selection,
+        prediction_mode=prediction_mode,
+        live_context=live_context,
+    )
     aggregator.add_signals(signals)
     aggregator.load_learned_weights()
     return aggregator.calculate_probabilities()
