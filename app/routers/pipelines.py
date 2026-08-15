@@ -43,7 +43,7 @@ def list_pipelines():
 @router.post("/{engine_id}/enable")
 def enable_pipeline(engine_id: str):
     """Enable a toggleable pipeline by engine_id and trigger an immediate run if applicable."""
-    from app.scheduling.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP, PRESETS
+    from app.scheduling.pipeline_registry import TOGGLEABLE_IDS, PIPELINE_MAP, PRESETS, activate_pipeline
     from app.storage.league_memory import set_engine_status
     from app.utils.activity_log import record_activity
     import threading
@@ -60,8 +60,9 @@ def enable_pipeline(engine_id: str):
     if engine_id == "ai_prediction_queue":
         for pipeline_id, status in PRESETS["ai_prematch"].items():
             set_engine_status(pipeline_id, status)
+        activation_changes = PRESETS["ai_prematch"]
     else:
-        set_engine_status(engine_id, "active")
+        activation_changes = activate_pipeline(engine_id)
     record_activity(
         f"Pipeline '{PIPELINE_MAP[engine_id].label}' enabled",
         job="pipeline_control",
@@ -70,15 +71,16 @@ def enable_pipeline(engine_id: str):
             "engine_id": engine_id,
             "action": "enable",
             "preset": "ai_prematch" if engine_id == "ai_prediction_queue" else None,
+            "activation_changes": activation_changes,
         },
     )
 
     # Immediate run for pipelines that have a dedicated job function
     _IMMEDIATE_RUN_MAP = {
-        "ai_prediction_queue": "app.ai_prediction_pipeline.job_ai_prediction_queue",
-        "unified_upcoming": "app.scheduler.job_unified_upcoming",
-        "unified_live":     "app.scheduler.job_unified_live",
-        "sofa_pipeline":    "app.scheduler.job_sofa_pipeline",
+        "ai_prediction_queue": "app.ai.ai_prediction_pipeline.job_ai_prediction_queue",
+        "unified_upcoming": "app.scheduling.scheduler.job_unified_upcoming",
+        "unified_live":     "app.scheduling.scheduler.job_unified_live",
+        "sofa_pipeline":    "app.scheduling.scheduler.job_sofa_pipeline",
     }
     if engine_id in _IMMEDIATE_RUN_MAP:
         def _run():
@@ -87,7 +89,11 @@ def enable_pipeline(engine_id: str):
                 import importlib
                 mod = importlib.import_module(module_path)
                 fn = getattr(mod, fn_name)
-                fn()
+                if engine_id in {"unified_upcoming", "unified_live", "sofa_pipeline"}:
+                    from app.scheduling.scheduler import run_job_with_guard
+                    run_job_with_guard(fn, guard_job_id=engine_id)
+                else:
+                    fn()
             except Exception as exc:
                 _logger.warning("Immediate run failed for %s: %s", engine_id, exc)
         threading.Thread(target=_run, daemon=True).start()
@@ -99,6 +105,7 @@ def enable_pipeline(engine_id: str):
         "label": PIPELINE_MAP[engine_id].label,
         "immediate_run": engine_id in _IMMEDIATE_RUN_MAP,
         "preset_applied": "ai_prematch" if engine_id == "ai_prediction_queue" else None,
+        "activation_changes": activation_changes,
     }
 
 

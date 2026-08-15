@@ -79,11 +79,14 @@ def toggle_sofa_pipeline(payload: dict[str, Any] = Body(...)):
     Body: `{"enabled": true}` or `{"enabled": false}`
     """
     from app.data_clients.sofa_pipeline import set_sofa_pipeline_mode
+    from app.scheduling.pipeline_registry import activate_pipeline
 
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
         raise HTTPException(status_code=400, detail="Body must be {\"enabled\": true|false}")
 
+    if enabled:
+        activate_pipeline("sofa_pipeline")
     mode = set_sofa_pipeline_mode(enabled)
     return {
         "status": "success",
@@ -110,14 +113,17 @@ def run_sofa_pipeline(
     - `include_live`: also fetch live events
     """
     from app.data_clients.sofa_pipeline import run_sofa_pipeline_cycle
+    from app.scheduling.scheduler import run_job_with_guard
 
     target_date = date or dt.today().isoformat()
     try:
-        result = run_sofa_pipeline_cycle(
+        result = run_job_with_guard(
+            run_sofa_pipeline_cycle,
             match_date=target_date,
             ingest_limit=ingest_limit,
             enrich_batch=enrich_batch,
             include_live=include_live,
+            guard_job_id="sofa_pipeline",
         )
         return result
     except Exception as exc:
@@ -158,13 +164,16 @@ def enrich_sofa(
 ):
     """Stage 2+3: Enrich buffered SofaScore matches and run predictions."""
     from app.data_clients.sofa_pipeline import enrich_sofa_pipeline
+    from app.scheduling.scheduler import run_job_with_guard
 
     target_date = date or dt.today().isoformat()
     try:
-        return enrich_sofa_pipeline(
+        return run_job_with_guard(
+            enrich_sofa_pipeline,
             match_date=target_date,
             batch_size=batch_size,
             live_only=live_only,
+            guard_job_id="sofa_pipeline",
         )
     except Exception as exc:
         _logger.exception("sofa-pipeline/enrich failed")

@@ -46,8 +46,10 @@ from app.utils.doc_helpers import _data_sources, _date_from_start_time, _is_not_
 from app.utils.match_helpers import _extract_1x2, _played_seconds as _played_seconds_local
 from app.utils.web_helpers import _fetch_web as _fetch_web_context
 
-# How many SofaScore detail calls to run in parallel
-ENRICH_WORKERS = 8
+# How many SofaScore detail calls to run in parallel. Keep this at one so a
+# backlog drains match-by-match instead of several enrichment lanes competing
+# for SofaScore and SQLite at the same time.
+ENRICH_WORKERS = 1
 WEB_WORKERS = 10
 
 # How many matches to enrich per worker cycle

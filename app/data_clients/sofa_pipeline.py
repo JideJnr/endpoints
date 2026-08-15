@@ -58,8 +58,9 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 SOFA_ID_PREFIX = "sofa:"
-ENRICH_WORKERS = 4   # parallel SofaScore detail fetches
-ENGINE_STATE_ID = "sofa_pipeline_mode"
+ENRICH_WORKERS = 1
+ENGINE_STATE_ID = "sofa_pipeline"
+LEGACY_ENGINE_STATE_ID = "sofa_pipeline_mode"
 
 
 # ── Toggle helpers ─────────────────────────────────────────────────────────────
@@ -68,7 +69,8 @@ def get_sofa_pipeline_mode() -> dict[str, Any]:
     """Return current toggle state from the engine_states table."""
     try:
         from app.storage.league_memory import get_engine_states
-        enabled = get_engine_states().get(ENGINE_STATE_ID) == "active"
+        states = get_engine_states()
+        enabled = states.get(ENGINE_STATE_ID, states.get(LEGACY_ENGINE_STATE_ID)) == "active"
     except Exception:
         enabled = False
     return {
@@ -85,6 +87,7 @@ def set_sofa_pipeline_mode(enabled: bool) -> dict[str, Any]:
 
     status = "active" if enabled else "paused"
     set_engine_status(ENGINE_STATE_ID, status)
+    set_engine_status(LEGACY_ENGINE_STATE_ID, status)
     record_activity(
         f"SofaScore pipeline {'enabled' if enabled else 'disabled'}",
         job="sofa_pipeline",

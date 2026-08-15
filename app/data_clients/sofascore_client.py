@@ -209,8 +209,12 @@ LIVE_STATUS_TYPES = {"inprogress", "live"}
 
 def _status_text(event: dict) -> tuple[str, str]:
     status = event.get("status") or (event.get("eventState") or {}).get("status") or {}
-    status_type = str(status.get("type") or "").lower().replace(" ", "").replace("_", "")
-    description = str(status.get("description") or "").lower()
+    if isinstance(status, dict):
+        status_type = str(status.get("type") or "").lower().replace(" ", "").replace("_", "")
+        description = str(status.get("description") or "").lower()
+    else:
+        status_type = str(status or "").lower().replace(" ", "").replace("_", "")
+        description = status_type
     return status_type, description
 
 

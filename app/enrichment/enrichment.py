@@ -19,7 +19,7 @@ from app.data_clients.sportradar_client import fetch_match_intelligence
 from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post
 from app.utils.time_context import match_time_context
 from app.enrichment.web_context import search_league_sentiment, search_match_context
-from app.storage.buffer import _data_sources
+from app.utils.doc_helpers import _data_sources
 from app.config.config import _hf_token
 from app.utils.web_helpers import _fetch_web as _fetch_web_context
 

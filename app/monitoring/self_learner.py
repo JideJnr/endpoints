@@ -366,11 +366,17 @@ def run_learning_cycle() -> dict[str, Any]:
                 "league_name": row["league_name"],
                 "samples": 0, "wins": 0,
                 "confidence_sum": 0.0,
+                "weighted_wins": 0.0,
+                "weighted_total": 0.0,
             }
+        row_result = row["result"]
+        w = _row_weight(row, now_ref)
         league_stats[key]["samples"] += 1
         league_stats[key]["confidence_sum"] += float(row["confidence"] or 0)
-        if result == "win":
+        league_stats[key]["weighted_total"] += w
+        if row_result == "win":
             league_stats[key]["wins"] += 1
+            league_stats[key]["weighted_wins"] += w
 
     # ── 3. Aggregate per-model accuracy from signals ──────────────────────────
     model_signal_map = {
@@ -382,34 +388,46 @@ def run_learning_cycle() -> dict[str, Any]:
                         "avg_rating_edge", "market_steam", "odds_edge"},
         "openrouter":  {"openrouter_agent", "ai_brain_review"},
     }
-    model_stats: dict[str, dict] = {m: {"samples": 0, "wins": 0} for m in model_signal_map}
+    model_stats: dict[str, dict] = {
+        m: {"samples": 0, "wins": 0, "weighted_wins": 0.0, "weighted_total": 0.0}
+        for m in model_signal_map
+    }
 
     for row in rows:
         signals = _decision_signals_for_row(row)
         signal_names = {str(s.get("name") or "") for s in signals}
         result = row["result"]
+        w = _row_weight(row, now_ref)
         for model, model_signals in model_signal_map.items():
             if signal_names & model_signals:
                 model_stats[model]["samples"] += 1
+                model_stats[model]["weighted_total"] += w
                 if result == "win":
                     model_stats[model]["wins"] += 1
+                    model_stats[model]["weighted_wins"] += w
 
     # ── 3b. Direct model accuracy from models_json ──────────────────
     # Uses the actual models stored with each prediction to determine
     # which models passed, rather than inferring from signal names.
-    direct_model_stats: dict[str, dict] = {m: {"samples": 0, "wins": 0} for m in model_signal_map}
+    direct_model_stats: dict[str, dict] = {
+        m: {"samples": 0, "wins": 0, "weighted_wins": 0.0, "weighted_total": 0.0}
+        for m in model_signal_map
+    }
 
     for row in rows:
         models_json = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
         if not models_json:
             continue
         result = row["result"]
+        w = _row_weight(row, now_ref)
         passed = _get_passed_models(models_json, result)
         for model_name in passed:
             if model_name in direct_model_stats:
                 direct_model_stats[model_name]["samples"] += 1
+                direct_model_stats[model_name]["weighted_total"] += w
                 if result == "win":
                     direct_model_stats[model_name]["wins"] += 1
+                    direct_model_stats[model_name]["weighted_wins"] += w
 
     # ── 4. Write everything to DB ─────────────────────────────────────────────
     signal_updates = 0
@@ -483,7 +501,12 @@ def run_learning_cycle() -> dict[str, Any]:
             wins = stats["wins"]
             if samples < 5:
                 continue
-            win_rate = wins / samples
+            weighted_total = stats.get("weighted_total", 0.0)
+            win_rate = (
+                stats["weighted_wins"] / weighted_total
+                if weighted_total > 0
+                else (wins / samples if samples > 0 else 0.0)
+            )
             avg_conf = stats["confidence_sum"] / samples
             calibration_gap = round(win_rate - avg_conf / 100, 4)
             conn.execute("""
@@ -510,8 +533,8 @@ def run_learning_cycle() -> dict[str, Any]:
             "rules": 0.20, "openrouter": 0.10,
         }
         for model in base_weights:
-            direct = direct_model_stats.get(model, {"samples": 0, "wins": 0})
-            heuristic = model_stats.get(model, {"samples": 0, "wins": 0})
+            direct = direct_model_stats.get(model, {"samples": 0, "wins": 0, "weighted_wins": 0.0, "weighted_total": 0.0})
+            heuristic = model_stats.get(model, {"samples": 0, "wins": 0, "weighted_wins": 0.0, "weighted_total": 0.0})
             # Use direct data when we have enough samples, else fall back
             use_direct = direct["samples"] >= MIN_SAMPLES
             stats = direct if use_direct else heuristic
@@ -519,7 +542,12 @@ def run_learning_cycle() -> dict[str, Any]:
             wins = stats["wins"]
             if samples < MIN_SAMPLES:
                 continue
-            win_rate = wins / samples
+            weighted_total = stats.get("weighted_total", 0.0)
+            win_rate = (
+                stats["weighted_wins"] / weighted_total
+                if weighted_total > 0
+                else (wins / samples if samples > 0 else 0.0)
+            )
             base = base_weights.get(model, 0.20)
             performance_factor = 0.5 + (win_rate - 0.50) * 2.0
             learned = round(base * (1 - BLEND_WEIGHT) + base * performance_factor * BLEND_WEIGHT, 4)
@@ -1001,7 +1029,7 @@ def _learn_signal_combinations(conn: sqlite3.Connection, rows: list) -> int:
 
     stats: dict[tuple, dict] = {}
     for row in rows:
-        signals = _safe_json(row["signals_json"])
+        signals = _safe_json(row["signals_json"], [])
         if not signals:
             continue
         league_key = _norm_league(row["league_name"] or "")
@@ -1354,7 +1382,7 @@ def _decision_signals_for_row(row: sqlite3.Row) -> list[dict[str, Any]]:
     relevant evidence first and falls back to strong support signals only when
     the pick type is unknown.
     """
-    signals = _safe_json(row["signals_json"])
+    signals = _safe_json(row["signals_json"], [])
     if not signals:
         return []
 

@@ -95,8 +95,12 @@ def rebuild_calibration() -> dict[str, Any]:
         rows = conn.execute(f"""
             select
                 pick_type,
-                -- bucket into 10-point bands, cap at 80 so top band is 80+
-                min(80, (confidence / 10) * 10) as band_low,
+                -- bucket into 10-point bands; 80-89 and 90-99 are separate bands
+                case
+                    when confidence >= 90 then 90
+                    when confidence >= 80 then 80
+                    else (confidence / 10) * 10
+                end as band_low,
                 count(*) as samples,
                 sum(case when result = 'win'  then 1 else 0 end) as wins,
                 sum(case when result = 'loss' then 1 else 0 end) as losses
@@ -107,7 +111,11 @@ def rebuild_calibration() -> dict[str, Any]:
         global_rows = conn.execute(f"""
             select
                 '__global__' as pick_type,
-                min(80, (confidence / 10) * 10) as band_low,
+                case
+                    when confidence >= 90 then 90
+                    when confidence >= 80 then 80
+                    else (confidence / 10) * 10
+                end as band_low,
                 count(*) as samples,
                 sum(case when result = 'win'  then 1 else 0 end) as wins,
                 sum(case when result = 'loss' then 1 else 0 end) as losses
@@ -147,7 +155,12 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
       - win_rate: historical win rate for this band (None if not enough data)
       - samples: how many graded predictions back this band
     """
-    band_low = min(80, (raw_confidence // 10) * 10)
+    if raw_confidence >= 90:
+        band_low = 90
+    elif raw_confidence >= 80:
+        band_low = 80
+    else:
+        band_low = (raw_confidence // 10) * 10
     _init_db()
     with _conn() as conn:
         _init_calibration_table(conn)
@@ -211,7 +224,7 @@ def calibrate_confidence(pick_type: str, raw_confidence: int) -> dict[str, Any]:
         "win_rate": round(win_rate * 100, 1),
         "samples": row['samples'],
         "calibrated": True,
-        "band": "80%+" if band_low >= 80 else f"{band_low}-{band_low + 9}%",
+        "band": "90-99%" if band_low >= 90 else ("80-89%" if band_low >= 80 else f"{band_low}-{band_low + 9}%"),
     }
 
 
@@ -230,7 +243,7 @@ def get_calibration_table() -> list[dict[str, Any]]:
     return [
         {
             "pick_type":    row["pick_type"],
-            "band":         "80%+" if int(row["band_low"] or 0) >= 80 else f"{row['band_low']}-{row['band_low'] + 9}%",
+            "band":         "90-99%" if int(row["band_low"] or 0) >= 90 else ("80-89%" if int(row["band_low"] or 0) >= 80 else f"{row['band_low']}-{row['band_low'] + 9}%"),
             "band_low":     row["band_low"],
             "samples":      row["samples"],
             "wins":         row["wins"],

@@ -224,14 +224,76 @@ def is_pipeline_enabled(engine_id: str) -> bool:
     return states.get(engine_id, "paused") == "active"
 
 
+PIPELINE_EXCLUSIONS: dict[str, tuple[str, ...]] = {
+    "sofa_pipeline": (
+        "sportybet_ingest_live",
+        "sportybet_ingest_upcoming",
+        "sportybet_enrich_prematch",
+        "sportybet_enrich_live",
+        "unified_upcoming",
+        "unified_live",
+        "live_priority_mode",
+        "sporty_only_upcoming",
+    ),
+    "unified_upcoming": (
+        "sofa_pipeline",
+        "sportybet_enrich_prematch",
+        "sporty_only_upcoming",
+    ),
+    "unified_live": (
+        "sofa_pipeline",
+        "sportybet_enrich_live",
+        "live_priority_mode",
+    ),
+    "sportybet_enrich_prematch": (
+        "sofa_pipeline",
+        "unified_upcoming",
+        "sporty_only_upcoming",
+    ),
+    "sportybet_enrich_live": (
+        "sofa_pipeline",
+        "unified_live",
+    ),
+    "live_priority_mode": (
+        "sofa_pipeline",
+        "unified_live",
+    ),
+    "sporty_only_upcoming": (
+        "sofa_pipeline",
+        "unified_upcoming",
+        "sportybet_enrich_prematch",
+    ),
+}
+
+
+def activate_pipeline(engine_id: str) -> dict[str, str]:
+    """Enable one pipeline and pause lanes that would process the same matches."""
+    from app.storage.league_memory import set_engine_status
+
+    changes: dict[str, str] = {}
+    for competing_id in PIPELINE_EXCLUSIONS.get(engine_id, ()):
+        set_engine_status(competing_id, "paused")
+        changes[competing_id] = "paused"
+    set_engine_status(engine_id, "active")
+    changes[engine_id] = "active"
+    return changes
+
+
 def get_enrich_worker_mode() -> dict[str, bool]:
     """
     Derive live_only / exclude_live / disabled from the two enrichment toggles.
 
     Called by job_enrich_worker to decide its run mode.
     """
-    live_on = is_pipeline_enabled("sportybet_enrich_live")
-    prematch_on = is_pipeline_enabled("sportybet_enrich_prematch")
+    # Unified/SofaScore-only jobs own the same enrichment surface. When they are
+    # active, the shared enrich_worker becomes an extension only for lanes that
+    # are not already owned elsewhere.
+    if is_pipeline_enabled("sofa_pipeline"):
+        live_on = False
+        prematch_on = False
+    else:
+        live_on = is_pipeline_enabled("sportybet_enrich_live") and not is_pipeline_enabled("unified_live")
+        prematch_on = is_pipeline_enabled("sportybet_enrich_prematch") and not is_pipeline_enabled("unified_upcoming")
     return {
         "disabled": not live_on and not prematch_on,
         "live_only": live_on and not prematch_on,

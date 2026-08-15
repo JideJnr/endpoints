@@ -48,7 +48,16 @@ LIVE_PRIORITY_ENGINE_ID = "live_priority_mode"
 # A full SofaScore detail fetch fans out into several provider calls. Keep each
 # scheduled pass comfortably below its five-minute cadence, then advance the
 # priority queue on the next pass.
-UNIFIED_UPCOMING_BATCH_SIZE = 12
+UNIFIED_UPCOMING_BATCH_SIZE = 500
+MATCH_PIPELINE_JOB_IDS = {
+    "enrich_worker",
+    "enrich_future",
+    "live_priority",
+    "live_priority_toggle",
+    "sofa_pipeline",
+    "unified_upcoming",
+    "unified_live",
+}
 SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "ai_prediction_queue": {"label": "AI prediction queue", "default": 300, "min": 60, "max": 600, "pipeline_id": "ai_prediction_queue"},
     "ingest_live": {"label": "Live ingest", "default": 180, "min": 15, "max": 600, "pipeline_id": "sportybet_ingest_live"},
@@ -613,17 +622,12 @@ def job_unified_upcoming() -> dict[str, Any]:
     # ── Step 2 + 3: Match unmatched buffer matches against SofaScore ─────────
     today = date_cls.today().isoformat()
     tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
-    # Work through a small, time-bounded queue.  One enriched fixture fans out
-    # into multiple SofaScore detail calls; processing the whole backlog here
-    # leaves the scheduler job running indefinitely and blocks later cycles.
-    eligible_dates = {today, tomorrow}
-    pending = [
-        item for item in get_unenriched_batch(
-            limit=UNIFIED_UPCOMING_BATCH_SIZE,
-            exclude_live=True,
-        )
-        if item.get("match_date") in eligible_dates
-    ]
+    # Drain the full upcoming backlog in kickoff order. The shared match
+    # pipeline lease keeps other enrichment lanes out while this owner works.
+    pending = get_unenriched_batch(
+        limit=UNIFIED_UPCOMING_BATCH_SIZE,
+        exclude_live=True,
+    )
     record_activity(
         f"Unified upcoming matching {len(pending)} next fixtures",
         job="unified_upcoming",
@@ -642,7 +646,7 @@ def job_unified_upcoming() -> dict[str, Any]:
 
     from app.enrichment.match_enrichment import _resolve_sofascore_match
 
-    # Match all in parallel detail fetches
+    # Match all queued fixtures, then enrich/predict sequentially.
     pairs: list[tuple[dict, Any, float]] = []
     for item in pending:
         sporty = item["sporty"]
@@ -682,7 +686,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         existing = item.get("existing") or {}
         if sofa and existing.get("sofascore_detail") and existing.get("sofascore_id"):
             details[i] = existing["sofascore_detail"]
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futures = {pool.submit(_fetch_detail_safe, sofa): i for i, sofa, item in needs_detail}
         for future in as_completed(futures):
             details[futures[future]] = future.result()
@@ -859,6 +863,18 @@ def reset_deferred_predictions_and_repredict() -> dict[str, Any]:
     return result
 
 
+def _require_pipeline_enabled(engine_id: str) -> dict[str, Any] | None:
+    """Return a skipped result unless the pipeline is explicitly active."""
+    try:
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
+        enabled = is_pipeline_enabled(engine_id)
+    except Exception as exc:
+        return {"status": "skipped", "job": engine_id, "reason": "pipeline_state_unavailable", "error": str(exc)}
+    if not enabled:
+        return {"status": "skipped", "job": engine_id, "reason": "pipeline_disabled"}
+    return None
+
+
 def job_unified_live() -> dict[str, Any]:
     """Unified Live Pipeline:
     1. Fetch live matches from SportyBet → ingest + patch scores + snapshot odds
@@ -869,12 +885,9 @@ def job_unified_live() -> dict[str, Any]:
     """
     if is_shutting_down():
         return {"status": "shutdown", "job": "unified_live"}
-    try:
-        from app.scheduling.pipeline_registry import is_pipeline_enabled
-        if not is_pipeline_enabled("unified_live"):
-            return {"status": "skipped", "job": "unified_live", "reason": "pipeline_disabled"}
-    except Exception:
-        pass
+    enabled_check = _require_pipeline_enabled("unified_live")
+    if enabled_check:
+        return enabled_check
 
     from app.data_clients.sportybet_client import fetch_live_matches_post
     from app.storage.buffer import (
@@ -898,14 +911,26 @@ def job_unified_live() -> dict[str, Any]:
     except Exception as exc:
         record_activity(f"Unified live: SportyBet fetch failed: {exc}", job="unified_live", status="error")
         return {"status": "error", "job": "unified_live", "error": str(exc)}
+    enabled_check = _require_pipeline_enabled("unified_live")
+    if enabled_check:
+        return {**enabled_check, "stage": "after_sportybet_fetch"}
 
     # ── Step 1: Ingest + patch + snapshot ─────────────────────────────────────
     groups = _group_matches_by_local_date(matches)
     ingested = 0
     for match_date, dated_matches in groups.items():
+        enabled_check = _require_pipeline_enabled("unified_live")
+        if enabled_check:
+            return {**enabled_check, "stage": "during_ingest", "new": ingested}
         ingested += ingest_matches(dated_matches, match_date)
     patched = patch_live_scores(matches)
+    enabled_check = _require_pipeline_enabled("unified_live")
+    if enabled_check:
+        return {**enabled_check, "stage": "after_score_patch", "new": ingested, "patched": patched}
     for m in matches:
+        enabled_check = _require_pipeline_enabled("unified_live")
+        if enabled_check:
+            return {**enabled_check, "stage": "during_odds_snapshot", "new": ingested, "patched": patched}
         try:
             snapshot_odds({"sportybet_id": m.get("id"), "sportybet_name": m.get("name"),
                            "match_date": _match_local_date(m), "sportybet_markets": m.get("markets", []),
@@ -913,12 +938,18 @@ def job_unified_live() -> dict[str, Any]:
         except Exception:
             pass
     observe_matches("sportybet", matches)
+    enabled_check = _require_pipeline_enabled("unified_live")
+    if enabled_check:
+        return {**enabled_check, "stage": "after_observe_matches", "new": ingested, "patched": patched}
 
     # ── Step 2: Fetch Sofa live events once ───────────────────────────────────
     try:
         live_sofa_events = fetch_live_events()
     except Exception:
         live_sofa_events = []
+    enabled_check = _require_pipeline_enabled("unified_live")
+    if enabled_check:
+        return {**enabled_check, "stage": "after_sofascore_live_fetch", "new": ingested, "patched": patched}
 
     # ── Step 3: Get live buffer items needing enrichment ──────────────────────
     pending = get_unenriched_batch(limit=8, live_only=True)
@@ -956,10 +987,10 @@ def job_unified_live() -> dict[str, Any]:
                 pairs.append((item, None, None))
                 unmatched_count += 1
 
-    # Fetch details in parallel
+    # Fetch details sequentially under the shared match-pipeline lease.
     details: dict[int, dict | None] = {}
     needs_detail = [(i, sofa_id, existing_detail) for i, (item, sofa_id, existing_detail) in enumerate(pairs) if sofa_id]
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futures = {pool.submit(_fetch_detail_safe, sofa_id, existing_detail): i
                    for i, sofa_id, existing_detail in needs_detail}
         for future in as_completed(futures):
@@ -2107,6 +2138,7 @@ def run_job_with_guard(fn, *args, guard_job_id: str | None = None, **kwargs):
 
 def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwargs):
     from app.scheduling.job_state import JobBusy, finish_job, heartbeat, job_guard
+    from app.scheduling.loop_authority import CorrectionAuthorityBusy, correction_authority
 
     job_id = guard_job_id or (fn.__name__[4:] if fn.__name__.startswith("job_") else fn.__name__)
     stale_after = _JOB_STALE_SECONDS.get(job_id, 900)
@@ -2125,7 +2157,25 @@ def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwa
             heartbeat_thread = threading.Thread(target=_beat, name=f"{job_id}_heartbeat", daemon=True)
             heartbeat_thread.start()
             try:
-                result = fn(*args, **kwargs)
+                if job_id in MATCH_PIPELINE_JOB_IDS:
+                    try:
+                        with correction_authority(
+                            job_id,
+                            "match_pipeline",
+                            ttl_seconds=max(stale_after, 6 * 60 * 60),
+                            reason="serialize match ingest/enrich/predict lanes",
+                        ):
+                            result = fn(*args, **kwargs)
+                    except CorrectionAuthorityBusy as exc:
+                        result = {
+                            "status": "busy",
+                            "job": job_id,
+                            "reason": "match_pipeline_busy",
+                            "owner": exc.owner,
+                            "source": exc.source,
+                        }
+                else:
+                    result = fn(*args, **kwargs)
                 status = "ok" if not isinstance(result, dict) else str(result.get("status") or "ok")
                 if status == "busy":
                     final_status = "busy"
