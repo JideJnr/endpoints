@@ -16,6 +16,10 @@ Run the PredictX FastAPI backend on your Android device using Termux.
    ```bash
    termux-setup-storage
    ```
+3. Update packages first:
+   ```bash
+   pkg update -y && pkg upgrade -y
+   ```
 
 ## Step 2: Transfer Project Files
 

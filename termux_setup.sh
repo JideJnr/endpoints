@@ -26,7 +26,7 @@ pkg install -y \
     libopenblas \
     libffi \
     openssl \
-    libsqlite3 \
+    sqlite \
     git
 
 # 3. Upgrade pip
