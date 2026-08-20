@@ -745,6 +745,7 @@ def job_unified_upcoming() -> dict[str, Any]:
         try:
             fresh = get_buffered_match(item["match_id"]) or doc
             result = apply_prediction_state(fresh, match_id=str(item["match_id"]))
+            store_enriched(item["match_id"], fresh)
             if result.get("status") == "predicted":
                 predicted_count += 1
             elif result.get("status") == "deferred":

@@ -614,7 +614,7 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
             (
                 now,
                 doc.get("data_source") or _provider_state_from_doc(doc),
-                str(doc.get("sportybet_id") or match_id or ""),
+                _stored_sportybet_id(doc),
                 str(doc.get("sofascore_id") or ""),
                 json.dumps(doc),
                 match_id,
@@ -757,7 +757,10 @@ def bulk_get_buffered_matches(match_ids: list[str]) -> dict[str, dict[str, Any]]
 def _buffer_lookup_ids(match_id: str) -> list[str]:
     ids = [match_id]
     if match_id and ":" not in match_id:
+        ids.append(f"sofascore:{match_id}")
         ids.append(f"competition:world-cup-2026:{match_id}")
+    if match_id.startswith("competition:"):
+        ids.append(f"sofascore:{match_id.rsplit(':', 1)[-1]}")
     return ids
 
 
@@ -1061,33 +1064,67 @@ def get_buffer_stats() -> dict[str, Any]:
             select count(*) from match_buffer
             where is_finished = 0
               and is_live = 0
+              and (start_time is null or cast(start_time as real) <= (strftime('%s','now') + 86400) * 1000)
               and (start_time is null or cast(start_time as real) > (strftime('%s','now') - 7200) * 1000)
+            """
+        ).fetchone()[0]
+        future_buffered = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and is_live = 0
+              and start_time is not null
+              and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
+            """
+        ).fetchone()[0]
+        future_enriched = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and is_live = 0
+              and enriched_at is not null
+              and start_time is not null
+              and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
+            """
+        ).fetchone()[0]
+        future_pending = conn.execute(
+            """
+            select count(*) from match_buffer
+            where is_finished = 0
+              and is_live = 0
+              and (
+                enriched_at is null
+                or sofascore_id is null
+                or sofascore_id = ''
+              )
+              and start_time is not null
+              and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
             """
         ).fetchone()[0]
 
     return {
         "total_buffered": total,
         "visible_buffered": total,
-        "hot_buffered": total,
-        "future_buffered": 0,
+        "hot_buffered": total - future_buffered,
+        "future_buffered": future_buffered,
         "today": today_count,
         "live": live_count,
         "upcoming": hot_upcoming,
         "enriched": enriched,
-        "hot_enriched": enriched,
-        "future_enriched": 0,
+        "hot_enriched": enriched - future_enriched,
+        "future_enriched": future_enriched,
         "pending_enrichment": pending,
-        "hot_pending_enrichment": pending,
-        "future_pending_enrichment": 0,
+        "hot_pending_enrichment": pending - future_pending,
+        "future_pending_enrichment": future_pending,
         "needs_enrichment": needs_enrichment,
         "no_sofa_match": no_sofa_match,
         "ready": ready,
         "deferred": deferred,
         "stale_live": stale_live,
-        "future_queued": 0,
+        "future_queued": future_pending,
         "queue_labels": {
             "upcoming": hot_upcoming,
-            "future_queued": 0,
+            "future_queued": future_pending,
             "needs_enrichment": needs_enrichment,
             "no_sofa_match": no_sofa_match,
             "ready": ready,
@@ -2024,13 +2061,30 @@ def _provider_state_from_doc(doc: dict[str, Any]) -> str:
     source = str(doc.get("data_source") or "").strip().lower()
     if source in {"sportybet", "sofascore", "both"}:
         return source
-    sporty_available = bool(doc.get("sportybet_id") or doc.get("sportybet_detail") or doc.get("sportybet_markets") or doc.get("raw_sporty"))
+    raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else {}
+    synthetic_competition = bool(raw_sporty.get("competition_special_proxy") or (doc.get("competition_special") or {}).get("provider") == "sofascore")
+    sporty_available = bool(
+        doc.get("sportybet_id")
+        or doc.get("sportybet_detail")
+        or (doc.get("sportybet_markets") and not synthetic_competition)
+        or (raw_sporty and not synthetic_competition)
+    )
     sofa_available = bool(doc.get("sofascore_id") or doc.get("sofascore_event") or doc.get("sofascore_detail"))
     if sporty_available and sofa_available:
         return "both"
     if sofa_available:
         return "sofascore"
     return "sportybet"
+
+
+def _stored_sportybet_id(doc: dict[str, Any]) -> str | None:
+    value = doc.get("sportybet_id")
+    if value:
+        return str(value)
+    raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else {}
+    if raw_sporty.get("competition_special_proxy"):
+        return None
+    return None
 
 
 def _country_from_sporty(m: dict[str, Any]) -> str | None:

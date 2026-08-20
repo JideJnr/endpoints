@@ -299,7 +299,7 @@ def _learned_home_advantage_multiplier() -> float:
     try:
         from app.monitoring.self_learner import get_bias_corrections
         bias = get_bias_corrections()
-        return max(0.80, min(1.05, float(bias.get("home_advantage_multiplier") or 1.0)))
+        return max(0.80, min(1.0, float(bias.get("home_advantage_multiplier") or 1.0)))
     except Exception:
         return HOME_ADVANTAGE
 

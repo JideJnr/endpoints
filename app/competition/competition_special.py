@@ -40,8 +40,8 @@ TOP_30_COMPETITIONS: tuple[dict[str, Any], ...] = (
     {"key": "champions-league", "name": "UEFA Champions League", "unique_tournament_id": 7},
     {"key": "europa-league", "name": "UEFA Europa League", "unique_tournament_id": 679},
     {"key": "conference-league", "name": "UEFA Conference League", "unique_tournament_id": 329},
-    {"key": "championship", "name": "EFL Championship", "unique_tournament_id": 37},
-    {"key": "eredivisie", "name": "Eredivisie", "unique_tournament_id": 44},
+    {"key": "championship", "name": "EFL Championship", "unique_tournament_id": 18},
+    {"key": "eredivisie", "name": "Eredivisie", "unique_tournament_id": 37},
     {"key": "primeira-liga", "name": "Primeira Liga", "unique_tournament_id": 238},
     {"key": "super-lig", "name": "Süper Lig", "unique_tournament_id": 52},
     {"key": "mls", "name": "Major League Soccer", "unique_tournament_id": 242},
@@ -437,15 +437,22 @@ def sync_competition_fixtures(
 
 def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> dict[str, Any]:
     _init_db()
+    ensure_competition_main_buffer(key)
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
         rows = conn.execute(
             """
-            select * from competition_special_buffer
-            where competition_key = ?
-            order by start_time asc
+            select csb.*,
+                   mb.match_id as main_match_id,
+                   mb.raw_enriched as main_raw_enriched,
+                   mb.enriched_at as main_enriched_at
+            from competition_special_buffer csb
+            left join match_buffer mb
+              on mb.match_id = ('sofascore:' || csb.match_id)
+            where csb.competition_key = ?
+            order by csb.start_time asc
             limit ?
             """,
             (key, limit),
@@ -462,6 +469,7 @@ def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> di
 
 def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
     _init_db()
+    ensure_competition_main_buffer(key)
     with db_conn() as conn:
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
@@ -469,14 +477,16 @@ def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
             """
             select
               count(*) as total,
-              sum(case when raw_detail is not null then 1 else 0 end) as enriched,
-              sum(case when prediction_json is not null then 1 else 0 end) as predicted,
-              min(match_date) as first_match_date,
-              max(match_date) as last_match_date,
-              max(enriched_at) as last_enriched_at,
-              max(predicted_at) as last_predicted_at
-            from competition_special_buffer
-            where competition_key = ?
+              sum(case when coalesce(mb.raw_enriched, csb.raw_detail) is not null then 1 else 0 end) as enriched,
+              sum(case when coalesce(json_extract(mb.raw_enriched, '$.prediction'), csb.prediction_json) is not null then 1 else 0 end) as predicted,
+              min(csb.match_date) as first_match_date,
+              max(csb.match_date) as last_match_date,
+              max(coalesce(mb.enriched_at, csb.enriched_at)) as last_enriched_at,
+              max(csb.predicted_at) as last_predicted_at
+            from competition_special_buffer csb
+            left join match_buffer mb
+              on mb.match_id = ('sofascore:' || csb.match_id)
+            where csb.competition_key = ?
             """,
             (key,),
         ).fetchone()
@@ -588,7 +598,7 @@ def enrich_predict_competition(key: str = "world-cup-2026", limit: int = 12, all
             readiness = prediction_readiness(doc)
             state = apply_prediction_state(
                 doc,
-                match_id=f"competition:{key}:{fresh_event.get('id')}",
+                match_id=_main_buffer_match_id(fresh_event.get("id")),
                 match_date=doc.get("match_date"),
                 source=f"competition_special:{key}",
                 allow_repeat=allow_repeat,
@@ -775,7 +785,7 @@ def sort_enriched_doc_into_competition(doc: dict[str, Any]) -> None:
         key = _tournament_key(tournament_id, tournament)
         name = str(tournament.get("name") or key)
         match_date = doc.get("match_date") or _event_match_date(event, date.today().isoformat())
-        sportybet_match_id = str(doc.get("sportybet_id") or doc.get("match_id") or "")
+        sportybet_match_id = _real_sportybet_match_id(doc)
         _init_db()
         with db_conn() as conn:
             init_competition_tables(conn)
@@ -834,6 +844,18 @@ def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
     conn.execute("""update competition_special_settings
                     set unique_tournament_id = 52, updated_at = current_timestamp
                     where key = 'super-lig' and unique_tournament_id = 325""")
+    conn.execute("""update competition_special_settings
+                    set unique_tournament_id = 18,
+                        metadata_json = json_remove(coalesce(metadata_json, '{}'), '$.last_sync_end_date'),
+                        updated_at = current_timestamp
+                    where key = 'championship' and unique_tournament_id = 37""")
+    conn.execute("""update competition_special_settings
+                    set unique_tournament_id = 37,
+                        metadata_json = json_remove(coalesce(metadata_json, '{}'), '$.last_sync_end_date'),
+                        updated_at = current_timestamp
+                    where key = 'eredivisie' and unique_tournament_id = 44""")
+    _purge_wrong_competition_key_rows(conn, "championship", 18)
+    _purge_wrong_competition_key_rows(conn, "eredivisie", 37)
 
 
 def _event_unique_tournament_id(event: dict[str, Any]) -> int | None:
@@ -850,6 +872,35 @@ def _event_unique_tournament_id(event: dict[str, Any]) -> int | None:
         return int(unique.get("id")) if unique.get("id") is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _purge_wrong_competition_key_rows(conn: sqlite3.Connection, key: str, expected_tournament_id: int) -> int:
+    """Remove regenerable competition rows stored under a key with the wrong tournament ID."""
+    rows = conn.execute(
+        "select match_id, raw_event from competition_special_buffer where competition_key = ?",
+        (key,),
+    ).fetchall()
+    wrong_ids: list[str] = []
+    for row in rows:
+        try:
+            raw_event = row["raw_event"] if hasattr(row, "keys") else row[1]
+            event = json.loads(raw_event or "{}")
+        except Exception:
+            continue
+        actual_id = _event_unique_tournament_id(event)
+        if actual_id is not None and actual_id != expected_tournament_id:
+            wrong_ids.append(str(row["match_id"]))
+    if not wrong_ids:
+        return 0
+    placeholders = ",".join("?" for _ in wrong_ids)
+    removed = conn.execute(
+        f"delete from competition_special_buffer where competition_key = ? and match_id in ({placeholders})",
+        (key, *wrong_ids),
+    ).rowcount
+    prefixed = [f"competition:{key}:{item}" for item in wrong_ids]
+    main_placeholders = ",".join("?" for _ in prefixed)
+    conn.execute(f"delete from match_buffer where match_id in ({main_placeholders})", prefixed)
+    return int(removed or 0)
 
 
 def purge_misclassified_competition_rows() -> dict[str, int]:
@@ -1096,12 +1147,17 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
     markets = _special_markets(detail)
     importance = _match_importance_context(key, event)
     intelligence = _competition_intelligence_context(key, event, detail, {})
+    main_id = _main_buffer_match_id(event.get("id"))
+    legacy_id = _prefixed_match_id(key, event.get("id"))
     return {
-        "sportybet_id": f"competition:{key}:{event.get('id')}",
-        "id": f"competition:{key}:{event.get('id')}",
+        "id": main_id,
+        "match_id": main_id,
+        "competition_match_id": str(event.get("id") or ""),
+        "legacy_competition_id": legacy_id,
         "sofascore_id": event.get("id"),
         "sofascore_match_status": "matched",
-        "sportybet_name": event.get("name"),
+        "data_source": "sofascore",
+        "sofascore_only": True,
         "name": event.get("name"),
         "home_team": event.get("home_team"),
         "away_team": event.get("away_team"),
@@ -1114,9 +1170,11 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
         "sofascore_event": event,
         "raw_sofascore_event": event.get("raw_event") or event,
         "sofascore_detail": detail,
-        "sportybet_detail": {"provider": "competition_special", "markets": markets},
+        "sportybet_detail": None,
+        "sportybet_data_status": "not_applicable",
         "raw_sporty": {
-            "id": f"competition:{key}:{event.get('id')}",
+            "id": main_id,
+            "legacy_id": legacy_id,
             "name": event.get("name"),
             "home_team": event.get("home_team"),
             "away_team": event.get("away_team"),
@@ -1125,6 +1183,8 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
             "period": (event.get("status") or {}).get("description") or "Not started",
             "start_time": int(float(start or 0) * 1000) if start else None,
             "markets": markets,
+            "competition_special_proxy": True,
+            "source": "sofascore",
         },
         "markets": markets,
         "sportybet_markets": markets,
@@ -1141,7 +1201,7 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
             },
             "sportybet": {
                 "available": False,
-                "markets": True,
+                "markets": False,
                 "market_count": len(markets),
                 "competition_special_proxy": True,
             },
@@ -1220,17 +1280,19 @@ def _settings_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _buffer_row(row: sqlite3.Row) -> dict[str, Any]:
     event = json.loads(row["raw_event"] or "{}")
+    main_doc = _json_row_value(row, "main_raw_enriched")
     detail = json.loads(row["raw_detail"] or "null") if row["raw_detail"] else None
-    prediction = json.loads(row["prediction_json"] or "null") if row["prediction_json"] else None
+    prediction = (main_doc or {}).get("prediction") or (json.loads(row["prediction_json"] or "null") if row["prediction_json"] else None)
     importance = json.loads(row["importance_context_json"] or "{}")
-    doc = _competition_doc(row["competition_key"], event, detail or {}) if detail else {"sofascore_event": event, "period": row["status"], "start_time": row["start_time"]}
+    doc = main_doc or (_competition_doc(row["competition_key"], event, detail or {}) if detail else {"sofascore_event": event, "period": row["status"], "start_time": row["start_time"]})
     intelligence = (detail or {}).get("competition_intelligence") if isinstance(detail, dict) else None
     if not intelligence:
         intelligence = doc.get("competition_intelligence") if isinstance(doc, dict) else {}
     state = classify_match_state(doc)
     return {
         "competition_key": row["competition_key"],
-        "match_id": _prefixed_match_id(row["competition_key"], row["match_id"]),
+        "match_id": str(_row_get(row, "main_match_id") or _main_buffer_match_id(row["match_id"])),
+        "legacy_match_id": _prefixed_match_id(row["competition_key"], row["match_id"]),
         "competition_match_id": row["match_id"],
         "sofascore_id": row["match_id"],
         "match_date": row["match_date"],
@@ -1241,9 +1303,9 @@ def _buffer_row(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "score": {"home": row["score_home"], "away": row["score_away"]},
         "match_state": state,
-        "enriched": bool(row["raw_detail"]),
-        "predicted": bool(row["prediction_json"]),
-        "enriched_at": row["enriched_at"],
+        "enriched": bool(main_doc or row["raw_detail"]),
+        "predicted": bool(prediction),
+        "enriched_at": _row_get(row, "main_enriched_at") or row["enriched_at"],
         "predicted_at": row["predicted_at"],
         "prediction": prediction,
         "readiness": (detail or {}).get("prediction_readiness") if isinstance(detail, dict) else None,
@@ -1251,6 +1313,21 @@ def _buffer_row(row: sqlite3.Row) -> dict[str, Any]:
         "competition_intelligence": intelligence,
         "event": event,
     }
+
+
+def _row_get(row: sqlite3.Row, key: str) -> Any:
+    return row[key] if key in row.keys() else None
+
+
+def _json_row_value(row: sqlite3.Row, key: str) -> dict[str, Any] | None:
+    value = _row_get(row, key)
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
 
 
 def _watcher_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -1262,6 +1339,8 @@ def _watcher_row(row: sqlite3.Row) -> dict[str, Any]:
         "competition_key": row["competition_key"],
         "team_id": row["team_id"],
         "team_name": row["team_name"],
+        "detail_path": f"/competition/{row['competition_key']}/team/{row['team_id']}",
+        "api_path": f"/competition-special/{row['competition_key']}/team-watchers/{row['team_id']}",
         "analyst_name": row["analyst_name"],
         "profile": profile,
         "match_count": row["match_count"],
@@ -1372,6 +1451,15 @@ def _prefixed_match_id(key: str, match_id: Any) -> str:
     return f"{prefix}{value}"
 
 
+def _main_buffer_match_id(match_id: Any) -> str:
+    value = str(match_id or "").strip()
+    if value.startswith("sofascore:") or value.startswith("sr:match:"):
+        return value
+    if value.startswith("competition:"):
+        value = value.rsplit(":", 1)[-1]
+    return f"sofascore:{value}" if value else ""
+
+
 def _match_importance_context(key: str, event: dict[str, Any]) -> dict[str, Any]:
     """Classify competition fixture importance from event metadata."""
     tournament = event.get("tournament") if isinstance(event.get("tournament"), dict) else {}
@@ -1470,16 +1558,16 @@ def _mirror_competition_event_to_main_buffer(
     })
     is_live = 1 if state.get("is_live") else 0
     is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
-    match_id = _prefixed_match_id(key, event.get("id"))
+    match_id = _main_buffer_match_id(event.get("id"))
     raw_sporty = _competition_raw_sporty(key, event, match_date, importance)
     conn.execute(
         """
         insert into match_buffer (
             match_id, match_date, tournament, category, name, start_time, period,
             score_home, score_away, is_live, is_finished, ingested_at,
-            sofascore_id, raw_sporty, raw_enriched
+            data_source, sofascore_id, sofascore_only, raw_sporty, raw_enriched, enriched_at
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(match_id) do update set
             match_date = excluded.match_date,
             tournament = excluded.tournament,
@@ -1492,9 +1580,13 @@ def _mirror_competition_event_to_main_buffer(
             is_live = excluded.is_live,
             is_finished = excluded.is_finished,
             ingested_at = excluded.ingested_at,
+            data_source = excluded.data_source,
             sofascore_id = excluded.sofascore_id,
+            sofascore_only = excluded.sofascore_only,
+            sportybet_id = null,
             raw_sporty = excluded.raw_sporty,
-            raw_enriched = coalesce(excluded.raw_enriched, match_buffer.raw_enriched)
+            raw_enriched = coalesce(excluded.raw_enriched, match_buffer.raw_enriched),
+            enriched_at = coalesce(excluded.enriched_at, match_buffer.enriched_at)
         """,
         (
             match_id,
@@ -1509,9 +1601,12 @@ def _mirror_competition_event_to_main_buffer(
             is_live,
             is_finished,
             datetime.now(timezone.utc).isoformat(),
+            "sofascore",
             str(event.get("id") or ""),
+            1,
             json.dumps(raw_sporty),
             json.dumps(enriched_doc) if enriched_doc else None,
+            datetime.now(timezone.utc).isoformat() if enriched_doc else None,
         ),
     )
 
@@ -1520,7 +1615,8 @@ def _competition_raw_sporty(key: str, event: dict[str, Any], match_date: str, im
     status = event.get("status") or {}
     score = event.get("score") or {}
     return {
-        "id": _prefixed_match_id(key, event.get("id")),
+        "id": _main_buffer_match_id(event.get("id")),
+        "legacy_id": _prefixed_match_id(key, event.get("id")),
         "competition_source_id": str(event.get("id") or ""),
         "name": event.get("name"),
         "home_team": event.get("home_team"),
@@ -1533,6 +1629,8 @@ def _competition_raw_sporty(key: str, event: dict[str, Any], match_date: str, im
         "score": {"home": _score_value(score.get("home")), "away": _score_value(score.get("away"))},
         "markets": _special_markets(),
         "competition_special": {"key": key, "source": "sofascore"},
+        "competition_special_proxy": True,
+        "source": "sofascore",
         "match_importance_context": importance,
         "importance_context": importance,
         "sofascore_event": event,
@@ -2053,7 +2151,8 @@ def _team_match_observation(
     return {
         "team_id": team_id,
         "team_name": team_name,
-        "match_id": str(event.get("id") or _prefixed_match_id(key, event.get("id"))),
+        "match_id": _main_buffer_match_id(event.get("id")),
+        "competition_match_id": str(event.get("id") or ""),
         "match_date": match_date,
         "opponent": opponent_name,
         "venue": venue,
@@ -2307,6 +2406,22 @@ def competition_dashboard_summary(buffer_limit: int = 200) -> dict[str, Any]:
         "errors": errors,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _real_sportybet_match_id(doc: dict[str, Any]) -> str:
+    value = str(doc.get("sportybet_id") or "").strip()
+    if not value or value.startswith("sofascore:") or value.startswith("competition:"):
+        return ""
+    return value
+
+
+def list_all_competition_summaries(
+    buffer_limit: int = 200,
+    analysis_limit: int = 1,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the composite competition dashboard endpoint."""
+    _ = analysis_limit
+    return competition_dashboard_summary(buffer_limit=buffer_limit)
 
 
 

@@ -165,13 +165,47 @@ def _get_base_probs(league_key: str) -> tuple[float, float, float, str]:
     return 0.45, 0.30, 0.25, "static_fallback"
 
 
+def _get_home_baseline(league_key: str) -> float:
+    """Return the home-win baseline probability for a given league.
+
+    Lookup order:
+    1. league_outcome_distribution for the specific league (samples >= 20)
+    2. Global average home_rate across all rows with samples >= 20
+    3. Hardcoded constant 0.50
+    """
+    try:
+        _init_db()
+        with db_conn(timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            # Step 1: league-specific row
+            row = conn.execute("""
+                SELECT home_rate
+                FROM league_outcome_distribution
+                WHERE league_key = ? AND samples >= 20
+            """, (league_key,)).fetchone()
+            if row is not None:
+                return float(row["home_rate"])
+            # Step 2: global average
+            row = conn.execute("""
+                SELECT AVG(home_rate) AS avg_home
+                FROM league_outcome_distribution
+                WHERE samples >= 20
+            """).fetchone()
+            if row is not None and row["avg_home"] is not None:
+                return float(row["avg_home"])
+    except Exception:
+        pass
+    # Step 3: hardcoded default
+    return 0.50
+
+
 def _get_away_baseline(league_key: str) -> float:
     """Return the away-win baseline probability for a given league.
 
     Lookup order:
     1. league_outcome_distribution for the specific league (samples >= 20)
     2. Global average away_rate across all rows with samples >= 20
-    3. Hardcoded constant 0.54
+    3. Hardcoded constant 0.50
     """
     try:
         _init_db()
@@ -196,7 +230,7 @@ def _get_away_baseline(league_key: str) -> float:
     except Exception:
         pass
     # Step 3: hardcoded default
-    return 0.54
+    return 0.50
 
 
 # ── Signal aggregator ──────────────────────────────────────────
@@ -533,7 +567,8 @@ class SignalAggregator:
                 abs(sig.get("strength", 0.5)) for sig in self.signals
                 if sig.get("direction", 0) > 0
             )
-            home_prob = min(0.85, 0.50 + total_strength * 0.15)
+            home_baseline = _get_home_baseline(self.league_key)
+            home_prob = min(0.85, home_baseline + total_strength * 0.15)
             away_prob = (1 - home_prob) * 0.65
             away_prob = max(0.05, away_prob)
             draw_prob = max(0.05, 1 - home_prob - away_prob)
@@ -549,8 +584,8 @@ class SignalAggregator:
 
             # Home win probability varies with signal mix
             base_home, base_draw, base_away, base_probs_source = _get_base_probs(self.league_key)
-            home_prob = base_home + home_ratio * 0.25 - away_ratio * 0.10
-            away_prob = base_away + away_ratio * 0.25 - home_ratio * 0.10
+            home_prob = base_home + home_ratio * 0.15 - away_ratio * 0.15
+            away_prob = base_away + away_ratio * 0.15 - home_ratio * 0.15
             draw_prob = base_draw + neutral_ratio * 0.10 - abs(home_ratio - away_ratio) * 0.05
 
             # Clamp probabilities

@@ -592,8 +592,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 name = sig.get("name") or ""
                 weight_adj = learned_weights.get(name)
                 if weight_adj is not None and abs(weight_adj) > 0.1:
-                    # Scale: weight_adj of +1.0 → +3 confidence, -1.0 → -3
-                    contribution = round(weight_adj * 3)
+                    # Scale down positive learned boosts while reset-era
+                    # duplicate pollution is still washing out of history.
+                    contribution = _stabilized_learned_adjustment(weight_adj)
                     learned_signal_adj += contribution
             learned_signal_adj = _cap_learned_signal_adjustment(signals, learned_signal_adj)
             if learned_signal_adj != 0:
@@ -722,7 +723,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             raw_conf = int(pick.get("confidence") or 50)
             cal = calibrate_confidence(pick.get("type") or "match_result", raw_conf)
             memory = weighted_prediction_memory(doc, pick.get("type"), pick.get("selection"))
-            memory_adj = int(memory.get("confidence_adjustment") or 0)
+            memory_adj = _stabilized_memory_adjustment(int(memory.get("confidence_adjustment") or 0))
             pick_learned_adj = _learned_signal_adjustment_for_pick(doc, signals, pick.get("type"))
             aggregator_adj = _signal_aggregator_pick_adjustment(pick, signal_aggregator_context)
             combo_memory = {}
@@ -2118,33 +2119,9 @@ def _combined_picks(
                 }
                 break
     if not picks:
-        # Try signal aggregator for directional picks before falling back to no_bet
-        try:
-            from app.enrichment.signal_aggregator import SignalAggregator
-            from app.risk.fallback_logic import FallbackHandler
-
-            aggregator = SignalAggregator()
-            probs = ensemble.get("probabilities") or {}
-            aggregator.add_signal("home_odds", probs.get("home_win", 33), source="ensemble")
-            aggregator.add_signal("away_odds", probs.get("away_win", 33), source="ensemble")
-            aggregator.add_signal("draw_odds", probs.get("draw", 33), source="ensemble")
-
-            sig_probs = aggregator.calculate_probabilities()
-            handler = FallbackHandler()
-            fallback = handler.get_fallback_pick(
-                signals=aggregator.signals,
-                odds={"home": 1.0, "draw": 1.0, "away": 1.0},
-                prob_result=sig_probs,
-            )
-            if fallback and fallback.get("type") != "no_bet" and fallback.get("confidence", 0) >= 35:
-                picks.append(_selector_pick(
-                    fallback.get("type", "match_result"),
-                    fallback.get("selection", "Home Win"),
-                    max(50, int(fallback.get("confidence", 50))),
-                    f"signal aggregator fallback: {fallback.get('selection')}",
-                ))
-        except Exception:
-            pass
+        draw_exclusion = _draw_exclusion_fallback(ensemble)
+        if draw_exclusion:
+            picks.append(draw_exclusion)
 
     if not picks:
         picks.append({
@@ -2154,6 +2131,24 @@ def _combined_picks(
             "reason": "Low confidence ensemble — insufficient rule signals",
         })
     return _curate_picks(picks, doc)
+
+
+def _draw_exclusion_fallback(ensemble: dict[str, Any]) -> dict[str, Any] | None:
+    probs = (ensemble or {}).get("probabilities") or {}
+    home = _to_float(probs.get("home_win")) or 0.0
+    draw = _to_float(probs.get("draw")) or 0.0
+    away = _to_float(probs.get("away_win")) or 0.0
+    if home + away < 72 or draw > 24:
+        return None
+    pick = _selector_pick(
+        "double_chance",
+        "Home or Away",
+        min(84, home + away),
+        "draw probability is low; protect against choosing the wrong winner",
+    )
+    pick["draw_exclusion"] = True
+    pick["source"] = "draw_exclusion_fallback"
+    return pick
 
 
 def _live_inplay_picks(
@@ -2349,25 +2344,29 @@ def _source_quality_signals(doc: dict[str, Any], readiness: dict[str, Any] | Non
         signals.append({
             "name": "sportybet_detail_available",
             "value": {"market_count": sporty.get("market_count"), "live_clock": sporty.get("live_clock")},
-            "impact": 2 if sporty.get("markets") else 0,
+            "impact": 0,
+            "role": "readiness",
         })
     if sporty.get("markets"):
         signals.append({
             "name": "sportybet_markets_available",
             "value": {"market_count": sporty.get("market_count")},
-            "impact": 3,
+            "impact": 0,
+            "role": "readiness",
         })
     if sofa.get("detail"):
         signals.append({
             "name": "sofascore_detail_available",
             "value": {"statistics": sofa.get("statistics"), "history": sofa.get("history")},
-            "impact": 4 if sofa.get("history") else 2,
+            "impact": 0,
+            "role": "readiness",
         })
     if sofa.get("statistics"):
         signals.append({
             "name": "sofascore_statistics_available",
             "value": {"statistics": True},
-            "impact": 3,
+            "impact": 0,
+            "role": "readiness",
         })
     if sportradar.get("available"):
         summary = sportradar_detail.get("summary") or {}
@@ -2382,7 +2381,8 @@ def _source_quality_signals(doc: dict[str, Any], readiness: dict[str, Any] | Non
                 "summary": summary,
                 "standings": bool(sportradar.get("standings")),
             },
-            "impact": min(4, 1 + evidence_count // 2),
+            "impact": 0,
+            "role": "readiness",
         })
     elif sportradar.get("error"):
         signals.append({
@@ -2395,7 +2395,8 @@ def _source_quality_signals(doc: dict[str, Any], readiness: dict[str, Any] | Non
         signals.append({
             "name": f"source_blend_{assurance}",
             "value": {"assurance": assurance, "sources": sources},
-            "impact": 4 if assurance == "full_signal_plus_sporty" else 1 if "sporty" in str(assurance) else 2,
+            "impact": 0,
+            "role": "readiness",
         })
     return signals
 
@@ -2446,8 +2447,8 @@ def _learned_signal_adjustment_for_pick(
             if weight_adj is not None and abs(weight_adj) > 0.1:
                 impact = _to_float(signal.get("impact")) or 1.0
                 direction = 1 if impact >= 0 else -1
-                adjustment += round(float(weight_adj) * 3 * direction)
-        return max(-8, min(8, adjustment))
+                adjustment += _stabilized_learned_adjustment(float(weight_adj) * direction)
+        return max(-8, min(2, adjustment))
     except Exception as exc:
         from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "learned_signal_adjustment_failed", exc)
@@ -2478,7 +2479,18 @@ def _cap_learned_signal_adjustment(signals: list[dict[str, Any]], adjustment: in
                 weak_support += 1
     if checked and weak_support >= max(1, checked // 2):
         return min(2, adjustment)
-    return max(-8, min(8, adjustment))
+    return max(-8, min(2, adjustment))
+
+
+def _stabilized_learned_adjustment(weight_adj: float) -> int:
+    contribution = round(float(weight_adj) * 3)
+    return max(-3, min(1, contribution)) if contribution > 0 else max(-3, contribution)
+
+
+def _stabilized_memory_adjustment(adjustment: int) -> int:
+    if adjustment > 0:
+        return min(2, adjustment)
+    return max(-8, adjustment)
 
 
 
@@ -3840,58 +3852,22 @@ def _market_selector_picks(
     side_conf = {"Home Win": home, "Draw": draw, "Away Win": away}[best_side]
     second_side = sorted([home, draw, away], reverse=True)[1]
     clear_gap = float(get_settings().clear_winner_probability_gap)
-    if home - away >= clear_gap and home > draw:
-        pick = _selector_pick("match_result", "Home Win", max(home, 55 if home >= 45 else home), "ensemble home-win probability clears draw and away by threshold")
+    if home >= 55 and home - away >= clear_gap and home > draw:
+        pick = _selector_pick("match_result", "Home Win", home, "ensemble home-win probability clears draw and away by threshold")
         pick["clear_winner"] = True
-        pick["confidence_floor_applied"] = home >= 45 and home < 55
         picks.append(pick)
-    elif away - home >= clear_gap and away > draw:
-        pick = _selector_pick("match_result", "Away Win", max(away, 55 if away >= 45 else away), "ensemble away-win probability clears draw and home by threshold")
+    elif away >= 55 and away - home >= clear_gap and away > draw:
+        pick = _selector_pick("match_result", "Away Win", away, "ensemble away-win probability clears draw and home by threshold")
         pick["clear_winner"] = True
-        pick["confidence_floor_applied"] = away >= 45 and away < 55
         picks.append(pick)
     # Straight 1X2 needs a real separation. A 45-50% side can be useful for
     # double chance, but it is too fragile as a primary match-winner pick.
     if side_conf >= 55 and side_conf - second_side >= 12 and samples >= 8:
         picks.append(_selector_pick("match_result", best_side, side_conf, "1X2 model and local finished-score memory agree with separation"))
 
-    # When 1X2 lacks clear separation, use the signal aggregator to find
-    # directional picks with high odds and proven win history instead of
-    # defaulting to double chance.
-    if side_conf - second_side < 12 or samples < 8:
-        try:
-            from app.enrichment.signal_aggregator import SignalAggregator
-            from app.risk.fallback_logic import FallbackHandler
-
-            # Build signals from the current model probabilities
-            aggregator = SignalAggregator()
-            aggregator.add_signal("home_odds", home, source="ensemble")
-            aggregator.add_signal("away_odds", away, source="ensemble")
-            aggregator.add_signal("draw_odds", draw, source="ensemble")
-            if home > draw and home > away:
-                aggregator.add_signal("home_form", 0.7, source="ensemble")
-            elif away > draw and away > home:
-                aggregator.add_signal("away_form", 0.7, source="ensemble")
-            else:
-                aggregator.add_signal("home_form", 0.5, source="ensemble")
-                aggregator.add_signal("away_form", 0.5, source="ensemble")
-
-            sig_probs = aggregator.calculate_probabilities()
-            handler = FallbackHandler()
-            fallback = handler.get_fallback_pick(
-                signals=aggregator.signals,
-                odds={"home": 1 / (home / 100) if home > 0 else 1.0, "draw": 1 / (draw / 100) if draw > 0 else 1.0, "away": 1 / (away / 100) if away > 0 else 1.0},
-                prob_result=sig_probs,
-            )
-            if fallback and fallback.get("type") != "no_bet" and fallback.get("confidence", 0) >= 40:
-                picks.append(_selector_pick(
-                    fallback.get("type", "match_result"),
-                    fallback.get("selection", "Home Win"),
-                    max(55, int(fallback.get("confidence", 55))),
-                    f"signal aggregator directional pick: {fallback.get('selection')} (odds {fallback.get('odds', 0):.2f})",
-                ))
-        except Exception:
-            pass
+    # When 1X2 lacks clear separation, do not manufacture a side pick from
+    # synthetic fallback signals.  The safer protection market is draw-only
+    # exclusion ("Home or Away") when draw probability is genuinely low.
 
     # Double chance as last resort — only when directional picks are unavailable
     dc_options = [
@@ -3904,7 +3880,9 @@ def _market_selector_picks(
         if selection == "Home or Away":
             max_draw = 18 if goal_env.get("profile") == "hot" else 24
             if probability >= 72 and draw <= max_draw:
-                picks.append(_selector_pick("double_chance", selection, min(probability, 82), reason))
+                pick = _selector_pick("double_chance", selection, min(probability + 3, 84), reason)
+                pick["draw_exclusion"] = True
+                picks.append(pick)
         elif probability >= 66 and excluded <= 34:
             penalty = _double_chance_conflict_penalty(selection, side_signal_total)
             adjusted_probability = min(probability, 86) - penalty
@@ -3977,20 +3955,27 @@ def _blended_model_probabilities(
     dixon: dict[str, Any] | None,
 ) -> dict[str, float]:
     totals = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0, "over_2_5": 0.0, "btts": 0.0}
-    weight = 0.0
+    goal_weight = 0.0
 
-    def add(probs: dict[str, Any], w: float) -> None:
-        nonlocal weight
+    def add_goal(probs: dict[str, Any], w: float) -> None:
+        nonlocal goal_weight
         if not probs:
             return
-        for key in totals:
+        for key in ("over_2_5", "btts"):
             totals[key] += float(probs.get(key) or 0) * w
-        weight += w
+        goal_weight += w
 
-    add((dixon or {}).get("probabilities") or {}, 0.45)
-    add((poisson or {}).get("probabilities") or {}, 0.25)
-    add((ensemble or {}).get("probabilities") or {}, 0.30)
-    return {key: round(value / weight, 2) for key, value in totals.items()} if weight else totals
+    # Poisson/Dixon-Coles are goal-shape models.  They can support totals/BTTS,
+    # but they must not push Home/Draw/Away side picks.
+    ensemble_probs = (ensemble or {}).get("probabilities") or {}
+    for key in ("home_win", "draw", "away_win"):
+        totals[key] = float(ensemble_probs.get(key) or 0)
+
+    add_goal((dixon or {}).get("probabilities") or {}, 0.55)
+    add_goal((poisson or {}).get("probabilities") or {}, 0.45)
+    for key in ("over_2_5", "btts"):
+        totals[key] = round(totals[key] / goal_weight, 2) if goal_weight else float(ensemble_probs.get(key) or 0)
+    return {key: round(value, 2) for key, value in totals.items()}
 
 
 def _rules_side_edge(rules: dict[str, Any]) -> float:
@@ -4279,6 +4264,8 @@ def _finalize_prediction_output(prediction: dict[str, Any], ensemble: dict[str, 
     picks = prediction.get("picks") or []
     if picks:
         picks.sort(key=lambda pick: int(pick.get("confidence") or 0), reverse=True)
+        _apply_publication_filters(prediction, picks)
+        picks.sort(key=lambda pick: int(pick.get("confidence") or 0), reverse=True)
         for index, pick in enumerate(picks):
             pick["role"] = "primary" if index == 0 else "alternative"
             selection = str(pick.get("selection") or "")
@@ -4309,6 +4296,150 @@ def _finalize_prediction_output(prediction: dict[str, Any], ensemble: dict[str, 
     if (prediction.get("data_quality") or {}).get("live_stats_available"):
         detail_stats = prediction.get("live_statistics_summary")
         prediction["live_statistics_summary"] = detail_stats or live_summary.get("box_score") or {}
+
+
+def _apply_publication_filters(prediction: dict[str, Any], picks: list[dict[str, Any]]) -> None:
+    signals = prediction.get("signals") or []
+    direction = _directional_signal_map(signals)
+    conflict = all(key in direction for key in ("h2h_edge", "odds_edge", "common_opponent_edge")) and len({
+        direction["h2h_edge"],
+        direction["odds_edge"],
+        direction["common_opponent_edge"],
+    }) > 1
+    if conflict:
+        _append_publication_signal(prediction, "directional_signal_conflict", {
+            "h2h": direction["h2h_edge"],
+            "market": direction["odds_edge"],
+            "common_opponents": direction["common_opponent_edge"],
+            "action": "cap_high_confidence",
+        })
+
+    blocked: list[dict[str, Any]] = []
+    for pick in picks:
+        selection = str(pick.get("selection") or "")
+        normalized = selection.lower()
+        reasons: list[str] = []
+        if conflict:
+            reasons.append("h2h_market_common_opponent_conflict")
+        if "away or draw" in normalized and not _all_directional_support(direction, "away", ("odds_edge", "recent_history_edge", "common_opponent_edge")):
+            reasons.append("away_or_draw_requires_market_recent_common_support")
+        if ("home win" in normalized or normalized == "home") and not _home_win_has_enough_support(direction):
+            reasons.append("home_win_requires_market_plus_recent_or_common_support")
+        excluded_side = _double_chance_excluded_side(normalized)
+        if excluded_side:
+            exclusion = _excluded_side_strength(signals, excluded_side)
+            if exclusion["block"]:
+                reasons.append("double_chance_excludes_clear_stronger_side")
+                pick.setdefault("publication_filter", {})
+                pick["publication_filter"]["blocked"] = True
+                pick["publication_filter"]["reasons"] = reasons
+                pick["publication_filter"]["excluded_side_strength"] = exclusion
+                pick["reason"] = f"{pick.get('reason') or ''}; blocked by publication filter: {', '.join(reasons)}"
+                blocked.append(pick)
+                continue
+
+        if reasons and int(pick.get("confidence") or 0) >= 65:
+            pick["confidence"] = 64
+            pick.setdefault("publication_filter", {})
+            pick["publication_filter"]["capped"] = True
+            pick["publication_filter"]["reasons"] = reasons
+            pick["reason"] = f"{pick.get('reason') or ''}; capped by publication filter: {', '.join(reasons)}"
+    if blocked:
+        picks[:] = [pick for pick in picks if not (pick.get("publication_filter") or {}).get("blocked")]
+        if not picks:
+            picks.append({
+                "type": "no_bet",
+                "selection": "No Bet",
+                "confidence": 50,
+                "reason": "blocked side pick because double chance excluded the clearer stronger side",
+                "suppressed_picks": blocked,
+            })
+
+
+def _directional_signal_map(signals: list[dict[str, Any]]) -> dict[str, str]:
+    direction: dict[str, str] = {}
+    for signal in signals:
+        name = str(signal.get("name") or "")
+        impact = _to_float(signal.get("impact"))
+        if impact is None or abs(impact) < 1.5:
+            continue
+        if name in {"h2h_edge", "odds_edge", "common_opponent_edge", "recent_history_edge", "league_position_edge", "venue_form_edge", "avg_rating_edge", "market_steam"}:
+            direction[name] = "home" if impact > 0 else "away"
+    return direction
+
+
+def _double_chance_excluded_side(normalized_selection: str) -> str | None:
+    if "home or draw" in normalized_selection:
+        return "away"
+    if "away or draw" in normalized_selection:
+        return "home"
+    return None
+
+
+def _excluded_side_strength(signals: list[dict[str, Any]], side: str) -> dict[str, Any]:
+    """Return whether a double-chance pick is excluding a clearly stronger team.
+
+    Positive impacts mean home edge; negative impacts mean away edge.  We only
+    block when several independent side signals point toward the excluded team,
+    so a single noisy venue/form metric cannot veto a pick by itself.
+    """
+    if side not in {"home", "away"}:
+        return {"block": False, "side": side, "support_count": 0, "total": 0.0, "signals": []}
+    side_names = {
+        "avg_rating_edge",
+        "odds_edge",
+        "market_steam",
+        "league_position_edge",
+        "common_opponent_edge",
+        "recent_history_edge",
+        "venue_form_edge",
+        "h2h_edge",
+    }
+    strong_names = {"avg_rating_edge", "odds_edge", "market_steam", "league_position_edge", "common_opponent_edge"}
+    support: list[dict[str, Any]] = []
+    opposing_total = 0.0
+    for signal in signals:
+        name = str(signal.get("name") or "")
+        if name not in side_names:
+            continue
+        impact = _to_float(signal.get("impact"))
+        if impact is None:
+            continue
+        side_impact = impact if side == "home" else -impact
+        if side_impact >= 3:
+            support.append({"name": name, "impact": round(side_impact, 2), "strong": name in strong_names})
+        elif side_impact <= -3:
+            opposing_total += abs(side_impact)
+    total = round(sum(float(item["impact"]) for item in support), 2)
+    strong_count = sum(1 for item in support if item.get("strong"))
+    support_count = len(support)
+    block = (strong_count >= 2 and total >= 14 and total - opposing_total >= 6) or (strong_count >= 3 and total >= 11)
+    return {
+        "block": bool(block),
+        "side": side,
+        "support_count": support_count,
+        "strong_count": strong_count,
+        "total": total,
+        "opposing_total": round(opposing_total, 2),
+        "signals": support,
+    }
+
+
+def _all_directional_support(direction: dict[str, str], side: str, names: tuple[str, ...]) -> bool:
+    return all(direction.get(name) == side for name in names)
+
+
+def _home_win_has_enough_support(direction: dict[str, str]) -> bool:
+    if direction.get("odds_edge") != "home":
+        return False
+    return direction.get("recent_history_edge") == "home" or direction.get("common_opponent_edge") == "home"
+
+
+def _append_publication_signal(prediction: dict[str, Any], name: str, value: dict[str, Any]) -> None:
+    signals = prediction.setdefault("signals", [])
+    if any(signal.get("name") == name for signal in signals):
+        return
+    signals.append({"name": name, "value": value, "impact": -6, "role": "risk_signal"})
 
 
 def _prediction_label(pick: dict[str, Any]) -> str:
@@ -4345,9 +4476,23 @@ def _model_signals(
     doc: dict[str, Any],
 ) -> list[dict[str, Any]]:
     signals = []
-    if poisson and not poisson.get("error"):
+    has_poisson = bool(poisson and not poisson.get("error"))
+    has_dixon = bool(dixon and not dixon.get("error"))
+    if has_poisson and has_dixon:
+        signals.append({
+            "name": "goal_model_family",
+            "value": {
+                "poisson": poisson.get("probabilities"),
+                "dixon_coles": dixon.get("probabilities"),
+                "note": "poisson and dixon-coles are correlated goal models and count as one family",
+                "applies_to": ["goals", "btts"],
+            },
+            "impact": 0,
+            "role": "goal_market_evidence",
+        })
+    elif has_poisson:
         signals.append({"name": "poisson_model", "value": poisson.get("probabilities"), "impact": _prob_impact(poisson), "role": "supporting_evidence"})
-    if dixon and not dixon.get("error"):
+    elif has_dixon:
         signals.append({"name": "dixon_coles_model", "value": dixon.get("probabilities"), "impact": _prob_impact(dixon), "role": "supporting_evidence"})
     if elo and not elo.get("error"):
         signals.append({"name": "elo_model", "value": elo, "impact": round((elo.get("home_win_probability", 50) - 50) / 3, 2), "role": "supporting_evidence"})
@@ -4481,6 +4626,10 @@ def _model_consensus_signal(
 def _prob_impact(model: dict[str, Any]) -> float:
     probs = model.get("probabilities") or {}
     return round((max(float(probs.get("home_win") or 0), float(probs.get("away_win") or 0), float(probs.get("draw") or 0)) - 33.3) / 3, 2)
+
+
+def _correlated_model_family_impact(poisson: dict[str, Any], dixon: dict[str, Any]) -> float:
+    return round((_prob_impact(poisson) + _prob_impact(dixon)) / 2, 2)
 
 
 def _market_adjustment(ensemble: dict[str, Any], odds_movement: dict[str, Any]) -> int:

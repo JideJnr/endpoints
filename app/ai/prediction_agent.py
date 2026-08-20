@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from statistics import mean
 from typing import Any
 
@@ -131,6 +132,7 @@ def predict_sofascore_event(
         away_history,
         signals,
         event.get("standings") or event.get("league_table") or [],
+        event,
     )
 
     total_goals = _to_int(score.get("home"), 0) + _to_int(score.get("away"), 0)
@@ -269,6 +271,7 @@ def predict_sofascore_event(
     if not picks:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available data"))
 
+    picks = _apply_conflict_safety_gate(picks, signals)
     picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
 
     return {
@@ -390,6 +393,7 @@ def _common_opponent_edge(
     away_history: list[dict[str, Any]],
     signals: list[dict[str, Any]],
     standings: list[dict[str, Any]] | None = None,
+    event: dict[str, Any] | None = None,
 ) -> float:
     """
     Find opponents both teams have faced recently and compare results.
@@ -479,9 +483,36 @@ def _common_opponent_edge(
         position = int(entry["position"])
         return season_aware_table_weight(position, table_size, season_stage)
 
-    # Build lookup: normalised opponent name → best result for each team
+    event = event or {}
+    event_dt = _event_datetime(event) or datetime.now(timezone.utc)
+    cutoff_dt = event_dt - timedelta(days=365)
+    season_key = _season_key(event)
+    competition_key = _competition_key(event)
+
+    def _same_season_or_recent(ev: dict[str, Any]) -> bool:
+        ev_season = _season_key(ev)
+        if season_key and ev_season:
+            return ev_season == season_key
+        ev_dt = _event_datetime(ev)
+        return bool(ev_dt and cutoff_dt <= ev_dt <= event_dt)
+
+    def _same_comp(ev: dict[str, Any]) -> bool:
+        return bool(competition_key and _competition_key(ev) == competition_key)
+
+    filtered_home = [ev for ev in home_history if _same_season_or_recent(ev)]
+    filtered_away = [ev for ev in away_history if _same_season_or_recent(ev)]
+    same_comp_home = [ev for ev in filtered_home if _same_comp(ev)]
+    same_comp_away = [ev for ev in filtered_away if _same_comp(ev)]
+    if same_comp_home and same_comp_away:
+        filtered_home = same_comp_home
+        filtered_away = same_comp_away
+        competition_scope = "same_competition"
+    else:
+        competition_scope = "recent_all_competitions"
+
+    # Build lookup: normalised opponent name -> most recent result for each team
     home_opp: dict[str, dict] = {}
-    for ev in home_history:
+    for ev in filtered_home:
         if (ev.get("status") or {}).get("type") != "finished":
             continue
         opp = _opp_name(ev, home_name)
@@ -493,11 +524,12 @@ def _common_opponent_edge(
             continue
         gd = _goal_diff(ev, home_name)
         rating = pts + (gd * 0.35)
-        if key not in home_opp or rating > home_opp[key]["rating"]:
-            home_opp[key] = {"pts": pts, "gd": gd, "rating": rating, "opp": opp, "event": ev}
+        ev_dt = _event_datetime(ev) or datetime.min.replace(tzinfo=timezone.utc)
+        if key not in home_opp or ev_dt > home_opp[key]["event_dt"]:
+            home_opp[key] = {"pts": pts, "gd": gd, "rating": rating, "opp": opp, "event": ev, "event_dt": ev_dt}
 
     away_opp: dict[str, dict] = {}
-    for ev in away_history:
+    for ev in filtered_away:
         if (ev.get("status") or {}).get("type") != "finished":
             continue
         opp = _opp_name(ev, away_name)
@@ -509,8 +541,9 @@ def _common_opponent_edge(
             continue
         gd = _goal_diff(ev, away_name)
         rating = pts + (gd * 0.35)
-        if key not in away_opp or rating > away_opp[key]["rating"]:
-            away_opp[key] = {"pts": pts, "gd": gd, "rating": rating, "opp": opp, "event": ev}
+        ev_dt = _event_datetime(ev) or datetime.min.replace(tzinfo=timezone.utc)
+        if key not in away_opp or ev_dt > away_opp[key]["event_dt"]:
+            away_opp[key] = {"pts": pts, "gd": gd, "rating": rating, "opp": opp, "event": ev, "event_dt": ev_dt}
 
     shared_keys = set(home_opp) & set(away_opp)
     if not shared_keys:
@@ -567,6 +600,10 @@ def _common_opponent_edge(
                 "standings_meaningful": season_stage.get("standings_meaningful"),
                 "table_size": table_size,
                 "table_category": table_size_info.get("category"),
+                "season_key": season_key,
+                "cutoff_date": cutoff_dt.strftime("%Y-%m-%d"),
+                "competition_scope": competition_scope,
+                "selection_rule": "most_recent_meeting_per_opponent",
                 "comparisons": [
                     {
                         "opponent": c["opponent"],
@@ -616,6 +653,50 @@ def _event_date(event: dict[str, Any]) -> str:
         return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%d %b %Y")
     except Exception:
         return str(ts)[:10]
+
+
+def _event_datetime(event: dict[str, Any]) -> datetime | None:
+    ts = event.get("start_timestamp") or event.get("startTimestamp") or event.get("start_time") or event.get("match_date")
+    if not ts:
+        return None
+    try:
+        value = float(ts)
+        if value > 1e10:
+            value /= 1000
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except Exception:
+        pass
+    try:
+        text = str(ts).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _season_key(event: dict[str, Any]) -> str:
+    season = event.get("season") or ((event.get("tournament") or {}).get("season") if isinstance(event.get("tournament"), dict) else None)
+    if isinstance(season, dict):
+        for key in ("id", "year", "name"):
+            if season.get(key):
+                return str(season.get(key))
+    if season:
+        return str(season)
+    return ""
+
+
+def _competition_key(event: dict[str, Any]) -> str:
+    tournament = event.get("tournament") or event.get("uniqueTournament") or {}
+    if isinstance(tournament, dict):
+        tid = tournament.get("id") or tournament.get("uniqueTournamentId")
+        if tid:
+            return f"id:{tid}"
+        name = tournament.get("name")
+        if name:
+            return f"name:{_norm(str(name))}"
+    if tournament:
+        return f"name:{_norm(str(tournament))}"
+    return ""
 
 
 def _form_edge(event: dict[str, Any], home_form: dict[str, Any], away_form: dict[str, Any], signals: list[dict[str, Any]]) -> float:
@@ -792,6 +873,54 @@ def _league_strength_edge(
 
 def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
     h2h = event.get("h2h") or {}
+    meetings = []
+    if isinstance(h2h, dict):
+        meetings = h2h.get("events") or h2h.get("last_meetings") or h2h.get("lastMeetings") or []
+    elif isinstance(h2h, list):
+        meetings = h2h
+    if meetings:
+        weighted_home = 0.0
+        weighted_away = 0.0
+        weighted_draw = 0.0
+        total_weight = 0.0
+        event_dt = _event_datetime(event) or datetime.now(timezone.utc)
+        for meeting in sorted((m for m in meetings if isinstance(m, dict)), key=lambda m: _event_datetime(m) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:10]:
+            score = meeting.get("score") or {}
+            hs = _first_int(score.get("home"), meeting.get("home_goals"), meeting.get("score_home"), default=-1)
+            as_ = _first_int(score.get("away"), meeting.get("away_goals"), meeting.get("score_away"), default=-1)
+            if hs < 0 or as_ < 0:
+                continue
+            meeting_dt = _event_datetime(meeting)
+            if meeting_dt:
+                age_days = max(0, (event_dt - meeting_dt).days)
+                weight = max(0.2, 1.0 - (age_days / 1095))
+            else:
+                weight = 0.35
+            total_weight += weight
+            if hs > as_:
+                weighted_home += weight
+            elif as_ > hs:
+                weighted_away += weight
+            else:
+                weighted_draw += weight
+        if total_weight >= 1.5:
+            raw_edge = (weighted_home - weighted_away) / total_weight
+            edge = round(max(-6, min(6, raw_edge * 8)), 2)
+            if abs(edge) < 1:
+                return 0.0
+            signals.append({
+                "name": "h2h_edge",
+                "value": {
+                    "home_weighted_wins": round(weighted_home, 2),
+                    "away_weighted_wins": round(weighted_away, 2),
+                    "weighted_draws": round(weighted_draw, 2),
+                    "weighted_sample": round(total_weight, 2),
+                    "decay": "date_weighted_3_year_floor_20pct",
+                },
+                "impact": edge,
+            })
+            return edge
+
     team_duel = h2h.get("team_duel") or h2h.get("teamDuel") or {}
     if not isinstance(team_duel, dict):
         return 0.0
@@ -802,7 +931,7 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
     if sample_size < 2:
         return 0.0
     raw_edge = (home_wins - away_wins) / sample_size
-    edge = round(max(-8, min(8, raw_edge * 10)), 2)
+    edge = round(max(-4, min(4, raw_edge * 5)), 2)
     if abs(edge) < 1:
         return 0.0
     signals.append({
@@ -812,10 +941,53 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
             "away_wins": away_wins,
             "draws": draws,
             "sample_size": sample_size,
+            "decay": "aggregate_fallback_reduced_influence",
         },
         "impact": edge,
     })
     return edge
+
+
+def _first_int(*values: Any, default: int = 0) -> int:
+    for value in values:
+        if value is None:
+            continue
+        parsed = _to_int(value, default)
+        if parsed != default or str(value).strip() == str(default):
+            return parsed
+    return default
+
+
+def _apply_conflict_safety_gate(picks: list[dict[str, Any]], signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    directions = {}
+    for name in ("h2h_edge", "odds_edge", "common_opponent_edge"):
+        impact = next((float(sig.get("impact") or 0) for sig in signals if sig.get("name") == name), 0.0)
+        if abs(impact) >= 1.5:
+            directions[name] = 1 if impact > 0 else -1
+    if len(directions) < 3 or len(set(directions.values())) == 1:
+        return picks
+
+    signals.append({
+        "name": "directional_signal_conflict",
+        "value": {
+            "h2h": "home" if directions.get("h2h_edge") == 1 else "away",
+            "market": "home" if directions.get("odds_edge") == 1 else "away",
+            "common_opponents": "home" if directions.get("common_opponent_edge") == 1 else "away",
+            "action": "cap_high_confidence",
+        },
+        "impact": -6,
+    })
+    gated: list[dict[str, Any]] = []
+    for pick in picks:
+        if int(pick.get("confidence") or 0) >= 65:
+            gated.append({
+                **pick,
+                "confidence": 64,
+                "reason": f"{pick.get('reason')}; capped because H2H, market, and common-opponent signals conflict",
+            })
+        else:
+            gated.append(pick)
+    return gated
 
 
 def _table_edge(

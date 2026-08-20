@@ -253,20 +253,36 @@ def record_prediction(prediction: dict[str, Any]) -> None:
     if (best_pick.get("confidence") or 0) < 55:
         return
     with _conn() as conn:
+        match_name_key = _prediction_text_key(prediction.get("name"))
+        league_name_key = _prediction_text_key(league_name)
         existing = conn.execute(
             """
             select id
             from prediction_history
-            where match_id = ?
-              and coalesce(prediction_mode, 'prematch') = ?
+            where coalesce(prediction_mode, 'prematch') = ?
               and pick_type = ?
               and selection = ?
-              and result is null
-              and datetime(created_at) >= datetime('now', '-4 hours')
+              and (
+                    match_id = ?
+                 or (
+                    ? != ''
+                    and lower(trim(coalesce(match_name, ''))) = ?
+                    and lower(trim(coalesce(league_name, ''))) = ?
+                    and datetime(created_at) >= datetime('now', '-180 days')
+                 )
+              )
             order by created_at desc
             limit 1
             """,
-            (match_id, prediction.get("prediction_mode") or "prematch", best_pick.get("type"), best_pick.get("selection")),
+            (
+                prediction.get("prediction_mode") or "prematch",
+                best_pick.get("type"),
+                best_pick.get("selection"),
+                match_id,
+                match_name_key,
+                match_name_key,
+                league_name_key,
+            ),
         ).fetchone()
         if existing:
             return
@@ -322,6 +338,10 @@ def record_prediction(prediction: dict[str, Any]) -> None:
         from app.utils.health_counters import record_health_event
 
         record_health_event("league_memory", "clv_entry_record_failed", exc, match_id=match_id)
+
+
+def _prediction_text_key(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
 
 
 def record_deferred_prediction_decision(

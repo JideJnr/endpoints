@@ -9,6 +9,7 @@ Nothing in this module makes LLM calls.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -28,6 +29,8 @@ from app.monitoring.self_learner import (
 )
 from app.utils.primitives import _to_float, _to_int
 from app.utils.match_helpers import _normalise_selection
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

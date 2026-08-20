@@ -169,7 +169,7 @@ def _elo_doc_context(doc: dict[str, Any] | None) -> dict[str, Any]:
     has_markets = bool(doc.get("odds_1x2") or doc.get("sportybet_markets") or doc.get("markets"))
     return {
         "source": "enriched_doc",
-        "home_adjustment": 5 if has_standings else 0,
+        "home_adjustment": 0,
         "away_adjustment": 0,
         "has_standings": has_standings,
         "has_markets": has_markets,

@@ -380,10 +380,9 @@ def run_learning_cycle() -> dict[str, Any]:
 
     # ── 3. Aggregate per-model accuracy from signals ──────────────────────────
     model_signal_map = {
-        "dixon_coles": {"dixon_coles_model"},
+        "goal_model_family": {"goal_model_family", "dixon_coles_model", "poisson_model"},
         "elo":         {"elo_model"},
-        "poisson":     {"poisson_model"},
-        "rules":       {"goal_pressure", "h2h_edge", "league_position_edge",
+        "rules":       {"h2h_edge", "league_position_edge",
                         "recent_history_edge", "common_opponent_edge",
                         "avg_rating_edge", "market_steam", "odds_edge"},
         "openrouter":  {"openrouter_agent", "ai_brain_review"},
@@ -1458,6 +1457,7 @@ def _market_signal_names(pick_type: str, selection: str, context: dict[str, Any]
     goal = {
         "goal_pressure",
         "goal_environment",
+        "goal_model_family",
         "poisson_model",
         "dixon_coles_model",
         "odds_progression",
@@ -1473,8 +1473,7 @@ def _market_signal_names(pick_type: str, selection: str, context: dict[str, Any]
     side = {
         "ensemble_model",
         "elo_model",
-        "poisson_model",
-        "dixon_coles_model",
+        "goal_model_family",
         "league_strength_edge",
         "h2h_edge",
         "recent_history_edge",
