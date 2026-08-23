@@ -27,7 +27,9 @@ pkg install -y \
     libffi \
     openssl \
     sqlite \
-    git
+    git \
+    pkg-config \
+    gfortran
 
 # 3. Upgrade pip
 echo "[3/5] Upgrading pip..."
@@ -41,7 +43,10 @@ python -m venv .venv
 # 5. Install Python dependencies
 echo "[5/5] Installing Python dependencies..."
 source .venv/bin/activate
-pip install --upgrade pip
+pip install --upgrade pip setuptools wheel
+export SCIPY_USE_LEGACY_BUILD=1
+pip install --no-build-isolation numpy
+pip install --no-build-isolation scipy
 pip install -r requirements.txt
 
 echo ""

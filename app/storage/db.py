@@ -96,6 +96,24 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
         conn.execute(f"alter table {table} add column {column} {definition}")
 
 
+def _ensure_specialist_performance_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        create table if not exists specialist_performance (
+            specialist_name text not null,
+            league_key text not null,
+            pick_type text not null,
+            samples integer not null default 0,
+            wins integer not null default 0,
+            losses integer not null default 0,
+            win_rate real,
+            weight real not null default 1.0,
+            last_updated text,
+            unique (specialist_name, league_key, pick_type)
+        )
+    """)
+    conn.execute("create index if not exists idx_specialist_performance_scope on specialist_performance(league_key, pick_type, samples)")
+
+
 
 
 # Backward-compatible underscore alias
@@ -776,6 +794,7 @@ def _init_db_unlocked() -> None:
                 raw_doc     text
             )
         """)
+        _ensure_specialist_performance_table(conn)
         conn.commit()
 
 
@@ -794,6 +813,7 @@ def _init_db() -> None:
                 _ensure_prediction_history_columns(conn)
                 _ensure_match_fact_columns(conn)
                 _ensure_signal_combination_outcomes_table(conn)
+                _ensure_specialist_performance_table(conn)
             _DB_SCHEMA_READY = True
             return
         try:
