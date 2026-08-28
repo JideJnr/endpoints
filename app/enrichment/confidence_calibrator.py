@@ -25,6 +25,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from app.config.config import get_settings
 from app.storage.db import DB_PATH, _conn
 from app.storage.league_memory import _init_db
 
@@ -258,6 +259,45 @@ def get_calibration_table() -> list[dict[str, Any]]:
 
 # ── Calibration gap monitoring ─────────────────────────────────────────────────
 
+def _gap_severity_thresholds() -> tuple[float, float]:
+    """Return (moderate_threshold, severe_threshold) for calibration-gap severity.
+
+    Prefers thresholds derived from the observed distribution of calibration
+    gaps: the 50th and 75th percentile of abs(band_mid - win_rate*100) across
+    '__global__' bands with enough samples. Falls back to the configurable
+    Settings defaults (calibrator_moderate_threshold / calibrator_severe_threshold,
+    10.0 / 20.0) when there isn't enough data yet for a percentile estimate.
+
+    Shared by compute_calibration_gap and get_calibration_gap_report so a
+    given gap gets the same severity label from either call path. Previously
+    these two functions used different hardcoded literals for the same
+    concept (10.0/20.0 here vs. 8/15 in get_calibration_gap_report), so the
+    same gap could be "moderate" from one function and "none" from the other.
+    """
+    settings = get_settings()
+    moderate_threshold = float(settings.calibrator_moderate_threshold)
+    severe_threshold = float(settings.calibrator_severe_threshold)
+    try:
+        with _conn() as _c:
+            _init_calibration_table(_c)
+            _gap_rows = _c.execute(
+                "SELECT band_low, win_rate FROM confidence_calibration "
+                "WHERE pick_type = '__global__' AND samples >= ? AND win_rate IS NOT NULL",
+                (MIN_SAMPLES,),
+            ).fetchall()
+        if len(_gap_rows) >= 3:
+            _abs_gaps = sorted(
+                abs((r["band_low"] + 5) - float(r["win_rate"]) * 100)
+                for r in _gap_rows
+            )
+            n = len(_abs_gaps)
+            moderate_threshold = _abs_gaps[max(0, int(n * 0.50) - 1)]
+            severe_threshold   = _abs_gaps[max(0, int(n * 0.75) - 1)]
+    except Exception:
+        pass
+    return moderate_threshold, severe_threshold
+
+
 def compute_calibration_gap(pick_type: str, raw_confidence: int) -> dict[str, Any]:
     """
     Compute the gap between raw confidence and historical win rate.
@@ -281,31 +321,8 @@ def compute_calibration_gap(pick_type: str, raw_confidence: int) -> dict[str, An
     
     historical_conf = cal["win_rate"]  # Already in percentage form (0-100)
     gap = round(raw_confidence - historical_conf, 1)
-    
-    # Derive severity thresholds from the distribution of calibration gaps
-    # stored in confidence_calibration.  Use the 50th and 75th percentile of
-    # abs(band_mid - win_rate*100) across all bands with enough samples.
-    # Falls back to hardcoded 10 / 20 when insufficient data.
-    moderate_threshold = 10.0
-    severe_threshold = 20.0
-    try:
-        with _conn() as _c:
-            _init_calibration_table(_c)
-            _gap_rows = _c.execute(
-                "SELECT band_low, win_rate FROM confidence_calibration "
-                "WHERE pick_type = '__global__' AND samples >= ? AND win_rate IS NOT NULL",
-                (MIN_SAMPLES,),
-            ).fetchall()
-        if len(_gap_rows) >= 3:
-            _abs_gaps = sorted(
-                abs((r["band_low"] + 5) - float(r["win_rate"]) * 100)
-                for r in _gap_rows
-            )
-            n = len(_abs_gaps)
-            moderate_threshold = _abs_gaps[max(0, int(n * 0.50) - 1)]
-            severe_threshold   = _abs_gaps[max(0, int(n * 0.75) - 1)]
-    except Exception:
-        pass
+
+    moderate_threshold, severe_threshold = _gap_severity_thresholds()
 
     if gap <= moderate_threshold:
         severity = "none"
@@ -342,6 +359,8 @@ def get_calibration_gap_report(pick_type: str = "match_result") -> dict[str, Any
             order by band_low asc
         """, (pick_type,)).fetchall()
     
+    moderate_threshold, severe_threshold = _gap_severity_thresholds()
+
     gaps = []
     for row in rows:
         if row["win_rate"] is None or row["samples"] < MIN_SAMPLES:
@@ -349,10 +368,10 @@ def get_calibration_gap_report(pick_type: str = "match_result") -> dict[str, Any
         band_mid = row["band_low"] + 5
         historical_conf = round(row["win_rate"] * 100, 1)
         gap = round(band_mid - historical_conf, 1)
-        
-        if gap > 15:
+
+        if gap > severe_threshold:
             severity = "severe"
-        elif gap > 8:
+        elif gap > moderate_threshold:
             severity = "moderate"
         else:
             severity = "none"

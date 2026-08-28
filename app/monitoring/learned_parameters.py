@@ -50,13 +50,7 @@ def clear_learned_parameter_cache() -> None:
     global _GRADED_ROWS_CACHE, _GRADED_ROWS_FETCHED_AT
     get_learned_ensemble_weights.cache_clear()
     get_market_regime_params.cache_clear()
-    get_pick_generator_thresholds.cache_clear()
-    get_prediction_agent_params.cache_clear()
-    get_calibration_gap_thresholds.cache_clear()
     get_league_goal_average.cache_clear()
-    get_frontend_engine_params.cache_clear()
-    get_frontend_api_limits.cache_clear()
-    get_engine_learning_limits.cache_clear()
     _GRADED_ROWS_CACHE = None
     _GRADED_ROWS_FETCHED_AT = 0.0
 
@@ -166,83 +160,6 @@ def get_market_regime_params(min_samples: int = 8) -> dict[int, dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
-def get_pick_generator_thresholds(min_samples: int = 10) -> dict[str, float]:
-    wins_by_side: dict[str, list[float]] = {"home": [], "away": [], "draw": []}
-    value_edges: list[float] = []
-    for row in _graded_rows():
-        if row.get("result") != "win":
-            continue
-        side = _selection_side(row.get("selection"))
-        conf = _num(row.get("confidence"))
-        if side and conf is not None:
-            wins_by_side[side].append(conf / 100 if conf > 1 else conf)
-        for pick in _json_list(row.get("picks_json")):
-            edge = _num(pick.get("value_edge"))
-            if edge is not None and edge > 0:
-                value_edges.append(edge)
-    result: dict[str, float] = {}
-    for side, values in wins_by_side.items():
-        if len(values) >= min_samples:
-            result[f"{side}_baseline"] = round(max(0.01, min(0.99, _percentile(values, 25) or 0)), 4)
-    all_wins = [value for values in wins_by_side.values() for value in values]
-    if len(all_wins) >= min_samples:
-        result["minimum"] = round(max(0.01, min(0.99, _percentile(all_wins, 10) or 0)), 4)
-        result["medium"] = round(max(0.01, min(0.99, _percentile(all_wins, 35) or 0)), 4)
-        result["high"] = round(max(0.01, min(0.99, _percentile(all_wins, 70) or 0)), 4)
-    if len(value_edges) >= min_samples:
-        result["value_edge"] = round(max(0.0, _percentile(value_edges, 25) or 0), 4)
-    return result
-
-
-@lru_cache(maxsize=1)
-def get_prediction_agent_params(min_samples: int = 10) -> dict[str, float]:
-    rows = list(_graded_rows())
-    if len(rows) < min_samples:
-        return {}
-    wins = [_num(row.get("confidence")) for row in rows if row.get("result") == "win"]
-    losses = [_num(row.get("confidence")) for row in rows if row.get("result") == "loss"]
-    wins = [v for v in wins if v is not None]
-    losses = [v for v in losses if v is not None]
-    if len(wins) < min_samples:
-        return {}
-    win_floor = _percentile(wins, 20) or 0
-    loss_mid = median(losses) if losses else win_floor
-    return {
-        "directional_base_confidence": round(win_floor, 2),
-        "no_bet_confidence": round(max(1.0, min(win_floor, loss_mid)), 2),
-        "common_opponent_goal_diff_weight": _learn_signal_scale("common_opponent_edge", 0.35),
-        "common_opponent_edge_scale": _learn_signal_scale("common_opponent_edge", 1.0),
-        "form_edge_scale": _learn_signal_scale("recent_history_edge", 1.0),
-        "opponent_top_weight": _learn_side_weight("top"),
-        "opponent_bottom_weight": _learn_side_weight("bottom"),
-    }
-
-
-@lru_cache(maxsize=1)
-def get_calibration_gap_thresholds(min_samples: int = 3) -> dict[str, float]:
-    try:
-        _init_db()
-        with db_conn(timeout=30) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                select band_low, win_rate
-                from confidence_calibration
-                where pick_type = '__global__'
-                  and samples >= ?
-                  and win_rate is not null
-            """, (min_samples,)).fetchall()
-    except Exception:
-        rows = []
-    gaps = sorted(abs((int(row["band_low"]) + 5) - float(row["win_rate"]) * 100) for row in rows)
-    if len(gaps) < min_samples:
-        return {}
-    return {
-        "moderate": round(_percentile(gaps, 50) or 0, 2),
-        "severe": round(_percentile(gaps, 75) or 0, 2),
-    }
-
-
-@lru_cache(maxsize=1)
 def get_league_goal_average(min_matches: int = 20) -> dict[str, Any]:
     totals: list[float] = []
     try:
@@ -267,51 +184,6 @@ def get_league_goal_average(min_matches: int = 20) -> dict[str, Any]:
     return {"available": True, "samples": len(totals), "team_goal_average": round(avg_total / 2, 4), "match_goal_average": round(avg_total, 4)}
 
 
-@lru_cache(maxsize=1)
-def get_frontend_engine_params() -> dict[str, Any]:
-    goal_avg = get_league_goal_average(min_matches=5)
-    weights = get_learned_ensemble_weights(min_samples=5)
-    params: dict[str, Any] = {"source": "historical"}
-    if goal_avg.get("available"):
-        params["leagueAvgGoals"] = goal_avg["team_goal_average"]
-        params["maxGoals"] = max(4, min(14, int(round(goal_avg["match_goal_average"] * 3))))
-    if weights:
-        params["ELO_K"] = round(16 + 48 * weights.get("elo", 0), 2)
-        params["ELO_HOME_ADVANTAGE"] = round(50 + 150 * _home_win_rate(), 2)
-        params["DEFAULT_ELO"] = round(1000 + 1000 * max(weights.values()), 2)
-    return params
-
-
-@lru_cache(maxsize=1)
-def get_frontend_api_limits() -> dict[str, int]:
-    samples = len(_graded_rows())
-    if samples <= 0:
-        return {}
-    return {
-        "similarMatches": max(5, min(25, samples // 20)),
-        "systemActivity": max(10, min(100, samples // 10)),
-        "competitionBuffer": max(50, min(500, samples)),
-        "teamWatchers": max(20, min(200, samples // 5)),
-        "predictionHistory": max(50, min(1000, samples)),
-        "predictionCheckData": max(100, min(2000, samples * 2)),
-        "engineDashboard": max(500, min(20000, samples * 10)),
-        "modelExplorer": max(100, min(5000, samples * 2)),
-        "sofaIngest": max(50, min(500, samples // 2)),
-    }
-
-
-@lru_cache(maxsize=1)
-def get_engine_learning_limits() -> dict[str, int]:
-    samples = len(_graded_rows())
-    if samples <= 0:
-        return {}
-    return {
-        "matchHistory": max(10, min(500, samples // 4)),
-        "topEngines": max(3, min(50, int(max(3, samples ** 0.5)))),
-        "topRules": max(5, min(100, int(max(5, samples ** 0.5) * 2))),
-    }
-
-
 def _json_list(raw: Any) -> list[dict[str, Any]]:
     try:
         value = json.loads(raw) if isinstance(raw, str) else raw
@@ -332,48 +204,6 @@ def _models_for_row(row: dict[str, Any]) -> set[str]:
         if models.get(name):
             result.add("llm" if name == "openrouter" else name)
     return result
-
-
-def _learn_signal_scale(signal_name: str, neutral: float) -> float:
-    wins: list[float] = []
-    losses: list[float] = []
-    for row in _graded_rows():
-        for sig in _json_list(row.get("signals_json")):
-            if str(sig.get("name") or "") != signal_name:
-                continue
-            impact = abs(_num(sig.get("impact")) or _num(sig.get("value")) or 0)
-            (wins if row.get("result") == "win" else losses).append(impact)
-    if len(wins) < 5:
-        return neutral
-    win_med = median(wins)
-    loss_med = median(losses) if losses else win_med
-    return round(max(0.1, min(3.0, neutral * (1 + (win_med - loss_med) / 10))), 3)
-
-
-def _learn_side_weight(bucket: str) -> float:
-    params = get_pick_generator_thresholds(min_samples=5)
-    baseline = params.get("home_baseline" if bucket == "top" else "away_baseline")
-    if baseline is None:
-        return 1.0
-    return round(max(0.2, min(2.0, baseline * 2)), 3)
-
-
-def _home_win_rate() -> float:
-    rows = [row for row in _graded_rows() if _selection_side(row.get("selection")) == "home"]
-    if not rows:
-        return 0.5
-    return sum(1 for row in rows if row.get("result") == "win") / len(rows)
-
-
-def _selection_side(selection: Any) -> str | None:
-    text = str(selection or "").lower()
-    if text in {"1", "home"} or "home" in text:
-        return "home"
-    if text in {"2", "away"} or "away" in text:
-        return "away"
-    if text in {"x", "draw"} or "draw" in text:
-        return "draw"
-    return None
 
 
 def _percentile(values: list[float], pct: float) -> float | None:

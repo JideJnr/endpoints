@@ -494,7 +494,10 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
         home_delta = final_home - start_home
         away_delta = final_away - start_away
         side = _side_from_selection_and_match(str(selection or "").lower(), row["match_name"])
-        if not side:
+        # side can also come back "ambiguous" (both team names plausibly
+        # matched the selection text) — that must be refused, not treated
+        # as a guessable side.
+        if side not in ("home", "away"):
             return "void"
         picked_delta = home_delta if side == "home" else away_delta
         other_delta = away_delta if side == "home" else home_delta

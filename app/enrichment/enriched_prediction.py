@@ -4263,9 +4263,23 @@ def _pick(kind: str, selection: str, confidence: float, reason: str) -> dict[str
 def _finalize_prediction_output(prediction: dict[str, Any], ensemble: dict[str, Any]) -> None:
     picks = prediction.get("picks") or []
     if picks:
-        picks.sort(key=lambda pick: int(pick.get("confidence") or 0), reverse=True)
+        # A pick tagged clear_winner=True by _market_selector_picks is a
+        # genuine 1X2 favorite (ensemble side probability clears the
+        # configured floor and gap over the next outcome). That status must
+        # outrank the rest of the candidate pool regardless of raw
+        # confidence -- previously this sorted purely by confidence, so a
+        # double-chance/BTTS hedge with a higher post-calibration number
+        # could bump a real favorite out of the primary slot even though
+        # clear_winner/prediction_label below were computed as if it hadn't.
+        # Confidence still breaks ties within the same clear_winner status,
+        # and publication filters below can still cap/block a pick's
+        # confidence or remove it outright -- this only fixes the ordering.
+        def _publish_rank(pick: dict[str, Any]) -> tuple[int, int]:
+            return (1 if pick.get("clear_winner") else 0, int(pick.get("confidence") or 0))
+
+        picks.sort(key=_publish_rank, reverse=True)
         _apply_publication_filters(prediction, picks)
-        picks.sort(key=lambda pick: int(pick.get("confidence") or 0), reverse=True)
+        picks.sort(key=_publish_rank, reverse=True)
         for index, pick in enumerate(picks):
             pick["role"] = "primary" if index == 0 else "alternative"
             selection = str(pick.get("selection") or "")

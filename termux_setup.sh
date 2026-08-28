@@ -28,8 +28,11 @@ pkg install -y \
     openssl \
     sqlite \
     git \
-    pkg-config \
-    gfortran
+    pkg-config
+
+# gfortran may not be available in all Termux repositories
+echo "Attempting to install gfortran (optional for scipy compilation)..."
+pkg install -y gfortran || echo "gfortran not available - scipy may use pre-built wheels if compatible"
 
 # 3. Upgrade pip
 echo "[3/5] Upgrading pip..."

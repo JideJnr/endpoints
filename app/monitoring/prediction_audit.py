@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.market.market_intent import classify_market_intent, grade_market_intent
+from app.storage.league_memory._helpers import _contains_word, _side_from_selection_and_match
 from app.utils.match_state import classify_match_state
 from app.utils.time_context import match_time_context
 from app.utils.doc_helpers import _impact
@@ -260,16 +261,31 @@ def _temporal_snapshot(prediction: dict[str, Any], doc: dict[str, Any], time_con
 
 
 def _fallback_grade(pick_type: str | None, selection: str | None, home: int, away: int, match_name: str | None) -> str:
+    """Last-resort grade when `grade_market_intent` cannot classify the pick.
+
+    This used to re-implement its own independent (and less careful)
+    substring matching against `match_name`. It now delegates the
+    team-name-matching case to the single hardened
+    `_side_from_selection_and_match`, so there is exactly one place that
+    does fuzzy text matching for grading, and exactly one place to audit
+    or further improve it.
+    """
     sel = str(selection or "").lower()
     pt = str(pick_type or "").lower()
     if pt in {"match_result", "ensemble_1x2", "live_match_winner"}:
-        side = "home" if "home" in sel else "away" if "away" in sel else "draw" if "draw" in sel else None
-        if not side and match_name and " vs " in match_name:
-            home_name, away_name = [part.strip().lower() for part in match_name.split(" vs ", 1)]
-            if home_name and home_name in sel:
-                side = "home"
-            elif away_name and away_name in sel:
-                side = "away"
+        if _contains_word(sel, "home"):
+            side: str | None = "home"
+        elif _contains_word(sel, "away"):
+            side = "away"
+        elif _contains_word(sel, "draw"):
+            side = "draw"
+        else:
+            # Selection is most likely a team display name (e.g. "Arsenal
+            # Win") rather than a literal home/away/draw label.
+            resolved = _side_from_selection_and_match(sel, match_name)
+            # "ambiguous" (both team names plausibly matched) must be
+            # refused here too, not treated as a guessable side.
+            side = resolved if resolved in ("home", "away") else None
         if side == "home":
             return "win" if home > away else "loss"
         if side == "away":

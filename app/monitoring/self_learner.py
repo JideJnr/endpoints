@@ -70,12 +70,54 @@ UNIQUE_GRADED_HISTORY = """
     where rn = 1
 """
 
-MIN_SAMPLES = 15          # minimum graded predictions before trusting a signal
+MIN_SAMPLES = 15          # historical "trust it fully" sample count.
+                          # Still used as the shrinkage prior strength below
+                          # (see _shrink_win_rate) and by the model-weight /
+                          # bias-correction gates further down this file.
 MIN_LEAGUE_SAMPLES = 5
 MIN_COMBINATION_SAMPLES = 12
 BLEND_WEIGHT = 0.45       # how much learned accuracy pulls the raw signal weight
                           # 0 = no adjustment, 1 = fully replace with learned rate
 DECAY_FACTOR = 0.92       # older data matters less — applied per 30-day window
+
+# Signal weight_adj used to be gated by a flat cliff: below MIN_SAMPLES a
+# signal got zero influence, at/above MIN_SAMPLES it got the *raw* win rate
+# with full confidence — regardless of whether that was 15 samples or 1500.
+# At n=15 a Bernoulli win-rate estimate has a standard error of ~13 points,
+# so a short losing streak (pure variance) could swing weight_adj by close
+# to its full range and the system would "learn" a lesson from noise.
+#
+# SIGNAL_ROW_MIN_SAMPLES is now just an existence floor (avoid persisting a
+# row from a literal handful of observations); the actual trust-scaling is
+# handled continuously by _shrink_win_rate below, so there is no more hard
+# cliff at MIN_SAMPLES.
+SIGNAL_ROW_MIN_SAMPLES = 3
+
+
+def _shrink_win_rate(win_rate: float, samples: float, strength: float = MIN_SAMPLES, prior: float = 0.5) -> float:
+    """Empirical-Bayes (Beta-prior) shrinkage of a win rate toward `prior`.
+
+    Equivalent to blending in `strength` phantom observations at the prior
+    rate before averaging:
+
+        shrunk = (win_rate * samples + prior * strength) / (samples + strength)
+
+    This is a simple, well-known fix for "small-sample win rates are noisy":
+    instead of trusting a win rate 100% once it clears a fixed sample-count
+    cliff (and 0% below it), the estimate is pulled toward the neutral prior
+    by an amount that shrinks smoothly as `samples` grows relative to
+    `strength`. With strength == MIN_SAMPLES, a signal with exactly
+    MIN_SAMPLES samples is pulled halfway back to neutral; a signal needs
+    several multiples of MIN_SAMPLES before the raw win rate dominates.
+
+    Not research-grade (a real James-Stein or Wilson-interval estimator
+    would vary the effective strength with the observed variance), but it
+    directly fixes the "short losing streak swings the learned weight"
+    failure mode with one extra line of arithmetic per bucket.
+    """
+    if samples <= 0:
+        return prior
+    return (win_rate * samples + prior * strength) / (samples + strength)
 
 
 # ── Table setup ───────────────────────────────────────────────────────────────
@@ -447,12 +489,17 @@ def run_learning_cycle() -> dict[str, Any]:
             samples = stats["samples"]
             wins = stats["wins"]
             losses = stats["losses"]
-            if samples < MIN_SAMPLES:
+            if samples < SIGNAL_ROW_MIN_SAMPLES:
                 continue
-            win_rate = stats.get("weighted_wins", wins) / stats.get("weighted_total", samples)
+            effective_n = stats.get("weighted_total", samples)
+            win_rate = stats.get("weighted_wins", wins) / effective_n
             # weight_adj: positive = boost this signal, negative = suppress it
-            # Neutral is 0.50 win rate → adj = 0
-            weight_adj = round((win_rate - 0.50) * 2.0, 3)  # range ≈ -1.0 to +1.0
+            # Neutral is 0.50 win rate → adj = 0.
+            # win_rate is shrunk toward 0.50 based on effective sample size
+            # first (see _shrink_win_rate) so a handful of graded picks can't
+            # swing a signal's weight as hard as thousands of them would.
+            shrunk_win_rate = _shrink_win_rate(win_rate, effective_n)
+            weight_adj = round((shrunk_win_rate - 0.50) * 2.0, 3)  # range ≈ -1.0 to +1.0
             conn.execute("""
                 insert into signal_weights
                     (signal_name, league_key, samples, wins, losses, win_rate, weight_adj, last_updated)
@@ -473,10 +520,13 @@ def run_learning_cycle() -> dict[str, Any]:
             samples = stats["samples"]
             wins = stats["wins"]
             losses = stats["losses"]
-            if samples < MIN_SAMPLES:
+            if samples < SIGNAL_ROW_MIN_SAMPLES:
                 continue
-            win_rate = stats.get("weighted_wins", wins) / stats.get("weighted_total", samples)
-            weight_adj = round((win_rate - 0.50) * 2.0, 3)
+            effective_n = stats.get("weighted_total", samples)
+            win_rate = stats.get("weighted_wins", wins) / effective_n
+            # Same variance-aware shrinkage as the global signal_weights loop above.
+            shrunk_win_rate = _shrink_win_rate(win_rate, effective_n)
+            weight_adj = round((shrunk_win_rate - 0.50) * 2.0, 3)
             conn.execute("""
                 insert into signal_pick_weights
                     (signal_name, league_key, pick_type, samples, wins, losses, win_rate, weight_adj, last_updated)
@@ -1099,8 +1149,12 @@ def _populate_country_signal_weights(conn: sqlite3.Connection, rows: list, now: 
             continue
         wins = int(bucket["wins"])
         losses = int(bucket["losses"])
-        win_rate = bucket.get("weighted_wins", wins) / bucket.get("weighted_total", samples)
-        weight_adj = round((win_rate - 0.50) * 2.0, 3)
+        effective_n = bucket.get("weighted_total", samples)
+        win_rate = bucket.get("weighted_wins", wins) / effective_n
+        # Same variance-aware shrinkage as the global signal_weights loop in
+        # run_learning_cycle (see _shrink_win_rate).
+        shrunk_win_rate = _shrink_win_rate(win_rate, effective_n)
+        weight_adj = round((shrunk_win_rate - 0.50) * 2.0, 3)
         conn.execute("""
             insert into signal_weights
                 (signal_name, league_key, samples, wins, losses, win_rate, weight_adj, last_updated)

@@ -16,6 +16,45 @@ MAX_CALIBRATION_GAP_POINTS = 12.0
 MAX_RECENT_LOSS_RATE = 0.60
 MAX_RECENT_LOSS_STREAK = 3
 
+# Bootstrap graduated tolerance for the calibration-gap check.
+#
+# Previously, when a market had fewer than min_calibration_samples rows,
+# "insufficient_calibration_samples" was appended to `reasons` but the
+# calibration_gap_too_wide check (below) was in an `elif` branch that never
+# even ran, and "insufficient_calibration_samples" itself is non-blocking in
+# bootstrap mode (see _BOOTSTRAP_PASSTHROUGH). Net effect: with production's
+# confidence_calibration table sitting at 28 rows (just under the 30-sample
+# minimum), the gap check was permanently skipped and the gate provided zero
+# protection.
+#
+# Fix: still run the gap check below the sample minimum, but widen the
+# allowed tolerance proportionally to how far below the minimum the sample
+# count is, tightening linearly back to the full-strength
+# MAX_CALIBRATION_GAP_POINTS exactly at min_calibration_samples. The widening
+# is capped at BOOTSTRAP_GAP_WIDENING_MAX (reached at zero samples) so a
+# single noisy sample can't produce an effectively-infinite tolerance, while
+# still letting the gate catch a genuinely blown-out gap (e.g. a band
+# claiming 80% confidence but losing most of its first ~10-20 graded picks)
+# well before 30 samples accumulate. Linear interpolation was chosen over a
+# step function or exponential curve because it is the simplest curve that
+# satisfies both endpoints (2x tolerance at 0 samples, 1x at the minimum)
+# without a discontinuity partway through bootstrap.
+BOOTSTRAP_GAP_WIDENING_MAX = 2.0
+
+
+def _bootstrap_calibration_gap_tolerance(samples: int, min_calibration_samples: int) -> float:
+    """Return the calibration-gap tolerance to use while under the sample minimum.
+
+    Linearly interpolates from BOOTSTRAP_GAP_WIDENING_MAX x the full-strength
+    threshold at samples=0 down to exactly the full-strength threshold at
+    samples=min_calibration_samples.
+    """
+    if min_calibration_samples <= 0:
+        return MAX_CALIBRATION_GAP_POINTS
+    fraction_of_min = max(0.0, min(1.0, samples / min_calibration_samples))
+    widening = BOOTSTRAP_GAP_WIDENING_MAX - (BOOTSTRAP_GAP_WIDENING_MAX - 1.0) * fraction_of_min
+    return MAX_CALIBRATION_GAP_POINTS * widening
+
 
 def evaluate_promotion_gate(doc: dict[str, Any], pick: dict[str, Any]) -> dict[str, Any]:
     """Return whether a pick has enough market-specific proof to be promoted.
@@ -59,6 +98,15 @@ def evaluate_promotion_gate(doc: dict[str, Any], pick: dict[str, Any]) -> dict[s
 
     if min_calibration_samples > 0 and calibration["samples"] < min_calibration_samples:
         reasons.append("insufficient_calibration_samples")
+        # Bootstrap mode still gets *some* protection: check the gap against a
+        # widened (but not infinite) tolerance rather than skipping the check
+        # entirely. See BOOTSTRAP_GAP_WIDENING_MAX above.
+        if calibration["calibration_gap_points"] is not None:
+            bootstrap_tolerance = _bootstrap_calibration_gap_tolerance(
+                calibration["samples"], min_calibration_samples
+            )
+            if calibration["calibration_gap_points"] > bootstrap_tolerance:
+                reasons.append("calibration_gap_too_wide")
     elif calibration["calibration_gap_points"] is not None and calibration["calibration_gap_points"] > MAX_CALIBRATION_GAP_POINTS:
         reasons.append("calibration_gap_too_wide")
 
@@ -76,7 +124,15 @@ def evaluate_promotion_gate(doc: dict[str, Any], pick: dict[str, Any]) -> dict[s
     # Bootstrap mode: sample-count shortfalls (insufficient_*) are NOT blocking.
     # Only genuine quality failures (drawdown, CLV quality) can block in bootstrap.
     _BOOTSTRAP_PASSTHROUGH = {"insufficient_calibration_samples", "insufficient_clv_samples"}
-    _HARD_BLOCK_IN_BOOTSTRAP = {"recent_drawdown_breach", "recent_loss_streak_breach", "negative_or_flat_clv"}
+    _HARD_BLOCK_IN_BOOTSTRAP = {
+        "recent_drawdown_breach",
+        "recent_loss_streak_breach",
+        "negative_or_flat_clv",
+        # Added so the graduated bootstrap calibration-gap check above (which
+        # uses a widened but finite tolerance) can actually block a pick, not
+        # just get computed and discarded.
+        "calibration_gap_too_wide",
+    }
 
     if bootstrap_mode:
         # In bootstrap, only block on genuine quality failures.

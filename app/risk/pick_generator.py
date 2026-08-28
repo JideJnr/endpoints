@@ -131,35 +131,41 @@ class PickGenerator:
             )
             picks.append(pick)
 
-        # Secondary pick: second best direction (if confidence is medium+)
-        secondary_directions = [
-            d for d in ["home", "draw", "away"]
-            if d != primary_direction
-        ]
-        for sec in secondary_directions[:1]:
-            sec_scored = score_pick_direction(
-                home_scored["home_prob"],
-                home_scored["away_prob"],
-                home_scored["draw_prob"],
-                confidence,
-                odds.get("home", 1.0),
-                odds.get("draw", 1.0),
-                odds.get("away", 1.0),
+        # Secondary pick: second best direction (if confidence is medium+).
+        #
+        # The old version re-called score_pick_direction() with the exact
+        # same probabilities/odds as the primary call above -- a pure
+        # function of identical inputs, so it always returned the SAME
+        # direction as primary_direction. The `sec` loop variable (meant to
+        # pick a distinct direction) was never actually passed in, making
+        # this branch dead: it could never surface a genuinely different
+        # second-best direction. Rank the two non-primary directions by
+        # their own scores (already computed in home_scored) instead.
+        direction_scores = {
+            "home": home_scored["home_score"],
+            "draw": home_scored["draw_score"],
+            "away": home_scored["away_score"],
+        }
+        remaining_scores = {
+            direction: score
+            for direction, score in direction_scores.items()
+            if direction != primary_direction
+        }
+        if remaining_scores and confidence >= CONFIDENCE_THRESHOLDS["medium"]:
+            secondary_direction = max(remaining_scores, key=remaining_scores.get)
+            pick = self._create_pick(
+                direction=secondary_direction,
+                prob=home_scored[f"{secondary_direction}_prob"],
+                confidence=confidence,
+                score=remaining_scores[secondary_direction],
+                odds=odds.get(secondary_direction, 1.0),
+                match_name=match_name,
+                league_name=league_name,
+                signal_scores=prob_result.get("signal_scores", {}),
+                learned=learned is not None,
+                secondary=True,
             )
-            if sec_scored["confidence"] >= CONFIDENCE_THRESHOLDS["medium"]:
-                pick = self._create_pick(
-                    direction=sec_scored["direction"],
-                    prob=sec_scored[f"{sec_scored['direction']}_prob"],
-                    confidence=sec_scored["confidence"],
-                    score=sec_scored["score"],
-                    odds=odds.get(sec_scored["direction"], 1.0),
-                    match_name=match_name,
-                    league_name=league_name,
-                    signal_scores=prob_result.get("signal_scores", {}),
-                    learned=learned is not None,
-                    secondary=True,
-                )
-                picks.append(pick)
+            picks.append(pick)
 
         # Step 6: Fallback logic for edge cases
         if not picks:

@@ -49,11 +49,48 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from app.storage.db import db_conn
 from app.storage.db import DB_PATH, _conn
 from app.storage.league_memory import _init_db
+
+# Learned risk-outcome rows are trusted only while reasonably fresh.
+#
+# rebuild_risk_controls() (below) is currently the ONLY writer of the
+# risk_outcomes table and it is NOT called from anywhere in the app (no
+# scheduler job, no grading hook) — see the warning on rebuild_risk_controls()
+# for why it has been left disconnected. That means, today, risk_outcomes is
+# always empty and every call to get_learned_risk_controls() falls through to
+# the "bootstrap" default at the bottom of that function, which is the
+# existing fail-safe for "no data yet".
+#
+# RISK_CONTROLS_MAX_AGE_DAYS exists for the future: if rebuild_risk_controls()
+# (or a proper incremental writer) is ever wired in and then stops running
+# (a broken cron entry, an exception that gets swallowed upstream, etc.), a
+# learned row should not go on being trusted forever just because it once
+# existed. Once a row is older than this, it is treated the same as
+# "insufficient samples" and the read path falls back the same way it does
+# for a genuinely empty table.
+RISK_CONTROLS_MAX_AGE_DAYS = 45
+
+
+def _risk_row_is_stale(last_updated: Any, max_age_days: int = RISK_CONTROLS_MAX_AGE_DAYS) -> bool:
+    """True when a risk_outcomes row's last_updated is missing, unparseable,
+    or older than max_age_days. Fails safe: anything we can't confidently
+    call "fresh" is treated as stale so callers fall back to conservative
+    defaults instead of trusting it."""
+    if not last_updated:
+        return True
+    try:
+        row_dt = datetime.fromisoformat(str(last_updated).replace("Z", "+00:00"))
+        if row_dt.tzinfo is None:
+            row_dt = row_dt.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - row_dt.astimezone(timezone.utc)).days
+        return age_days > max_age_days
+    except Exception:
+        return True
 
 
 # ── Data Structures ────────────────────────────────────────────────────────────
@@ -319,7 +356,10 @@ def get_learned_risk_controls(
               and league_tier = ? and odds_range = ?
         """, (conditions_key, pick_type, band, league_tier, odds_range)).fetchone()
 
-    if row and row["samples"] >= min_samples:
+    # Only trust this row when it has enough samples AND has been refreshed
+    # recently (see _risk_row_is_stale / RISK_CONTROLS_MAX_AGE_DAYS above) —
+    # a stale row is treated the same as "not enough data".
+    if row and row["samples"] >= min_samples and not _risk_row_is_stale(row["last_updated"]):
         win_rate = row["win_rate"]
         hard_block = win_rate is not None and win_rate < 0.30 and row["samples"] >= 20
         block_reason = "learned_poor_performance" if hard_block else None
@@ -346,7 +386,7 @@ def get_learned_risk_controls(
             limit 1
         """, (conditions_key, pick_type, league_tier)).fetchone()
 
-    if row and row["samples"] >= min_samples:
+    if row and row["samples"] >= min_samples and not _risk_row_is_stale(row["last_updated"]):
         win_rate = row["win_rate"]
         hard_block = win_rate is not None and win_rate < 0.30 and row["samples"] >= 20
         return LearnedRiskControls(
@@ -360,7 +400,7 @@ def get_learned_risk_controls(
             avg_clv=row["avg_clv_percent"],
         )
 
-    # Bootstrap: no data yet, use conservative defaults
+    # Bootstrap: no data yet (or the only matching rows are stale), use conservative defaults
     return LearnedRiskControls(
         confidence_cap=72,
         stake_cap_per_100=2.0,
@@ -415,6 +455,42 @@ def rebuild_risk_controls() -> dict[str, Any]:
 
     Scans prediction_history for all graded predictions, extracts their
     risk conditions at prediction time, and recomputes optimal caps.
+
+    NOT CURRENTLY CALLED ANYWHERE IN THE APP. This is intentional, not an
+    oversight — do not wire it into a scheduled job (e.g. self_learner's
+    run_learning_cycle, which two scheduler.py jobs already invoke on every
+    grading pass) without first fixing the issue below:
+
+    This function is NOT idempotent / safe to call repeatedly. It does a
+    full, unfiltered rescan of every graded prediction in prediction_history
+    every time it runs (no "since last run" cursor, no delete-and-rebuild of
+    risk_outcomes first — contrast with self_learner.run_learning_cycle,
+    which does `delete from signal_weights` etc. before recomputing from
+    scratch). Each row it processes goes through record_risk_outcome(),
+    whose SQL does `samples = risk_outcomes.samples + 1` — an incremental
+    counter increment, designed for "record one freshly-graded outcome"
+    calls, not for repeatedly replaying the entire history. Calling this on
+    a schedule would re-add every already-counted historical outcome on
+    every run, inflating `samples`/`wins`/`losses` without bound and
+    corrupting the derived recommended_confidence_cap / recommended_stake_cap
+    (both of which gate real stake sizing in risk_manager.py).
+
+    Before wiring this in, either (a) rewrite it to aggregate stats in
+    Python and delete-and-rebuild risk_outcomes from scratch each run (the
+    pattern self_learner.run_learning_cycle uses), or (b) hook
+    record_risk_outcome() directly into wherever predictions get graded, so
+    each outcome is recorded exactly once, and drop the periodic full
+    rescan entirely.
+
+    Until one of those is done, the read path (get_learned_risk_controls /
+    get_learned_risk_controls_for_pick) is written to be safe regardless:
+    with risk_outcomes always empty, every read falls through to the
+    documented "bootstrap" conservative default, and risk_manager.py's
+    apply_risk_controls() additionally never trusts a learned row with
+    fewer than LEARNED_RISK_MIN_SAMPLES samples. See RISK_CONTROLS_MAX_AGE_DAYS
+    above for the staleness guard that also protects against a
+    once-populated table silently going stale if this is later wired in and
+    then breaks.
     """
     _init_db()
     with db_conn(timeout=30) as conn:

@@ -19,6 +19,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
+from app.config.config import get_settings
 from app.storage.db import db_conn, DB_PATH, _conn, _init_db
 from app.storage.league_memory import _init_db as lm_init_db
 
@@ -837,14 +838,37 @@ def score_pick_direction(
     draw_edge = draw_prob - implied_draw
     away_edge = away_prob - implied_away
 
-    # Combined score: probability * (1 + value_edge)
-    home_score = home_prob * (1 + home_edge)
-    draw_score = draw_prob * (1 + draw_edge)
-    away_score = away_prob * (1 + away_edge)
+    # Bound how far a single direction's odds-value edge can move its score,
+    # so an extreme/short-priced-favorite market cannot create a runaway
+    # multiplier in either direction.
+    MAX_EDGE = 0.35
+    home_edge_bounded = max(-MAX_EDGE, min(MAX_EDGE, home_edge))
+    draw_edge_bounded = max(-MAX_EDGE, min(MAX_EDGE, draw_edge))
+    away_edge_bounded = max(-MAX_EDGE, min(MAX_EDGE, away_edge))
 
-    # Determine best direction
+    # Combined score: probability * (1 + bounded value_edge)
+    home_score = home_prob * (1 + home_edge_bounded)
+    draw_score = draw_prob * (1 + draw_edge_bounded)
+    away_score = away_prob * (1 + away_edge_bounded)
+
+    # Determine best direction. Odds value is only allowed to decide among
+    # directions that are already close contenders on raw probability -- it
+    # must never override a clear statistical favorite. A cheap, generously
+    # priced longshot (large positive edge because the market discounts it
+    # heavily) must not be able to outrank a side that already has a
+    # clearly higher true probability just because it scores well on value.
+    # "Clear favorite" mirrors the clear-winner floor/gap used elsewhere in
+    # the pipeline: >=55% raw probability with a wide lead over the next
+    # outcome. When that holds, the raw-probability leader wins outright;
+    # value only breaks the tie among genuinely close candidates otherwise.
     scores = {"home": home_score, "draw": draw_score, "away": away_score}
-    best_direction = max(scores, key=scores.get)
+    raw_probs = {"home": home_prob, "draw": draw_prob, "away": away_prob}
+    top_direction = max(raw_probs, key=raw_probs.get)
+    top_prob = raw_probs[top_direction]
+    second_prob = sorted(raw_probs.values(), reverse=True)[1]
+    clear_gap = float(get_settings().clear_winner_probability_gap) / 100.0
+    has_clear_favorite = top_prob >= 0.55 and (top_prob - second_prob) >= clear_gap
+    best_direction = top_direction if has_clear_favorite else max(scores, key=scores.get)
 
     return {
         "direction": best_direction,

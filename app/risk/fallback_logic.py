@@ -105,6 +105,11 @@ class FallbackHandler:
         - It has a proven win rate (>= proven_win_rate) from betbuilder_pick_memory
         - It has enough samples (>= proven_samples)
         """
+        # Draw is intentionally excluded from this loop (see module and class
+        # docstrings: "no fallback to double chance or draw"). Evaluate BOTH
+        # remaining directions and keep the best-qualifying one instead of
+        # returning on the first match -- home is not entitled to win ties.
+        qualifying: list[dict[str, Any]] = []
         for direction in ["home", "away"]:
             dir_odds = odds.get(direction, 0)
             dir_prob = prob_result.get(f"{direction}_prob", 0)
@@ -122,20 +127,31 @@ class FallbackHandler:
                 direction, dir_odds, league_name
             )
             if proven and proven["win_rate"] >= self.config["proven_win_rate"]:
-                return self._create_fallback_pick(
-                    direction=direction,
-                    prob=dir_prob,
-                    confidence=min(0.85, proven["win_rate"]),
-                    odds=dir_odds,
-                    match_name=match_name,
-                    league_name=league_name,
-                    source="proven_directional",
-                    proven=True,
-                    win_rate=proven["win_rate"],
-                    samples=proven["samples"],
-                )
+                qualifying.append({
+                    "direction": direction,
+                    "dir_prob": dir_prob,
+                    "dir_odds": dir_odds,
+                    "proven": proven,
+                })
 
-        return None
+        if not qualifying:
+            return None
+
+        # Best-scoring qualifying direction: rank by proven win rate first
+        # (that is what "proven" means here), then by raw probability.
+        best = max(qualifying, key=lambda item: (item["proven"]["win_rate"], item["dir_prob"]))
+        return self._create_fallback_pick(
+            direction=best["direction"],
+            prob=best["dir_prob"],
+            confidence=min(0.85, best["proven"]["win_rate"]),
+            odds=best["dir_odds"],
+            match_name=match_name,
+            league_name=league_name,
+            source="proven_directional",
+            proven=True,
+            win_rate=best["proven"]["win_rate"],
+            samples=best["proven"]["samples"],
+        )
 
     def _try_directional(
         self,
@@ -150,6 +166,10 @@ class FallbackHandler:
         Directional picks are the only acceptable fallback — double chance
         and draw are not used because they have lower odds and lower value.
         """
+        # Draw is intentionally excluded here too (module/class docstrings).
+        # Evaluate both directions and keep the best-scoring qualifying one
+        # (highest probability) rather than always favoring "home" on a tie.
+        qualifying: list[dict[str, Any]] = []
         for direction in ["home", "away"]:
             dir_odds = odds.get(direction, 0)
             dir_prob = prob_result.get(f"{direction}_prob", 0)
@@ -170,18 +190,22 @@ class FallbackHandler:
                 if dir_prob < 0.40:
                     continue
 
-            return self._create_fallback_pick(
-                direction=direction,
-                prob=dir_prob,
-                confidence=max(0.40, dir_prob),
-                odds=dir_odds,
-                match_name=match_name,
-                league_name=league_name,
-                source="directional",
-                proven=False,
-            )
+            qualifying.append({"direction": direction, "dir_prob": dir_prob, "dir_odds": dir_odds})
 
-        return None
+        if not qualifying:
+            return None
+
+        best = max(qualifying, key=lambda item: item["dir_prob"])
+        return self._create_fallback_pick(
+            direction=best["direction"],
+            prob=best["dir_prob"],
+            confidence=max(0.40, best["dir_prob"]),
+            odds=best["dir_odds"],
+            match_name=match_name,
+            league_name=league_name,
+            source="directional",
+            proven=False,
+        )
 
     def _check_proven_history(
         self,

@@ -7,13 +7,54 @@ or on a caller-supplied ``conn`` argument.
 """
 from __future__ import annotations
 
+import logging
 import re
 import json
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 _TEAM_HISTORY_CACHE_DAYS = 7
+
+# Audit counters for the last-resort text-matching grading fallback
+# (`_side_from_selection_and_match`). Grading trains every downstream
+# learning table (self-learner weights, calibration curves, bias
+# corrections), so a silent mis-grade here teaches the wrong lesson
+# everywhere. These counters let an operator check, without grepping logs,
+# how often grading actually had to fall back to fuzzy name matching and
+# how often that match was unambiguous vs. had to be refused.
+_TEXT_MATCH_FALLBACK_STATS = {"resolved": 0, "ambiguous": 0, "unresolved": 0}
+
+
+def get_text_match_fallback_stats() -> dict[str, int]:
+    """Return in-process counts of how the last-resort side-matching
+    fallback (`_side_from_selection_and_match`) has resolved so far.
+
+    ``resolved``: a side was inferred unambiguously from team-name text.
+    ``ambiguous``: both sides plausibly matched the selection text, so no
+        side was guessed (grading falls through to void instead).
+    ``unresolved``: no side could be inferred at all (e.g. no usable
+        match_name, or no name/token overlap with the selection).
+    Reset only on process restart; intended for periodic audit sampling,
+    not as a persisted metric.
+    """
+    return dict(_TEXT_MATCH_FALLBACK_STATS)
+
+
+def _contains_word(text: str, word: str) -> bool:
+    """Whole-word containment check (word-boundary aware).
+
+    Plain ``word in text`` substring checks are what let a team name like
+    "Home Farm" trip a literal "home" check, or a short team name like
+    "Sporting" silently match inside "Sporting Gijon". This requires the
+    word to appear as its own token, not merely as a substring of a longer
+    one.
+    """
+    if not word:
+        return False
+    return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text) is not None
 def normalize_league(value: str | None) -> str:
     text = str(value or "").lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
@@ -660,42 +701,105 @@ def _grade_pick_for_match(pick_type: str | None, selection: str | None, home: in
                 return "win" if home >= away else "loss"
             if picked_side == "away":
                 return "win" if away >= home else "loss"
-            # These are home-or-draw / away-or-draw style picks
-            # Try to detect which side from context
-            if "home" in sel_lower:
+            # These are home-or-draw / away-or-draw style picks. Only trust the
+            # literal words "home"/"away" as whole words here — a plain
+            # substring check would also fire on a team literally named e.g.
+            # "Home Farm", mislabeling the pick.
+            if _contains_word(sel_lower, "home"):
                 return "win" if home >= away else "loss"
-            if "away" in sel_lower:
+            if _contains_word(sel_lower, "away"):
                 return "win" if away >= home else "loss"
             # Generic "or draw protection" — treat as favourite side wins or draws
             return "win" if home == away or home > away else "loss"
-        if "home" in sel_lower:
+        if _contains_word(sel_lower, "home"):
             return "win" if home > away else "loss"
-        if "away" in sel_lower:
+        if _contains_word(sel_lower, "away"):
             return "win" if away > home else "loss"
-        if "draw" in sel_lower:
+        if _contains_word(sel_lower, "draw"):
             return "win" if home == away else "loss"
+        # No literal "home"/"away"/"draw" wording — the selection is most
+        # likely a team display name (e.g. "Arsenal Win"). Try the
+        # structured-ish name match as a last resort before giving up.
+        side = _side_from_selection_and_match(sel_lower, match_name)
+        if side == "home":
+            return "win" if home > away else "loss"
+        if side == "away":
+            return "win" if away > home else "loss"
         return "void"
 
     return "void"
 
 
 def _side_from_selection_and_match(selection: str, match_name: str | None) -> str | None:
+    """Last-resort inference of which side (home/away) a free-text selection
+    picks, by fuzzy-matching it against ``match_name`` ("Home vs Away").
+
+    This is the fallback of last resort for grading — every prediction's
+    win/loss label, and everything that learns from it, can depend on this
+    guess being right. Two failure modes matter more than raw accuracy:
+
+    1. A short/generic name being a substring of the other team's longer
+       name (e.g. home="Sporting", away="Sporting Gijon" — a naive
+       ``"sporting" in sel`` would match "home" even when the selection is
+       plainly "Sporting Gijon"). We require a whole-word match, not a
+       substring, and we check BOTH sides before deciding, so a name that
+       is contained within the other's is never silently preferred.
+    2. Silently guessing when the text is genuinely ambiguous (both sides
+       plausibly match, or a tied token overlap). Callers must treat the
+       string "ambiguous" the same as "unresolved" — never as a real side.
+
+    Returns "home", "away", "ambiguous" (do not guess — both sides match),
+    or None (nothing usable could be inferred).
+    """
     if not match_name or " vs " not in match_name:
+        _TEXT_MATCH_FALLBACK_STATS["unresolved"] += 1
         return None
     home_name, away_name = [part.strip().lower() for part in match_name.split(" vs ", 1)]
     sel = str(selection or "").lower()
-    if home_name and home_name in sel:
+    if not home_name or not away_name:
+        _TEXT_MATCH_FALLBACK_STATS["unresolved"] += 1
+        return None
+
+    home_full = _contains_word(sel, home_name)
+    away_full = _contains_word(sel, away_name)
+    if home_full and not away_full:
+        _TEXT_MATCH_FALLBACK_STATS["resolved"] += 1
         return "home"
-    if away_name and away_name in sel:
+    if away_full and not home_full:
+        _TEXT_MATCH_FALLBACK_STATS["resolved"] += 1
         return "away"
-    home_tokens = [part for part in re.split(r"\W+", home_name) if len(part) >= 4]
-    away_tokens = [part for part in re.split(r"\W+", away_name) if len(part) >= 4]
-    home_hits = sum(1 for token in home_tokens if token in sel)
-    away_hits = sum(1 for token in away_tokens if token in sel)
+    if home_full and away_full:
+        logger.info(
+            "grading fallback: selection %r matched both team names in %r — refusing to guess",
+            selection, match_name,
+        )
+        _TEXT_MATCH_FALLBACK_STATS["ambiguous"] += 1
+        return "ambiguous"
+
+    # Neither full team name appears as a whole word (nicknames, abbreviations,
+    # partial names). Fall back to token overlap, but only trust it when one
+    # side has strictly more overlapping tokens than the other.
+    sel_tokens = set(re.split(r"\W+", sel))
+    home_tokens = {part for part in re.split(r"\W+", home_name) if len(part) >= 4}
+    away_tokens = {part for part in re.split(r"\W+", away_name) if len(part) >= 4}
+    home_hits = len(home_tokens & sel_tokens)
+    away_hits = len(away_tokens & sel_tokens)
+    if home_hits and away_hits and home_hits == away_hits:
+        logger.info(
+            "grading fallback: selection %r tied on token overlap with both sides of %r — refusing to guess",
+            selection, match_name,
+        )
+        _TEXT_MATCH_FALLBACK_STATS["ambiguous"] += 1
+        return "ambiguous"
     if home_hits > away_hits:
+        logger.debug("grading fallback: resolved %r -> home via token overlap against %r", selection, match_name)
+        _TEXT_MATCH_FALLBACK_STATS["resolved"] += 1
         return "home"
     if away_hits > home_hits:
+        logger.debug("grading fallback: resolved %r -> away via token overlap against %r", selection, match_name)
+        _TEXT_MATCH_FALLBACK_STATS["resolved"] += 1
         return "away"
+    _TEXT_MATCH_FALLBACK_STATS["unresolved"] += 1
     return None
 
 

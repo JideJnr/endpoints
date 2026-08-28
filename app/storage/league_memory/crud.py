@@ -474,9 +474,32 @@ def _record_prediction_candidates(
     for index, pick in enumerate(picks):
         pick_type = pick.get("type")
         selection = pick.get("selection")
-        confidence = int(pick.get("confidence") or 0)
-        if not pick_type or not selection or pick_type == "no_bet" or confidence < 50:
+        # Issue 2 fix: this used to also drop any pick below 50 confidence,
+        # which meant prediction_candidate_history (the one table that is
+        # supposed to retain every candidate pick for calibration purposes,
+        # unlike the user-facing prediction_history table which legitimately
+        # filters no_bet/low-confidence picks -- see record_prediction's
+        # "Fix 3" filter and app/routers/mongo.py's cleanup of the same) was
+        # silently missing exactly the low-confidence directional picks
+        # (pick_generator's own floor goes down to 35, see
+        # app/risk/pick_generator.py CONFIDENCE_THRESHOLDS["minimum"]) that
+        # confidence_calibrator.py needs to tell whether the confidence scale
+        # is well-calibrated at the low end. Only require that a confidence
+        # value was actually supplied (excludes genuinely missing/junk data);
+        # no longer impose an additional, undocumented 50-point floor on top
+        # of whatever the pick-generation logic already decided was worth
+        # producing as a pick.
+        #
+        # "no_bet" stays excluded here: it has no directional selection to
+        # grade against a final score (see _grade_candidate_row in
+        # app/storage/league_memory/queries.py, and confidence_calibrator.py's
+        # UNIQUE_GRADED_HISTORY, which also excludes pick_type='no_bet'), so
+        # there is nothing this table could usefully retain for a no_bet pick
+        # beyond what record_deferred_prediction_decision already records.
+        confidence_raw = pick.get("confidence")
+        if not pick_type or not selection or pick_type == "no_bet" or confidence_raw is None:
             continue
+        confidence = int(confidence_raw)
         market_intent = classify_market_intent(str(pick_type), str(selection), pick)
         pick_context = {**context, "market_intent": market_intent}
         rows.append((

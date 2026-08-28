@@ -120,10 +120,10 @@ To keep the backend running when Termux is closed:
 ### "metadata generation failed while generating scipy"
 This is a known issue on Termux when building scipy from source. The setup script now handles this automatically, but if you encounter it manually:
 
-1. Install gfortran: `pkg install gfortran`
-2. Set the legacy build flag: `export SCIPY_USE_LEGACY_BUILD=1`
-3. Install numpy first: `pip install --no-build-isolation numpy`
-4. Then install scipy: `pip install --no-build-isolation scipy`
+1. Set the legacy build flag: `export SCIPY_USE_LEGACY_BUILD=1`
+2. Install numpy first: `pip install --no-build-isolation numpy`
+3. Then install scipy: `pip install --no-build-isolation scipy`
+4. If compilation fails due to missing gfortran, try installing a pre-built wheel or use `--only-binary=:all:` flag
 5. If memory is an issue, try: `pip install --no-build-isolation scipy --no-cache-dir`
 
 ### "Permission denied" on scripts
