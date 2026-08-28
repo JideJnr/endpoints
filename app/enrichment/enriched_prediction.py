@@ -4335,7 +4335,7 @@ def _apply_publication_filters(prediction: dict[str, Any], picks: list[dict[str,
         reasons: list[str] = []
         if conflict:
             reasons.append("h2h_market_common_opponent_conflict")
-        if "away or draw" in normalized and not _all_directional_support(direction, "away", ("odds_edge", "recent_history_edge", "common_opponent_edge")):
+        if "away or draw" in normalized and not _away_or_draw_has_enough_support(direction):
             reasons.append("away_or_draw_requires_market_recent_common_support")
         if ("home win" in normalized or normalized == "home") and not _home_win_has_enough_support(direction):
             reasons.append("home_win_requires_market_plus_recent_or_common_support")
@@ -4410,6 +4410,12 @@ def _excluded_side_strength(signals: list[dict[str, Any]], side: str) -> dict[st
         "h2h_edge",
     }
     strong_names = {"avg_rating_edge", "odds_edge", "market_steam", "league_position_edge", "common_opponent_edge"}
+    # h2h_edge also counts as strong evidence, but only once it's backed by
+    # enough head-to-head meetings -- a thin/noisy h2h reading (1-2 meetings)
+    # still shouldn't get to force a block by itself. Previously h2h_edge was
+    # excluded from strong_names entirely, so even a well-supported h2h
+    # reading could never contribute to strong_count.
+    H2H_STRONG_MIN_SAMPLE = 3
     support: list[dict[str, Any]] = []
     opposing_total = 0.0
     for signal in signals:
@@ -4420,8 +4426,17 @@ def _excluded_side_strength(signals: list[dict[str, Any]], side: str) -> dict[st
         if impact is None:
             continue
         side_impact = impact if side == "home" else -impact
+        is_strong = name in strong_names
+        if name == "h2h_edge":
+            value = signal.get("value")
+            sample = None
+            if isinstance(value, dict):
+                sample = _to_float(value.get("weighted_sample"))
+                if sample is None:
+                    sample = _to_float(value.get("sample_size"))
+            is_strong = bool(sample is not None and sample >= H2H_STRONG_MIN_SAMPLE)
         if side_impact >= 3:
-            support.append({"name": name, "impact": round(side_impact, 2), "strong": name in strong_names})
+            support.append({"name": name, "impact": round(side_impact, 2), "strong": is_strong})
         elif side_impact <= -3:
             opposing_total += abs(side_impact)
     total = round(sum(float(item["impact"]) for item in support), 2)
@@ -4446,7 +4461,31 @@ def _all_directional_support(direction: dict[str, str], side: str, names: tuple[
 def _home_win_has_enough_support(direction: dict[str, str]) -> bool:
     if direction.get("odds_edge") != "home":
         return False
-    return direction.get("recent_history_edge") == "home" or direction.get("common_opponent_edge") == "home"
+    return (
+        direction.get("recent_history_edge") == "home"
+        or direction.get("common_opponent_edge") == "home"
+        or direction.get("h2h_edge") == "home"
+    )
+
+
+def _away_or_draw_has_enough_support(direction: dict[str, str]) -> bool:
+    """Mirror of _home_win_has_enough_support for the away side.
+
+    Previously this used _all_directional_support requiring odds_edge,
+    recent_history_edge, AND common_opponent_edge to all agree on away --
+    h2h_edge wasn't consulted at all, and requiring three-way agreement was
+    already stricter than the home-side check next to it. This brings the
+    two in line: a core market signal (odds_edge) plus at least one
+    corroborating side signal, with h2h_edge now counted as one of the
+    corroborating options instead of being ignored.
+    """
+    if direction.get("odds_edge") != "away":
+        return False
+    return (
+        direction.get("recent_history_edge") == "away"
+        or direction.get("common_opponent_edge") == "away"
+        or direction.get("h2h_edge") == "away"
+    )
 
 
 def _append_publication_signal(prediction: dict[str, Any], name: str, value: dict[str, Any]) -> None:

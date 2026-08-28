@@ -905,7 +905,11 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
                 weighted_draw += weight
         if total_weight >= 1.5:
             raw_edge = (weighted_home - weighted_away) / total_weight
-            edge = round(max(-6, min(6, raw_edge * 8)), 2)
+            # Capped to the same +/-12 range as common_opponent_edge -- h2h
+            # was previously capped at +/-6, roughly a third of the other
+            # side-evidence signals, so it could never compete with them by
+            # scale alone even when it was the most relevant evidence.
+            edge = round(max(-12, min(12, raw_edge * 12)), 2)
             if abs(edge) < 1:
                 return 0.0
             signals.append({
@@ -931,7 +935,10 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
     if sample_size < 2:
         return 0.0
     raw_edge = (home_wins - away_wins) / sample_size
-    edge = round(max(-4, min(4, raw_edge * 5)), 2)
+    # Aggregate fallback stays weaker than the date-weighted path above (it's
+    # coarser data), but +/-8 instead of +/-4 keeps it from being drowned out
+    # by uncapped side signals like recent_history_edge purely on scale.
+    edge = round(max(-8, min(8, raw_edge * 8)), 2)
     if abs(edge) < 1:
         return 0.0
     signals.append({
