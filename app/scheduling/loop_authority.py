@@ -104,6 +104,79 @@ def correction_authority(
             conn.commit()
 
 
+def renew_authority_lease(scope: str, owner: str, *, ttl_seconds: int = 300) -> bool:
+    """
+    Push a held lease's expiry forward from a live heartbeat.
+
+    Call this periodically while genuinely still working inside a
+    `correction_authority(...)` block. Keeping the *initial* ttl_seconds small
+    (see run_job_with_guard) and relying on this renewal to keep long jobs
+    alive means a crashed/killed process's lease self-expires within one
+    ttl window instead of sitting stuck for hours. No-ops (returns False)
+    if this owner no longer holds the lease — e.g. it already expired and
+    was reclaimed by someone else.
+    """
+    expires_at = _now_ts() + max(30, ttl_seconds)
+    with db_conn(timeout=30) as conn:
+        _init_authority_table(conn)
+        cur = conn.execute(
+            """
+            update correction_authority_leases
+            set heartbeat_at = ?, expires_at = ?
+            where scope = ? and owner = ?
+            """,
+            (_now_iso(), expires_at, scope, owner),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def clear_all_authority_leases(reason: str = "process boot") -> int:
+    """
+    Unconditionally drop every correction-authority lease.
+
+    Call this once, early, on process startup only. A fresh process has not
+    acquired anything yet, so any row already in the table belongs to a
+    process that no longer exists (a previous run of this same app that
+    crashed, was force-killed, or was replaced by --reload) — expired or
+    not by its own stored expires_at. This is the immediate remedy for a
+    lease stuck under the old 6-hour TTL (see run_job_with_guard); the
+    renew/short-ttl fix there prevents new leases from getting stuck this
+    way going forward, but does not retroactively fix a row already
+    written with the old, much longer expiry.
+    """
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        _init_authority_table(conn)
+        cur = conn.execute("delete from correction_authority_leases")
+        conn.commit()
+        return cur.rowcount
+
+
+def recover_abandoned_leases(stale_after_seconds: int = 300) -> dict[str, Any]:
+    """
+    Delete leases that expired a while ago and were never cleaned up.
+
+    Normal expiry already makes a lease unenforceable (acquire checks
+    expires_at > now()), so this is just housekeeping — it keeps the table
+    from accumulating dead rows and gives an explicit recovery hook to call
+    at startup / on a timer, mirroring job_state.recover_abandoned_jobs().
+    """
+    _init_db()
+    cutoff = _now_ts() - max(30, stale_after_seconds)
+    with db_conn(timeout=30) as conn:
+        _init_authority_table(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "select scope, owner from correction_authority_leases where expires_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        if rows:
+            conn.execute("delete from correction_authority_leases where expires_at <= ?", (cutoff,))
+            conn.commit()
+    return {"recovered": len(rows), "scopes": [r["scope"] for r in rows]}
+
+
 def authority_snapshot() -> list[dict[str, Any]]:
     _init_db()
     with db_conn(timeout=30) as conn:

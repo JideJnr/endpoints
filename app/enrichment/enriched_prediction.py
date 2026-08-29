@@ -4335,10 +4335,86 @@ def _apply_publication_filters(prediction: dict[str, Any], picks: list[dict[str,
         reasons: list[str] = []
         if conflict:
             reasons.append("h2h_market_common_opponent_conflict")
+
+        # Every side-evidence signal gets a vote here, not just one gatekeeper
+        # (previously only odds_edge could gate Home Win, and nothing gated
+        # Away Win at all). An outright Home/Away Win only stays outright when
+        # NO side signal that has an opinion disagrees with it. If even one
+        # dissents, downgrade the SELECTION itself to the matching
+        # double-chance hedge -- not just shave points off the confidence
+        # number while still publishing the same outright bet. Full agreement
+        # (or no signals having an opinion either way) leaves it untouched.
+        outright_side = "home" if normalized in {"home win", "home"} else "away" if normalized in {"away win", "away"} else None
+        if outright_side and _side_signal_dissent(direction, outright_side):
+            dissenters = sorted(name for name, d in direction.items() if d != outright_side)
+            new_selection = "Home or Draw" if outright_side == "home" else "Away or Draw"
+            pick["selection"] = new_selection
+            pick["type"] = "double_chance"
+            pick["clear_winner"] = False
+            try:
+                from app.market.market_intent import classify_market_intent
+                pick["market_intent"] = classify_market_intent("double_chance", new_selection)
+            except Exception:
+                pass
+            pick["family"] = "double_chance"
+            pick.setdefault("publication_filter", {})
+            pick["publication_filter"]["downgraded"] = True
+            pick["publication_filter"]["downgraded_from"] = selection
+            pick["publication_filter"]["dissenting_signals"] = dissenters
+            pick["reason"] = (
+                f"{pick.get('reason') or ''}; downgraded from {selection} to {new_selection} because "
+                f"{', '.join(dissenters)} disagreed with {outright_side}"
+            )
+            selection = new_selection
+            normalized = new_selection.lower()
+            outright_side = None
+
+        # Mirror of the downgrade above, in the other direction: when a
+        # published hedge has UNANIMOUS side-evidence agreement on the side
+        # it doesn't exclude -- not just "no dissent", every signal with an
+        # opinion actively agreeing, and enough of them for that to mean
+        # something -- upgrade it to the outright pick instead of leaving
+        # value on the table with a needlessly cautious hedge. This is what
+        # lets a case like all 6 side signals agreeing Away, but the
+        # market_selector/ensemble not clearing its own clear_winner gap,
+        # still publish Away Win instead of Away or Draw. Confidence comes
+        # from the ensemble's own probability for that side when available,
+        # not the hedge's inflated confidence number -- we're trusting rule
+        # signals to override a call the ensemble itself didn't make, so this
+        # should not inherit clear_winner status either.
+        if outright_side is None:
+            hedge_side = "home" if normalized == "home or draw" else "away" if normalized == "away or draw" else None
+            if hedge_side and _unanimous_side_signal_agreement(direction) == hedge_side:
+                agreeing = sorted(direction.keys())
+                new_selection = "Home Win" if hedge_side == "home" else "Away Win"
+                ensemble_probability = _ensemble_side_probability(signals, hedge_side)
+                new_confidence = (
+                    ensemble_probability
+                    if ensemble_probability is not None
+                    else max(55, int(pick.get("confidence") or 0) - 12)
+                )
+                pick["selection"] = new_selection
+                pick["type"] = "match_result"
+                pick["confidence"] = max(1, min(95, round(new_confidence)))
+                try:
+                    from app.market.market_intent import classify_market_intent
+                    pick["market_intent"] = classify_market_intent("match_result", new_selection)
+                except Exception:
+                    pass
+                pick["family"] = "match_result"
+                pick.setdefault("publication_filter", {})
+                pick["publication_filter"]["upgraded"] = True
+                pick["publication_filter"]["upgraded_from"] = selection
+                pick["publication_filter"]["agreeing_signals"] = agreeing
+                pick["reason"] = (
+                    f"{pick.get('reason') or ''}; upgraded from {selection} to {new_selection} because "
+                    f"every side-evidence signal ({', '.join(agreeing)}) agreed on {hedge_side}"
+                )
+                selection = new_selection
+                normalized = new_selection.lower()
+
         if "away or draw" in normalized and not _away_or_draw_has_enough_support(direction):
             reasons.append("away_or_draw_requires_market_recent_common_support")
-        if ("home win" in normalized or normalized == "home") and not _home_win_has_enough_support(direction):
-            reasons.append("home_win_requires_market_plus_recent_or_common_support")
         excluded_side = _double_chance_excluded_side(normalized)
         if excluded_side:
             exclusion = _excluded_side_strength(signals, excluded_side)
@@ -4368,6 +4444,60 @@ def _apply_publication_filters(prediction: dict[str, Any], picks: list[dict[str,
                 "reason": "blocked side pick because double chance excluded the clearer stronger side",
                 "suppressed_picks": blocked,
             })
+    # A downgrade or upgrade above can leave two picks sharing the same
+    # (type, selection) -- e.g. a Home Win just downgraded to Home or Draw
+    # alongside a separately-generated Home or Draw candidate, or an Away or
+    # Draw just upgraded to Away Win alongside a separate Away Win candidate.
+    # Keep the stronger one.
+    picks[:] = _dedupe_picks(picks)
+
+
+def _side_signal_dissent(direction: dict[str, str], side: str) -> bool:
+    """True if any side-evidence signal with an opinion disagrees with `side`.
+
+    Used to decide whether an outright Home/Away Win gets to stay outright:
+    every signal gets a vote, and a single dissenter is enough to downgrade
+    the pick to its double-chance hedge rather than just capping confidence
+    while still publishing the same bet.
+    """
+    opposite = "away" if side == "home" else "home"
+    return any(direction_value == opposite for direction_value in direction.values())
+
+
+# Minimum number of side-evidence signals that must actually have an opinion
+# before their unanimous agreement is trusted enough to upgrade a hedge to an
+# outright pick. One or two agreeing signals on a thin-data match isn't real
+# consensus -- this requires at least this many independent signals to have
+# cleared the direction threshold and all landed on the same side.
+UPGRADE_UNANIMOUS_MIN_SIGNALS = 3
+
+
+def _unanimous_side_signal_agreement(direction: dict[str, str]) -> str | None:
+    """Return 'home' or 'away' when every side-evidence signal with an
+    opinion agrees on that side AND at least UPGRADE_UNANIMOUS_MIN_SIGNALS of
+    them actually have one. Returns None otherwise (including when no
+    signals have an opinion at all -- silence is not consensus).
+    """
+    if len(direction) < UPGRADE_UNANIMOUS_MIN_SIGNALS:
+        return None
+    values = set(direction.values())
+    if len(values) == 1:
+        return next(iter(values))
+    return None
+
+
+def _ensemble_side_probability(signals: list[dict[str, Any]], side: str) -> float | None:
+    """The ensemble model's own raw probability for `side` winning outright,
+    if the ensemble_model signal is present. Used so an upgraded pick's
+    confidence reflects the statistical model's actual estimate rather than
+    inheriting the hedge's inflated confidence number.
+    """
+    ensemble = next((s for s in signals if s.get("name") == "ensemble_model"), None)
+    if not ensemble:
+        return None
+    probabilities = (ensemble.get("value") or {}).get("probabilities") or {}
+    key = "home_win" if side == "home" else "away_win"
+    return _to_float(probabilities.get(key))
 
 
 def _directional_signal_map(signals: list[dict[str, Any]]) -> dict[str, str]:
@@ -4458,26 +4588,18 @@ def _all_directional_support(direction: dict[str, str], side: str, names: tuple[
     return all(direction.get(name) == side for name in names)
 
 
-def _home_win_has_enough_support(direction: dict[str, str]) -> bool:
-    if direction.get("odds_edge") != "home":
-        return False
-    return (
-        direction.get("recent_history_edge") == "home"
-        or direction.get("common_opponent_edge") == "home"
-        or direction.get("h2h_edge") == "home"
-    )
-
-
 def _away_or_draw_has_enough_support(direction: dict[str, str]) -> bool:
-    """Mirror of _home_win_has_enough_support for the away side.
+    """Whether an Away or Draw hedge itself is well-supported enough to stay
+    at full confidence: a core market signal (odds_edge) plus at least one
+    corroborating side signal (recent_history_edge, common_opponent_edge, or
+    h2h_edge). This is about trusting the HEDGE on its own terms -- separate
+    from _side_signal_dissent, which decides whether an OUTRIGHT Home/Away
+    Win pick gets downgraded into a hedge like this one in the first place.
 
-    Previously this used _all_directional_support requiring odds_edge,
-    recent_history_edge, AND common_opponent_edge to all agree on away --
-    h2h_edge wasn't consulted at all, and requiring three-way agreement was
-    already stricter than the home-side check next to it. This brings the
-    two in line: a core market signal (odds_edge) plus at least one
-    corroborating side signal, with h2h_edge now counted as one of the
-    corroborating options instead of being ignored.
+    Previously this required all three of odds_edge, recent_history_edge,
+    AND common_opponent_edge to agree on away (h2h_edge wasn't consulted at
+    all). That three-way requirement is now one core signal plus any one
+    corroborator, with h2h_edge counted as a valid corroborator too.
     """
     if direction.get("odds_edge") != "away":
         return False

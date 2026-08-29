@@ -1476,6 +1476,12 @@ def job_autopilot_guardian() -> dict[str, Any]:
             return {"status": "error", "error": str(exc)}
 
     guarded("recover_abandoned_jobs", _recover_jobs)
+
+    def _recover_leases():
+        from app.scheduling.loop_authority import recover_abandoned_leases
+        return recover_abandoned_leases()
+
+    guarded("recover_abandoned_leases", _recover_leases)
     stats = guarded("buffer_stats", get_buffer_stats)
 
     # Flow healing: if live work or enrichment backlog is visible, nudge the
@@ -1543,6 +1549,22 @@ def start_scheduler():
     except Exception as exc:
         print(f"[scheduler] disabled - apscheduler not installed: {exc}")
         return None
+
+    # One-time boot recovery: drop any correction-authority lease left behind
+    # by a previous run of this process (crash, --reload restart, sleep).
+    # Safe only here — a fresh process hasn't acquired anything yet, so any
+    # row still in the table is necessarily abandoned. See
+    # loop_authority.clear_all_authority_leases for why this is needed even
+    # after the short-ttl/renewal fix below (that fix stops NEW leases from
+    # getting stuck for hours; it can't retroactively fix one already
+    # written with the old 6-hour expiry).
+    try:
+        from app.scheduling.loop_authority import clear_all_authority_leases
+        cleared = clear_all_authority_leases()
+        if cleared:
+            print(f"[scheduler] boot: cleared {cleared} stale correction-authority lease(s)")
+    except Exception as exc:
+        print(f"[scheduler] boot: correction-authority lease cleanup failed: {exc}")
 
     scheduler = BackgroundScheduler(timezone="UTC")
     now = datetime.now(timezone.utc)
@@ -2139,14 +2161,26 @@ def run_job_with_guard(fn, *args, guard_job_id: str | None = None, **kwargs):
 
 def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwargs):
     from app.scheduling.job_state import JobBusy, finish_job, heartbeat, job_guard
-    from app.scheduling.loop_authority import CorrectionAuthorityBusy, correction_authority
+    from app.scheduling.loop_authority import CorrectionAuthorityBusy, correction_authority, renew_authority_lease
 
     job_id = guard_job_id or (fn.__name__[4:] if fn.__name__.startswith("job_") else fn.__name__)
     stale_after = _JOB_STALE_SECONDS.get(job_id, 900)
+    # NOTE: this used to be max(stale_after, 6 * 60 * 60) — a fixed 6-HOUR floor
+    # on the "match_pipeline" correction-authority lease, completely decoupled
+    # from the job's own (much shorter) stale_after window. Since the lease's
+    # expires_at is set once at acquire time and was never renewed, a process
+    # that died mid-run (crash, --reload restart, sleep) while holding it left
+    # every job in MATCH_PIPELINE_JOB_IDS returning "match_pipeline_busy" —
+    # silently, surviving process restarts — for up to 6 hours. Fixed by
+    # granting a short initial lease and renewing it from the live heartbeat
+    # below, so a dead process's lease now expires within one stale_after
+    # window instead of hours.
+    authority_ttl = max(stale_after, 120)
     try:
         with job_guard(job_id, stale_after_seconds=stale_after) as state:
             stop_heartbeat = threading.Event()
             interval = max(15, min(60, stale_after // 3))
+            authority_owner: dict[str, str] = {}
 
             def _beat() -> None:
                 while not stop_heartbeat.wait(interval):
@@ -2154,6 +2188,12 @@ def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwa
                         heartbeat(job_id, owner=state["owner"])
                     except Exception:
                         pass
+                    owner = authority_owner.get("owner")
+                    if owner:
+                        try:
+                            renew_authority_lease("match_pipeline", owner, ttl_seconds=authority_ttl)
+                        except Exception:
+                            pass
 
             heartbeat_thread = threading.Thread(target=_beat, name=f"{job_id}_heartbeat", daemon=True)
             heartbeat_thread.start()
@@ -2163,9 +2203,10 @@ def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwa
                         with correction_authority(
                             job_id,
                             "match_pipeline",
-                            ttl_seconds=max(stale_after, 6 * 60 * 60),
+                            ttl_seconds=authority_ttl,
                             reason="serialize match ingest/enrich/predict lanes",
-                        ):
+                        ) as lease:
+                            authority_owner["owner"] = lease["owner"]
                             result = fn(*args, **kwargs)
                     except CorrectionAuthorityBusy as exc:
                         result = {
@@ -2175,6 +2216,8 @@ def _run_job_with_guard_locked(fn, *args, guard_job_id: str | None = None, **kwa
                             "owner": exc.owner,
                             "source": exc.source,
                         }
+                    finally:
+                        authority_owner.pop("owner", None)
                 else:
                     result = fn(*args, **kwargs)
                 status = "ok" if not isinstance(result, dict) else str(result.get("status") or "ok")

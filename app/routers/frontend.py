@@ -1922,22 +1922,35 @@ def get_signal_matches(
     with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         if signal_name == "consensus_longshot_value":
+            # Analytics surfaces (this endpoint feeds the analytics-dashboard
+            # "longshots" section) should only ever reflect what the pipeline
+            # actually PUBLISHED, not every candidate it merely considered.
+            # consensus_longshot_value is logged to prediction_candidate_history
+            # as an observational "signal" row on every match where the signal
+            # fires -- most of those are never chosen as the published pick.
+            # Reading from candidate_history here silently mixed "the model
+            # noticed longshot value" (common) with "the model bet on it"
+            # (rare), inflating this section with picks nothing was ever
+            # actually recommended on. Source from prediction_history instead,
+            # same as every other signal_name below -- model-explorer is left
+            # untouched and still reads both tables intentionally, since it's
+            # a decision-diagnosis view, not an accuracy view.
             rows = conn.execute(
                 """
                 select id, match_id, match_name, league_name, country_name, pick_type,
                        selection, confidence, reason, result, final_home, final_away,
-                       graded_at, created_at, context_json, signals_json
+                       graded_at, created_at, '{}' as context_json, signals_json
                 from (
                     select
-                        pch.*,
+                        ph.*,
                         row_number() over (
-                            partition by match_id, pick_type, selection, coalesce(role, 'candidate')
+                            partition by match_id, pick_type, selection
                             order by
                                 case when graded_at is not null then 0 else 1 end,
                                 datetime(coalesce(graded_at, created_at)) desc,
                                 id desc
                         ) as rn
-                    from prediction_candidate_history pch
+                    from prediction_history ph
                     where pick_type = 'consensus_longshot_value'
                       and (? = '' or result = ?)
                 )
@@ -1981,6 +1994,18 @@ def get_signal_matches(
         except Exception:
             context = {}
         signal_value = context.get("signal") if isinstance(context.get("signal"), dict) else {}
+        if not signal_value:
+            # published-picks rows (see above) don't carry context_json, but
+            # the same signal object is already embedded in signals_json --
+            # pull it from there instead of losing decimal_odds/edge_percent.
+            try:
+                signals_list = json.loads(row["signals_json"] or "[]")
+            except Exception:
+                signals_list = []
+            for sig in signals_list:
+                if sig.get("name") == signal_name and isinstance(sig.get("value"), dict):
+                    signal_value = sig.get("value")
+                    break
         market_intent = context.get("market_intent") if isinstance(context.get("market_intent"), dict) else signal_value.get("market_intent") if isinstance(signal_value, dict) else {}
         items.append({
             "id": row["id"],

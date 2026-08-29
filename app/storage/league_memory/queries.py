@@ -476,7 +476,34 @@ def grade_prediction(prediction_id: int, final_home: int, final_away: int) -> di
         conn.commit()
     _grade_decision_logs_by_ids([str(row["match_id"])], final_home, final_away)
     _store_signal_outcome_for_row(row, result)
+    _grade_ai_specialist_contributions(row, result)
     return {"graded": True, "id": prediction_id, "result": result, "final_home": final_home, "final_away": final_away}
+
+
+def _grade_ai_specialist_contributions(row: sqlite3.Row, result: str) -> None:
+    """Feed graded outcomes back into ai_prediction_pipeline's specialist weights.
+
+    Only ai_prediction_pipeline.run_ai_prediction_with_fallback's picks carry a
+    reasoning_context.analysts list (stashed inside audit_json since
+    prediction_history has no dedicated column for it) — the deterministic
+    ensemble path has none, so this is a no-op for those rows.
+    """
+    if result not in {"win", "loss"}:
+        return
+    try:
+        audit = _safe_json(row["audit_json"] if "audit_json" in row.keys() else "{}", {})
+        analysts = (audit or {}).get("reasoning_context", {}).get("analysts") if isinstance(audit, dict) else None
+        if not analysts:
+            return
+        from app.ai.ai_prediction_pipeline import grade_specialist_contributions
+        grade_specialist_contributions(
+            {"analysts": analysts},
+            result,
+            league=row["league_name"] if "league_name" in row.keys() else None,
+            pick_type=row["pick_type"] if "pick_type" in row.keys() else None,
+        )
+    except Exception:
+        pass
 
 
 def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> str:

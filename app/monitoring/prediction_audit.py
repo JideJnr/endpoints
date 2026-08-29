@@ -43,6 +43,10 @@ def build_prediction_audit(prediction: dict[str, Any], doc: dict[str, Any] | Non
         "match_state": _trim(match_state),
         "time_context": _trim(time_context),
         "enrichment": _enrichment_snapshot(prediction, doc, readiness),
+        # Only set for app.ai.ai_prediction_pipeline predictions — carries the
+        # evidence-specialist findings so grading can feed specialist_performance
+        # weights back in (see queries.py::_grade_ai_specialist_contributions).
+        "reasoning_context": prediction.get("reasoning_context"),
         "market": {
             "classification": classify_market_intent(primary.get("type"), primary.get("selection"), primary),
             "pick_classifications": [

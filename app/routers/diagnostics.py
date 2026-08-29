@@ -148,3 +148,28 @@ def prediction_coverage() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.get("/pipeline-locks")
+def pipeline_locks() -> dict[str, Any]:
+    """
+    Show the current scheduler job ledger and correction-authority leases.
+
+    Makes the previously-invisible job_guard / correction_authority state
+    inspectable — in particular the shared "match_pipeline" lease that
+    serializes enrich_worker/enrich_future/live_priority*/sofa_pipeline/
+    unified_upcoming/unified_live. A lease with a large expires_in_seconds
+    and no corresponding job actually running is the signature of a stuck
+    lock (see loop_authority.clear_all_authority_leases).
+    """
+    try:
+        from app.scheduling.job_state import list_job_states
+        from app.scheduling.loop_authority import authority_snapshot
+
+        return {
+            "status": "success",
+            "job_runs": list_job_states(),
+            "correction_authority_leases": authority_snapshot(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+

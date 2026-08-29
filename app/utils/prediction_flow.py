@@ -31,6 +31,7 @@ def predict_and_record_enriched(
     source: str = "enriched_ensemble",
     attach_brain: bool = False,
     use_llm_pipeline: bool | None = False,
+    prebuilt_prediction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Single prediction write path for enriched buffer documents.
@@ -38,11 +39,40 @@ def predict_and_record_enriched(
     History is append-only. This helper only decides whether the current document
     is ready, builds the prediction, optionally applies the AI brain adjustment,
     and records the immutable prediction row for future grading/learning.
+
+    prebuilt_prediction: pass an already-built prediction dict (with a "picks"
+    list, as produced by build_pick()) to record it as-is, instead of deriving
+    one here via the LLM pipeline or the deterministic ensemble. Used by
+    run_ai_prediction_with_fallback (app/ai/ai_prediction_pipeline.py), which
+    runs its own evidence-specialist + decider pipeline and must not trigger a
+    second, independent LLM pipeline run in here.
     """
     readiness = prediction_readiness(doc)
     doc["prediction_readiness"] = readiness
     if not readiness.get("ready"):
         raise PredictionDeferred(readiness)
+
+    if prebuilt_prediction is not None:
+        prediction = prebuilt_prediction
+        if attach_brain and "ai_brain" not in prediction:
+            _attach_brain_review(prediction, doc)
+        prediction["audit"] = build_prediction_audit(prediction, doc)
+        resolved_match_id = str(
+            match_id
+            or prediction.get("match_id")
+            or doc.get("sportybet_id")
+            or doc.get("id")
+            or ""
+        )
+        record_prediction({
+            **prediction,
+            "match_id": resolved_match_id,
+            "sportybet_id": prediction.get("sportybet_id") or resolved_match_id,
+            "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
+            "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
+            "source": source,
+        })
+        return prediction
 
     # Use LLM pipeline if requested and available
     if use_llm_pipeline:
@@ -100,6 +130,7 @@ def apply_prediction_state(
     attach_brain: bool = False,
     allow_repeat: bool = False,
     use_llm_pipeline: bool | None = False,
+    prebuilt_prediction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Apply the single prediction state transition used by workers and endpoints.
@@ -137,6 +168,7 @@ def apply_prediction_state(
             source=_prediction_source(source, readiness),
             attach_brain=attach_brain,
             use_llm_pipeline=use_llm_pipeline,
+            prebuilt_prediction=prebuilt_prediction,
         )
         readiness = doc.get("prediction_readiness") or prediction.get("prediction_readiness") or prediction_readiness(doc)
         doc["prediction"] = prediction

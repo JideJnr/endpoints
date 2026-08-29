@@ -813,11 +813,6 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
         specialist_weights = get_specialist_weights(league=_tournament(doc))
         decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context, specialist_weights=specialist_weights)
-        from app.utils.prediction_flow import apply_prediction_state
-
-        result = apply_prediction_state(doc, **kwargs)
-        if result.get("status") != "predicted": return result
-        prediction = result["prediction"]
         reasoning_context = {
             **asdict(ReasoningContext(_name(doc), *chain)),
             "response_chain": chain,
@@ -837,21 +832,72 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                 {"name": "Team Previous Matches Analyst",  "trained_knowledge": "Both teams' full recent finished-match profiles",          "finding": chain[5], "evidence_status": _evidence_status(chain[5]), "weight": specialist_weights.get("Team Previous Matches Analyst", 1.0)},
             ],
         }
-        prediction.update({
+
+        # Build the one canonical prediction dict (with a real "picks" list) here,
+        # instead of letting apply_prediction_state's use_llm_pipeline=True branch
+        # trigger a second, independent LLM pipeline run (app.ai.llm_pipeline.run_llm_pipeline).
+        # That second pipeline's output has no "picks" list, so record_prediction's
+        # confidence/no_bet gate silently dropped it before it ever reached
+        # prediction_history — this decider's decision is now the only thing recorded.
+        from app.storage.league_memory._helpers import build_pick
+        confidence = _convert_confidence(decision["confidence"])
+        reason_text = decision.get("reasoning")
+        if isinstance(reason_text, dict):
+            reason_text = " ".join(str(v) for v in reason_text.values() if v)
+        reason_text = str(reason_text or "AI evidence-pipeline decision")[:500]
+        pick = build_pick(
+            str(decision.get("market") or "match_result"),
+            str(decision.get("outcome") or ""),
+            confidence,
+            reason_text,
+            source="ai_prediction_pipeline",
+            include_market_intent=True,
+        )
+        signals = [
+            {
+                "name": f"specialist_{str(a['name']).lower().replace(' ', '_')}",
+                "value": a["finding"],
+                "impact": round((float(a.get("weight") or 1.0) - 1.0) * 10, 1),
+            }
+            for a in reasoning_context["analysts"]
+        ]
+        resolved_match_id = str(match_id or doc.get("sportybet_id") or doc.get("id") or "")
+        prebuilt_prediction: dict[str, Any] = {
+            "name": _name(doc),
+            "tournament": _tournament(doc),
+            "country": doc.get("country") or doc.get("category"),
+            "match_id": resolved_match_id,
+            "sportybet_id": doc.get("sportybet_id") or resolved_match_id,
+            "sofascore_id": doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
+            "match_date": match_date or doc.get("match_date"),
             "prediction_source": "llm_pipeline",
             "ai_provider": model,
             "reasoning_context": reasoning_context,
             "market": decision["market"],
             "outcome": decision["outcome"],
-            "key_factors": decision["key_factors"],
-            "reasoning": decision["reasoning"],
-            "confidence": _convert_confidence(decision["confidence"]),
-            "value_bet": decision["value_bet"],
-            "btts": decision["btts"],
-            "over_2_5": decision["over_2_5"],
-        })
+            "key_factors": decision.get("key_factors") or [],
+            "reasoning": decision.get("reasoning"),
+            "confidence": confidence,
+            "value_bet": bool(decision.get("value_bet")),
+            "btts": decision.get("btts"),
+            "over_2_5": decision.get("over_2_5"),
+            "picks": [pick],
+            "signals": signals,
+        }
+
+        from app.utils.prediction_flow import apply_prediction_state
+        result = apply_prediction_state(
+            doc,
+            match_id=match_id,
+            match_date=match_date,
+            source=source,
+            attach_brain=attach_brain,
+            allow_repeat=allow_repeat,
+            prebuilt_prediction=prebuilt_prediction,
+        )
+        if result.get("status") != "predicted": return result
         result["prediction_source"] = "llm_pipeline"
-        result["reasoning_context"] = prediction["reasoning_context"]
+        result["reasoning_context"] = reasoning_context
         result["competition_analysis_used"] = competition_context is not None
         result["competition_analysis_key"] = competition_analysis_key
         logger.info("AI pipeline completed match=%s outcome=%s", _name(doc), decision["outcome"])
@@ -918,6 +964,7 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
             match_id=str(doc.get("match_id") or ""),
             match_date=doc.get("match_date"),
             use_llm_pipeline=True,
+            attach_brain=True,
         )
         doc["ai_prediction_queue_pending"] = False
         _store(str(doc.get("match_id") or ""), doc)

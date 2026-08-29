@@ -514,7 +514,10 @@ def get_unenriched_batch(
             live_clause = "and is_live = 0"
         else:
             live_clause = ""
-        stale_clause = "or (is_live = 1 and enriched_at < datetime('now', '-2 minutes'))"
+        # 3 minutes: matches the live prediction cooldown in apply_prediction_state
+        # (2-3 min) and keeps this well clear of SofaScore's rate limiting — no
+        # point re-fetching stats faster than we're willing to act on them.
+        stale_clause = "or (is_live = 1 and enriched_at < datetime('now', '-3 minutes'))"
         retry_clause = "1 = 1" if force_live_retry else """
               (
                 json_extract(raw_enriched, '$.sofascore_match_status') is null
@@ -1501,14 +1504,30 @@ def run_enrichment_worker(
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
-        # Enrichment owns the manual deterministic prediction path.
-        # The AI queue may add a later overlay, but it never blocks this lane.
+        # Pipeline ownership: when the AI Prediction Queue toggle is active, it is
+        # the SOLE predictor for both prematch and live matches — enrichment stops
+        # at data-gathering and leaves the row flagged for job_ai_prediction_queue.
+        # Previously this flag was computed but never actually gated the call below,
+        # so the deterministic path always predicted first and the AI queue's own
+        # cooldown check almost always found a too-recent prediction and skipped —
+        # meaning "AI Prediction Queue" was on in name but rarely actually decided
+        # anything. Caveat: the AI queue's specialists (H2H/form/odds/similar-match/
+        # team-history) are prematch snapshots — they don't see live score or
+        # minute, so a live match in AI-only mode gets one prematch-style decision
+        # rather than the continuous in-play updates the deterministic lane gave it.
         try:
             from app.scheduling.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
-        if sofa or item.get("is_live"):
+        if (sofa or item.get("is_live")) and ai_queue_enabled:
+            from app.enrichment.enriched_prediction import prediction_readiness
+
+            doc["prediction"] = None
+            doc["prediction_error"] = None
+            doc["prediction_readiness"] = prediction_readiness(doc)
+            doc["ai_prediction_queue_pending"] = True
+        elif sofa or item.get("is_live"):
             from app.utils.prediction_flow import apply_prediction_state
 
             state = apply_prediction_state(
@@ -1555,8 +1574,6 @@ def run_enrichment_worker(
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
-            if ai_queue_enabled and not item.get("is_live"):
-                doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
             from app.enrichment.enriched_prediction import prediction_readiness
 
@@ -1824,12 +1841,23 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
+        # Pipeline ownership: mirrors run_enrichment_worker above — when the
+        # AI Prediction Queue toggle is active, it is the SOLE predictor for
+        # both prematch and live matches; this lane only gathers data and
+        # flags the row for job_ai_prediction_queue instead of racing it.
         try:
             from app.scheduling.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
-        if sofa or item.get("is_live"):
+        if (sofa or item.get("is_live")) and ai_queue_enabled:
+            from app.enrichment.enriched_prediction import prediction_readiness
+
+            doc["prediction"] = None
+            doc["prediction_error"] = None
+            doc["prediction_readiness"] = prediction_readiness(doc)
+            doc["ai_prediction_queue_pending"] = True
+        elif sofa or item.get("is_live"):
             from app.utils.prediction_flow import apply_prediction_state
 
             state = apply_prediction_state(
@@ -1876,11 +1904,6 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
-            if ai_queue_enabled and not item.get("is_live"):
-                from app.enrichment.enriched_prediction import prediction_readiness
-
-                doc["prediction_readiness"] = prediction_readiness(doc)
-                doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
             from app.enrichment.enriched_prediction import prediction_readiness
 
