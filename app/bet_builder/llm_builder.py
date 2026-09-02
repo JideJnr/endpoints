@@ -25,6 +25,7 @@ from app.bet_builder.core import (
     select_by_odds,
     trim_to_ceiling,
     combined_odds,
+    track_suggested_slip,
     _rank_analyses,
 )
 
@@ -158,6 +159,14 @@ def run_llm_bet(
             "selections": [],
         }
 
+    tracked = track_suggested_slip(
+        selected,
+        mode="llm",
+        combined_odds_value=synthesis.get("combined_odds"),
+        avg_confidence=synthesis.get("avg_confidence"),
+        extra_request={"target_odds": target_odds, "candidate_limit": _limit},
+    )
+
     selections = [{
         "sportybet_id": i.get("match_id") or i.get("sportybet_id"),
         "type": i.get("type") or i.get("pick_type"),
@@ -175,6 +184,7 @@ def run_llm_bet(
             "mode": "llm",
             "candidates_considered": len(candidates),
             "selections": selections,
+            "betbuilder_id": tracked.get("id") if tracked else None,
         }
 
     result: dict[str, Any] = {
@@ -192,6 +202,7 @@ def run_llm_bet(
         "booking_payload": booking_payload,
         "selections": selected,
         "synthesis_reasoning": synthesis.get("synthesis_reasoning"),
+        "betbuilder_id": tracked.get("id") if tracked else None,
     }
     if request_code:
         try:

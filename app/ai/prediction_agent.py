@@ -72,27 +72,106 @@ def _time_decay_multiplier(minute: int) -> float:
     return 1.0
 
 
+def _learned_league_goal_timing_adjustment(match: dict[str, Any] | None) -> float:
+    """Small multiplicative nudge (roughly ±0.18) from real per-league late-goal
+    history, replacing the old HIGH_LATE_GOAL_LEAGUES allowlist (which was always
+    empty -- see the warning at import time above). Sourced from
+    late_goal_memory_signal(), which reads late_goal_snapshots: real, timestamped
+    observations of whether a league's matches picked up goals late, smoothed
+    around 50% so tiny samples can't dominate.
+
+    With no history for a league yet this returns 0.0 -- decay behaves exactly
+    like the old fixed curve. It only starts expressing anything once matches
+    in that league have actually finished and been resolved, which grows over
+    time on its own (see the finish-time snapshot resolution in buffer.py's
+    patch_live_scores). No new hardcoded list to keep in sync.
+    """
+    if not match:
+        return 0.0
+    try:
+        mem_signal = late_goal_memory_signal(match)
+    except Exception:
+        return 0.0
+    if not mem_signal:
+        return 0.0
+    impact = float(mem_signal.get("impact") or 0.0)  # roughly ±12 at full smoothed confidence
+    return max(-0.18, min(0.18, (impact / 12.0) * 0.18))
+
+
 def _apply_time_decay(
     picks: list[dict[str, Any]],
     minute: int,
     is_live: bool,
     late_goal_league: bool,
+    *,
+    match: dict[str, Any] | None = None,
+    home_goals: int | None = None,
+    away_goals: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply time-decay to confidence for live matches."""
+    """Apply time-decay to confidence for live matches.
+
+    Every pick type keeps the original flat clock-based curve (_DECAY_BRACKETS)
+    UNCHANGED, except picks that are specifically about "does a goal still
+    happen" (BTTS, live goal / next-goal markets) -- those additionally:
+
+      1. Use the real current score when it's available, so a pick that's
+         already mathematically settled isn't punished by the clock for no
+         reason (e.g. BTTS-Yes once both sides have scored is already a
+         winner regardless of minute; BTTS-No at that point is already
+         wrong and should collapse, not just mildly decay).
+      2. Blend in a small, LEARNED per-league adjustment
+         (_learned_league_goal_timing_adjustment) instead of a hardcoded
+         league list -- some leagues genuinely spark up late, some don't,
+         and that's now read from real resolved match history rather than
+         guessed.
+
+    Scoped deliberately: match_result / live_match_winner / other non-goal-
+    timing live picks are untouched by any of this.
+    """
     if not is_live or minute < 46:
         return picks
 
     decay = _time_decay_multiplier(minute)
+    league_adj = _learned_league_goal_timing_adjustment(match)
+
+    both_scored = home_goals is not None and away_goals is not None and home_goals > 0 and away_goals > 0
+    one_scored = (
+        home_goals is not None
+        and away_goals is not None
+        and not both_scored
+        and (home_goals > 0 or away_goals > 0)
+    )
+
     result = []
     for pick in picks:
         kind = pick.get("type", "")
+        selection = str(pick.get("selection") or "").lower()
         conf = pick["confidence"]
 
-        # Late-goal picks in high-late-goal leagues: boost instead of decay
-        if kind in ("live_goals", "late_goal") and late_goal_league:
-            # Slight boost for being in the prime late-goal window
+        is_btts = "btts" in selection or "both teams" in selection
+        is_btts_no = is_btts and "no" in selection
+        is_btts_yes = is_btts and not is_btts_no
+        is_goal_timing_pick = kind in ("live_goals", "late_goal", "live_next_goal", "live_total_goals") or is_btts
+
+        if is_btts_yes and both_scored:
+            # Already happened. The clock has nothing left to say about it.
+            new_conf = conf
+        elif is_btts_no and both_scored:
+            # Already contradicted by the score on the board -- collapse it
+            # rather than let a mild decay leave it looking live.
+            new_conf = 5
+        elif is_btts_yes and one_scored:
+            # Only the side that hasn't scored yet needs to -- an easier bar
+            # than "both from 0-0", so decay less harshly than the flat curve.
+            soft_decay = min(1.0, decay + (1 - decay) * 0.5)
+            new_conf = max(1, min(95, round(conf * soft_decay * (1 + league_adj))))
+        elif kind in ("live_goals", "late_goal") and (late_goal_league or league_adj > 0.03):
+            # Late-goal picks in a league whose learned (or, as a fallback,
+            # allowlisted) profile favours late goals: boost instead of decay.
             boost = 1.05 if minute >= 70 else 1.0
-            new_conf = max(1, min(95, round(conf * boost)))
+            new_conf = max(1, min(95, round(conf * boost * (1 + league_adj))))
+        elif is_goal_timing_pick:
+            new_conf = max(1, min(95, round(conf * decay * (1 + league_adj))))
         else:
             new_conf = max(1, min(95, round(conf * decay)))
 
@@ -272,7 +351,12 @@ def predict_sofascore_event(
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available data"))
 
     picks = _apply_conflict_safety_gate(picks, signals)
-    picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
+    picks = _apply_time_decay(
+        picks, minute, is_live, late_goal_league,
+        match=event,
+        home_goals=_to_int(score.get("home"), 0),
+        away_goals=_to_int(score.get("away"), 0),
+    )
 
     return {
         "match_id": event.get("id"),
@@ -328,7 +412,10 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available live data"))
 
     late_goal_league_sporty = _is_high_late_goal_league(f"{category} {tournament}")
-    picks = _apply_time_decay(picks, minute, is_live_sporty, late_goal_league_sporty)
+    picks = _apply_time_decay(
+        picks, minute, is_live_sporty, late_goal_league_sporty,
+        match=match, home_goals=home_goals, away_goals=away_goals,
+    )
 
     return {
         "match_id": match.get("id"),

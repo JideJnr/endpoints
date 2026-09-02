@@ -27,6 +27,12 @@ class BetBuilderRequest(BaseModel):
     request_code: bool = False
 
 
+class SmartBetRequest(BaseModel):
+    stake: int = Field(default=100, gt=0)
+    candidate_limit: int = Field(default=50, gt=0, le=200)
+    request_code: bool = False
+
+
 @router.post("/manual")
 def manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
     """
@@ -61,6 +67,30 @@ def llm_bet(body: BetBuilderRequest) -> dict[str, Any]:
     return run_llm_bet(
         target_odds=body.target_odds,
         max_total_odds=body.max_total_odds,
+        stake=body.stake,
+        candidate_limit=body.candidate_limit,
+        request_code=body.request_code,
+    )
+
+
+@router.post("/smart")
+def smart_bet(body: SmartBetRequest) -> dict[str, Any]:
+    """
+    Smart bet builder — no target odds.
+
+    Reads stored unified predictions, scores them with the same conviction
+    logic as the other two modes (learned pick accuracy, per-league
+    accuracy, signal-combination history), and includes every pick whose
+    conviction clears its own learned bar. Combined odds is whatever
+    results from stacking every leg that earns its place -- there's no
+    target to hit and nothing trims the slip back down once it grows.
+
+    Returns status "no_smart_bet" (not a weak fallback pick) on a day
+    nothing clears the bar. No LLM calls.
+    """
+    from app.bet_builder.smart_builder import run_smart_bet
+
+    return run_smart_bet(
         stake=body.stake,
         candidate_limit=body.candidate_limit,
         request_code=body.request_code,

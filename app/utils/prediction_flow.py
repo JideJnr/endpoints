@@ -71,6 +71,7 @@ def predict_and_record_enriched(
             "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
             "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
             "source": source,
+            "engine": "ai_llm" if prediction.get("prediction_source") == "llm_pipeline" else "deterministic",
         })
         return prediction
 
@@ -95,6 +96,7 @@ def predict_and_record_enriched(
                 "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
                 "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
                 "source": source,
+                "engine": "ai_llm",
             })
             return prediction
 
@@ -117,6 +119,7 @@ def predict_and_record_enriched(
         "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
         "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
         "source": source,
+        "engine": "deterministic",
     })
     return prediction
 
@@ -143,6 +146,11 @@ def apply_prediction_state(
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
         doc["prediction_readiness"] = readiness
         prediction_mode = _prediction_mode_from_readiness(readiness)
+        cooldown_engine = (
+            "ai_llm"
+            if (prebuilt_prediction or {}).get("prediction_source") == "llm_pipeline" or use_llm_pipeline
+            else "deterministic"
+        )
         if resolved_match_id and not allow_repeat:
             cooldown_minutes = 3 if prediction_mode == "live" else 180
             if (
@@ -151,7 +159,9 @@ def apply_prediction_state(
                 and "sofascore" in (readiness.get("live_data_sources") or [])
             ):
                 cooldown_minutes = 2
-            recent = _recent_ungraded_prediction(resolved_match_id, minutes=cooldown_minutes, prediction_mode=prediction_mode)
+            recent = _recent_ungraded_prediction(
+                resolved_match_id, minutes=cooldown_minutes, prediction_mode=prediction_mode, engine=cooldown_engine
+            )
             if recent:
                 return {
                     "status": "skipped",
@@ -217,8 +227,20 @@ def apply_prediction_state(
         }
 
 
-def _recent_ungraded_prediction(match_id: str, *, minutes: int, prediction_mode: str = "prematch") -> dict[str, Any] | None:
-    """Return the most recent ungraded prediction for match_id within a time window."""
+def _recent_ungraded_prediction(
+    match_id: str, *, minutes: int, prediction_mode: str = "prematch", engine: str = "deterministic"
+) -> dict[str, Any] | None:
+    """Return the most recent ungraded prediction for match_id within a time window.
+
+    Scoped to `engine`: this cooldown exists to stop one engine from
+    re-predicting the same match over and over, not to stop a SECOND engine
+    from also having a say. Without the engine filter, the deterministic
+    engine (which fires immediately on every enrichment pass) would always
+    win this check and permanently block the AI pipeline's attempt at the
+    same match -- the AI would burn a real LLM call and then have its result
+    silently discarded by this gate. Each engine gets its own independent
+    cooldown clock against itself.
+    """
     if not match_id or minutes <= 0:
         return None
     with db_conn(timeout=10) as conn:
@@ -229,13 +251,14 @@ def _recent_ungraded_prediction(match_id: str, *, minutes: int, prediction_mode:
             from prediction_history
             where match_id = ?
               and coalesce(prediction_mode, 'prematch') = ?
+              and coalesce(engine, 'deterministic') = ?
               and graded_at is null
               and pick_type != 'no_bet'
               and datetime(created_at) >= datetime('now', ?)
             order by datetime(created_at) desc, id desc
             limit 1
             """,
-            (match_id, prediction_mode, f"-{int(minutes)} minutes"),
+            (match_id, prediction_mode, engine, f"-{int(minutes)} minutes"),
         ).fetchone()
         if not row:
             return None

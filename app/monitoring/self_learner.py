@@ -577,8 +577,21 @@ def run_learning_cycle() -> dict[str, Any]:
 
         # Learned model weights — prefer direct models_json accuracy,
         # fall back to signal-based heuristics when models_json is empty.
+        #
+        # "goal_model_family" (not separate "dixon_coles"/"poisson" keys):
+        # those two models are almost always reported as one combined
+        # "goal_model_family" signal (they're correlated goal-scoring models,
+        # deliberately not double-counted as two independent votes -- see
+        # enriched_prediction.py::_model_signals and app/models/ensemble.py).
+        # model_signal_map above already tracks accuracy under the
+        # "goal_model_family" key to match; this dict previously used
+        # separate "dixon_coles"/"poisson" keys that model_stats/
+        # direct_model_stats never actually populated (confirmed: 0 of 376
+        # graded predictions), so neither model could ever clear MIN_SAMPLES
+        # and both silently got weight=0 in the ensemble blend forever.
+        # 0.30 + 0.15 preserves the same total default weight as before.
         base_weights = {
-            "dixon_coles": 0.30, "elo": 0.25, "poisson": 0.15,
+            "goal_model_family": 0.45, "elo": 0.25,
             "rules": 0.20, "openrouter": 0.10,
         }
         for model in base_weights:

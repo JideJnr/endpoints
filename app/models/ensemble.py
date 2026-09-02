@@ -5,10 +5,26 @@ from typing import Any
 
 
 # Hardcoded fallback weights — overridden by learned weights when enough data exists
+#
+# "goal_model_family" combines Poisson and Dixon-Coles into one learnable
+# slot (0.30 + 0.15 from the old separate weights, so the total influence is
+# unchanged from before this fix). They're correlated goal-scoring models
+# built the same way, so they're intentionally never weighted as two
+# independent "votes" -- see the matching "goal_model_family" signal built in
+# enriched_prediction.py::_model_signals, which merges them for the exact
+# same reason. Previously the weight-LEARNING code (self_learner.py,
+# learned_parameters.py) still looked for separate "dixon_coles"/"poisson"
+# keys that the signal layer almost never emits (confirmed: 0 of 376 graded
+# predictions ever had either name on its own), so neither model could ever
+# earn a learned weight -- they silently contributed 0 to every blended
+# prediction, regardless of how much graded data existed. That's why the
+# ensemble's draw% was so often identical across unrelated matches: with the
+# real goal models zeroed out, the blend was driven almost entirely by elo
+# and rules, whose own draw estimates are both the same generic
+# distance-from-50 formula, not a real per-match calculation.
 _BASE_WEIGHTS: dict[str, float] = {
-    "dixon_coles": 0.30,
+    "goal_model_family": 0.45,
     "elo": 0.25,
-    "poisson": 0.15,
     "rules": 0.20,
     "llm": 0.10,
 }
@@ -179,9 +195,29 @@ def ensemble_prediction(
         scores["away_win"] += float(probs.get("away_win") or 0) * weight / 100
         total_weight += weight
 
-    if dixon and dixon.get("probabilities"):
-        _add(dixon["probabilities"], weights.get("dixon_coles", 0.0))
+    # Poisson and Dixon-Coles are correlated goal-scoring models -- treat them
+    # as one "goal_model_family" contribution with one learned weight instead
+    # of two separate ones, matching how the signal layer already reports
+    # them (see enriched_prediction.py::_model_signals) and how the weight
+    # LEARNING code now tracks them (see _BASE_WEIGHTS above for the full
+    # why). When both are available, average their probabilities so the
+    # family's overall influence stays equal to one model's weight, not two.
+    has_dixon = bool(dixon and dixon.get("probabilities"))
+    has_poisson = bool(poisson and poisson.get("probabilities"))
+    if has_dixon and has_poisson:
+        goal_family_probs = {
+            outcome: (float(dixon["probabilities"].get(outcome) or 0) + float(poisson["probabilities"].get(outcome) or 0)) / 2
+            for outcome in ("home_win", "draw", "away_win")
+        }
+        _add(goal_family_probs, weights.get("goal_model_family", 0.0))
         models_used.append("dixon_coles")
+        models_used.append("poisson")
+    elif has_dixon:
+        _add(dixon["probabilities"], weights.get("goal_model_family", 0.0))
+        models_used.append("dixon_coles")
+    elif has_poisson:
+        _add(poisson["probabilities"], weights.get("goal_model_family", 0.0))
+        models_used.append("poisson")
     if elo:
         draw_estimate = max(5, 30 - abs(float(elo["home_win_probability"]) - 50) * 0.4)
         _add(
@@ -193,9 +229,6 @@ def ensemble_prediction(
             weights.get("elo", 0.0),
         )
         models_used.append("elo")
-    if poisson and poisson.get("probabilities"):
-        _add(poisson["probabilities"], weights.get("poisson", 0.0))
-        models_used.append("poisson")
 
     rules_prob = max(0, min(100, rules_confidence))
     pick = str(rules_pick or "").lower()

@@ -1517,7 +1517,7 @@ def get_grading_metrics() -> dict[str, Any]:
                                 id desc
                         ) as rn
                     from prediction_history ph
-                    where pick_type != 'no_bet'
+                    where pick_type != 'no_bet' and coalesce(is_final, 1) = 1
                 )
                 where rn = 1
             )
@@ -1542,7 +1542,7 @@ def get_grading_metrics() -> dict[str, Any]:
                                 id desc
                         ) as rn
                     from prediction_history ph
-                    where graded_at is not null and pick_type != 'no_bet'
+                    where graded_at is not null and pick_type != 'no_bet' and coalesce(is_final, 1) = 1
                 )
                 where rn = 1
             )
@@ -1563,7 +1563,7 @@ def get_grading_metrics() -> dict[str, Any]:
                             order by datetime(coalesce(graded_at, created_at)) desc, id desc
                         ) as rn
                     from prediction_history ph
-                    where graded_at is not null and pick_type != 'no_bet'
+                    where graded_at is not null and pick_type != 'no_bet' and coalesce(is_final, 1) = 1
                 )
                 where rn = 1
             )
@@ -1714,8 +1714,23 @@ def weighted_signal_combination_memory(
         samples += row["samples"]
     win_rate = weighted / weight_total if weight_total else None
     adjustment = 0
-    if win_rate is not None and samples >= 3:
-        adjustment = round((win_rate - 0.52) * 20)
+    if win_rate is not None:
+        # weight_total is already a graceful confidence measure: each scope's
+        # sample_factor (samples/20, capped at 1.0) damps a thin scope down
+        # before it's even blended, so a single exact-combo sample naturally
+        # contributes ~0.035 of full weight (0.70 * 1/20), not zero. The old
+        # hard `samples >= 3` gate threw that damped signal away entirely --
+        # in practice, real data (checked in production) shows ~250 distinct
+        # combination keys from 257 graded rows, i.e. the exact scope is a
+        # singleton for the vast majority of combinations, so almost nothing
+        # ever cleared that gate. Scaling by weight_total instead means a
+        # single sample nudges by a fraction of a point (rounds to 0 when
+        # truly negligible) and a well-populated exact/league match can still
+        # reach the full +-10 range -- graceful, not all-or-nothing, and it
+        # gets stronger automatically as more graded outcomes accumulate.
+        raw_adjustment = (win_rate - 0.52) * 20
+        confidence_factor = min(1.0, weight_total)
+        adjustment = round(raw_adjustment * confidence_factor)
         adjustment = max(-10, min(10, adjustment))
     return {
         "samples": samples,

@@ -25,7 +25,7 @@ from app.competition.league_strength import league_strength_score
 from app.competition.competition_registry import get_team_competition_stats
 from app.monitoring.self_learner import (
     get_signal_weights, get_league_accuracy, get_learned_weights,
-    get_signal_combination_performance, get_learned_thresholds,
+    get_learned_thresholds,
 )
 from app.utils.primitives import _to_int, _to_float
 
@@ -650,18 +650,22 @@ def _rules_model(
 
     # -- Phase 4d: signal combination performance ----------------------------
     # If this exact signal combination has a tracked win_rate, nudge confidence.
+    # Uses weighted_signal_combination_memory (the same real, league-weighted
+    # memory the core prediction path uses) rather than build_signal_combination
+    # called positionally + get_signal_combination_performance -- that older
+    # pairing always raised TypeError against the current keyword-only
+    # build_signal_combination signature (silently swallowed below) and read
+    # from signal_combination_memory, a table with zero rows in production.
     try:
-        from app.signal_combinations import build_signal_combination  # noqa: PLC0415
+        from app.storage.league_memory import weighted_signal_combination_memory  # noqa: PLC0415
         _signals_for_combo = [
             {"name": _SIGNAL_NAME.get(pick_type, "recent_history_edge"), "impact": raw_score * 10}
         ]
-        _combo = build_signal_combination(_signals_for_combo, pick_type, selection)
-        _combo_perf = get_signal_combination_performance(
-            _combo["key"], league=str(tournament), pick_type=pick_type
+        _combo_memory = weighted_signal_combination_memory(
+            match_doc, _signals_for_combo, pick_type, selection
         )
-        if _combo_perf["win_rate"] is not None and _combo_perf["samples"] >= 5:
-            # win_rate > 0.55 -> boost up to +6; < 0.45 -> cut up to -6
-            combo_nudge = int((_combo_perf["win_rate"] - 0.50) * 12)
+        combo_nudge = int(_combo_memory.get("adjustment") or 0)
+        if combo_nudge:
             confidence = max(1, min(88, confidence + max(-6, min(6, combo_nudge))))
     except Exception:
         pass

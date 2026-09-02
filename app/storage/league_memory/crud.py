@@ -225,6 +225,21 @@ def run_memory_maintenance(raw_retention_days: int = 30, odds_retention_days: in
     }
 
 
+def _engine_for_prediction(prediction: dict[str, Any]) -> str:
+    """Fallback engine tag when the caller didn't set prediction['engine'] explicitly.
+
+    run_ai_prediction_with_fallback (app/ai/ai_prediction_pipeline.py) sets
+    prediction_source='llm_pipeline' on a real LLM decision; the legacy
+    use_llm_pipeline branch in predict_and_record_enriched does the same.
+    Everything else (the deterministic/Poisson engine, and the rules-engine
+    fallback -- which IS the deterministic engine, just reached via a
+    different caller) is 'deterministic'.
+    """
+    if prediction.get("prediction_source") == "llm_pipeline":
+        return "ai_llm"
+    return "deterministic"
+
+
 def record_prediction(prediction: dict[str, Any]) -> None:
     _init_db()
     match_id = str(prediction.get("match_id") or "")
@@ -252,6 +267,8 @@ def record_prediction(prediction: dict[str, Any]) -> None:
         return
     if (best_pick.get("confidence") or 0) < 55:
         return
+    engine = str(prediction.get("engine") or _engine_for_prediction(prediction))
+
     with _conn() as conn:
         match_name_key = _prediction_text_key(prediction.get("name"))
         league_name_key = _prediction_text_key(league_name)
@@ -262,6 +279,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
             where coalesce(prediction_mode, 'prematch') = ?
               and pick_type = ?
               and selection = ?
+              and coalesce(engine, 'deterministic') = ?
               and (
                     match_id = ?
                  or (
@@ -278,6 +296,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 prediction.get("prediction_mode") or "prematch",
                 best_pick.get("type"),
                 best_pick.get("selection"),
+                engine,
                 match_id,
                 match_name_key,
                 match_name_key,
@@ -293,9 +312,10 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 confidence, reason, signals_json, picks_json, audit_json,
                 country_name, sofascore_id, sportybet_id, prediction_mode,
                 data_source, live_data_sources_json, models_json,
-                signal_combination_key, signal_combination_json, live_context_json, created_at
+                signal_combination_key, signal_combination_json, live_context_json,
+                engine, is_final, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             """,
             (
                 source,
@@ -319,9 +339,27 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 combination.get("key"),
                 json.dumps(combination.get("payload") or {}),
                 json.dumps(live_context),
+                engine,
+                1,
             ),
         )
         conn.commit()
+
+    # ── Dual-engine consolidation: if the OTHER engine also has a live,
+    # unarbitrated prediction for this match, decide which one counts as THE
+    # pick now that both exist, instead of leaving both marked is_final=1. ──
+    try:
+        from app.ai.engine_arbitration import arbitrate_dual_engine_prediction
+
+        arbitrate_dual_engine_prediction(
+            match_id=match_id,
+            league_name=league_name,
+            just_recorded_engine=engine,
+        )
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+
+        record_health_event("league_memory", "engine_arbitration_failed", exc, match_id=match_id)
 
     # ── Record CLV entry: capture entry odds at prediction time ────────────────
     try:

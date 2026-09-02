@@ -62,9 +62,30 @@ def close_db() -> None:
 
 @contextmanager
 def db_conn(timeout: int = DEFAULT_TIMEOUT_SECONDS) -> Iterator[sqlite3.Connection]:
-    """Yield a short-lived connection with consistent WAL and busy-timeout pragmas."""
-    with connect_db(timeout=timeout) as conn:
-        yield conn
+    """Yield a short-lived connection with consistent WAL and busy-timeout pragmas.
+
+    IMPORTANT: sqlite3.Connection's own context-manager protocol
+    (`with conn:`) only commits or rolls back the open transaction -- it
+    does NOT close the connection (a well-known stdlib gotcha). Every
+    caller across this app uses `with db_conn(...) as conn:` /
+    `with _conn(...) as conn:` expecting a short-lived connection, so this
+    wrapper explicitly closes it afterward. Without this, every one of the
+    ~300 call sites throughout the app leaked a raw OS-level file handle to
+    the database on every single call, for the entire lifetime of the
+    process -- the connection was never returned, just abandoned for the
+    garbage collector to maybe clean up eventually. That's the most likely
+    real cause of persistent "database is locked" / "disk I/O error"
+    symptoms that get worse the longer the app has been running: leaked
+    handles pile up, and in WAL mode any connection still holding a read
+    lock (even an abandoned one waiting on GC) blocks the WAL file from
+    being checkpointed back into the main database file.
+    """
+    conn = connect_db(timeout=timeout)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _is_sqlite_lock(exc: Exception) -> bool:
@@ -168,6 +189,13 @@ def _ensure_prediction_history_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "prediction_history", "signal_combination_key", "text")
     _ensure_column(conn, "prediction_history", "signal_combination_json", "text not null default '{}'")
     _ensure_column(conn, "prediction_history", "live_context_json", "text not null default '{}'")
+    # Dual-engine consolidation: which engine produced this row ('deterministic'
+    # or 'ai_llm'), and whether it's the one actually shown/counted as THE pick
+    # for its match after arbitration between the two engines. is_final defaults
+    # to 1 so every pre-existing, single-engine row keeps behaving exactly as
+    # before -- only a row that lost an arbitration comparison ever gets set to 0.
+    _ensure_column(conn, "prediction_history", "engine", "text not null default 'deterministic'")
+    _ensure_column(conn, "prediction_history", "is_final", "integer not null default 1")
 
 
 def _ensure_match_fact_columns(conn: sqlite3.Connection) -> None:

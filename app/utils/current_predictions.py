@@ -23,12 +23,12 @@ def list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list
                 """
                 select id, source, match_id, match_name, league_name, country_name,
                        pick_type, selection, confidence, reason, signals_json,
-                       picks_json, created_at, result, graded_at
+                       picks_json, created_at, result, graded_at, engine, is_final
                 from prediction_history
                 where created_at >= datetime('now', ?)
                   and graded_at is null
                   and pick_type != 'no_bet'
-                order by created_at desc
+                order by coalesce(is_final, 1) desc, created_at desc
                 limit ?
                 """,
                 (f"-{int(hours)} hours", int(limit)),

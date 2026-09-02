@@ -804,16 +804,85 @@ def _tournament_key(tournament_id: int, tournament: dict[str, Any]) -> str:
 
 
 def _ensure_dynamic_competition(conn: sqlite3.Connection, key: str, name: str, tournament_id: int) -> None:
-    """Upsert a competition_special_settings row for any dynamically discovered competition."""
+    """Upsert a competition_special_settings row for any dynamically discovered competition.
+
+    IMPORTANT: enabled defaults to 0 here, not 1. A previous version of this
+    function auto-enabled every competition it had ever seen a single match
+    from, which meant the always-on job_competition_special scheduler job
+    (see app/scheduling/scheduler.py) ended up running the expensive
+    day-by-day SofaScore fixture-sync (sync_competition_fixtures) for ~297
+    leagues instead of the ~30 the TOP_30_COMPETITIONS catalogue actually
+    curates for — including things like a Swedish district-level 5th tier
+    league pulling more ingestion volume than Bundesliga. Being "known" (row
+    exists here, so apply_known_competition_context() and the
+    competition_intelligence signal in enriched_prediction.py can tag/score
+    the match) is deliberately kept separate from being "enabled" (runs the
+    always-on fixture-sync job) -- the DB lookup in
+    apply_known_competition_context() does not filter by enabled, so
+    creating this row still gets the match tagged even while disabled. An
+    operator can still deliberately flip a specific dynamic competition on
+    via update_competition_settings() / the settings UI.
+
+    Also guards against creating a second row for a tournament_id that
+    already has a settings row under a different key (this happened for
+    real: 'championship' the curated key and 'championship-18' a dynamic
+    duplicate both pointed at unique_tournament_id 18) -- if any row for
+    this tournament_id already exists, skip inserting a duplicate entirely.
+    """
+    existing = conn.execute(
+        "select key from competition_special_settings where unique_tournament_id = ? limit 1",
+        (tournament_id,),
+    ).fetchone()
+    if existing:
+        return
     conn.execute(
         """
         insert into competition_special_settings
             (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
-        values (?, ?, 1, ?, null, '', '', ?)
+        values (?, ?, 0, ?, null, '', '', ?)
         on conflict(key) do nothing
         """,
         (key, name, tournament_id, json.dumps({"source": "ingest", "mode": "dynamic"})),
     )
+
+
+def disable_dynamic_competitions() -> dict[str, Any]:
+    """
+    One-time (idempotent, safe to re-run) cleanup for the auto-enable bug
+    fixed in _ensure_dynamic_competition above: disables every currently
+    ENABLED competition_special_settings row that was dynamically
+    auto-registered (metadata_json.mode == "dynamic"), stopping their
+    day-by-day SofaScore fixture-sync immediately. Does not delete any rows
+    or history, and does not touch the curated TOP_30_COMPETITIONS /
+    World Cup rows (metadata_json.mode == "competition_special") or any row
+    an operator has manually configured with different metadata. Reversible
+    per-key via update_competition_settings().
+    """
+    _init_db()
+    with db_conn() as conn:
+        init_competition_tables(conn)
+        before = conn.execute(
+            "select count(*) from competition_special_settings where enabled = 1"
+        ).fetchone()[0]
+        cur = conn.execute(
+            """
+            update competition_special_settings
+            set enabled = 0, updated_at = current_timestamp
+            where enabled = 1
+              and json_extract(metadata_json, '$.mode') = 'dynamic'
+            """
+        )
+        disabled = cur.rowcount
+        after = conn.execute(
+            "select count(*) from competition_special_settings where enabled = 1"
+        ).fetchone()[0]
+        conn.commit()
+    return {
+        "status": "success",
+        "enabled_before": before,
+        "disabled": disabled,
+        "enabled_after": after,
+    }
 
 
 def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:

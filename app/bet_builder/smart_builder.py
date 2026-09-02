@@ -1,12 +1,21 @@
 """
-Bet Builder — Manual (Deterministic)
-=====================================
-Ranks candidates using stored prediction data only.  No LLM calls.
+Bet Builder — Smart (Learned Conviction, No Target)
+====================================================
+Unlike the manual/LLM builders, this mode does not accept a target odds.
+It reads stored unified predictions, scores them with the same conviction
+logic (learned pick accuracy, league accuracy, signal-combination history),
+and includes every candidate whose conviction clears its own learned bar.
+Combined odds is whatever results from stacking every leg that earns its
+place — there is no target to hit and no ceiling to trim back down to.
+
+If nothing clears the bar today, this mode returns "no_smart_bet" rather
+than falling back to a weak pick — forcing a bet on a day nothing is
+actually confident about would defeat the point of a "smart" mode.
 
 Entry points
 ------------
-- rank_picks_deterministic(analyses, *, target_odds, max_total_odds) -> dict
-- run_manual_bet(...)  -> dict   (full pipeline: candidates → rank → book)
+- rank_picks_smart(analyses) -> dict
+- run_smart_bet(...) -> dict   (full pipeline: candidates -> rank -> book)
 """
 from __future__ import annotations
 
@@ -15,32 +24,20 @@ from typing import Any
 
 from app.bet_builder.core import (
     upcoming_prediction_candidates,
-    score_pick,
-    select_by_odds,
-    trim_to_ceiling,
+    select_by_conviction,
     combined_odds,
-    pick_decimal_odds,
     track_suggested_slip,
-    _best_pick,
     _rank_analyses,
-    _to_int,
-    _to_float,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def rank_picks_deterministic(
-    analyses: list[dict[str, Any]],
-    *,
-    target_odds: float,
-    max_total_odds: float,
-) -> dict[str, Any]:
+def rank_picks_smart(analyses: list[dict[str, Any]]) -> dict[str, Any]:
     """
-    Score and rank analyses without any LLM call.
-
-    Conviction is derived entirely from stored prediction data, research
-    conviction adjustments, league accuracy history, and signal combinations.
+    Score and select analyses using learned conviction only. No LLM call,
+    no target odds — every candidate that clears its own learned threshold
+    is included.
     """
     clean = [
         item for item in analyses
@@ -49,14 +46,10 @@ def rank_picks_deterministic(
     if len(clean) < 1:
         raise ValueError("At least one completed analysis is required")
 
-    ranked = _rank_analyses(analyses, "deterministic", "manual_pick")
+    ranked = _rank_analyses(analyses, "smart", "smart_pick")
+    selected = select_by_conviction(ranked)
 
-    selected = select_by_odds(ranked, target_odds, max_total_odds)
-    selected = trim_to_ceiling(selected, max_total_odds)
-    if not selected:
-        selected = ranked[:1]
-
-    _annotate_reasoning(selected, llm=False)
+    _annotate_smart_reasoning(selected)
 
     total = combined_odds(selected)
     avg_conf = (
@@ -70,31 +63,28 @@ def rank_picks_deterministic(
         "avg_confidence": avg_conf,
         "confirmed_count": sum(1 for i in selected if i.get("confirmed")),
         "no_consensus": not any(i.get("confirmed") for i in selected),
-        "target_not_met": total < target_odds,
-        "synthesis_reasoning": "Deterministic ranking — no LLM used.",
+        "synthesis_reasoning": "Learned-conviction selection — no target odds, no LLM used.",
     }
 
 
-def run_manual_bet(
-    target_odds: float = 1.80,
-    max_total_odds: float | None = None,
+def run_smart_bet(
     stake: int = 100,
     candidate_limit: int = 50,
     request_code: bool = False,
 ) -> dict[str, Any]:
     """
-    Full manual pipeline: fetch candidates → deterministic rank → book.
-    No LLM calls at any stage.
+    Full smart pipeline: fetch candidates -> conviction-only rank -> book.
+    No target odds, no LLM calls at any stage.
     """
     from app.data_clients.sportybet_booking import build_booking_payload, request_share_code
+    from app.bet_builder.manual_builder import _candidate_to_analysis
 
-    _max = max_total_odds or target_odds * 3.0
     candidates = upcoming_prediction_candidates(limit=candidate_limit)
     if not candidates:
         return {
             "status": "no_candidates",
             "message": "No upcoming ungraded predictions available for today/tomorrow that pass all filters (date, time, live status, odds, research gate, buffer data).",
-            "mode": "manual",
+            "mode": "smart",
             "candidates_considered": 0,
             "selections": [],
         }
@@ -102,12 +92,12 @@ def run_manual_bet(
     analyses = [_candidate_to_analysis(c) for c in candidates]
 
     try:
-        synthesis = rank_picks_deterministic(analyses, target_odds=target_odds, max_total_odds=_max)
+        synthesis = rank_picks_smart(analyses)
     except Exception as exc:
         return {
             "status": "synthesis_failed",
             "message": str(exc),
-            "mode": "manual",
+            "mode": "smart",
             "candidates_considered": len(candidates),
             "selections": [],
         }
@@ -115,18 +105,19 @@ def run_manual_bet(
     selected = synthesis.get("ranked_picks") or []
     if not selected:
         return {
-            "status": "no_selection",
-            "message": "Research gate left no bookable picks",
-            "mode": "manual",
+            "status": "no_smart_bet",
+            "message": "Nothing today clears the learned conviction bar for a smart bet. This is by design — the system won't force a pick just to have one.",
+            "mode": "smart",
+            "candidates_considered": len(candidates),
             "selections": [],
         }
 
     tracked = track_suggested_slip(
         selected,
-        mode="manual",
+        mode="smart",
         combined_odds_value=synthesis.get("combined_odds"),
         avg_confidence=synthesis.get("avg_confidence"),
-        extra_request={"target_odds": target_odds, "candidate_limit": candidate_limit},
+        extra_request={"candidate_limit": candidate_limit},
     )
 
     selections = [{
@@ -143,7 +134,7 @@ def run_manual_bet(
         return {
             "status": "booking_failed",
             "message": str(exc),
-            "mode": "manual",
+            "mode": "smart",
             "candidates_considered": len(candidates),
             "selections": selections,
             "betbuilder_id": tracked.get("id") if tracked else None,
@@ -151,12 +142,12 @@ def run_manual_bet(
 
     result: dict[str, Any] = {
         "status": "success",
-        "mode": "manual",
+        "mode": "smart",
         "research_gate": "applied",
-        "target_odds": target_odds,
         "combined_odds": synthesis.get("combined_odds"),
         "avg_confidence": synthesis.get("avg_confidence"),
         "confirmed_count": synthesis.get("confirmed_count"),
+        "leg_count": len(selected),
         "candidates_considered": len(candidates),
         "booking_payload": booking_payload,
         "selections": selected,
@@ -174,33 +165,10 @@ def run_manual_bet(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _candidate_to_analysis(candidate: dict[str, Any]) -> dict[str, Any]:
-    """Convert a stored prediction candidate into the analysis shape."""
-    pick = candidate.get("best_pick") or {}
-    return {
-        "match_id": candidate.get("match_id") or candidate.get("sportybet_id"),
-        "sportybet_id": candidate.get("sportybet_id") or candidate.get("match_id"),
-        "match_name": candidate.get("match_name") or candidate.get("name"),
-        "league_name": candidate.get("league_name") or candidate.get("tournament"),
-        "country_name": candidate.get("country_name") or candidate.get("category"),
-        "llm_recommendation": pick.get("selection"),
-        "llm_confidence": int(pick.get("confidence") or 0),
-        "prediction_engine_pick": pick,
-        "key_factors": pick.get("key_factors") or candidate.get("key_factors"),
-        "market_signal": candidate.get("market_signal") or pick.get("market_signal"),
-        "btts": candidate.get("btts") if candidate.get("btts") is not None else pick.get("btts"),
-        "over_2_5": candidate.get("over_2_5") if candidate.get("over_2_5") is not None else pick.get("over_2_5"),
-        "source": candidate.get("source") or pick.get("source") or "stored_prediction",
-        "status": "success",
-        "confirmed": bool(candidate.get("confirmed")),
-        "similar_matches_used": int(candidate.get("similar_matches_used") or 0),
-    }
-
-
-def _annotate_reasoning(picks: list[dict[str, Any]], *, llm: bool) -> None:
+def _annotate_smart_reasoning(picks: list[dict[str, Any]]) -> None:
     for item in picks:
         if not item.get("synthesis_reasoning"):
             if item.get("confirmed"):
-                item["synthesis_reasoning"] = "Prediction engine consensus pick."
+                item["synthesis_reasoning"] = "Prediction engine consensus pick, clears learned conviction bar."
             else:
-                item["synthesis_reasoning"] = "High-conviction deterministic pick."
+                item["synthesis_reasoning"] = "High-conviction pick backed by learned pick/league accuracy."

@@ -560,6 +560,20 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "team_watch_signal_error", exc)
 
+    # Competition intelligence signal (table position, recent form, long-term
+    # team-watcher edge — see _competition_intelligence_signal below). This
+    # data was previously computed by app/competition/competition_special.py
+    # but only ever reached an LLM as loose prompt context, never the
+    # deterministic signal list, so it was never weighted, calibrated, or
+    # learned the way every other signal here is.
+    try:
+        comp_signal = _competition_intelligence_signal(doc)
+        if comp_signal:
+            signals.append(comp_signal)
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("enriched_prediction", "competition_intelligence_signal_error", exc)
+
     # ── SofaScore grade signal ────────────────────────────────────────────────
     longshot_signal = _consensus_longshot_value_signal(doc, ensemble, poisson, dixon, elo, rules, odds_movement)
     if longshot_signal:
@@ -638,6 +652,12 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         })
     live_prior = {**ensemble, "probabilities": _blended_model_probabilities(ensemble, poisson, dixon)}
     live_picks = _live_inplay_picks(doc, detail, rules, live_prior, finished_memory, odds_movement) if is_live else []
+    if is_live:
+        try:
+            live_picks = live_picks + _live_grid_projection_picks(doc, detail, poisson, dixon, minute)
+        except Exception as exc:
+            from app.utils.health_counters import record_health_event
+            record_health_event("enriched_prediction", "live_grid_projection_call_failed", exc)
     if live_picks:
         signals.append({
             "name": "live_inplay_state",
@@ -652,7 +672,11 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     picks.extend(live_picks)
     if is_live and live_stats_available:
         _apply_live_stat_result_boosts(picks, detail, signals, minute)
-    picks = _apply_time_decay(picks, minute, is_live, late_goal_league)
+    live_home_goals, live_away_goals = _live_score(doc, detail) if is_live else (None, None)
+    picks = _apply_time_decay(
+        picks, minute, is_live, late_goal_league,
+        match=doc, home_goals=live_home_goals, away_goals=live_away_goals,
+    )
 
     # ── Confidence floor: ensure no non-no_bet pick is below 55 when ensemble ─
     # probability for the pick's outcome is at least 45 %.
@@ -2149,6 +2173,238 @@ def _draw_exclusion_fallback(ensemble: dict[str, Any]) -> dict[str, Any] | None:
     pick["draw_exclusion"] = True
     pick["source"] = "draw_exclusion_fallback"
     return pick
+
+
+def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Turns app/competition/competition_special.py's per-match competition
+    intelligence into an actual scored, weighted, self-learned signal.
+
+    BACKGROUND: apply_known_competition_context() already computes three
+    real numeric edges per match — table position (points-per-game),
+    recent-form (goal difference + opponent quality), and a long-term
+    AI team-watcher profile score. Investigation found this was previously
+    only ever read by app/ai/ai_brain.py, as loose unweighted JSON context
+    handed to an LLM — never by this deterministic signals list, and never
+    calibrated or learned the way every other signal here is (see
+    app/monitoring/self_learner.py get_signal_weights, keyed by
+    signal["name"], which this signal now participates in via the name
+    "competition_intelligence"). It also was frequently never even computed
+    at all for a given match, since apply_known_competition_context() is
+    only called from the manual/admin re-enrichment path and the AI
+    specialist path (app/enrichment/match_enrichment.py,
+    app/ai/ai_prediction_pipeline.py) — not from the main scheduled worker
+    (app/storage/buffer.py run_enrichment_worker) that most matches go
+    through. Calling it here directly (idempotent, DB + in-memory catalogue
+    lookups only, no network fetch) makes the signal actually available
+    regardless of which pipeline produced the doc.
+
+    SCALING (first pass, not yet calibrated against graded outcomes — same
+    caveat as app/live/live_pressure.py's pressing thresholds): table_edge
+    is a points-per-game difference (realistic range roughly -3..+3), while
+    strength_edge and watcher_edge are both differences of 1-99 scored
+    profiles (realistic range roughly -30..+30). Weights below are chosen so
+    each contributes a comparable amount before the final cap, not because
+    either has been proven more predictive — self_learner is what's meant to
+    correct that over time as this signal accumulates graded history.
+    """
+    try:
+        from app.competition.competition_special import apply_known_competition_context
+        from app.utils.primitives import _safe_num
+        apply_known_competition_context(doc)
+    except Exception:
+        return None
+
+    known = doc.get("known_competition") or {}
+    if not known.get("known"):
+        return None
+    intelligence = doc.get("competition_intelligence") or {}
+    if not intelligence:
+        return None
+
+    table = intelligence.get("table") or {}
+    strength = intelligence.get("team_strength") or {}
+    watchers = intelligence.get("team_watchers") or {}
+
+    contribution = 0.0
+    used: list[str] = []
+
+    if table.get("available") and table.get("standings_meaningful"):
+        edge = _safe_num(table.get("edge_ppg"))
+        if edge:
+            contribution += edge * 3.0
+            used.append("table")
+
+    strength_home = (strength.get("home") or {}) if isinstance(strength.get("home"), dict) else {}
+    strength_away = (strength.get("away") or {}) if isinstance(strength.get("away"), dict) else {}
+    # Guard against thin recent-form samples the way _longshot_quality_context
+    # already does elsewhere in this file (min sample < 4 -> too noisy to trust).
+    if int(strength_home.get("sample_size") or 0) >= 4 and int(strength_away.get("sample_size") or 0) >= 4:
+        edge = _safe_num(strength.get("edge"))
+        if edge:
+            contribution += edge * 0.15
+            used.append("form")
+
+    if watchers.get("available"):
+        edge = _safe_num(watchers.get("edge"))
+        if edge:
+            contribution += edge * 0.15
+            used.append("watcher")
+
+    if not used:
+        return None
+
+    impact = max(-8.0, min(8.0, contribution))
+    if abs(impact) < 0.5:
+        return None
+
+    return {
+        "name": "competition_intelligence",
+        "value": {
+            "competition": known.get("key"),
+            "components_used": used,
+            "table_edge_ppg": table.get("edge_ppg"),
+            "table_leader": table.get("leader"),
+            "form_edge": strength.get("edge"),
+            "form_leader": strength.get("leader"),
+            "watcher_edge": watchers.get("edge"),
+            "watcher_leader": watchers.get("leader"),
+            "direction": "home" if impact > 0 else "away",
+        },
+        "impact": round(impact, 2),
+    }
+
+
+def _live_grid_projection_picks(
+    doc: dict[str, Any],
+    detail: dict[str, Any],
+    poisson: dict[str, Any],
+    dixon: dict[str, Any],
+    minute: int,
+) -> list[dict[str, Any]]:
+    """
+    Live picks from the shared-probability-grid model in app/live/live_projection.py,
+    run ALONGSIDE (not instead of) the independent heuristics in
+    _live_inplay_picks below. Every market read off one call here (winner,
+    BTTS, over/under, next goal) comes from the SAME grid, so they can never
+    contradict each other for a given match — unlike the heuristics, which
+    score each market with its own separate hand-tuned formula.
+
+    Deliberately additive rather than a replacement: live_projection.py is a
+    prototype that has not been checked against real live outcomes yet (see
+    its own module docstring). Publishing both sets of candidates and letting
+    the normal confidence/clear_winner ranking in _finalize_prediction_output
+    pick the best one per market means the grid model has to actually win on
+    the numbers before it displaces the heuristics, rather than being trusted
+    on arrival.
+
+    Only wired into the main statistical path (predict_enriched_match), not
+    the thin-history fallback (_predict_thin_history) — that fallback runs
+    precisely when there isn't enough data for a real Poisson/Dixon-Coles fit,
+    and this model needs a genuine prematch home_lambda/away_lambda to seed
+    the remaining-time projection. Forcing it there would mean silently
+    falling back to a hardcoded default lambda instead of behaving
+    conservatively the way the rest of that fallback path already does.
+    """
+    if minute <= 0 or minute >= 90:
+        return []
+    live_summary = (doc.get("live_statistics") or {}).get("summary") or {}
+    if not live_summary:
+        # Same policy as _live_inplay_picks: never publish a live_* pick
+        # without real live statistics behind it.
+        return []
+
+    home_goals, away_goals = _live_score(doc, detail)
+    prematch_result = {
+        "home_lambda": (dixon or {}).get("home_lambda") or (poisson or {}).get("home_lambda"),
+        "away_lambda": (dixon or {}).get("away_lambda") or (poisson or {}).get("away_lambda"),
+    }
+    if not prematch_result["home_lambda"] or not prematch_result["away_lambda"]:
+        return []
+
+    try:
+        from app.live.live_projection import project_live_match
+        projection = project_live_match(
+            prematch_result,
+            elapsed_minutes=float(minute),
+            home_score=home_goals or 0,
+            away_score=away_goals or 0,
+            live_statistics_summary=live_summary,
+        )
+        grid_total = sum(projection.grid.values())
+        if abs(grid_total - 1.0) > 1e-4:
+            # Refuse to publish from a probability set that doesn't actually
+            # sum to 1 -- something upstream fed it a bad input.
+            return []
+    except Exception as exc:
+        try:
+            from app.utils.health_counters import record_health_event
+            record_health_event("enriched_prediction", "live_grid_projection_failed", exc)
+        except Exception:
+            pass
+        return []
+
+    pressure_note = ""
+    try:
+        from app.live.live_pressure import get_half_pressure
+        match_id = str(doc.get("sportybet_id") or doc.get("id") or doc.get("match_id") or "")
+        pressure = get_half_pressure(match_id) if match_id else None
+        current_half = (pressure or {}).get("second_half") or (pressure or {}).get("first_half")
+        team_pressing = current_half.get("pressing_team") if current_half else None
+        if team_pressing:
+            side_name = _team_name(doc, team_pressing) or team_pressing
+            pressure_note = f"; {side_name} pressing this half (dangerous attacks + shots)"
+    except Exception:
+        pressure_note = ""
+
+    diag = projection.diagnostics
+    xg_note = (
+        f"live xG so far {diag.get('home_xg_so_far')}-{diag.get('away_xg_so_far')} "
+        f"({diag.get('home_xg_source')}/{diag.get('away_xg_source')})"
+    )
+    lambda_note = f"remaining lambdas {round(projection.home_lambda_remaining, 2)}/{round(projection.away_lambda_remaining, 2)}"
+
+    home_name = _team_name(doc, "home") or "Home"
+    away_name = _team_name(doc, "away") or "Away"
+    picks: list[dict[str, Any]] = []
+
+    winner = projection.match_winner()
+    winner_map = {home_name: winner.get("home_win", 0.0), "Draw": winner.get("draw", 0.0), away_name: winner.get("away_win", 0.0)}
+    best_selection = max(winner_map, key=winner_map.get)
+    if winner_map[best_selection] >= 0.55:
+        picks.append(_pick(
+            "live_match_winner_grid",
+            f"{best_selection} to win (grid)",
+            round(winner_map[best_selection] * 100, 1),
+            f"shared-grid live model, {lambda_note}; {xg_note}{pressure_note}",
+        ))
+
+    btts_prob = projection.btts()
+    if btts_prob >= 0.55:
+        picks.append(_pick("live_btts_grid", "BTTS Yes (grid)", round(btts_prob * 100, 1), f"joint grid model; {xg_note}{pressure_note}"))
+    elif (1 - btts_prob) >= 0.55:
+        picks.append(_pick("live_btts_grid", "BTTS No (grid)", round((1 - btts_prob) * 100, 1), f"joint grid model; {xg_note}{pressure_note}"))
+
+    current_total = (home_goals or 0) + (away_goals or 0)
+    for line in (current_total + 0.5, current_total + 1.5):
+        ou = projection.over_under(line)
+        if ou["over"] >= 0.55:
+            picks.append(_pick("live_total_goals_grid", f"Over {line:g} (grid)", round(ou["over"] * 100, 1), f"joint grid model; {xg_note}{pressure_note}"))
+        elif ou["under"] >= 0.55:
+            picks.append(_pick("live_total_goals_grid", f"Under {line:g} (grid)", round(ou["under"] * 100, 1), f"joint grid model; {xg_note}{pressure_note}"))
+
+    next_goal = projection.next_goal()
+    next_goal_map = {home_name: next_goal.get("home_scores_next", 0.0), away_name: next_goal.get("away_scores_next", 0.0)}
+    best_next = max(next_goal_map, key=next_goal_map.get)
+    if next_goal_map[best_next] >= 0.40 and next_goal.get("no_more_goals", 1.0) < 0.50:
+        picks.append(_pick(
+            "live_next_goal_grid",
+            f"{best_next} to score next (grid)",
+            round(next_goal_map[best_next] * 100, 1),
+            f"competing-Poisson next-scorer read, {lambda_note}; {xg_note}{pressure_note}",
+        ))
+
+    return _dedupe_picks(picks)
 
 
 def _live_inplay_picks(
@@ -4384,7 +4640,42 @@ def _apply_publication_filters(prediction: dict[str, Any], picks: list[dict[str,
         # should not inherit clear_winner status either.
         if outright_side is None:
             hedge_side = "home" if normalized == "home or draw" else "away" if normalized == "away or draw" else None
-            if hedge_side and _unanimous_side_signal_agreement(direction) == hedge_side:
+            # Require h2h_edge specifically to be one of the agreeing signals,
+            # not just silent. Checked against real graded results: upgrades
+            # where h2h had no opinion (absent from `direction` -- too little
+            # head-to-head history to clear the impact threshold) won 62.5%
+            # (5/8 graded), vs 68.8% (11/16 graded) when h2h actually agreed.
+            # Small samples, but consistent with the general principle here --
+            # unanimous-minus-one isn't the same as unanimous, and h2h is too
+            # informative a signal to let sit out. If h2h has no real opinion
+            # on this match, the hedge stays a hedge.
+            #
+            # Also require the model's OWN draw probability to be genuinely
+            # low. The side-evidence signals above (h2h_edge included) are a
+            # pure home-vs-away axis -- none of them can express "these two
+            # draw a lot" even when the real data says so (found this by
+            # hand on HamKam vs Kristiansund BK: real head-to-head was 3-5-2,
+            # draws the single most common result, yet every side-evidence
+            # signal was silent on it because the axis has no way to vote
+            # draw -- the pick upgraded to Home Win anyway and lost to a
+            # 2-2). The ensemble's draw% (Poisson/Dixon-Coles-driven, only
+            # trustworthy as of the goal_model_family weight-learning fix)
+            # is where a real draw-heavy read actually shows up, so it gets
+            # a veto here: a hedge that's protecting against a draw the
+            # model itself sees as live shouldn't be stripped of that
+            # protection just because home-vs-away evidence agrees on a
+            # side. UPGRADE_MAX_DRAW_PROBABILITY is a first-pass number
+            # (a bit above a typical league's average draw rate), not yet
+            # calibrated against graded outcomes -- same honest-uncertainty
+            # caveat as the other new thresholds this session.
+            draw_probability = _ensemble_draw_probability(signals)
+            draw_is_low = draw_probability is None or draw_probability < UPGRADE_MAX_DRAW_PROBABILITY
+            if (
+                hedge_side
+                and _unanimous_side_signal_agreement(direction) == hedge_side
+                and direction.get("h2h_edge") == hedge_side
+                and draw_is_low
+            ):
                 agreeing = sorted(direction.keys())
                 new_selection = "Home Win" if hedge_side == "home" else "Away Win"
                 ensemble_probability = _ensemble_side_probability(signals, hedge_side)
@@ -4498,6 +4789,31 @@ def _ensemble_side_probability(signals: list[dict[str, Any]], side: str) -> floa
     probabilities = (ensemble.get("value") or {}).get("probabilities") or {}
     key = "home_win" if side == "home" else "away_win"
     return _to_float(probabilities.get(key))
+
+
+# Above this ensemble draw%, a Home-or-Draw/Away-or-Draw hedge does not get
+# upgraded to an outright win even with full side-evidence agreement -- see
+# the upgrade branch in _apply_publication_filters for the full reasoning.
+# Set a bit above a typical league's average draw rate (roughly 24-27% across
+# most leagues); a first-pass number, not yet calibrated against graded
+# outcomes.
+UPGRADE_MAX_DRAW_PROBABILITY = 28.0
+
+
+def _ensemble_draw_probability(signals: list[dict[str, Any]]) -> float | None:
+    """The ensemble model's own draw probability, if the ensemble_model
+    signal is present. Unlike the side-evidence signals (h2h_edge, odds_edge,
+    etc, all of which are a pure home-vs-away axis with no way to express
+    "these two draw a lot"), this number comes from the Poisson/Dixon-Coles
+    goal-scoring models and is a genuine per-match draw estimate -- see
+    app/models/ensemble.py's "goal_model_family" weight-learning fix for the
+    full story on why this number is only trustworthy as of that fix.
+    """
+    ensemble = next((s for s in signals if s.get("name") == "ensemble_model"), None)
+    if not ensemble:
+        return None
+    probabilities = (ensemble.get("value") or {}).get("probabilities") or {}
+    return _to_float(probabilities.get("draw"))
 
 
 def _directional_signal_map(signals: list[dict[str, Any]]) -> dict[str, str]:

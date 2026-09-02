@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError
@@ -48,6 +49,16 @@ from urllib.error import HTTPError
 from app.config.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# How long an availability check result is trusted before re-checking.
+# Asymmetric on purpose: a model that just proved itself healthy doesn't need
+# re-pinging every call, but a model that failed should be retried soon --
+# previously a single bad/slow ping at process start-up (a 5s-timeout ping to
+# OpenRouter's free tier, which is often slow or rate-limited) cached
+# "unavailable" with NO expiry, so the LLM was silently skipped for the
+# entire remaining lifetime of the process. That's the bug this fixes.
+_AVAILABILITY_TTL_OK_SECONDS = 300.0
+_AVAILABILITY_TTL_FAIL_SECONDS = 60.0
 
 # ── Model catalogue ────────────────────────────────────────────────────────
 
@@ -78,7 +89,7 @@ class AIRouter:
         self._timeout_analysis = timeout_analysis
         self._timeout_reasoning = timeout_reasoning
         self._timeout_review = timeout_review
-        self._availability_cache: dict[str, bool] = {}
+        self._availability_cache: dict[str, tuple[bool, float]] = {}
         self._last_provider: str | None = None
 
     # ── Public call surface ────────────────────────────────────────────────
@@ -134,9 +145,16 @@ class AIRouter:
     # ── Availability helpers ───────────────────────────────────────────────
 
     def is_available(self, model: str) -> bool:
-        if model not in self._availability_cache:
-            self._availability_cache[model] = self._check_openrouter(model)
-        return self._availability_cache[model]
+        cached = self._availability_cache.get(model)
+        now = time.monotonic()
+        if cached is not None:
+            result, checked_at = cached
+            ttl = _AVAILABILITY_TTL_OK_SECONDS if result else _AVAILABILITY_TTL_FAIL_SECONDS
+            if now - checked_at < ttl:
+                return result
+        result = self._check_openrouter(model)
+        self._availability_cache[model] = (result, now)
+        return result
 
     def is_pipeline_available(self) -> bool:
         """Check if the small-context pipeline is available (OpenRouter key set)."""
@@ -329,6 +347,45 @@ def _openrouter_url() -> str:
     return settings.openrouter_base_url.rstrip("/")
 
 
+def _bounded(fn, *args, timeout: float, **kwargs):
+    """
+    Run fn(*args, **kwargs) with a hard wall-clock deadline.
+
+    Why this exists: `urllib.request.urlopen(req, timeout=N)` only bounds the
+    socket connect/read calls. DNS resolution (getaddrinfo) happens BEFORE the
+    socket exists and is not covered by that timeout at all in the stdlib --
+    on a flaky resolver (observed in practice on Windows) a call can hang far
+    past its stated timeout with no way to interrupt it from inside the call
+    itself. This previously took down the whole app for 4+ minutes from a
+    single stuck OpenRouter request (see /matches/{id}/ai-analysis incident).
+
+    Running the call in its own single-worker executor lets the CALLER give up
+    after `timeout` seconds and raise, even if the underlying call is still
+    stuck. The stuck thread itself can't be force-killed (Python limitation)
+    and keeps running in the background until it eventually finishes or the
+    process exits, but it no longer blocks this request or anything else.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except _FutureTimeoutError as exc:
+            raise TimeoutError(f"{getattr(fn, '__name__', fn)} exceeded {timeout}s deadline") from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _do_ping(url: str, payload: bytes, headers: dict, model: str | None) -> bool:
+    req = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+    with urllib_request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if model:
+        return True
+    return bool(data.get("choices"))
+
+
 def is_llm_available(model: str | None = None) -> bool:
     """Check if OpenRouter is reachable (API key is set)."""
     settings = get_settings()
@@ -342,24 +399,29 @@ def is_llm_available(model: str | None = None) -> bool:
             "temperature": 0,
             "max_tokens": 1,
         }).encode("utf-8")
-        req = urllib_request.Request(
-            url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {settings.openrouter_api_key}",
-                "HTTP-Referer": "https://predictx.app",
-                "X-Title": "PredictX",
-            },
-            method="POST",
-        )
-        with urllib_request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        if model:
-            return True
-        return bool(data.get("choices"))
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "HTTP-Referer": "https://predictx.app",
+            "X-Title": "PredictX",
+        }
+        # Hard 15s wall-clock deadline (12s urlopen timeout + margin) even if
+        # DNS resolution itself is what's stuck.
+        return _bounded(_do_ping, url, payload, headers, model, timeout=15)
     except Exception:
         return False
+
+
+def _do_llm_call(url: str, payload: bytes, headers: dict, timeout: int) -> str:
+    req = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
@@ -374,26 +436,16 @@ def _call_llm(model: str, prompt: str, timeout: int = 60) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
     }).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://predictx.app",
-            "X-Title": "PredictX",
-        },
-        method="POST",
-    )
-    try:
-        with urllib_request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body[:300]}") from exc
-
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "HTTP-Referer": "https://predictx.app",
+        "X-Title": "PredictX",
+    }
+    # Give the DNS-hang guard a few seconds of margin over the caller's own
+    # urlopen timeout so a normal slow-but-legitimate response isn't cut off
+    # early by the outer deadline.
+    return _bounded(_do_llm_call, url, payload, headers, timeout, timeout=timeout + 10)
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────

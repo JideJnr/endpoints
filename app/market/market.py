@@ -211,6 +211,164 @@ def get_all_movements(match_date: str | None = None) -> list[dict[str, Any]]:
     return [get_movement(row[0]) for row in rows]
 
 
+def cleanup_finished_match_odds(match_id: str) -> dict[str, int]:
+    """
+    Post-match odds-snapshot retention: once a match is finished, keep only
+    the OPENING snapshot and the true CLOSING LINE, delete everything
+    recorded in between.
+
+    "Closing line" here means the last snapshot recorded AT OR BEFORE
+    kickoff -- not simply the last snapshot ever recorded. For a match that
+    went live, the last snapshot overall would be some in-play price move,
+    which is a different thing from the pre-match closing line CLV is built
+    around (see app/risk/clv.py::_get_closing_odds, which does this same
+    kickoff-time cutoff for the same reason). Naively keeping "the last row"
+    would have silently broken CLV.
+
+    Covers odds_snapshots (1X2) and odds_market_changes (the curated
+    Over/Under, Double Chance, GG/NG rows from _market_family) -- each
+    market+selection in odds_market_changes is trimmed independently, since
+    they move independently. Does not touch odds_market_snapshots ("full"
+    tracking mode), since that mode is not the active default
+    (PREDICTX_ODDS_TRACK_MODE=lean).
+
+    Safe to call more than once for the same match: a group with 2 or fewer
+    rows already has nothing to delete.
+    """
+    _init_db()
+    match_id = str(match_id)
+    deleted = {"odds_snapshots": 0, "odds_market_changes": 0}
+    with db_conn(timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
+        _ensure_tables(conn)
+        kickoff = _match_kickoff_iso_for_cleanup(conn, match_id)
+
+        rows = conn.execute(
+            "select id, snapshot_time from odds_snapshots where match_id = ? order by snapshot_time asc",
+            (match_id,),
+        ).fetchall()
+        keep_ids = _first_and_closing_ids(rows, kickoff)
+        if keep_ids and len(rows) > len(keep_ids):
+            placeholders = ", ".join("?" for _ in keep_ids)
+            cur = conn.execute(
+                f"delete from odds_snapshots where match_id = ? and id not in ({placeholders})",
+                (match_id, *keep_ids),
+            )
+            deleted["odds_snapshots"] = cur.rowcount
+
+        groups = conn.execute(
+            """
+            select distinct source, market_id, specifier, selection_id
+            from odds_market_changes where match_id = ?
+            """,
+            (match_id,),
+        ).fetchall()
+        keep_ids = []
+        for source, market_id, specifier, selection_id in groups:
+            group_rows = conn.execute(
+                """
+                select id, snapshot_time from odds_market_changes
+                where match_id = ? and source = ? and market_id = ? and specifier = ? and selection_id = ?
+                order by snapshot_time asc
+                """,
+                (match_id, source, market_id, specifier, selection_id),
+            ).fetchall()
+            keep_ids.extend(_first_and_closing_ids(group_rows, kickoff))
+        if keep_ids:
+            total = conn.execute(
+                "select count(*) from odds_market_changes where match_id = ?", (match_id,)
+            ).fetchone()[0]
+            if total > len(keep_ids):
+                placeholders = ", ".join("?" for _ in keep_ids)
+                cur = conn.execute(
+                    f"delete from odds_market_changes where match_id = ? and id not in ({placeholders})",
+                    (match_id, *keep_ids),
+                )
+                deleted["odds_market_changes"] = cur.rowcount
+
+        conn.commit()
+    return deleted
+
+
+def cleanup_odds_for_date(match_date: str) -> dict[str, int]:
+    """Run cleanup_finished_match_odds() for every match_id recorded for a
+    given date. Intended to be called once matches on that date are done
+    (see app/scheduling/scheduler.py::job_grade_predictions, which only
+    calls this for dates strictly before today -- today's matches may still
+    be live)."""
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
+        _ensure_tables(conn)
+        match_ids = {
+            row[0]
+            for row in conn.execute(
+                "select distinct match_id from odds_snapshots where match_date = ?", (match_date,)
+            ).fetchall()
+        }
+        match_ids |= {
+            row[0]
+            for row in conn.execute(
+                "select distinct match_id from odds_market_changes where match_date = ?", (match_date,)
+            ).fetchall()
+        }
+    totals = {"matches": len(match_ids), "odds_snapshots": 0, "odds_market_changes": 0}
+    for match_id in match_ids:
+        result = cleanup_finished_match_odds(match_id)
+        totals["odds_snapshots"] += result.get("odds_snapshots", 0)
+        totals["odds_market_changes"] += result.get("odds_market_changes", 0)
+    return totals
+
+
+def _match_kickoff_iso_for_cleanup(conn: sqlite3.Connection, match_id: str) -> str | None:
+    """Same lookup as app.risk.clv._match_kickoff_iso (reused logic, not the
+    private function itself, to avoid a market<->risk import cycle): checks
+    match_buffer / future_match_buffer for start_time. Returns None once a
+    match has been archived out of those tables -- callers fall back to
+    keeping the last snapshot overall in that case, same graceful
+    degradation CLV itself already falls back to."""
+    for table in ("match_buffer", "future_match_buffer"):
+        try:
+            row = conn.execute(f"select start_time from {table} where match_id = ? limit 1", (match_id,)).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if row and row[0] not in (None, ""):
+            try:
+                value = row[0]
+                if isinstance(value, (int, float)) or str(value).isdigit():
+                    timestamp = float(value)
+                    if timestamp > 1e10:
+                        timestamp /= 1000
+                    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+            except Exception:
+                return None
+    return None
+
+
+def _first_and_closing_ids(rows: list[tuple[Any, str]], kickoff: str | None) -> list[Any]:
+    """rows: [(id, snapshot_time), ...] ordered oldest-first. Returns the ids
+    to KEEP: the first row, plus the last row at/before kickoff (the true
+    closing line) -- or the last row overall if kickoff is unknown or every
+    row already falls before it."""
+    if not rows:
+        return []
+    if len(rows) == 1:
+        return [rows[0][0]]
+    keep = {rows[0][0]}
+    closing_id = None
+    if kickoff:
+        for row_id, snapshot_time in rows:
+            if snapshot_time and snapshot_time <= kickoff:
+                closing_id = row_id
+            else:
+                break
+    if closing_id is None:
+        closing_id = rows[-1][0]
+    keep.add(closing_id)
+    return list(keep)
+
+
 def _ensure_tables(conn: sqlite3.Connection) -> None:
     settings = get_settings()
     conn.execute(
@@ -407,6 +565,7 @@ def _extract_sofascore_market_rows(detail: dict[str, Any]) -> list[dict[str, Any
         if not isinstance(market, dict):
             continue
         market_name = market.get("market_name") or market.get("marketName") or key
+        market_group = market.get("market_group") or market.get("marketGroup") or ""
         for choice in market.get("choices") or []:
             odds = _fractional_to_decimal(choice.get("fractional_value") or choice.get("fractionalValue"))
             if odds is None:
@@ -415,6 +574,7 @@ def _extract_sofascore_market_rows(detail: dict[str, Any]) -> list[dict[str, Any
                 {
                     "market_id": key,
                     "market_name": market_name,
+                    "market_group": market_group,
                     "specifier": market.get("market_period") or market.get("marketPeriod") or "",
                     "selection_id": choice.get("name"),
                     "selection_name": choice.get("name"),
@@ -660,7 +820,7 @@ def _filter_market_rows(rows: list[dict[str, Any]], *, allowed: list[str], max_r
 
     curated = []
     for row in rows:
-        family = _market_family(row.get("market_name") or row.get("market_id") or "")
+        family = _market_family(row.get("market_name") or row.get("market_id") or "", row.get("market_group"))
         if family in allowed_set:
             if family == "total_goals" and not _is_core_total_line(row):
                 continue
@@ -670,15 +830,31 @@ def _filter_market_rows(rows: list[dict[str, Any]], *, allowed: list[str], max_r
     return curated
 
 
-def _market_family(market_name: str) -> str:
-    name = str(market_name or "").lower()
-    if "1x2" in name or name.strip() == "match result":
+def _market_family(market_name: str, market_group: str | None = None) -> str:
+    """
+    Classify a market row into one of the curated "core" families, or "other".
+
+    Deliberately uses EXACT name matching (not substring) for the full-match
+    markets. A loose "in" check previously let derivative markets leak into
+    the curated set — e.g. "1X2 - 1UP", "1X2 - 2UP", "1X2 - Never Down", and
+    "1st Half - 1X2" all contain "1x2" as a substring and were being counted
+    as the core match-winner market; "<Team Name> Over/Under" (a team's own
+    goal total, a different market from the match total) was being counted
+    as total_goals for the same reason. SportyBet's actual BTTS market name
+    is "GG/NG", which the old check (only "both teams"/"btts") never matched,
+    so btts was silently never captured despite being in the default
+    PREDICTX_ODDS_TRACK_MARKETS allowlist.
+    """
+    name = str(market_name or "").strip().lower()
+    group = str(market_group or "").strip().lower()
+
+    if name in {"1x2", "match result"} or group == "1x2":
         return "1x2"
-    if "double chance" in name or name.strip() in {"1x", "x2", "12"}:
+    if name == "double chance":
         return "double_chance"
-    if "both teams" in name or "btts" in name:
+    if name in {"gg/ng", "gg ng", "both teams to score", "btts"}:
         return "btts"
-    if "over/under" in name or "total goals" in name or "goals" == name.strip():
+    if name in {"over/under", "total goals", "goals"}:
         return "total_goals"
     return "other"
 

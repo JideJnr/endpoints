@@ -73,18 +73,29 @@ def _graded_rows() -> tuple[dict[str, Any], ...]:
 
 @lru_cache(maxsize=1)
 def get_learned_ensemble_weights(min_samples: int = 15) -> dict[str, float]:
-    model_names = ("dixon_coles", "elo", "poisson", "rules", "llm")
+    # "goal_model_family" combines Poisson and Dixon-Coles into one
+    # learnable slot -- they're correlated goal-scoring models, deliberately
+    # reported as a single combined signal rather than two independent votes
+    # (see enriched_prediction.py::_model_signals and app/models/ensemble.py
+    # for the full reasoning). Previously this tracked "dixon_coles" and
+    # "poisson" as separate names that the signal layer almost never emits
+    # on their own (confirmed: 0 of 376 graded predictions), so neither
+    # could ever clear min_samples -- both silently got weight=0 in every
+    # ensemble blend regardless of how much graded data existed.
+    model_names = ("goal_model_family", "elo", "rules", "llm")
     stats = {name: {"samples": 0, "wins": 0} for name in model_names}
     signal_map = {
-        "dixon_coles": {"dixon_coles_model"},
+        "goal_model_family": {"goal_model_family", "dixon_coles_model", "poisson_model"},
         "elo": {"elo_model"},
-        "poisson": {"poisson_model"},
         "rules": {"goal_pressure", "h2h_edge", "league_position_edge", "recent_history_edge", "common_opponent_edge", "avg_rating_edge", "market_steam", "odds_edge"},
         "llm": {"openrouter_agent", "ai_brain_review"},
     }
     for row in _graded_rows():
         result = row.get("result")
-        model_hits = _models_for_row(row)
+        model_hits = {
+            ("goal_model_family" if m in ("dixon_coles", "poisson") else m)
+            for m in _models_for_row(row)
+        }
         if not model_hits:
             signal_names = {str(sig.get("name") or "") for sig in _json_list(row.get("signals_json"))}
             model_hits = {model for model, names in signal_map.items() if signal_names & names}

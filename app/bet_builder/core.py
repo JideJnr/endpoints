@@ -17,20 +17,55 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
-from app.storage.league_memory import list_prediction_history
+from app.storage.league_memory import list_prediction_history, save_betbuilder
 from app.research.research_filter import (
     _research_filter_candidate,
     _normalise_league_key,
     _get_dynamic_rules,
 )
 from app.monitoring.self_learner import (
-    get_signal_combination_performance,
     get_learned_thresholds,
 )
 from app.utils.primitives import _to_float, _to_int
 from app.utils.match_helpers import _normalise_selection
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Suggestion tracking
+# ---------------------------------------------------------------------------
+
+def track_suggested_slip(
+    selected: list[dict[str, Any]],
+    *,
+    mode: str,
+    combined_odds_value: float | None,
+    avg_confidence: int | None,
+    extra_request: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """
+    Persist a just-suggested ticket to betbuilder_history the moment it is
+    generated, so it is tracked and later auto-graded even if nobody books
+    it. Called by every builder (manual/llm/smart) right after ranking.
+
+    Never raises — a tracking failure must not break the suggestion
+    response the caller is about to return.
+    """
+    if not selected:
+        return None
+    try:
+        request = {"builder": mode, **(extra_request or {})}
+        saved = save_betbuilder(
+            selected,
+            round(float(combined_odds_value or 0), 3),
+            int(avg_confidence or 0),
+            request,
+        )
+        return {"id": saved.get("id")}
+    except Exception:
+        logger.exception("Failed to auto-track suggested %s betbuilder slip", mode)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +352,53 @@ def combined_odds(items: list[dict[str, Any]]) -> float:
     return math.prod(float(i.get("odds") or i.get("estimated_odds") or 1) for i in items)
 
 
+def select_by_conviction(
+    candidates: list[dict[str, Any]],
+    min_leg_odds: float = 1.30,
+) -> list[dict[str, Any]]:
+    """
+    "Smart bet" selection: no target odds, no odds ceiling, no leg cap.
+
+    Every candidate whose conviction_score clears ITS OWN learned bar
+    (per league + pick type, via the same get_learned_thresholds() the
+    research gate and _optimal_profile_score already use elsewhere) is
+    included. One leg per match — if the same match produced more than one
+    scored candidate, the higher-conviction one wins. Combined odds is
+    whatever results from stacking every leg that earns its place; by
+    design there is nothing here that trims the slip back down once it
+    grows, since the whole point of this mode is "only bet what you're
+    actually confident about," not "hit a number."
+    """
+    from app.monitoring.self_learner import get_learned_thresholds
+
+    best_per_match: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        match_id = str(item.get("match_id") or item.get("sportybet_id") or "")
+        if not match_id:
+            continue
+        odds = float(item.get("odds") or item.get("estimated_odds") or 1)
+        if odds < min_leg_odds:
+            continue
+        league = item.get("league") or item.get("league_name") or "__global__"
+        pick_type = item.get("pick_type") or item.get("type") or "match_result"
+        try:
+            min_conviction = float(
+                get_learned_thresholds(league=league, pick_type=pick_type).get("min_confidence", 72.0)
+            )
+        except Exception:
+            min_conviction = 72.0
+        conviction = float(item.get("conviction_score") or 0)
+        if conviction < min_conviction:
+            continue
+        current = best_per_match.get(match_id)
+        if current is None or conviction > float(current.get("conviction_score") or 0):
+            best_per_match[match_id] = item
+
+    selected = list(best_per_match.values())
+    selected.sort(key=lambda i: float(i.get("conviction_score") or 0), reverse=True)
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Pick utilities
 # ---------------------------------------------------------------------------
@@ -363,7 +445,7 @@ def _recent_ungraded_prediction_rows(allowed_dates: set[str], limit: int) -> lis
                 """
                 select ph.id, ph.source, ph.match_id, ph.match_name, ph.league_name, ph.country_name,
                        ph.pick_type, ph.selection, ph.confidence, ph.reason, ph.signals_json,
-                       ph.picks_json, ph.created_at, ph.result, ph.graded_at,
+                       ph.picks_json, ph.created_at, ph.result, ph.graded_at, ph.engine, ph.is_final,
                        coalesce(mb.match_date, date(ph.created_at)) as match_date,
                        mb.start_time as start_time,
                        coalesce(mb.is_live, 0) as is_live,
@@ -374,7 +456,7 @@ def _recent_ungraded_prediction_rows(allowed_dates: set[str], limit: int) -> lis
                   and ph.graded_at is null
                   and ph.pick_type != 'no_bet'
                   and coalesce(mb.match_date, date(ph.created_at)) in (?, ?)
-                order by datetime(ph.created_at) desc, ph.id desc
+                order by coalesce(ph.is_final, 1) desc, datetime(ph.created_at) desc, ph.id desc
                 limit ?
                 """,
                 (*sorted(allowed_dates), int(limit)),
@@ -569,25 +651,39 @@ def _league_accuracy_boost(item: dict[str, Any], engine_pick: dict[str, Any]) ->
 
 
 def _signal_combination_boost(item: dict[str, Any], engine_pick: dict[str, Any]) -> float:
+    """Reuses the same real, league-weighted signal-combination memory the
+    core prediction path already uses (weighted_signal_combination_memory in
+    app.storage.league_memory), instead of a second, separate implementation.
+
+    The previous version called build_signal_combination(signals) with a
+    bare list of strings; the real function takes keyword-only arguments
+    (signals as list[dict], plus pick_type/selection) -- that call always
+    raised TypeError, silently swallowed by the except below, so this always
+    contributed 0. It also read get_signal_combination_performance(), which
+    queries signal_combination_memory -- a table confirmed to have zero rows
+    in production; nothing in this app has ever written to it. Delegating to
+    weighted_signal_combination_memory fixes both: it reads from the table
+    that's actually populated (signal_combination_outcomes) and blends
+    exact-combo / league / country scopes exactly like the main prediction
+    path does.
+    """
     try:
-        from app.signal_combinations import build_signal_combination
-        signals = []
-        for factor in item.get("key_factors") or []:
-            signals.append(str(factor))
-        if item.get("market_signal"):
-            signals.append(str(item["market_signal"]))
-        if item.get("btts") is not None:
-            signals.append("btts" if item["btts"] else "no_btts")
-        if item.get("over_2_5") is not None:
-            signals.append("over_2_5" if item["over_2_5"] else "under_2_5")
-        if engine_pick.get("selection"):
-            signals.append(str(engine_pick["selection"]))
+        from app.storage.league_memory import weighted_signal_combination_memory
+
+        signals = _build_analysis_signals(item, engine_pick)
         if not signals:
             return 0.0
-        combo_key = build_signal_combination(signals)
-        perf = get_signal_combination_performance(combo_key)
-        if perf.get("samples", 0) >= 5:
-            return (perf.get("win_rate", 0.5) - 0.5) * 10
+        pseudo_match = {
+            "league_name": item.get("league_name") or item.get("league"),
+            "country_name": item.get("country_name") or item.get("country"),
+        }
+        memory = weighted_signal_combination_memory(
+            pseudo_match,
+            signals,
+            engine_pick.get("type") or item.get("pick_type"),
+            item.get("llm_recommendation") or engine_pick.get("selection"),
+        )
+        return float(memory.get("adjustment") or 0)
     except Exception:
         pass
     return 0.0

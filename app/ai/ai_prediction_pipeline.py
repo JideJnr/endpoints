@@ -786,8 +786,25 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                 )
         # Run all 5 evidence steps in parallel — they are fully independent.
         # Sequential execution was the single biggest AI pipeline bottleneck
-        # (5 × 20s timeout = up to 100s; parallel = ~20s worst case).
-        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        # (5 x 20s timeout = up to 100s; parallel = ~20-25s worst case).
+        #
+        # IMPORTANT: each step's own `timeout=` only bounds urllib's socket
+        # connect/read calls. DNS resolution (getaddrinfo) happens BEFORE the
+        # socket exists and is NOT covered by that timeout at all in the
+        # stdlib — on a flaky resolver (seen in practice on Windows) a step
+        # can hang far past its stated timeout with no way to interrupt it.
+        # Two defenses against that here:
+        #   1. `as_completed(..., timeout=EVIDENCE_STEPS_DEADLINE)` bounds how
+        #      long we personally wait, instead of waiting for every future.
+        #   2. `_pool.shutdown(wait=False, cancel_futures=True)` instead of a
+        #      `with`-block (which calls shutdown(wait=True) and would just
+        #      re-introduce the same unbounded hang on exit).
+        # A step that's still running when we give up keeps running in its
+        # thread in the background (Python can't force-kill a thread) but no
+        # longer blocks this request or the app.
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed, TimeoutError as _FutureTimeoutError
+        EVIDENCE_STEPS_DEADLINE = 35  # slightly above the slowest single step's own 25s timeout
+        DECIDER_DEADLINE = 40  # slightly above call_analysis's own 30s timeout
         _steps = [
             (_step_h2h,             H2H_FALLBACK,     0),
             (_step_common_opponent, COMMON_FALLBACK,  1),
@@ -797,22 +814,46 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             (_step_team_history,     "Team previous-match history unavailable.", 5),
         ]
         chain = [fallback for _, fallback, _ in _steps]  # pre-fill with fallbacks
-        with ThreadPoolExecutor(max_workers=len(_steps)) as _pool:
+        _pool = ThreadPoolExecutor(max_workers=len(_steps))
+        try:
             _futures = {
                 _pool.submit(fn, doc, model): (fallback, idx)
                 for fn, fallback, idx in _steps
             }
-            for _future in _as_completed(_futures):
-                _fallback, _idx = _futures[_future]
-                try:
-                    sentence = _future.result()
-                    chain[_idx] = sentence or _fallback
-                    logger.debug("AI step idx=%d: %s", _idx, chain[_idx])
-                except Exception as exc:
-                    logger.warning("AI step idx=%d failed: %s", _idx, exc)
+            try:
+                for _future in _as_completed(_futures, timeout=EVIDENCE_STEPS_DEADLINE):
+                    _fallback, _idx = _futures[_future]
+                    try:
+                        sentence = _future.result()
+                        chain[_idx] = sentence or _fallback
+                        logger.debug("AI step idx=%d: %s", _idx, chain[_idx])
+                    except Exception as exc:
+                        logger.warning("AI step idx=%d failed: %s", _idx, exc)
+            except _FutureTimeoutError:
+                logger.warning(
+                    "AI evidence steps exceeded %ss deadline; proceeding with fallback text for whichever steps didn't finish",
+                    EVIDENCE_STEPS_DEADLINE,
+                )
+        finally:
+            _pool.shutdown(wait=False, cancel_futures=True)
         markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
         specialist_weights = get_specialist_weights(league=_tournament(doc))
-        decision = _call_decider(chain, hp, ap, markets, [], _name(doc), model, competition_context=competition_context, specialist_weights=specialist_weights)
+        # Same DNS-hang risk applies to the single decider call — bound it
+        # with its own throwaway single-worker pool so a stuck call can be
+        # abandoned (raising, which the outer except already falls back on)
+        # instead of hanging the request forever.
+        _decider_pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            _decider_future = _decider_pool.submit(
+                _call_decider, chain, hp, ap, markets, [], _name(doc), model,
+                competition_context=competition_context, specialist_weights=specialist_weights,
+            )
+            try:
+                decision = _decider_future.result(timeout=DECIDER_DEADLINE)
+            except _FutureTimeoutError as exc:
+                raise RuntimeError(f"AI decider exceeded {DECIDER_DEADLINE}s deadline") from exc
+        finally:
+            _decider_pool.shutdown(wait=False, cancel_futures=True)
         reasoning_context = {
             **asdict(ReasoningContext(_name(doc), *chain)),
             "response_chain": chain,
@@ -918,7 +959,8 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
         return {"status": "skipped", "reason": "pipeline_disabled"}
     record_activity("AI prediction queue started", job="ai_prediction_queue", status="running")
     _init_db()
-    summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "llm_used": 0, "fallback_used": 0, "errors": 0}
+    summary = {"status": "ok", "job": "job_ai_prediction_queue", "batch_size": batch_size, "processed": 0, "llm_used": 0, "fallback_used": 0, "deferred_not_ready": 0, "errors": 0}
+    now_ts = datetime.now(timezone.utc).timestamp()
     with db_conn(timeout=30) as conn:
         rows = conn.execute(
             """
@@ -939,7 +981,24 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
                     )
               )
               and json_extract(raw_enriched, '$.ai_prediction_state') is null
+              -- A match with no sofascore_detail can never pass prediction_readiness()
+              -- (sofascore_detail is a hard requirement -- see enriched_prediction.py).
+              -- The enrichment worker already won't re-attempt a SofaScore match for
+              -- an unmatched fixture until its own sofascore_retry_after_ts cooldown
+              -- lapses (get_unenriched_batch, ~3h for prematch), so re-selecting such
+              -- a row here every 5-10 minutes in between can't find anything new --
+              -- skip it until it's actually due for reconsideration. Bind the
+              -- current time as a parameter rather than strftime('%s','now') --
+              -- that combined with coalesce() silently mis-compares (confirmed
+              -- empirically); a bound REAL parameter, the pattern already used
+              -- safely elsewhere in this codebase (buffer.py's get_unenriched_batch),
+              -- does not have that problem.
+              and (
+                    json_extract(raw_enriched, '$.sofascore_detail') is not null
+                 or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= ?
+              )
             """,
+            (now_ts,),
         ).fetchall()
     docs = []
     for match_id, date, raw in rows:
@@ -959,6 +1018,28 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
                     doc.update(refreshed)
             except Exception:
                 pass
+
+        # Cheap, local, no-network gate BEFORE the expensive work below (team
+        # profile derivation, 5 parallel AI evidence steps, the LLM call
+        # itself). predict_and_record_enriched already refuses to record a
+        # real prediction for a match that isn't SofaScore-enriched yet --
+        # that check was correct, it just ran at the very end, after all of
+        # that work had already happened, on every not-yet-enriched match,
+        # every single queue cycle. Checking readiness here instead means an
+        # unenriched match is skipped immediately instead of wastefully
+        # attempted. It isn't lost: enrich_worker re-flags
+        # ai_prediction_queue_pending=True on every pass until a match is
+        # actually ready, so it keeps getting reconsidered -- just cheaply
+        # in the meantime, not with a full AI pipeline run each time.
+        from app.enrichment.enriched_prediction import prediction_readiness
+
+        readiness = prediction_readiness(doc)
+        doc["prediction_readiness"] = readiness
+        if not readiness.get("ready"):
+            doc["ai_prediction_queue_pending"] = True
+            _store(str(doc.get("match_id") or ""), doc)
+            return {"status": "deferred", "prediction_source": "not_ready", "readiness": readiness}
+
         outcome = run_ai_prediction_with_fallback(
             doc,
             match_id=str(doc.get("match_id") or ""),
@@ -975,8 +1056,11 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
         for future in _ac(futures):
             try:
                 outcome = future.result()
-                summary["processed"] += 1
-                summary["llm_used" if outcome.get("prediction_source") == "llm_pipeline" else "fallback_used"] += 1
+                if outcome.get("prediction_source") == "not_ready":
+                    summary["deferred_not_ready"] += 1
+                else:
+                    summary["processed"] += 1
+                    summary["llm_used" if outcome.get("prediction_source") == "llm_pipeline" else "fallback_used"] += 1
             except Exception as exc:
                 logger.exception("AI queue match failed: %s", exc)
                 summary["errors"] += 1

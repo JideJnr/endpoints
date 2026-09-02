@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 from app.storage.db import DB_PATH, _conn
 from app.storage.db import _init_db
 from app.market.market import snapshot_odds
+from app.live.live_stat_history import snapshot_live_statistics
 from app.match_facts import enrich_match_facts, normalize_live_statistics
 from app.utils.match_state import classify_match_state
 from app.utils.normalise import normalise
@@ -384,6 +385,30 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                         )
                     except Exception:
                         pass
+
+                # Resolve any open live-timeline snapshots for THIS match now that
+                # it's finished. These snapshots were written with source="sportybet"
+                # (see observe_matches("sportybet", matches) in job_ingest_live) using
+                # SportyBet's own match_id. The old resolution path only ever ran via
+                # a separate SofaScore "finished today" scan under source="sofascore",
+                # which used a different id namespace and so could never match these
+                # rows — match_snapshots/late_goal_snapshots accumulated writes but
+                # were almost never resolved, starving the per-league goal-timing
+                # memory of any real sample size. Resolving here, at the exact place
+                # a sportybet match_id is first confirmed finished, closes that gap.
+                try:
+                    from app.storage.league_memory.crud import (
+                        _resolve_snapshots,
+                        _aggregate_resolved_snapshots,
+                    )
+
+                    final_home = int(str(score.get("home") or 0) or 0)
+                    final_away = int(str(score.get("away") or 0) or 0)
+                    _resolve_snapshots(conn, "sportybet", match_id, final_home, final_away)
+                    _aggregate_resolved_snapshots(conn)
+                except Exception:
+                    logger.warning("snapshot resolution failed for %s", match_id, exc_info=True)
+
                 conn.commit()
                 _try_archive_finished(match_id)
                 count += 1
@@ -624,6 +649,11 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
             ),
         )
         conn.commit()
+
+    try:
+        snapshot_live_statistics(doc)
+    except Exception:
+        logger.warning("live-stat snapshot failed for %s", match_id, exc_info=True)
 
     # When a SofaScore ID is newly resolved, push the full enriched doc to team
     # watcher so it gets sofa team IDs, standings, and last matches appended.
@@ -2411,8 +2441,14 @@ def _with_search_fallback_candidates(
     events: list[dict],
     live: bool = False,
 ) -> list[dict]:
-    """Add targeted SofaScore search results when scheduled-events is incomplete."""
-    if live or _is_junk_match_name(sporty.get("name") or ""):
+    """Add targeted SofaScore search results when scheduled-events is incomplete.
+
+    Runs for live matches too: the bulk `fetch_live_events()` list SofaScore
+    returns does not reliably include every lower-tier league, so a live match
+    with no confident candidate in that bulk list gets one more chance via a
+    team-name search before we give up on it for this cycle.
+    """
+    if _is_junk_match_name(sporty.get("name") or ""):
         return events
     best_score = 0.0
     for event in events:
@@ -2429,7 +2465,7 @@ def _with_search_fallback_candidates(
         seen_search_ids: set[str] = set()
         for query in _sofascore_search_queries(sporty):
             for event in search_events(query, limit=8):
-                if not is_usable_event_for_mode(event, live=False):
+                if not is_usable_event_for_mode(event, live=live):
                     continue
                 eid = str(event.get("id") or "")
                 if eid and eid not in seen_search_ids:

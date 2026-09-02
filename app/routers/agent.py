@@ -66,6 +66,18 @@ def post_memory_maintenance(
     return run_memory_maintenance(raw_retention_days=raw_retention_days, odds_retention_days=odds_retention_days)
 
 
+@router.post("/competition/disable-dynamic")
+def post_disable_dynamic_competitions():
+    """One-time cleanup: disable dynamically auto-enabled competition rows
+    (the enabled=1 default bug fixed in competition_special._ensure_dynamic_competition).
+    Idempotent — safe to call more than once."""
+    try:
+        from app.competition.competition_special import disable_dynamic_competitions
+        return {"status": "success", **disable_dynamic_competitions()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.post("/memory/observe")
 def post_memory_observation(source: str = "manual", match: dict = Body(...)):
     try:
@@ -291,6 +303,7 @@ def get_roi_analysis():
             from prediction_history ph
             where ph.graded_at is not null
               and ph.pick_type != 'no_bet'
+              and coalesce(ph.is_final, 1) = 1
             """
         ).fetchall()
 

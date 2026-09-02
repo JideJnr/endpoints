@@ -1190,6 +1190,19 @@ def job_grade_predictions() -> dict[str, Any]:
         except Exception as exc:
             clv_result = {"error": str(exc)}
 
+        # Trim odds-snapshot history for matches that are done: keep only the
+        # opening snapshot + the true closing line, delete the movement
+        # history in between. Only for dates strictly before today — a
+        # match dated "today" may still be live, and CLV above must run
+        # first so the closing-line row it needs is never the one deleted.
+        # Restricted to the same 4-day grading window as everything else in
+        # this job; a match graded later than that keeps its full history.
+        try:
+            from app.market.market import cleanup_odds_for_date
+            odds_cleanup_result = {"by_date": [{"date": d, **cleanup_odds_for_date(d)} for d in target_dates[1:]]}
+        except Exception as exc:
+            odds_cleanup_result = {"error": str(exc)}
+
         try:
             from app.storage.mongo_store import cleanup_buffer
             cleanup_result = cleanup_buffer()
@@ -1210,6 +1223,7 @@ def job_grade_predictions() -> dict[str, Any]:
                 "metrics": metrics, "elo_updated": elo_updated,
                 "calibration": cal_result, "patterns": pattern_result,
                 "clv": clv_result, "learning": learn_result, "cleanup": cleanup_result,
+                "odds_cleanup": odds_cleanup_result,
                 "overdue": overdue_result, "betbuilder": betbuilder_result}
     except Exception as exc:
         print(f"[scheduler] grade_predictions failed: {exc}")
