@@ -697,9 +697,45 @@ def _get_competition_context(doc: dict, conn) -> str | None:
         return None
 
 
-def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None, specialist_weights: dict[str, float] | None = None) -> dict:
+def _get_structured_competition_intelligence(doc: dict) -> dict | None:
+    """Same de-noised competition/team-watcher edge that now feeds the
+    statistical ensemble (app/models/ensemble.py's "competition_intelligence"
+    weight) and the deterministic signals list
+    (app/enrichment/enriched_prediction.py::_competition_intelligence_signal),
+    reused here instead of reimplemented a third time. Previously this AI
+    pipeline -- the one that actually runs live predictions -- only ever
+    saw a truncated free-text analysis blob (_get_competition_context
+    below), never the structured table/form/team-watcher numbers; the
+    structured version was only ever wired into the separate advisory
+    app/ai/llm_analysis.py path. Returns None (silently, non-critical) on
+    any error or when the signal itself decides the data is too thin/
+    unavailable -- same gating as everywhere else it's used.
+    """
+    try:
+        from app.enrichment.enriched_prediction import _competition_intelligence_signal
+        return _competition_intelligence_signal(doc)
+    except Exception as exc:
+        logger.debug("_get_structured_competition_intelligence failed (non-critical): %s", exc)
+        return None
+
+
+def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile, away_profile: TeamBehaviourProfile, shortlisted_markets: list[MarketCandidate], similar_match_history: Any, match_name: str, model: str, timeout: int = 45, competition_context: str | None = None, competition_intelligence: dict | None = None, specialist_weights: dict[str, float] | None = None) -> dict:
     from app.ai.ai_router import get_router, parse_json_response
     context_block = f"Competition context: {competition_context} | " if competition_context else ""
+    if competition_intelligence and competition_intelligence.get("value"):
+        # Compact numeric form (not prose) -- table/form/team-watcher edges
+        # on the same -8..+8-ish home/away scale the decider already sees
+        # from the ensemble's own signals, plus which components actually
+        # had enough data to be used.
+        ci_value = competition_intelligence["value"]
+        context_block += (
+            f"Competition intelligence (home-advantage direction, "
+            f"components_used={ci_value.get('components_used')}): "
+            f"table_edge_ppg={ci_value.get('table_edge_ppg')}, "
+            f"form_edge={ci_value.get('form_edge')}, "
+            f"watcher_edge={ci_value.get('watcher_edge')}, "
+            f"net_direction={ci_value.get('direction')} | "
+        )
     unavailable = [
         label for label, statement in zip(
             ("H2H", "common opponents", "form", "odds", "similar matches", "team previous matches"),
@@ -784,6 +820,11 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                     (doc.get("competition_special") or {}).get("key")
                     or (doc.get("known_competition") or {}).get("key")
                 )
+        # Structured table/form/team-watcher edge (same source now feeding
+        # the ensemble) -- independent of and in addition to the free-text
+        # competition_context above, so this pipeline sees the real numbers
+        # even on a match where no free-text analysis has been generated.
+        competition_intelligence = _get_structured_competition_intelligence(doc)
         # Run all 5 evidence steps in parallel — they are fully independent.
         # Sequential execution was the single biggest AI pipeline bottleneck
         # (5 x 20s timeout = up to 100s; parallel = ~20-25s worst case).
@@ -846,7 +887,9 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         try:
             _decider_future = _decider_pool.submit(
                 _call_decider, chain, hp, ap, markets, [], _name(doc), model,
-                competition_context=competition_context, specialist_weights=specialist_weights,
+                competition_context=competition_context,
+                competition_intelligence=competition_intelligence,
+                specialist_weights=specialist_weights,
             )
             try:
                 decision = _decider_future.result(timeout=DECIDER_DEADLINE)
@@ -941,6 +984,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         result["reasoning_context"] = reasoning_context
         result["competition_analysis_used"] = competition_context is not None
         result["competition_analysis_key"] = competition_analysis_key
+        result["competition_intelligence_used"] = bool(competition_intelligence)
         logger.info("AI pipeline completed match=%s outcome=%s", _name(doc), decision["outcome"])
         return result
     except Exception as exc:
@@ -948,6 +992,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         result = _rules_fallback(doc, "exception", **kwargs)
         result["competition_analysis_used"] = False
         result["competition_analysis_key"] = None
+        result["competition_intelligence_used"] = False
         return result
 
 

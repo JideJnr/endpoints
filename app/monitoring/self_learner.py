@@ -428,6 +428,13 @@ def run_learning_cycle() -> dict[str, Any]:
                         "recent_history_edge", "common_opponent_edge",
                         "avg_rating_edge", "market_steam", "odds_edge"},
         "openrouter":  {"openrouter_agent", "ai_brain_review"},
+        # Matches the "name": "competition_intelligence" signal emitted by
+        # enriched_prediction.py::_competition_intelligence_signal, and the
+        # matching ensemble weight key in app/models/ensemble.py -- same
+        # goal_model_family lesson applies: the signal name here MUST match
+        # what the signal layer actually emits, or this model can never
+        # earn samples and stays permanently at its base weight.
+        "competition_intelligence": {"competition_intelligence"},
     }
     model_stats: dict[str, dict] = {
         m: {"samples": 0, "wins": 0, "weighted_wins": 0.0, "weighted_total": 0.0}
@@ -591,8 +598,11 @@ def run_learning_cycle() -> dict[str, Any]:
         # and both silently got weight=0 in the ensemble blend forever.
         # 0.30 + 0.15 preserves the same total default weight as before.
         base_weights = {
-            "goal_model_family": 0.45, "elo": 0.25,
-            "rules": 0.20, "openrouter": 0.10,
+            # Keep in sync with app/models/ensemble.py's _BASE_WEIGHTS --
+            # see the comment there for why these five specific numbers.
+            "goal_model_family": 0.414, "elo": 0.23,
+            "rules": 0.184, "openrouter": 0.092,
+            "competition_intelligence": 0.08,
         }
         for model in base_weights:
             direct = direct_model_stats.get(model, {"samples": 0, "wins": 0, "weighted_wins": 0.0, "weighted_total": 0.0})

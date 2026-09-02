@@ -23,10 +23,25 @@ from typing import Any
 # and rules, whose own draw estimates are both the same generic
 # distance-from-50 formula, not a real per-match calculation.
 _BASE_WEIGHTS: dict[str, float] = {
-    "goal_model_family": 0.45,
-    "elo": 0.25,
-    "rules": 0.20,
-    "llm": 0.10,
+    # "competition_intelligence" is app/enrichment/enriched_prediction.py's
+    # _competition_intelligence_signal (table position, recent form, the
+    # team_watcher edge) turned into a bounded ensemble vote instead of only
+    # a post-hoc confidence nudge. It's deliberately the smallest weight
+    # here: the upstream signal is itself gated (min sample sizes on the
+    # form/table components, a discounted strength_edge when history is
+    # thin -- see app/competition/competition_special.py) but is still a
+    # first-pass, uncalibrated scale (see that function's own docstring),
+    # so it shouldn't be able to swing the blend the way elo or the goal
+    # models can. The other four weights are shaved down proportionally
+    # (each * 0.92) so the five sum back to 1.0, same total as before this
+    # slot existed -- keep this dict and self_learner.py's matching
+    # `base_weights` (see get_learned_weights()) in sync; see the
+    # goal_model_family comment above for what happens when they drift.
+    "goal_model_family": 0.414,
+    "elo": 0.23,
+    "rules": 0.184,
+    "llm": 0.092,
+    "competition_intelligence": 0.08,
 }
 
 # Module-level cache so we don't hit SQLite on every prediction
@@ -181,6 +196,7 @@ def ensemble_prediction(
     rules_confidence: int,
     rules_pick: str,
     llm: dict[str, Any] | None = None,
+    competition_intelligence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     diversity = compute_ensemble_diversity(dixon, elo, poisson, rules_confidence, rules_pick, llm)
     weights = _get_weights()
@@ -247,6 +263,26 @@ def ensemble_prediction(
     if llm and llm.get("probabilities"):
         _add(llm["probabilities"], weights.get("llm", 0.0))
         models_used.append("llm")
+
+    # competition_intelligence carries a single bounded ±8 "impact" (home
+    # advantage scale), not a probability triple like the other models --
+    # same conversion elo/rules already use (a home/away split plus a draw
+    # estimate that narrows as the edge gets more one-sided) so it blends
+    # through the same _add() math as everything else.
+    if competition_intelligence and competition_intelligence.get("impact") is not None:
+        try:
+            ci_impact = max(-8.0, min(8.0, float(competition_intelligence["impact"])))
+        except (TypeError, ValueError):
+            ci_impact = 0.0
+        if ci_impact:
+            ci_home = max(0.0, min(100.0, 50.0 + ci_impact * 3.5))
+            ci_draw = max(5.0, 30.0 - abs(ci_home - 50.0) * 0.4)
+            ci_away = max(0.0, 100.0 - ci_home - ci_draw)
+            _add(
+                {"home_win": ci_home, "draw": ci_draw, "away_win": ci_away},
+                weights.get("competition_intelligence", 0.0),
+            )
+            models_used.append("competition_intelligence")
 
     if total_weight == 0:
         neutral = {"home_win": 33.3, "draw": 33.4, "away_win": 33.3}

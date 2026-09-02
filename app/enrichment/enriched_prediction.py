@@ -383,12 +383,25 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                         elo = {"error": str(exc)}
 
     best_pick = (rules.get("picks") or [{}])[0]
+    # Computed here (rather than only later, where the signals list is
+    # built) so the same competition-intelligence edge that feeds the
+    # deterministic signals list also reaches the ensemble blend itself --
+    # see _competition_intelligence_signal's own docstring for what this
+    # actually measures. Idempotent / DB-only, safe to call before the
+    # signals list exists; reused below instead of recomputed.
+    try:
+        _comp_intel_signal = _competition_intelligence_signal(doc)
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("enriched_prediction", "competition_intelligence_signal_error", exc)
+        _comp_intel_signal = None
     ensemble = ensemble_prediction(
         dixon if dixon and not dixon.get("error") else None,
         elo if elo and not elo.get("error") else None,
         poisson if poisson and not poisson.get("error") else None,
         int(best_pick.get("confidence") or 50),
         str(best_pick.get("selection") or best_pick.get("pick") or ""),
+        competition_intelligence=_comp_intel_signal,
     )
 
     # ── Team prediction history signals ───────────────────────────────────────
@@ -574,13 +587,11 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     # but only ever reached an LLM as loose prompt context, never the
     # deterministic signal list, so it was never weighted, calibrated, or
     # learned the way every other signal here is.
-    try:
-        comp_signal = _competition_intelligence_signal(doc)
-        if comp_signal:
-            signals.append(comp_signal)
-    except Exception as exc:
-        from app.utils.health_counters import record_health_event
-        record_health_event("enriched_prediction", "competition_intelligence_signal_error", exc)
+    # Already computed above (before the ensemble blend) -- reuse instead
+    # of calling apply_known_competition_context() / DB lookups a second
+    # time for the same match.
+    if _comp_intel_signal:
+        signals.append(_comp_intel_signal)
 
     # ── SofaScore grade signal ────────────────────────────────────────────────
     longshot_signal = _consensus_longshot_value_signal(doc, ensemble, poisson, dixon, elo, rules, odds_movement)
