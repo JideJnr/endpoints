@@ -550,7 +550,14 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         tw_signal = None
         has_tw_pick = False
 
-    # Team Watch signal (opponent tier, goal timing, signal combo history)
+    # Team Watch signal (opponent tier, goal timing, signal combo history).
+    # Kept in scope (not just local to this try block) because the TW_Signal
+    # confidence-impact reconciliation below cross-checks its direction
+    # against team_watcher_engine's -- two independently computed
+    # team-intelligence opinions that can otherwise disagree with nothing
+    # noticing (see the reconciliation comment near "Apply TW_Signal
+    # confidence impact").
+    tw_watch = None
     try:
         from app.team_watcher.team_watcher import team_watch_signal as _tw_watch_signal
         tw_watch = _tw_watch_signal(doc)
@@ -559,6 +566,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "team_watch_signal_error", exc)
+        tw_watch = None
 
     # Competition intelligence signal (table position, recent form, long-term
     # team-watcher edge — see _competition_intelligence_signal below). This
@@ -816,6 +824,29 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             # Apply TW_Signal confidence impact (bounded ±8)
             if tw_signal and has_tw_pick:
                 tw_impact = max(-8, min(8, tw_signal.get("confidence_impact", 0)))
+                # Reconciliation: team_watcher_engine's confidence_impact and
+                # team_watch's impact (app/team_watcher/team_watcher.py) are
+                # two independently computed team-intelligence opinions on
+                # the SAME -8..+8 home/away scale (positive = home
+                # advantage), fed from different data (tournament-scoped
+                # rules+AI profiles vs. opponent-tier/goal-timing/signal-
+                # combo history). Previously both entered the prediction
+                # with no cross-check, so a clean disagreement between them
+                # (e.g. +6 vs -5) applied at full strength as if it were
+                # corroborating evidence. When they clearly disagree --
+                # opposite sign, both past a noise floor -- treat that
+                # disagreement itself as the signal and damp this impact
+                # rather than trust either opinion at full weight.
+                watch_impact = None
+                if tw_watch and (tw_watch.get("value") or {}).get("available"):
+                    watch_impact = _to_float(tw_watch.get("impact"))
+                if (
+                    watch_impact is not None
+                    and abs(tw_impact) >= 1.5
+                    and abs(watch_impact) >= 1.5
+                    and (tw_impact > 0) != (watch_impact > 0)
+                ):
+                    tw_impact = round(tw_impact * 0.4)
                 cal_conf = max(1, min(99, cal_conf + tw_impact))
             pick["confidence"] = cal_conf
 

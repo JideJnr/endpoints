@@ -67,12 +67,31 @@ _CATALOGUE_BY_KEY = {entry["key"]: entry for entry in TOP_30_COMPETITIONS}
 
 
 
-def _name_quality_score(name: str) -> float:
-    """Rough quality proxy for a team name — longer names score higher."""
-    n = str(name or '').strip()
-    if not n:
-        return 0.5
-    return min(1.0, 0.4 + len(n) / 40)
+def _opponent_quality_score(team_id: str, team_name: str) -> float:
+    """Real per-opponent quality signal, derived from the opponent's ELO
+    rating (app.models.elo.get_elo, team_id-keyed, K=32, default 1500 for
+    an unrated team) instead of the previous `_name_quality_score()`
+    placeholder, which scored a team's quality by the character length of
+    its name string.
+
+    Mapped onto the 0-100 scale `_recent_play_strength()` already expects
+    via `(quality - 50) * 0.25`: an opponent a full division stronger
+    (+400 ELO, roughly top-to-bottom of a league) reads as 100; a full
+    division weaker reads as 0. The previous name-length version was not
+    just noisy, it was a near-constant bias: every value it could return
+    (0.4-1.0) read as ~49 points BELOW the 50 baseline on this same scale,
+    so `_recent_play_strength()` applied roughly the same ~-12-point
+    penalty to every team's strength_score regardless of which opponents
+    were actually faced.
+    """
+    if not team_id:
+        return 50.0
+    try:
+        from app.models.elo import get_elo
+        rating = get_elo(team_id)
+    except Exception:
+        return 50.0
+    return max(0.0, min(100.0, 50.0 + (rating - 1500.0) / 8.0))
 
 
 def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
@@ -1943,6 +1962,15 @@ def _competition_intelligence_context(
         table_edge *= 0.25  # heavily discount table PPG edge when standings are unreliable
 
     strength_edge = _safe_num(home_strength.get("strength_score")) - _safe_num(away_strength.get("strength_score"))
+    # Same small-sample discount table_edge gets above, applied here for the
+    # same reason: strength_score is built from at most `limit` (8) recent
+    # matches per side (_recent_play_strength), and with too few of them
+    # the edge is mostly noise. Threshold of 4 matches per side matches the
+    # guard app/enrichment/enriched_prediction.py::_competition_intelligence_signal
+    # already applies when consuming this same edge, so both places agree
+    # on what "thin" means for this signal.
+    if int(home_strength.get("sample_size") or 0) < 4 or int(away_strength.get("sample_size") or 0) < 4:
+        strength_edge *= 0.25
     watcher_edge = _safe_num((home_watcher.get("profile") or {}).get("team_score")) - _safe_num((away_watcher.get("profile") or {}).get("team_score"))
     return {
         "competition_key": key,
@@ -2051,7 +2079,9 @@ def _recent_play_strength(matches: list[dict[str, Any]], team: dict[str, Any], l
         goal_diff += own - opp
         points += 3 if own > opp else 1 if own == opp else 0
         opponent = away if is_home else home
-        opponent_quality += _name_quality_score(str(opponent.get("name") or ""))
+        opponent_quality += _opponent_quality_score(
+            str(opponent.get("id") or ""), str(opponent.get("name") or "")
+        )
     ppg = points / sample if sample else 0.0
     gd_per_match = goal_diff / sample if sample else 0.0
     quality = opponent_quality / sample if sample else 50.0

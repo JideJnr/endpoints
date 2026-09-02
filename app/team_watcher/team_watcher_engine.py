@@ -14,9 +14,11 @@ main pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -480,6 +482,13 @@ def _rules_model(
         btts_c      = 0.45 + (btts_rate   - 0.45) * credibility
         over25_c    = 0.45 + (over25_rate  - 0.45) * credibility
         cs_c        = 0.25 + (cs_rate      - 0.25) * credibility
+        # blank_rate (failed-to-score rate) was previously returned raw/
+        # unshrunk here while every sibling rate above IS credibility-
+        # shrunk toward a baseline for thin samples -- letting one noisy,
+        # small-sample value through unfiltered next to seven shrunk ones.
+        # 0.25 baseline matches cs_rate's, the closest structural analogue
+        # (both are "one side fails to register" match-level rates).
+        blank_c     = 0.25 + (blank_rate   - 0.25) * credibility
 
         # Recency-weighted form from profile string (W=1, D=0.5, L=0)
         form_str = str((record.get("form") or ""))[:8]
@@ -501,7 +510,7 @@ def _rules_model(
             "btts_rate": round(btts_c, 3),
             "over25_rate": round(over25_c, 3),
             "cs_rate": round(cs_c, 3),
-            "blank_rate": round(blank_rate, 3),
+            "blank_rate": round(blank_c, 3),
             "form_score": round(form_score, 3),
             "credibility": round(credibility, 3),
             "sample": eff_sample,
@@ -738,6 +747,45 @@ def _build_venue_context(
 # Internal helpers â€” AI model
 # ---------------------------------------------------------------------------
 
+# _ai_model's live LLM call is the single most expensive step in
+# team_watcher_signal(), which enriched_prediction.py calls on every
+# prediction cycle for a match. This module's own README documents the
+# intent ("Brief generation should be cached ... with a TTL to avoid
+# redundant LLM requests") but nothing implemented it, so the same match
+# re-fired an identical LLM call every re-prediction with no cache at all.
+# In-process TTL cache, same pattern (module-level dict + time.monotonic())
+# already used by app/monitoring/learned_parameters.py's _graded_rows() for
+# the same class of problem -- process-local rather than the DB-persisted
+# cache the README describes, but this process is a single long-running
+# worker (not restarted per-request), so it delivers the same practical
+# effect without a new schema. Keyed on a hash of both profiles (so a
+# materially updated profile still gets a fresh AI opinion) plus match
+# identity, not just team names.
+_AI_MODEL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_AI_MODEL_CACHE_TTL = 1800  # 30 minutes
+_AI_MODEL_CACHE_MAX_SIZE = 2000  # bounds memory in a long-running process
+
+
+def _ai_model_cache_key(
+    home_profile: dict[str, Any] | None,
+    away_profile: dict[str, Any] | None,
+    match_doc: dict[str, Any],
+) -> str:
+    payload = json.dumps(
+        {
+            "home": home_profile or {},
+            "away": away_profile or {},
+            "home_team": match_doc.get("home_team"),
+            "away_team": match_doc.get("away_team"),
+            "tournament": match_doc.get("tournament") or match_doc.get("league"),
+            "match_date": match_doc.get("match_date"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _ai_model(
     home_profile: dict[str, Any] | None,
     away_profile: dict[str, Any] | None,
@@ -750,7 +798,16 @@ def _ai_model(
 
     On any exception falls back to _rules_model result augmented with
     ``ai_model_available: False``.
+
+    Cached with a TTL (see _AI_MODEL_CACHE above) -- an identical
+    (home_profile, away_profile, match) combination within the TTL window
+    returns the cached result instead of firing another LLM call.
     """
+    cache_key = _ai_model_cache_key(home_profile, away_profile, match_doc)
+    now = time.monotonic()
+    cached = _AI_MODEL_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _AI_MODEL_CACHE_TTL:
+        return cached[1]
     try:
         from app.ai.ai_router import get_router, parse_json_response  # noqa: PLC0415
 
@@ -794,7 +851,7 @@ def _ai_model(
         confidence = max(1, min(95, int(confidence_raw)))
 
         venue_context = _build_venue_context(home_profile, away_profile, match_doc)
-        return {
+        result = {
             "pick_type": pick_type,
             "selection": selection,
             "confidence": confidence,
@@ -802,6 +859,18 @@ def _ai_model(
             "ai_model_available": True,
             "venue_context": venue_context,
         }
+        # Only cache a genuine LLM result, never the rules-model fallback
+        # below -- caching a transient LLM failure would freeze that
+        # failure as "the answer" for the full TTL instead of retrying the
+        # LLM on the next call, defeating the point of having a fallback.
+        if len(_AI_MODEL_CACHE) >= _AI_MODEL_CACHE_MAX_SIZE:
+            expired = [k for k, (ts, _) in _AI_MODEL_CACHE.items() if now - ts >= _AI_MODEL_CACHE_TTL]
+            for k in expired:
+                _AI_MODEL_CACHE.pop(k, None)
+            while len(_AI_MODEL_CACHE) >= _AI_MODEL_CACHE_MAX_SIZE:
+                _AI_MODEL_CACHE.pop(next(iter(_AI_MODEL_CACHE)), None)
+        _AI_MODEL_CACHE[cache_key] = (now, result)
+        return result
 
     except Exception as exc:
         logger.warning("_ai_model fallback to rules: %s", exc)
