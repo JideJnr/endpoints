@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from copy import deepcopy
 
@@ -11,6 +12,8 @@ from app.risk.validation_gate import evaluate_promotion_gate
 
 
 from app.utils.primitives import _to_float
+
+logger = logging.getLogger(__name__)
 
 # ── Static Fallbacks (used when learned data is insufficient) ──────────────────
 # These remain as safety nets but are progressively replaced by learned values.
@@ -576,6 +579,12 @@ def _record_risk_control_application(
                 ))
             conn.commit()
     except Exception:
-        pass  # Non-critical — don't break prediction flow
+        # Non-critical — don't break prediction flow, but a silently
+        # swallowed failure here means risk-learning history quietly
+        # goes stale with no signal, so log it instead of `pass`.
+        logger.exception(
+            "Failed to record risk control application for match_id=%s",
+            doc.get("sportybet_id") or doc.get("id") or doc.get("match_id"),
+        )
 
 

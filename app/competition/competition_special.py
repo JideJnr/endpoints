@@ -234,6 +234,14 @@ def init_competition_tables(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists competition_special_migrations (
+            name text primary key,
+            applied_at text not null default current_timestamp
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists competition_special_buffer (
             competition_key text not null,
             match_id text not null,
@@ -901,30 +909,48 @@ def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
                 json.dumps({"source": "sofascore", "mode": "competition_special"}),
             ),
         )
-    # Correct two historic catalogue IDs without overwriting any other operator
-    # configuration. MLS was previously pointed at 955, while 242 is its
-    # SofaScore unique-tournament ID; Brasileirão Série A is 325.
-    conn.execute("""update competition_special_settings
-                    set unique_tournament_id = 242, updated_at = current_timestamp
-                    where key = 'mls' and unique_tournament_id = 955""")
-    conn.execute("""update competition_special_settings
-                    set unique_tournament_id = 325, updated_at = current_timestamp
-                    where key = 'brasileirao' and unique_tournament_id = 242""")
-    conn.execute("""update competition_special_settings
-                    set unique_tournament_id = 52, updated_at = current_timestamp
-                    where key = 'super-lig' and unique_tournament_id = 325""")
-    conn.execute("""update competition_special_settings
-                    set unique_tournament_id = 18,
-                        metadata_json = json_remove(coalesce(metadata_json, '{}'), '$.last_sync_end_date'),
-                        updated_at = current_timestamp
-                    where key = 'championship' and unique_tournament_id = 37""")
-    conn.execute("""update competition_special_settings
-                    set unique_tournament_id = 37,
-                        metadata_json = json_remove(coalesce(metadata_json, '{}'), '$.last_sync_end_date'),
-                        updated_at = current_timestamp
-                    where key = 'eredivisie' and unique_tournament_id = 44""")
-    _purge_wrong_competition_key_rows(conn, "championship", 18)
-    _purge_wrong_competition_key_rows(conn, "eredivisie", 37)
+    # One-time historic catalogue-ID correction. This used to run on every
+    # call (every GET to the competitions list/settings/status endpoints),
+    # and _purge_wrong_competition_key_rows() scans and json.loads()s every
+    # historical competition_special_buffer row for two leagues to do it —
+    # cost that grows with match history and was the root cause of the
+    # competitions list "loading eventually but taking a long time." A
+    # migration marker now makes this run once, ever, per database.
+    _MIGRATION_NAME = "purge_wrong_competition_key_rows_v1"
+    already_applied = conn.execute(
+        "select 1 from competition_special_migrations where name = ?",
+        (_MIGRATION_NAME,),
+    ).fetchone()
+    if not already_applied:
+        # Correct two historic catalogue IDs without overwriting any other
+        # operator configuration. MLS was previously pointed at 955, while
+        # 242 is its SofaScore unique-tournament ID; Brasileirão Série A is
+        # 325.
+        conn.execute("""update competition_special_settings
+                        set unique_tournament_id = 242, updated_at = current_timestamp
+                        where key = 'mls' and unique_tournament_id = 955""")
+        conn.execute("""update competition_special_settings
+                        set unique_tournament_id = 325, updated_at = current_timestamp
+                        where key = 'brasileirao' and unique_tournament_id = 242""")
+        conn.execute("""update competition_special_settings
+                        set unique_tournament_id = 52, updated_at = current_timestamp
+                        where key = 'super-lig' and unique_tournament_id = 325""")
+        conn.execute("""update competition_special_settings
+                        set unique_tournament_id = 18,
+                            metadata_json = json_remove(coalesce(metadata_json, '{}'), '$.last_sync_end_date'),
+                            updated_at = current_timestamp
+                        where key = 'championship' and unique_tournament_id = 37""")
+        conn.execute("""update competition_special_settings
+                        set unique_tournament_id = 37,
+                            metadata_json = json_remove(coalesce(metadata_json, '{}'), '$.last_sync_end_date'),
+                            updated_at = current_timestamp
+                        where key = 'eredivisie' and unique_tournament_id = 44""")
+        _purge_wrong_competition_key_rows(conn, "championship", 18)
+        _purge_wrong_competition_key_rows(conn, "eredivisie", 37)
+        conn.execute(
+            "insert into competition_special_migrations (name) values (?) on conflict(name) do nothing",
+            (_MIGRATION_NAME,),
+        )
 
 
 def _event_unique_tournament_id(event: dict[str, Any]) -> int | None:

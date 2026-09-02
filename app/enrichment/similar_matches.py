@@ -21,6 +21,7 @@ from typing import Any
 from app.storage.db import db_conn
 from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db, normalize_league
+from app.utils.normalise import normalise
 
 logger = logging.getLogger(__name__)
 
@@ -269,13 +270,25 @@ def _batch_load_elos(
     conn: sqlite3.Connection,
     team_names: list[str],
 ) -> dict[str, float]:
-    """Load ELO ratings for a list of team names in one query (case-insensitive)."""
+    """Load ELO ratings for a list of team names in one query.
+
+    Matches using the same alias/suffix normalisation (`app.utils.normalise`)
+    used everywhere else in the enrichment pipeline, not a plain lower() —
+    a raw lower() match silently misses cross-provider name variants (e.g.
+    "Paris SG" vs "Paris Saint-Germain") and falls back to a default 1500
+    ELO, quietly degrading similarity scoring.
+    """
     if not team_names:
         return {}
-    placeholders = ",".join("?" * len(team_names))
+    conn.create_function("normalise_team_name", 1, lambda n: normalise(n or ""))
+    keys = {normalise(n) for n in team_names if n}
+    if not keys:
+        return {}
+    placeholders = ",".join("?" * len(keys))
     rows = conn.execute(
-        f"select lower(team_name), rating from elo_ratings where lower(team_name) in ({placeholders})",
-        [str(n or "").lower() for n in team_names],
+        f"select normalise_team_name(team_name), rating from elo_ratings "
+        f"where normalise_team_name(team_name) in ({placeholders})",
+        list(keys),
     ).fetchall()
     return {row[0]: float(row[1]) for row in rows}
 
@@ -358,14 +371,14 @@ def _extract_target_elos(
     home_id = str(home_team.get("id") or "") if isinstance(home_team, dict) else ""
     away_id = str(away_team.get("id") or "") if isinstance(away_team, dict) else ""
 
-    home_name = (
+    home_name = normalise(
         (home_team.get("name") or "") if isinstance(home_team, dict)
         else str(home_team or "")
-    ).lower().strip()
-    away_name = (
+    )
+    away_name = normalise(
         (away_team.get("name") or "") if isinstance(away_team, dict)
         else str(away_team or "")
-    ).lower().strip()
+    )
 
     home_elo = elo_lookup.get(home_name, _DEFAULT_ELO)
     away_elo = elo_lookup.get(away_name, _DEFAULT_ELO)
@@ -522,33 +535,33 @@ def find_similar_matches(
         # ── Resolve target team names ─────────────────────────────────────────
         home_raw = (doc.get("home_team") or "")
         away_raw = (doc.get("away_team") or "")
-        target_home_name = (
+        target_home_name = normalise(
             home_raw.get("name") if isinstance(home_raw, dict) else str(home_raw or "")
-        ).lower().strip()
-        target_away_name = (
+        )
+        target_away_name = normalise(
             away_raw.get("name") if isinstance(away_raw, dict) else str(away_raw or "")
-        ).lower().strip()
+        )
 
         # Also try from sofascore_detail if top-level names are empty
         if not target_home_name or not target_away_name:
             detail = doc.get("sofascore_detail") or {}
             if not target_home_name:
-                target_home_name = str(
+                target_home_name = normalise(
                     (detail.get("home_team") or {}).get("name") or ""
-                ).lower().strip()
+                )
             if not target_away_name:
-                target_away_name = str(
+                target_away_name = normalise(
                     (detail.get("away_team") or {}).get("name") or ""
-                ).lower().strip()
+                )
 
         # Fallback: parse from match name
         if not target_home_name or not target_away_name:
             match_name = str(doc.get("sportybet_name") or doc.get("name") or "")
             parsed_home, parsed_away = _parse_match_name(match_name)
             if not target_home_name:
-                target_home_name = parsed_home.lower()
+                target_home_name = normalise(parsed_home)
             if not target_away_name:
-                target_away_name = parsed_away.lower()
+                target_away_name = normalise(parsed_away)
 
         # ── Collect all team names needed for ELO lookup ──────────────────────
         all_team_names: set[str] = set()
@@ -558,9 +571,9 @@ def find_similar_matches(
             mn = str(c.get("match_name") or "")
             ch, ca = _parse_match_name(mn)
             if ch:
-                all_team_names.add(ch.lower().strip())
+                all_team_names.add(normalise(ch))
             if ca:
-                all_team_names.add(ca.lower().strip())
+                all_team_names.add(normalise(ca))
 
         elo_lookup = _batch_load_elos(conn, list(all_team_names))
 
@@ -579,8 +592,8 @@ def find_similar_matches(
         # Parse home/away from match_name (candidates from prediction_history use this)
         mn = str(c.get("match_name") or "")
         cand_home_str, cand_away_str = _parse_match_name(mn)
-        cand_home_name = cand_home_str.lower().strip()
-        cand_away_name = cand_away_str.lower().strip()
+        cand_home_name = normalise(cand_home_str)
+        cand_away_name = normalise(cand_away_str)
         cand_home_elo = elo_lookup.get(cand_home_name, _DEFAULT_ELO)
         cand_away_elo = elo_lookup.get(cand_away_name, _DEFAULT_ELO)
 

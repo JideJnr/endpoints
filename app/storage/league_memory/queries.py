@@ -902,7 +902,6 @@ def grade_overdue_predictions(hours_after_kickoff: float = 2.0, limit: int = 300
     """
     _init_db()
     import time as _time
-    from collections import defaultdict
 
     now_seconds = _time.time()
     # Candidate = any match that has kicked off.  The finished-status check
@@ -1154,7 +1153,6 @@ def grade_orphaned_predictions(limit: int = 1000) -> dict[str, Any]:
         }
     """
     _init_db()
-    from collections import defaultdict
 
     # ── 1. Fetch all orphaned ungraded rows ──────────────────────────────────
     with _conn() as conn:
