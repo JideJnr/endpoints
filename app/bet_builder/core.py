@@ -278,29 +278,90 @@ def _live_match_prediction_state(limit: int) -> tuple[dict[str, dict[str, Any]],
     return fresh_by_match, stale_or_missing
 
 
-def _generate_fresh_live_predictions(match_ids: list[str]) -> None:
-    """Run and record a fresh live prediction for each match_id, synchronously,
-    right here in the request -- this is the "if we don't have data, pull it
-    and predict" behavior: job_unified_live covers the general live pipeline
-    on its own cycle, but a bet-builder request needs the answer now, not on
-    the next scheduled pass. Capped by LIVE_ON_DEMAND_GENERATE_LIMIT and never
-    raises -- a single match's prediction failing (thin live signal, no
-    SofaScore match yet, etc.) must not fail the whole candidate fetch.
+def _row_age_seconds(timestamp: str | None) -> float | None:
+    """Same ISO-timestamp-age parsing idiom used by _live_match_prediction_state
+    above, factored out so both the freshness check and the on-demand refresh
+    below agree on what "stale" means."""
+    if not timestamp:
+        return None
+    try:
+        created_ts = time.mktime(time.strptime(str(timestamp)[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+    return time.time() - created_ts
+
+
+def _refresh_live_stats_if_stale(doc: dict[str, Any], match_id: str) -> dict[str, Any]:
+    """Pull one lightweight SofaScore live refresh inline if this match is
+    already matched and its buffered statistics look older than the
+    prediction freshness window.
+
+    This is deliberately narrow: it never attempts matching (fuzzy-match,
+    LLM fallback, etc.) -- only the 3-call live refresh
+    (statistics/incidents/graph/lineups) for a match that already has a
+    saved sofascore_id + sofascore_detail. A match with no SofaScore match
+    yet is left to the background pipeline (job_enrich_worker /
+    job_unified_live), same as before. Never raises -- prediction should
+    still proceed on whatever's buffered if this fails.
     """
+    sofa_id = doc.get("sofascore_id")
+    existing_detail = doc.get("sofascore_detail")
+    if not sofa_id or not existing_detail:
+        return doc
+    age = _row_age_seconds(doc.get("enriched_at"))
+    if age is not None and age <= LIVE_PREDICTION_FRESHNESS_SECONDS:
+        return doc
+    try:
+        from app.data_clients.sofascore_client import fetch_event_detail_live_refresh
+        from app.storage.buffer import store_enriched
+
+        fresh_detail = fetch_event_detail_live_refresh(int(sofa_id), existing_detail)
+        store_enriched(match_id, {"sofascore_detail": fresh_detail})
+        doc = {**doc, "sofascore_detail": fresh_detail}
+    except Exception as exc:
+        logger.debug("live_prediction_candidates: inline live-stat refresh failed for %s: %s", match_id, exc)
+    return doc
+
+
+def _generate_fresh_live_predictions(match_ids: list[str]) -> None:
+    """Refresh live stats (if stale) and record a fresh live prediction for
+    each match_id, in parallel -- this is the "if we don't have data, pull
+    it and predict, right now" behavior: job_unified_live/job_enrich_worker
+    cover the general live pipeline on their own cycle, but a bet-builder
+    request needs the answer now, not on the next scheduled pass.
+
+    Bounded by LIVE_ON_DEMAND_GENERATE_LIMIT concurrent workers (each match
+    is an independent SofaScore fetch + prediction, so this is the same
+    "parallel across matches" shape job_enrich_worker already uses -- just
+    triggered synchronously from a request instead of a scheduler tick).
+    A single match's refresh or prediction failing (thin live signal, no
+    SofaScore match yet, etc.) must never fail the whole candidate fetch.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from app.storage.buffer import get_buffered_match
     from app.utils.prediction_flow import predict_and_record_enriched, PredictionDeferred
 
-    for match_id in match_ids[:LIVE_ON_DEMAND_GENERATE_LIMIT]:
+    targets = match_ids[:LIVE_ON_DEMAND_GENERATE_LIMIT]
+    if not targets:
+        return
+
+    def _refresh_and_predict(match_id: str) -> None:
         try:
             doc = get_buffered_match(match_id)
             if not doc:
-                continue
+                return
+            doc = _refresh_live_stats_if_stale(doc, match_id)
             predict_and_record_enriched(doc, match_id=match_id, source="live_bet_builder_on_demand")
         except PredictionDeferred:
-            continue
+            return
         except Exception as exc:
             logger.debug("live_prediction_candidates: on-demand prediction failed for %s: %s", match_id, exc)
-            continue
+
+    with ThreadPoolExecutor(max_workers=min(LIVE_ON_DEMAND_GENERATE_LIMIT, len(targets))) as pool:
+        futures = [pool.submit(_refresh_and_predict, match_id) for match_id in targets]
+        for future in as_completed(futures):
+            future.result()  # exceptions are already swallowed inside; surfaces anything that isn't
 
 
 def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:

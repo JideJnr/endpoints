@@ -783,6 +783,10 @@ def _convert_confidence(raw: float) -> int:
 def _rules_fallback(doc: dict, reason: str, **kwargs: Any) -> dict:
     from app.utils.prediction_flow import apply_prediction_state
     logger.warning("Rules-engine fallback invoked: %s", reason)
+    # Never trigger the LLM pipeline from the fallback path — it already failed
+    # or was unavailable, so forcing use_llm_pipeline=False here prevents a
+    # second independent pipeline run that would overwrite the DB row and return
+    # the wrong pipeline's output via the API.
     kwargs["use_llm_pipeline"] = False
     result = apply_prediction_state(doc, **kwargs)
     result["prediction_source"] = "rules_engine_fallback"
@@ -797,7 +801,10 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
         source=source,
         attach_brain=attach_brain,
         allow_repeat=allow_repeat,
-        use_llm_pipeline=True if use_llm_pipeline is None else use_llm_pipeline,
+        # Fallback path must never trigger the LLM pipeline — use_llm_pipeline
+        # is overridden to False in _rules_fallback above, but set it False here
+        # too so the kwargs dict is never accidentally used with True elsewhere.
+        use_llm_pipeline=False,
     )
     try:
         from app.ai.ai_router import get_router

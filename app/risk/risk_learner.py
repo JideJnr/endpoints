@@ -197,6 +197,12 @@ def record_risk_outcome(
 
     with db_conn(timeout=20) as conn:
         _init_risk_learner_tables(conn)
+        # Only update raw counters here. Computed caps (recommended_confidence_cap,
+        # recommended_stake_cap) are written exclusively by rebuild_risk_controls(),
+        # which runs as step 10 of run_learning_cycle() and uses the Python
+        # _compute_confidence_cap / _compute_stake_cap functions correctly.
+        # Previously this SQL called those functions as if they were SQLite UDFs,
+        # which silently failed and left risk_outcomes permanently empty.
         conn.execute("""
             insert into risk_outcomes
                 (risk_conditions, pick_type, confidence_band, league_tier, odds_range,
@@ -206,7 +212,7 @@ def record_risk_outcome(
                     case when ? = 'win' then 1 else 0 end,
                     case when ? = 'loss' then 1 else 0 end,
                     case when ? = 'win' then 1.0 else 0.0 end,
-                    ?, ?, ?, ?, current_timestamp)
+                    ?, null, 72, 5.0, current_timestamp)
             on conflict(risk_conditions, pick_type, confidence_band, league_tier, odds_range)
             do update set
                 samples = risk_outcomes.samples + 1,
@@ -221,31 +227,13 @@ def record_risk_outcome(
                     when ? is not null then round(?, 2)
                     else risk_outcomes.avg_clv_percent
                 end,
-                avg_roi = case
-                    when ? is not null and risk_outcomes.avg_roi is not null
-                    then round((risk_outcomes.avg_roi * risk_outcomes.samples + ?) /
-                               (risk_outcomes.samples + 1), 4)
-                    else risk_outcomes.avg_roi
-                end,
-                recommended_confidence_cap = _compute_confidence_cap(
-                    risk_outcomes.wins + case when ? = 'win' then 1 else 0 end,
-                    risk_outcomes.samples + 1,
-                    risk_outcomes.recommended_confidence_cap
-                ),
-                recommended_stake_cap = _compute_stake_cap(
-                    risk_outcomes.wins + case when ? = 'win' then 1 else 0 end,
-                    risk_outcomes.samples + 1,
-                    risk_outcomes.recommended_stake_cap,
-                    ?
-                ),
                 last_updated = current_timestamp
         """, (
             conditions_key, pick_type, band, league_tier, odds_range,
             result, result, result,
-            clv_percent, clv_percent,  # avg_clv update
-            clv_percent, clv_percent,  # avg_roi placeholder
-            result, result,  # confidence cap update
-            result, result, clv_percent,  # stake cap update
+            clv_percent,
+            result, result, result,
+            clv_percent, clv_percent, clv_percent, clv_percent,
         ))
         conn.commit()
 

@@ -75,11 +75,16 @@ def predict_and_record_enriched(
         })
         return prediction
 
-    # Use LLM pipeline if requested and available
+    # Use LLM pipeline if requested, available, and not disabled by operator
     if use_llm_pipeline:
         from app.ai.llm_pipeline import run_llm_pipeline
         from app.config.config import get_settings as _gs
-        if _gs().openrouter_api_key:
+        _settings = _gs()
+        if not _settings.llm_pipeline_enabled:
+            # Operator has set PREDICTX_LLM_PIPELINE_ENABLED=false — skip LLM
+            # and fall through to the deterministic ensemble below.
+            pass
+        elif _settings.openrouter_api_key:
             prediction = run_llm_pipeline(doc, attach_brain=attach_brain)
             prediction["audit"] = build_prediction_audit(prediction, doc)
             resolved_match_id = str(

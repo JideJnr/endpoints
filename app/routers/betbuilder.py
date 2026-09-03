@@ -1,13 +1,23 @@
 """
 Bet Builder Router
 ==================
-Two clearly separated endpoints:
+Prematch (upcoming) endpoints:
 
   POST /betbuilder/manual   - deterministic stored-pick builder
   POST /betbuilder/llm      - stored picks plus optional slip synthesis
+  POST /betbuilder/smart    - learned-conviction only, no target odds
 
-Both endpoints consume predictions already produced by unified upcoming/live.
-They do not generate per-match predictions.
+Live (in-play) endpoints — same three modes, sourced from currently live
+matches instead of upcoming ones:
+
+  POST /betbuilder/live/manual  - "Accept": deterministic, no LLM
+  POST /betbuilder/live/smart   - "Suggest": learned conviction, no target
+  POST /betbuilder/live/llm     - "AI": LLM-assisted slip synthesis
+
+All endpoints consume predictions already produced by unified upcoming/live.
+They do not generate per-match predictions themselves (the live candidate
+fetch may trigger an on-demand live prediction for a match with no fresh
+stored one, but that's the existing prediction pipeline, not new logic here).
 """
 from __future__ import annotations
 
@@ -91,6 +101,70 @@ def smart_bet(body: SmartBetRequest) -> dict[str, Any]:
     from app.bet_builder.smart_builder import run_smart_bet
 
     return run_smart_bet(
+        stake=body.stake,
+        candidate_limit=body.candidate_limit,
+        request_code=body.request_code,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live (in-play) — same three modes, sourced from currently live matches
+# ---------------------------------------------------------------------------
+
+@router.post("/live/manual")
+def live_manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
+    """
+    Live "Accept" builder — deterministic, no LLM.
+
+    Reads currently in-play matches with a fresh (or freshly generated)
+    live prediction from the shared live probability grid, scores and ranks
+    them with the same conviction logic as the prematch manual builder, and
+    builds a SportyBet booking slip (force-refreshed against live markets).
+    """
+    from app.bet_builder.live_builder import run_live_manual_bet
+
+    return run_live_manual_bet(
+        target_odds=body.target_odds,
+        max_total_odds=body.max_total_odds,
+        stake=body.stake,
+        candidate_limit=body.candidate_limit,
+        request_code=body.request_code,
+    )
+
+
+@router.post("/live/smart")
+def live_smart_bet(body: SmartBetRequest) -> dict[str, Any]:
+    """
+    Live "Suggest" builder — no target odds, learned conviction only.
+
+    Includes every currently in-play pick whose conviction clears its own
+    learned bar. Returns status "no_smart_bet" rather than forcing a pick
+    when nothing live clears the bar right now. No LLM calls.
+    """
+    from app.bet_builder.live_builder import run_live_smart_bet
+
+    return run_live_smart_bet(
+        stake=body.stake,
+        candidate_limit=body.candidate_limit,
+        request_code=body.request_code,
+    )
+
+
+@router.post("/live/llm")
+def live_llm_bet(body: BetBuilderRequest) -> dict[str, Any]:
+    """
+    Live "AI" builder — LLM-assisted slip synthesis.
+
+    Reads currently in-play matches with a fresh live prediction, scores
+    them, and (when available) uses the LLM to choose the combined slip
+    from those already-generated picks. It does not predict individual
+    matches itself.
+    """
+    from app.bet_builder.live_builder import run_live_llm_bet
+
+    return run_live_llm_bet(
+        target_odds=body.target_odds,
+        max_total_odds=body.max_total_odds,
         stake=body.stake,
         candidate_limit=body.candidate_limit,
         request_code=body.request_code,

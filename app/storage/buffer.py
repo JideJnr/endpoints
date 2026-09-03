@@ -1564,7 +1564,7 @@ def run_enrichment_worker(
                 doc,
                 match_id=str(item.get("match_id") or ""),
                 use_llm_pipeline=False,
-                attach_brain=False,
+                attach_brain=True,
             )
             readiness = state.get("readiness") or {}
             if state.get("status") == "predicted":
@@ -1894,7 +1894,7 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                 doc,
                 match_id=str(item.get("match_id") or ""),
                 use_llm_pipeline=False,
-                attach_brain=False,
+                attach_brain=True,
             )
             readiness = state.get("readiness") or {}
             if state.get("status") == "predicted":
