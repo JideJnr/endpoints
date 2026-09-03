@@ -94,6 +94,45 @@ def _opponent_quality_score(team_id: str, team_name: str) -> float:
     return max(0.0, min(100.0, 50.0 + (rating - 1500.0) / 8.0))
 
 
+def _classify_competition(key: str, league_name: str = "") -> str:
+    """
+    "known" vs "learned" classification the user asked for -- purely
+    descriptive metadata threaded through to downstream consumers
+    (the competition_intelligence signal, the ensemble, the AI prompt);
+    does NOT change TOP_30_COMPETITIONS, its scoring/importance logic, or
+    anything in _competition_intelligence_context -- those stay exactly
+    as they are.
+
+    "known": key is in the curated TOP_30_COMPETITIONS / World Cup
+    catalogue below (unchanged).
+
+    "learned": not in the curated catalogue, but has crossed
+    self_learner.MIN_SAMPLES graded predictions in league_accuracy -- the
+    same "trust it fully" sample bar used everywhere else in this
+    codebase, not a new one invented for this.
+
+    "unclassified": neither -- e.g. a dynamically-discovered competition
+    (see _ensure_dynamic_competition) with too little graded history yet
+    to say anything about it. apply_known_competition_context()'s own
+    "known" boolean does not distinguish any of this today: it's True for
+    the curated catalogue AND for any dynamically-tracked competition
+    that merely has a settings row, however thin its history -- exactly
+    the ambiguity being split out here.
+    """
+    if key == DEFAULT_WORLD_CUP.get("key") or key in _CATALOGUE_BY_KEY:
+        return "known"
+    try:
+        from app.monitoring.self_learner import get_league_accuracy, MIN_SAMPLES
+        lacc = get_league_accuracy(league_name or key)
+        if lacc.get("known"):
+            total_samples = sum(int(pt.get("samples") or 0) for pt in lacc.get("by_pick_type") or [])
+            if total_samples >= MIN_SAMPLES:
+                return "learned"
+    except Exception:
+        pass
+    return "unclassified"
+
+
 def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
     """Attach competition-special intelligence to any ordinary match document.
 
@@ -141,6 +180,11 @@ def apply_known_competition_context(doc: dict[str, Any]) -> dict[str, Any]:
         "unique_tournament_id": tournament_id,
         "importance": _match_importance_context(key, event),
         "intelligence": intelligence,
+        # See _classify_competition's own docstring: "known" above already
+        # covers curated + any dynamically-tracked competition; this splits
+        # that into "known" (curated) vs "learned" (earned trust from
+        # graded history) vs "unclassified" (neither yet).
+        "classification": _classify_competition(key, comp_name),
     }
     doc["known_competition"] = context
     doc["competition_special"] = {"key": key, "name": comp_name, "source": "known_competition_match"}

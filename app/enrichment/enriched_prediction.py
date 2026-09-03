@@ -2304,6 +2304,11 @@ def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | No
         "name": "competition_intelligence",
         "value": {
             "competition": known.get("key"),
+            # "known" (curated TOP_30) vs "learned" (earned trust from
+            # graded history) vs "unclassified" -- see
+            # competition_special.py::_classify_competition. Descriptive
+            # only; does not change contribution/impact math above.
+            "classification": known.get("classification"),
             "components_used": used,
             "table_edge_ppg": table.get("edge_ppg"),
             "table_leader": table.get("leader"),

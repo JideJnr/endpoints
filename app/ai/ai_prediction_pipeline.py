@@ -729,7 +729,9 @@ def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile,
         # had enough data to be used.
         ci_value = competition_intelligence["value"]
         context_block += (
-            f"Competition intelligence (home-advantage direction, "
+            f"Competition intelligence "
+            f"(classification={ci_value.get('classification')}, "
+            f"home-advantage direction, "
             f"components_used={ci_value.get('components_used')}): "
             f"table_edge_ppg={ci_value.get('table_edge_ppg')}, "
             f"form_edge={ci_value.get('form_edge')}, "
