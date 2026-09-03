@@ -511,7 +511,18 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
     selection = row["selection"]
     pt = str(pick_type or "").lower()
     sel = str(selection or "").lower()
-    if pt == "live_team_to_score":
+    # The shared-grid live picks in _live_grid_projection_picks() are tagged
+    # with a "_grid" suffix (live_next_goal_grid, live_no_goal_grid,
+    # live_total_goals_grid, live_match_winner_grid, live_btts_grid) so they
+    # can be told apart from the older independent-heuristic picks below.
+    # None of the pt == checks below matched that suffix, so every grid pick
+    # silently fell through to the generic final-score-only grader at the
+    # bottom -- which either voids them or (for market families that need to
+    # know the score AT PICK TIME, not just the final score) grades them
+    # wrong. Stripping the suffix here routes grid picks through the exact
+    # same live-context-aware logic as their heuristic counterparts.
+    pt_base = pt[:-5] if pt.endswith("_grid") else pt
+    if pt_base == "live_team_to_score":
         try:
             context = json.loads(row["context_json"] or "{}")
         except Exception:
@@ -520,7 +531,7 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
         start_away = _to_int(context.get("score_away"), 0)
         home_delta = final_home - start_home
         away_delta = final_away - start_away
-        side = _side_from_selection_and_match(str(selection or "").lower(), row["match_name"])
+        side = _side_from_selection_and_match(sel, row["match_name"])
         # side can also come back "ambiguous" (both team names plausibly
         # matched the selection text) — that must be refused, not treated
         # as a guessable side.
@@ -533,15 +544,49 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
         if picked_delta == 0 and other_delta > 0:
             return "loss"
         return "void"
-    if pt in {"live_next_goal", "live_total_goals"}:
+    if pt_base in {"live_next_goal", "live_no_goal"}:
+        try:
+            context = json.loads(row["context_json"] or "{}")
+        except Exception:
+            context = {}
+        start_home = _to_int(context.get("score_home"), 0)
+        start_away = _to_int(context.get("score_away"), 0)
+        start_total = start_home + start_away
+        final_total = final_home + final_away
+        # "No More Goals" is the OPPOSITE bet from "a team scores next" --
+        # this used to have no branch for it at all (there was no way to
+        # even publish that pick before this fix) and would have graded it
+        # backwards had it existed, since the old logic only ever asked "did
+        # any goal happen". Win only if the score never moved again.
+        if pt_base == "live_no_goal" or "no more goal" in sel or "no goal" in sel or sel.strip() in {"none", "no more goals"}:
+            return "win" if final_total == start_total else "loss"
+        # Selection names a specific team ("Arsenal to score next") -- grade
+        # on THAT team's delta, same as live_team_to_score, not "any goal by
+        # either side" like the old fallback below did.
+        side = _side_from_selection_and_match(sel, row["match_name"])
+        if side in ("home", "away"):
+            home_delta = final_home - start_home
+            away_delta = final_away - start_away
+            picked_delta = home_delta if side == "home" else away_delta
+            other_delta = away_delta if side == "home" else home_delta
+            if picked_delta > 0 and other_delta == 0:
+                return "win"
+            if picked_delta == 0 and other_delta > 0:
+                return "loss"
+            return "void"
+        if "next goal" in sel:
+            # Legacy generic phrasing with no identifiable team in the
+            # selection text -- keep the old "did any goal happen" behaviour
+            # as a last resort rather than voiding rows we used to grade.
+            return "win" if final_total > start_total else "loss"
+        return "void"
+    if pt_base == "live_total_goals":
         try:
             context = json.loads(row["context_json"] or "{}")
         except Exception:
             context = {}
         start_total = _to_int(context.get("score_home"), 0) + _to_int(context.get("score_away"), 0)
         final_total = final_home + final_away
-        if "next goal" in sel:
-            return "win" if final_total > start_total else "loss"
         match = re.search(r"(over|under)\s+(\d+(?:\.\d+)?)", sel)
         if match:
             line = float(match.group(2))
@@ -549,9 +594,21 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
                 return "win" if final_total > line else "loss"
             return "win" if final_total < line else "loss"
         return "void"
-    if pt == "live_match_winner":
+    if pt_base == "live_match_winner":
         return _grade_pick_for_match("match_result", selection, final_home, final_away, row["match_name"])
-    if pt == "consensus_longshot_value":
+    if pt_base in {"live_btts", "btts"}:
+        # BTTS doesn't need the score-at-pick-time context that the other
+        # live markets do -- "did both teams score at all" is answerable
+        # from the final score alone.
+        both_scored = final_home > 0 and final_away > 0
+        no_dir = bool(re.search(r"\bno\b", sel))
+        yes_dir = bool(re.search(r"\byes\b", sel))
+        if no_dir and not yes_dir:
+            return "win" if not both_scored else "loss"
+        if yes_dir:
+            return "win" if both_scored else "loss"
+        return "void"
+    if pt_base == "consensus_longshot_value":
         try:
             context = json.loads(row["context_json"] or "{}")
         except Exception:
@@ -561,7 +618,7 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
         if graded != "void":
             return graded
         return _grade_pick_for_match("match_result", selection, final_home, final_away, row["match_name"])
-    if pt == "value_overlay":
+    if pt_base == "value_overlay":
         pick_type = "value_bet"
     return _grade_pick_for_match(pick_type, selection, final_home, final_away, row["match_name"])
 

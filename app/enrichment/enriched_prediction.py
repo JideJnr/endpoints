@@ -2451,16 +2451,40 @@ def _live_grid_projection_picks(
         elif ou["under"] >= 0.55:
             picks.append(_pick("live_total_goals_grid", f"Under {line:g} (grid)", round(ou["under"] * 100, 1), f"joint grid model; {xg_note}{pressure_note}"))
 
+    # Three-way read off the same grid: home scores next / away scores next /
+    # no more goals at all. This used to only ever check "does a team clear
+    # 0.40" -- a weaker bar than every sibling market above (0.55), and it
+    # never considered "No More Goals" as a publishable pick in its own
+    # right even when the grid rated it the most likely of the three. Real
+    # graded tickets back this change up two ways: (1) "no goal" calls only
+    # actually paid off when they were genuinely the likely outcome (short
+    # odds / high modelled probability) -- picking "no goal" as a default
+    # lean regardless of match state is exactly what lost repeatedly; (2)
+    # per-leg conviction below 0.55 is weaker than what every other market
+    # here requires, no reason next-goal should get a lower bar.
     next_goal = projection.next_goal()
-    next_goal_map = {home_name: next_goal.get("home_scores_next", 0.0), away_name: next_goal.get("away_scores_next", 0.0)}
+    next_goal_map = {
+        home_name: next_goal.get("home_scores_next", 0.0),
+        away_name: next_goal.get("away_scores_next", 0.0),
+        "No More Goals": next_goal.get("no_more_goals", 0.0),
+    }
     best_next = max(next_goal_map, key=next_goal_map.get)
-    if next_goal_map[best_next] >= 0.40 and next_goal.get("no_more_goals", 1.0) < 0.50:
-        picks.append(_pick(
-            "live_next_goal_grid",
-            f"{best_next} to score next (grid)",
-            round(next_goal_map[best_next] * 100, 1),
-            f"competing-Poisson next-scorer read, {lambda_note}; {xg_note}{pressure_note}",
-        ))
+    best_next_prob = next_goal_map[best_next]
+    if best_next_prob >= 0.55:
+        if best_next == "No More Goals":
+            picks.append(_pick(
+                "live_no_goal_grid",
+                "No More Goals (grid)",
+                round(best_next_prob * 100, 1),
+                f"competing-Poisson next-scorer read, {lambda_note}; {xg_note}{pressure_note}",
+            ))
+        else:
+            picks.append(_pick(
+                "live_next_goal_grid",
+                f"{best_next} to score next (grid)",
+                round(best_next_prob * 100, 1),
+                f"competing-Poisson next-scorer read, {lambda_note}; {xg_note}{pressure_note}",
+            ))
 
     return _dedupe_picks(picks)
 
