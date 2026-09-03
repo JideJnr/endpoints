@@ -575,7 +575,18 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         from app.team_watcher.team_watcher import team_watch_signal as _tw_watch_signal
         tw_watch = _tw_watch_signal(doc)
         if tw_watch and (tw_watch.get("value") or {}).get("available"):
-            signals.append(tw_watch)
+            # De-dupe against `rules`: when the SofaScore-detail path was
+            # used above, `_rules_prediction` -> predict_sofascore_event
+            # already called this exact function (team_watch_signal) on the
+            # event and, if available, folded its "team_watch" entry into
+            # rules["signals"] -- which seeded this `signals` list. Without
+            # this check, an available team_watch signal was appended a
+            # second time here, silently double-counting the same edge in
+            # every consumer that reads `signals` (role classification,
+            # noisy-support checks, audit output). Same dedupe-by-name
+            # convention already used for H2H signals above (R13.6).
+            if not any(existing.get("name") == "team_watch" for existing in signals):
+                signals.append(tw_watch)
     except Exception as exc:
         from app.utils.health_counters import record_health_event
         record_health_event("enriched_prediction", "team_watch_signal_error", exc)
