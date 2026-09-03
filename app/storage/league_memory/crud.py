@@ -39,7 +39,7 @@ from ._helpers import (
     _match_1x2_odds_profile, _normalise_start_seconds, _datetime_to_seconds,
     _date_from_start, _sofa_ids_from_raw,
     _same_team, _close_match_row, _team_form_from_rows,
-    _grade_pick_for_match, _grade_pick, _side_from_selection_and_match,
+    _side_from_selection_and_match,
     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
     _decorate_betbuilder_selections, _betbuilder_learning_summary,
     _TEAM_HISTORY_CACHE_DAYS,
@@ -1179,9 +1179,8 @@ def _latest_leg_grade(conn: sqlite3.Connection, match_id: str, pick_type: str, s
     if score is None:
         return None
     final_home, final_away = score
-    result = _grade_pick_for_match(pick_type, selection, final_home, final_away, None)
     grade_info = grading_reason(pick_type, selection, final_home, final_away)
-    grade_info["result"] = result
+    result = grade_info["result"]
     return {
         "result": str(result or "void"),
         "graded_at": None,

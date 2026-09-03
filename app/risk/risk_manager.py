@@ -62,16 +62,10 @@ def apply_risk_controls(
 
     # Get learned risk controls for each pick (if enough data exists).
     #
-    # NOTE: as of 2026-08, app/risk/risk_learner.py's risk_outcomes table has
-    # no live writer (rebuild_risk_controls() exists but is not wired into
-    # any scheduled job — see its docstring for why), so
-    # get_learned_risk_controls_for_pick() always returns its "bootstrap"
-    # default (samples=0) in practice. The LEARNED_RISK_MIN_SAMPLES gate
-    # below is what makes that safe: a pick never gets a learned
-    # confidence/stake cap applied unless the underlying row is both
-    # sufficiently sampled and fresh (risk_learner._risk_row_is_stale), so
-    # an empty or stale table silently falls back to the static rules
-    # applied later in this function instead of being trusted.
+    # risk_outcomes is rebuilt by risk_learner.rebuild_risk_controls() on
+    # every learning cycle (step 10 of self_learner.run_learning_cycle).
+    # The LEARNED_RISK_MIN_SAMPLES gate below means a learned row is only
+    # trusted once it has enough samples; bootstrap defaults apply until then.
     learned_controls: dict[int, LearnedRiskControls] = {}
     for idx, pick in enumerate(picks):
         if pick.get("type") == "no_bet":

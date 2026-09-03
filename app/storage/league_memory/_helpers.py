@@ -711,6 +711,8 @@ def _grade_pick_for_match(pick_type: str | None, selection: str | None, home: in
                 return "win" if away >= home else "loss"
             # Generic "or draw protection" — treat as favourite side wins or draws
             return "win" if home == away or home > away else "loss"
+        if "home or away" in sel_lower or "away or home" in sel_lower or sel_lower.strip() == "12":
+            return "win" if home != away else "loss"
         if _contains_word(sel_lower, "home"):
             return "win" if home > away else "loss"
         if _contains_word(sel_lower, "away"):
@@ -718,13 +720,22 @@ def _grade_pick_for_match(pick_type: str | None, selection: str | None, home: in
         if _contains_word(sel_lower, "draw"):
             return "win" if home == away else "loss"
         # No literal "home"/"away"/"draw" wording — the selection is most
-        # likely a team display name (e.g. "Arsenal Win"). Try the
-        # structured-ish name match as a last resort before giving up.
+        # likely a team display name (e.g. "Arsenal Win", or for
+        # double_chance specifically "Arsenal or Chelsea" -- the
+        # home-or-away/12 double-chance pick phrased with both team names
+        # instead of the literal words). Try the structured-ish name match
+        # as a last resort before giving up.
         side = _side_from_selection_and_match(sel_lower, match_name)
         if side == "home":
             return "win" if home > away else "loss"
         if side == "away":
             return "win" if away > home else "loss"
+        if side == "ambiguous" and pt == "double_chance":
+            # Both team full names appear in the selection text with no
+            # draw wording anywhere -- the only realistic way that happens
+            # for a double_chance pick is "{TeamA} or {TeamB}" (12/home-or-
+            # away), not a genuine ambiguity between two candidate teams.
+            return "win" if home != away else "loss"
         return "void"
 
     return "void"
@@ -846,10 +857,20 @@ def grade_prediction_row(
     final_home: int,
     final_away: int,
 ) -> tuple[str, dict[str, Any]]:
-    """Apply grading_reason + _grade_pick_for_match fallback. Returns (result, grade_info)."""
+    """Apply grading_reason; returns (result, grade_info).
+
+    ``grading_reason`` calls ``grade_market_intent`` first, then
+    ``_fallback_grade`` (which handles team-name display-text cases via
+    ``_side_from_selection_and_match``). There is no longer a separate
+    ``_grade_pick_for_match`` call here — that was a duplicate path that
+    could produce different win/loss labels for the same pick depending on
+    which code path reached it.
+    """
     from app.monitoring.prediction_audit import grading_reason as _grading_reason
     grade_info = _grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
-    result = grade_info["result"] if grade_info.get("result") != "void" else _grade_pick_for_match(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
+    result = grade_info["result"]
+    # Keep "void" out of prediction_history — treat as "void" rather than
+    # forcing a spurious win/loss by falling back further.
     grade_info["result"] = result
     return result, grade_info
 

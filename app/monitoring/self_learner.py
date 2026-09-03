@@ -676,6 +676,15 @@ def run_learning_cycle() -> dict[str, Any]:
         except Exception:
             pass
 
+    # -- 10. Risk-control rebuild -----------------------------------------------
+    risk_control_result: dict[str, Any] = {}
+    try:
+        from app.risk.risk_learner import rebuild_risk_controls
+        risk_control_result = rebuild_risk_controls()
+    except Exception:
+        pass
+    risk_buckets = risk_control_result.get("buckets_written", 0)
+
     pref_updates = pref_result.get("updates", 0) if isinstance(pref_result, dict) else 0
     print(
         f"[self_learner] cycle complete: "
@@ -689,7 +698,8 @@ def run_learning_cycle() -> dict[str, Any]:
         f"{combination_updates} combination patterns | "
         f"{threshold_updates} learned thresholds | "
         f"{pref_updates} tournament preferences | "
-        f"{drift_events} drift events"
+        f"{drift_events} drift events | "
+        f"{risk_buckets} risk-control buckets"
     )
     return {
         "status": "ok",
@@ -708,6 +718,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "league_outcome_distribution_updates": outcome_distribution_updates,
         "context_penalty_updates": context_penalty_updates,
         "signal_outcome_backfills": signal_outcome_backfills,
+        "risk_control_buckets": risk_buckets,
     }
 
 

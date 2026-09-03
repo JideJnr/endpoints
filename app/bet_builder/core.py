@@ -183,6 +183,178 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Live candidate fetching
+# ---------------------------------------------------------------------------
+
+# Live pick-type families this bet builder will consider. Deliberately
+# excludes older heuristic-only live types with no verified booking path
+# (live_team_to_score) and includes both the newer shared-grid types
+# ("_grid" suffix) and their independent-heuristic counterparts, since
+# _live_grid_projection_picks and _live_inplay_picks run side by side and
+# either can win the confidence/clear_winner ranking for a given match.
+LIVE_BETTABLE_TYPES = {
+    "live_match_winner", "live_match_winner_grid",
+    "live_total_goals", "live_total_goals_grid",
+    "live_next_goal", "live_next_goal_grid",
+    "live_no_goal_grid",
+    "live_btts", "live_btts_grid",
+    "live_double_chance_grid",
+}
+
+# How old a stored live prediction is allowed to be before it's treated as
+# stale and regenerated. Live match state (score, minute, live stats) can
+# invalidate a prediction within seconds of a goal or a red card, so this is
+# deliberately much tighter than anything used for prematch predictions.
+LIVE_PREDICTION_FRESHNESS_SECONDS = 150
+
+# Cap on how many fresh predictions one live_prediction_candidates() call
+# will generate synchronously, to keep endpoint latency bounded. Matches
+# beyond this cap that lack a fresh stored prediction are simply skipped
+# for this call -- job_unified_live will pick them up on its own cycle.
+LIVE_ON_DEMAND_GENERATE_LIMIT = 6
+
+
+def _best_live_pick(picks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    usable = [p for p in picks if p.get("type") in LIVE_BETTABLE_TYPES]
+    if not usable:
+        return None
+    return max(usable, key=lambda p: int(p.get("confidence") or 0))
+
+
+def _live_match_prediction_state(limit: int) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Return (freshest prediction_history row per currently-live match_id,
+    list of live match_ids with no row fresh enough to trust)."""
+    try:
+        from app.storage.db import db_conn
+        from app.storage.league_memory import _init_db
+
+        _init_db()
+        with db_conn(timeout=20) as conn:
+            conn.row_factory = sqlite3.Row
+            live_rows = conn.execute(
+                """
+                select match_id from match_buffer
+                where is_live = 1 and coalesce(is_finished, 0) = 0
+                order by coalesce(enriched_at, ingested_at) desc
+                limit ?
+                """,
+                (int(max(limit, 100)),),
+            ).fetchall()
+            live_match_ids = [str(r["match_id"]) for r in live_rows if r["match_id"]]
+            if not live_match_ids:
+                return {}, []
+
+            placeholders = ",".join("?" for _ in live_match_ids)
+            pred_rows = conn.execute(
+                f"""
+                select match_id, created_at, picks_json, signals_json, match_name,
+                       league_name, country_name, source
+                from prediction_history
+                where match_id in ({placeholders})
+                  and created_at >= datetime('now', '-2 hours')
+                  and pick_type != 'no_bet'
+                order by datetime(created_at) desc, id desc
+                """,
+                tuple(live_match_ids),
+            ).fetchall()
+    except Exception:
+        return {}, []
+
+    now_ts = time.time()
+    fresh_by_match: dict[str, dict[str, Any]] = {}
+    for row in pred_rows:
+        match_id = str(row["match_id"] or "")
+        if not match_id or match_id in fresh_by_match:
+            continue  # already have this match's freshest row (rows are ordered desc)
+        try:
+            created_ts = time.mktime(time.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            continue
+        if now_ts - created_ts > LIVE_PREDICTION_FRESHNESS_SECONDS:
+            continue
+        fresh_by_match[match_id] = dict(row)
+
+    stale_or_missing = [m for m in live_match_ids if m not in fresh_by_match]
+    return fresh_by_match, stale_or_missing
+
+
+def _generate_fresh_live_predictions(match_ids: list[str]) -> None:
+    """Run and record a fresh live prediction for each match_id, synchronously,
+    right here in the request -- this is the "if we don't have data, pull it
+    and predict" behavior: job_unified_live covers the general live pipeline
+    on its own cycle, but a bet-builder request needs the answer now, not on
+    the next scheduled pass. Capped by LIVE_ON_DEMAND_GENERATE_LIMIT and never
+    raises -- a single match's prediction failing (thin live signal, no
+    SofaScore match yet, etc.) must not fail the whole candidate fetch.
+    """
+    from app.storage.buffer import get_buffered_match
+    from app.utils.prediction_flow import predict_and_record_enriched, PredictionDeferred
+
+    for match_id in match_ids[:LIVE_ON_DEMAND_GENERATE_LIMIT]:
+        try:
+            doc = get_buffered_match(match_id)
+            if not doc:
+                continue
+            predict_and_record_enriched(doc, match_id=match_id, source="live_bet_builder_on_demand")
+        except PredictionDeferred:
+            continue
+        except Exception as exc:
+            logger.debug("live_prediction_candidates: on-demand prediction failed for %s: %s", match_id, exc)
+            continue
+
+
+def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
+    """Return currently in-play matches with a bettable, fresh-enough stored
+    prediction -- generating one on demand for matches that are live but
+    whose stored prediction is missing or stale (see
+    LIVE_PREDICTION_FRESHNESS_SECONDS), up to LIVE_ON_DEMAND_GENERATE_LIMIT
+    per call.
+
+    Deliberately skips the research-filter gate `upcoming_prediction_candidates`
+    applies -- that gate's dynamic per-league rules are tuned against
+    prematch pick types and have no accuracy history yet for live/grid pick
+    types (which only started grading correctly recently). Revisit once live
+    picks have accumulated their own graded history.
+    """
+    from app.utils.primitives import _loads
+
+    fresh_by_match, stale_or_missing = _live_match_prediction_state(limit)
+    if stale_or_missing:
+        _generate_fresh_live_predictions(stale_or_missing)
+        # Re-check just the matches we attempted -- cheap relative to the
+        # full query above, and picks up whatever the on-demand pass stored.
+        refreshed, _still_stale = _live_match_prediction_state(limit)
+        fresh_by_match.update(refreshed)
+
+    candidates: list[dict[str, Any]] = []
+    for match_id, row in fresh_by_match.items():
+        picks = _loads(row.get("picks_json"), [])
+        pick = _best_live_pick(picks)
+        if not pick:
+            continue
+        odds = pick_decimal_odds(pick)
+        if odds is None or odds < 1.30:
+            continue
+        candidates.append({
+            "match_id": match_id,
+            "sportybet_id": match_id,
+            "match_name": row.get("match_name"),
+            "league_name": row.get("league_name"),
+            "country_name": row.get("country_name"),
+            "signals": _loads(row.get("signals_json"), []),
+            "picks": picks,
+            "is_live": True,
+            "best_pick": {**pick, "odds": odds},
+        })
+
+    candidates.sort(
+        key=lambda r: int((r.get("best_pick") or {}).get("confidence") or 0),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+# ---------------------------------------------------------------------------
 # Conviction scoring — shared by both rank functions
 # ---------------------------------------------------------------------------
 

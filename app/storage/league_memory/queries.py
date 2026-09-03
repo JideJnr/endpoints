@@ -32,7 +32,7 @@ from ._helpers import (
     _normalise_start_seconds, _datetime_to_seconds, _date_from_start,
     _sofa_ids_from_raw,
     _same_team, _close_match_row, _team_form_from_rows, _team_name,
-    _grade_pick, _grade_pick_for_match, _side_from_selection_and_match,
+    _grade_pick_for_match, _side_from_selection_and_match,
     _betbuilder_leg_key, _odds_band, _infer_betbuilder_pick_type,
     _decorate_betbuilder_selections,
     grade_prediction_row, update_prediction_result,
@@ -596,6 +596,8 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
         return "void"
     if pt_base == "live_match_winner":
         return _grade_pick_for_match("match_result", selection, final_home, final_away, row["match_name"])
+    if pt_base == "live_double_chance":
+        return _grade_pick_for_match("double_chance", selection, final_home, final_away, row["match_name"])
     if pt_base in {"live_btts", "btts"}:
         # BTTS doesn't need the score-at-pick-time context that the other
         # live markets do -- "did both teams score at all" is answerable
@@ -1504,8 +1506,9 @@ def _grade_decision_row(row: sqlite3.Row, final_home: int, final_away: int) -> d
     selection = row["selection"]
     if row["decision_type"] == "published" and pick_type != "no_bet":
         info = grading_reason(pick_type, selection, final_home, final_away, row["match_name"])
-        if info.get("result") == "void":
-            info["result"] = _grade_pick_for_match(pick_type, selection, final_home, final_away, row["match_name"])
+        # grading_reason already runs _fallback_grade internally when
+        # grade_market_intent returns "void", so there is no separate
+        # _grade_pick_for_match call here.
         info["decision_type"] = row["decision_type"]
         return info
 

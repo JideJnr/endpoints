@@ -58,21 +58,16 @@ from app.storage.league_memory import _init_db
 
 # Learned risk-outcome rows are trusted only while reasonably fresh.
 #
-# rebuild_risk_controls() (below) is currently the ONLY writer of the
-# risk_outcomes table and it is NOT called from anywhere in the app (no
-# scheduler job, no grading hook) — see the warning on rebuild_risk_controls()
-# for why it has been left disconnected. That means, today, risk_outcomes is
-# always empty and every call to get_learned_risk_controls() falls through to
-# the "bootstrap" default at the bottom of that function, which is the
-# existing fail-safe for "no data yet".
+# rebuild_risk_controls() is the sole writer of the risk_outcomes table and
+# is called as step 10 of self_learner.run_learning_cycle() on every grading
+# pass.  It is idempotent: it aggregates stats in Python first, then does a
+# full delete-and-rebuild of risk_outcomes (the same pattern run_learning_cycle
+# uses for signal_weights).
 #
-# RISK_CONTROLS_MAX_AGE_DAYS exists for the future: if rebuild_risk_controls()
-# (or a proper incremental writer) is ever wired in and then stops running
-# (a broken cron entry, an exception that gets swallowed upstream, etc.), a
-# learned row should not go on being trusted forever just because it once
-# existed. Once a row is older than this, it is treated the same as
-# "insufficient samples" and the read path falls back the same way it does
-# for a genuinely empty table.
+# RISK_CONTROLS_MAX_AGE_DAYS guards against a row going silently stale if the
+# learning cycle stops running (broken cron, unhandled exception, etc.). A
+# row older than this is treated the same as "insufficient samples" and the
+# read path falls back to the conservative bootstrap default.
 RISK_CONTROLS_MAX_AGE_DAYS = 45
 
 
@@ -453,114 +448,119 @@ def get_risk_control_summary() -> dict[str, Any]:
 def rebuild_risk_controls() -> dict[str, Any]:
     """Rebuild all risk control recommendations from graded prediction history.
 
-    Scans prediction_history for all graded predictions, extracts their
-    risk conditions at prediction time, and recomputes optimal caps.
+    Idempotent: aggregates stats in Python from the full graded-history scan,
+    then deletes and rewrites risk_outcomes from scratch — the same pattern
+    used by self_learner.run_learning_cycle for signal_weights.  Safe to call
+    on every learning cycle.
 
-    NOT CURRENTLY CALLED ANYWHERE IN THE APP. This is intentional, not an
-    oversight — do not wire it into a scheduled job (e.g. self_learner's
-    run_learning_cycle, which two scheduler.py jobs already invoke on every
-    grading pass) without first fixing the issue below:
-
-    This function is NOT idempotent / safe to call repeatedly. It does a
-    full, unfiltered rescan of every graded prediction in prediction_history
-    every time it runs (no "since last run" cursor, no delete-and-rebuild of
-    risk_outcomes first — contrast with self_learner.run_learning_cycle,
-    which does `delete from signal_weights` etc. before recomputing from
-    scratch). Each row it processes goes through record_risk_outcome(),
-    whose SQL does `samples = risk_outcomes.samples + 1` — an incremental
-    counter increment, designed for "record one freshly-graded outcome"
-    calls, not for repeatedly replaying the entire history. Calling this on
-    a schedule would re-add every already-counted historical outcome on
-    every run, inflating `samples`/`wins`/`losses` without bound and
-    corrupting the derived recommended_confidence_cap / recommended_stake_cap
-    (both of which gate real stake sizing in risk_manager.py).
-
-    Before wiring this in, either (a) rewrite it to aggregate stats in
-    Python and delete-and-rebuild risk_outcomes from scratch each run (the
-    pattern self_learner.run_learning_cycle uses), or (b) hook
-    record_risk_outcome() directly into wherever predictions get graded, so
-    each outcome is recorded exactly once, and drop the periodic full
-    rescan entirely.
-
-    Until one of those is done, the read path (get_learned_risk_controls /
-    get_learned_risk_controls_for_pick) is written to be safe regardless:
-    with risk_outcomes always empty, every read falls through to the
-    documented "bootstrap" conservative default, and risk_manager.py's
-    apply_risk_controls() additionally never trusts a learned row with
-    fewer than LEARNED_RISK_MIN_SAMPLES samples. See RISK_CONTROLS_MAX_AGE_DAYS
-    above for the staleness guard that also protects against a
-    once-populated table silently going stale if this is later wired in and
-    then breaks.
+    Called at the end of self_learner.run_learning_cycle() (step 10).
     """
+    import json as _json
+
     _init_db()
     with db_conn(timeout=30) as conn:
         _init_risk_learner_tables(conn)
         conn.row_factory = sqlite3.Row
 
-        # Get all graded predictions with their risk management data
         rows = conn.execute("""
             select ph.id, ph.match_id, ph.pick_type, ph.selection, ph.confidence,
                    ph.result, ph.league_name, ph.country_name, ph.graded_at,
-                   ph.audit_json, ph.signals_json,
-                   rm.risk_level, rm.violations, rm.assurance, rm.learned_classification
+                   ph.audit_json, ph.signals_json
             from prediction_history ph
-            left join (
-                select match_id, json_extract(risk_management, '$.risk_level') as risk_level,
-                       json_extract(risk_management, '$.violations') as violations,
-                       json_extract(risk_management, '$.assurance') as assurance,
-                       json_extract(risk_management, '$.learned_classification') as learned_classification
-                from prediction_history
-                where risk_management is not null
-            ) rm on ph.match_id = rm.match_id
             where ph.graded_at is not null
               and ph.result in ('win', 'loss')
               and ph.pick_type != 'no_bet'
               and ph.audit_json is not null
         """).fetchall()
 
-    updated = 0
+        clv_lookup: dict[tuple[str, str], float | None] = {}
+        for cr in conn.execute(
+            "select match_id, pick_type, clv_percent from clv_entries"
+        ).fetchall():
+            clv_lookup[(str(cr["match_id"]), str(cr["pick_type"]))] = cr["clv_percent"]
+
+    # ── Aggregate stats in Python (no incremental counters) ───────────────────
+    # Key: (conditions_key, pick_type, confidence_band, league_tier, odds_range)
+    BucketKey = tuple[str, str, str, int, str]
+    stats: dict[BucketKey, dict[str, Any]] = {}
+
+    processed = 0
     for row in rows:
         try:
             audit = _parse_json(row["audit_json"]) or {}
             risk_mgmt = audit.get("risk_management") or {}
             contextual = audit.get("contextual_intelligence") or {}
             market = contextual.get("market_behavior") or {}
-            readiness = audit.get("enrichment", {}).get("assurance", "full")
+            readiness = (audit.get("enrichment") or {}).get("assurance", "full")
 
-            # Extract risk conditions from the prediction
             conditions = _extract_risk_conditions(risk_mgmt, contextual, market, readiness)
             if not conditions:
                 continue
 
-            # Get odds from the prediction
             odds = _extract_odds_from_audit(audit)
             league_tier = _estimate_league_tier(row["league_name"], row["country_name"])
             pick_type = row["pick_type"]
             confidence = int(row["confidence"] or 50)
-            result = row["result"]
+            result = str(row["result"])
+            clv = clv_lookup.get((str(row["match_id"]), pick_type))
 
-            # Get CLV if available
-            clv_row = conn.execute("""
-                select clv_percent from clv_entries
-                where match_id = ? and pick_type = ?
-                limit 1
-            """, (row["match_id"], pick_type)).fetchone()
-            clv = clv_row["clv_percent"] if clv_row else None
-
-            record_risk_outcome(
-                risk_conditions=conditions,
-                pick_type=pick_type,
-                confidence=confidence,
-                league_tier=league_tier,
-                decimal_odds=odds,
-                result=result,
-                clv_percent=clv,
+            key: BucketKey = (
+                _conditions_key(conditions),
+                pick_type,
+                _confidence_band(confidence),
+                league_tier,
+                _odds_range(odds),
             )
-            updated += 1
+            if key not in stats:
+                stats[key] = {
+                    "samples": 0, "wins": 0, "losses": 0,
+                    "clv_sum": 0.0, "clv_count": 0,
+                }
+            bucket = stats[key]
+            bucket["samples"] += 1
+            if result == "win":
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+            if clv is not None:
+                bucket["clv_sum"] += float(clv)
+                bucket["clv_count"] += 1
+
+            processed += 1
         except Exception:
             continue
 
-    return {"status": "ok", "records_processed": updated}
+    now = datetime.now(timezone.utc).isoformat()
+
+    # ── Delete-and-rebuild (idempotent) ───────────────────────────────────────
+    with db_conn(timeout=30) as conn:
+        conn.execute("delete from risk_outcomes")
+
+        for (cond_key, pick_type, band, tier, odds_range), bucket in stats.items():
+            samples = bucket["samples"]
+            wins = bucket["wins"]
+            losses = bucket["losses"]
+            win_rate = round(wins / samples, 4) if samples else None
+            avg_clv = (
+                round(bucket["clv_sum"] / bucket["clv_count"], 2)
+                if bucket["clv_count"] > 0 else None
+            )
+            conf_cap = _compute_confidence_cap(wins, samples, 72)
+            stake_cap = _compute_stake_cap(wins, samples, 5.0, avg_clv)
+
+            conn.execute("""
+                insert into risk_outcomes
+                    (risk_conditions, pick_type, confidence_band, league_tier, odds_range,
+                     samples, wins, losses, win_rate, avg_clv_percent, avg_roi,
+                     recommended_confidence_cap, recommended_stake_cap, last_updated)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, ?)
+            """, (cond_key, pick_type, band, tier, odds_range,
+                  samples, wins, losses, win_rate, avg_clv,
+                  conf_cap, stake_cap, now))
+
+        conn.commit()
+
+    return {"status": "ok", "records_processed": processed, "buckets_written": len(stats)}
 
 
 # ── Helper Functions ───────────────────────────────────────────────────────────

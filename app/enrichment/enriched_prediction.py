@@ -2437,6 +2437,31 @@ def _live_grid_projection_picks(
             f"shared-grid live model, {lambda_note}; {xg_note}{pressure_note}",
         ))
 
+    # Double chance, read off the same three match_winner() probabilities:
+    # sum each pair (home+draw = 1X, draw+away = X2, home+away = 12) and
+    # publish whichever pair the grid rates most likely. Gated well above
+    # the 0.55 bar every single-outcome sibling above uses -- two-outcome
+    # combinations are structurally more likely than any one outcome on
+    # its own (they sum two slices of the same simplex), so a bar that low
+    # would make this pick fire almost every match regardless of whether
+    # the grid actually has a real edge.
+    home_win = winner.get("home_win", 0.0)
+    draw_prob = winner.get("draw", 0.0)
+    away_win = winner.get("away_win", 0.0)
+    dc_map = {
+        f"{home_name} or Draw": home_win + draw_prob,
+        f"{away_name} or Draw": away_win + draw_prob,
+        f"{home_name} or {away_name}": home_win + away_win,
+    }
+    best_dc = max(dc_map, key=dc_map.get)
+    if dc_map[best_dc] >= 0.75:
+        picks.append(_pick(
+            "live_double_chance_grid",
+            f"{best_dc} (grid)",
+            round(dc_map[best_dc] * 100, 1),
+            f"shared-grid live model, {lambda_note}; {xg_note}{pressure_note}",
+        ))
+
     btts_prob = projection.btts()
     if btts_prob >= 0.55:
         picks.append(_pick("live_btts_grid", "BTTS Yes (grid)", round(btts_prob * 100, 1), f"joint grid model; {xg_note}{pressure_note}"))

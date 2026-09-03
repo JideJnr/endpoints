@@ -30,33 +30,66 @@ def classify_market_intent(
     sel = normalise_market_text(selection or raw_value.get("selection"))
     line = parse_total_line(sel)
 
-    if kind == "no_bet" or "avoid game" in sel or "no strong bet" in sel:
+    # Live picks from the shared-probability-grid model
+    # (_live_grid_projection_picks, app/enrichment/enriched_prediction.py)
+    # carry a "_grid" suffix on their pick_type (live_match_winner_grid,
+    # live_next_goal_grid, live_no_goal_grid, live_total_goals_grid,
+    # live_btts_grid, live_double_chance_grid) to tell them apart from the
+    # older independent-heuristic live picks below, which don't have the
+    # suffix. Route both through the same intent branches by kind rather
+    # than depending on exact selection wording -- some grid selection text
+    # ("Arsenal to win (grid)", "Arsenal to score next (grid)") doesn't
+    # match any of the text heuristics below, so without this a grid pick
+    # would fall through to an unclassified "other" market and fail to
+    # book ("selection is no longer available"). Same suffix-stripping
+    # convention already used for grading in
+    # app/storage/league_memory/queries.py's _grade_candidate_row.
+    kind_base = kind[:-5] if kind.endswith("_grid") else kind
+
+    if kind_base == "no_bet" or "avoid game" in sel or "no strong bet" in sel:
         return _intent("avoid", "avoid", "avoid", None, line, selection)
 
-    if kind == "live_next_goal" or "next goal" in sel:
+    if kind_base == "live_no_goal" or "no more goal" in sel or "no goal" in sel:
+        return _intent("live_goal", "live_no_goal", "no_goal", "under", line, selection)
+
+    if kind_base == "live_next_goal" or "next goal" in sel or "to score next" in sel:
         return _intent("live_goal", "live_next_goal", "next_goal", "over", line, selection)
 
-    if kind == "live_total_goals":
+    # live_total_goals and live_match_winner map onto the SAME market
+    # names/outcomes SportyBet uses prematch ("Over/Under", "1X2") --
+    # confirmed against a real live match's stored markets
+    # (match_buffer.raw_sporty for a currently in-play fixture showed
+    # "1X2", "Double Chance" and "Over/Under" as the live in-play market
+    # names too, identical to prematch). So these deliberately return the
+    # existing "total_goals"/"1x2" market values rather than inventing new
+    # "live_*" ones _find_market_outcome doesn't know how to resolve --
+    # that gap is exactly why these picks were unbookable before this fix.
+    if kind_base == "live_total_goals":
         direction = "under" if "under" in sel else "over" if "over" in sel else None
-        return _intent("live_goal", "live_total_goals", f"{direction or 'total'}_live", direction, line, selection)
+        intent = f"{direction or 'total'}_{_line_key(line)}"
+        return _intent("live_goal", "total_goals", intent, direction, line, selection)
 
-    if kind == "live_team_to_score":
+    if kind_base == "live_team_to_score":
         return _intent("live_team_goal", "live_team_to_score", "team_to_score", _side_from_text(sel), line, selection)
 
-    if kind == "live_match_winner":
+    if kind_base == "live_match_winner" or "to win (grid)" in sel:
         side = _side_from_text(sel)
-        return _intent("live_outcome", "live_match_winner", f"{side or 'side'}_winner", side, line, selection)
+        return _intent("live_outcome", "1x2", f"{side or 'unknown'}_win", side, line, selection)
+
+    if kind_base == "live_double_chance":
+        intent, direction = _double_chance_intent(sel)
+        return _intent("double_chance", "double_chance", intent, direction, line, selection)
 
     if _is_btts(sel):
         direction = "no" if _is_no_btts(sel) else "yes"
         return _intent("btts", "btts", f"btts_{direction}", direction, line, selection)
 
-    if "over" in sel or "under" in sel or kind in {"goals", "live_goals"}:
+    if "over" in sel or "under" in sel or kind_base in {"goals", "live_goals"}:
         direction = "under" if "under" in sel else "over" if "over" in sel else None
         intent = f"{direction or 'total'}_{_line_key(line)}"
         return _intent("goal_total", "total_goals", intent, direction, line, selection)
 
-    if kind == "double_chance" or _is_double_chance(sel):
+    if kind_base == "double_chance" or _is_double_chance(sel):
         intent, direction = _double_chance_intent(sel)
         return _intent("double_chance", "double_chance", intent, direction, line, selection)
 

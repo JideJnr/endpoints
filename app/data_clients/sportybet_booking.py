@@ -8,10 +8,12 @@ code; one must never be invented locally.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from app.storage.buffer import get_buffered_match, refresh_sporty_match_state
 from app.market.market_intent import classify_market_intent
+from app.storage.league_memory._helpers import _side_from_selection_and_match
 from app.data_clients.sportybet_client import _browser_headers, _get_session
 
 
@@ -98,7 +100,8 @@ def _resolve_leg(selection: dict[str, Any], stake: int, *, force_refresh: bool =
         raise ValueError(f"No current SportyBet markets are available for event {event_id}")
 
     intent = classify_market_intent(selection.get("type") or selection.get("pick_type"), selection.get("selection"), selection)
-    market, outcome = _find_market_outcome(markets, intent, selection)
+    match_name = str(doc.get("name") or doc.get("sportybet_name") or "")
+    market, outcome = _find_market_outcome(markets, intent, selection, match_name=match_name)
     if not market or not outcome:
         label = str(selection.get("selection") or "selection")
         raise ValueError(f"{label!r} is no longer available for event {event_id}")
@@ -111,12 +114,50 @@ def _resolve_leg(selection: dict[str, Any], stake: int, *, force_refresh: bool =
     }
 
 
-def _find_market_outcome(markets: list[dict[str, Any]], intent: dict[str, Any], source: dict[str, Any]):
+def _find_market_outcome(
+    markets: list[dict[str, Any]],
+    intent: dict[str, Any],
+    source: dict[str, Any],
+    *,
+    match_name: str = "",
+):
     market_kind = str(intent.get("market") or "")
     direction = str(intent.get("direction") or "")
+    intent_name = intent.get("intent")
     line = intent.get("line")
     requested_market = str(source.get("marketId") or "")
     requested_outcome = str(source.get("outcomeId") or "")
+    raw_selection = str(intent.get("raw_selection") or source.get("selection") or "")
+
+    # Team-name-phrased picks ("Arsenal to win (grid)", "Arsenal or Draw
+    # (grid)") can't resolve through _outcome_matches's home/away/draw
+    # keyword check below -- verified against a real live match's stored
+    # 1X2/Double Chance markets, whose outcome labels are the generic
+    # "Home"/"Draw"/"Away" / "Home or Draw"/"Home or Away"/"Draw or Away",
+    # not team names -- because the SELECTION names the actual team, not
+    # the word "home"/"away". Resolve the side from match_name up front,
+    # the same way grading does (_side_from_selection_and_match,
+    # app/storage/league_memory/_helpers.py), before falling into the
+    # keyword matcher. "ambiguous" (both team names present, e.g. "Arsenal
+    # or Chelsea") is exactly the ~home-or-away~ double-chance case -- not
+    # a failure to resolve.
+    dc_unresolved = intent_name in (None, "double_chance")
+    if (market_kind == "1x2" and not direction) or (market_kind == "double_chance" and dc_unresolved):
+        clean_selection = re.sub(r"\(grid\)", "", raw_selection, flags=re.IGNORECASE).strip()
+        if market_kind == "1x2" and clean_selection.lower() == "draw":
+            direction = "draw"
+        elif match_name:
+            side = _side_from_selection_and_match(clean_selection, match_name)
+            if market_kind == "1x2" and side in ("home", "away"):
+                direction = side
+            elif market_kind == "double_chance":
+                if side == "home":
+                    intent_name = "home_or_draw"
+                elif side == "away":
+                    intent_name = "away_or_draw"
+                elif side == "ambiguous":
+                    intent_name = "home_or_away"
+
     for market in markets:
         outcomes = market.get("selections") or market.get("outcomes") or []
         if requested_market and str(market.get("id")) != requested_market:
@@ -125,18 +166,54 @@ def _find_market_outcome(markets: list[dict[str, Any]], intent: dict[str, Any], 
             continue
         if market_kind == "double_chance" and not _market_named(market, "double chance"):
             continue
-        if market_kind == "btts" and not _market_named(market, "both teams to score", "btts"):
+        if market_kind == "btts" and not _market_named(market, "both teams to score", "btts", "gg/ng", "gg ng"):
             continue
         if market_kind == "total_goals" and not _market_named(market, "over/under", "total goals"):
+            continue
+        # "Next Goal" / "No Goal" -- unlike 1x2/double-chance/over-under/btts
+        # above (confirmed identical to their prematch market names on a
+        # real live match), this market name is a best guess, not verified
+        # against real stored SportyBet data for this account -- the live
+        # match checked while building this had no "next goal"-style market
+        # in its stored snapshot to confirm against. Spot-check this against
+        # a real live slip before relying on it for actual staking.
+        if market_kind in ("live_next_goal", "live_no_goal") and not _market_named(market, "next goal"):
             continue
         if line is not None and str(line) not in str(market.get("specifier") or market.get("name") or ""):
             continue
         for outcome in outcomes:
             if requested_outcome and str(outcome.get("id")) == requested_outcome:
                 return market, outcome
-            if _outcome_matches(outcome.get("name") or outcome.get("desc"), market_kind, direction, intent.get("intent")):
+            outcome_text = outcome.get("name") or outcome.get("desc")
+            if _outcome_matches(outcome_text, market_kind, direction, intent_name):
+                return market, outcome
+            if market_kind in ("live_next_goal", "live_no_goal") and _next_goal_outcome_matches(
+                outcome_text, market_kind, direction, raw_selection, match_name,
+            ):
                 return market, outcome
     return None, None
+
+
+def _next_goal_outcome_matches(raw: Any, market_kind: str, direction: str, raw_selection: str, match_name: str) -> bool:
+    """Team-name-aware resolution for the live next-goal-scorer market.
+
+    Unlike 1x2/double-chance (where the pick's own selection text and the
+    provider's outcome text both reduce to home/away/draw keywords via
+    _outcome_matches/_side_from_text), a next-goal-scorer selection is
+    phrased with the actual team name ("Arsenal to score next (grid)"), not
+    the literal word "home"/"away" -- so it needs match_name to resolve
+    which side that team is on, the same way grading does
+    (_side_from_selection_and_match, app/storage/league_memory/_helpers.py).
+    """
+    value = " ".join(str(raw or "").lower().replace("-", " ").split())
+    if market_kind == "live_no_goal":
+        return "no goal" in value or "no more goal" in value or value in {"none", "no"}
+    side = _side_from_selection_and_match(raw_selection, match_name) if match_name else None
+    if side not in ("home", "away"):
+        return False
+    home_name, away_name = ([p.strip().lower() for p in match_name.split(" vs ", 1)] if " vs " in match_name else ("", ""))
+    expected_name = home_name if side == "home" else away_name
+    return bool(expected_name) and expected_name in value
 
 
 def _market_named(market: dict[str, Any], *needles: str) -> bool:

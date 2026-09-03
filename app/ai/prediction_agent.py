@@ -151,7 +151,23 @@ def _apply_time_decay(
         is_btts = "btts" in selection or "both teams" in selection
         is_btts_no = is_btts and "no" in selection
         is_btts_yes = is_btts and not is_btts_no
-        is_goal_timing_pick = kind in ("live_goals", "late_goal", "live_next_goal", "live_total_goals") or is_btts
+        # The shared-grid live picks (_live_grid_projection_picks in
+        # enriched_prediction.py) carry a "_grid" suffix on their pick type
+        # (live_next_goal_grid, live_total_goals_grid, live_no_goal_grid) to
+        # tell them apart from these older independent-heuristic picks. This
+        # used to only match the un-suffixed strings, so grid picks silently
+        # got the flat clock decay with NO learned per-league goal-timing
+        # adjustment at all -- the exact context this function exists to
+        # apply. live_btts_grid needs no separate entry: is_btts already
+        # matches it via selection text ("BTTS Yes/No (grid)").
+        is_no_goal_pick = kind == "live_no_goal_grid" or "no more goal" in selection or "no goal" in selection
+        is_goal_timing_pick = (
+            kind in (
+                "live_goals", "late_goal", "live_next_goal", "live_total_goals",
+                "live_next_goal_grid", "live_total_goals_grid", "live_no_goal_grid",
+            )
+            or is_btts
+        )
 
         if is_btts_yes and both_scored:
             # Already happened. The clock has nothing left to say about it.
@@ -170,6 +186,13 @@ def _apply_time_decay(
             # allowlisted) profile favours late goals: boost instead of decay.
             boost = 1.05 if minute >= 70 else 1.0
             new_conf = max(1, min(95, round(conf * boost * (1 + league_adj))))
+        elif is_no_goal_pick:
+            # Opposite side of the same coin from the branch above: a league
+            # whose learned history favours late goals makes "No More Goals"
+            # LESS safe, not more. Reusing league_adj with its normal sign
+            # here would boost a no-goal pick in exactly the leagues where
+            # it's least trustworthy -- invert it instead.
+            new_conf = max(1, min(95, round(conf * decay * (1 - league_adj))))
         elif is_goal_timing_pick:
             new_conf = max(1, min(95, round(conf * decay * (1 + league_adj))))
         else:
