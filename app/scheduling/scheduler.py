@@ -35,7 +35,7 @@ from app.utils.activity_log import record_activity
 from app.ai.ai_prediction_pipeline import job_ai_prediction_queue
 from app.competition.competition_analyser import job_competition_analysis
 from app.market.season_stage import detect_season_stage
-from app.competition.competition_special import _parse_datetime
+from app.utils.primitives import _parse_datetime
 from app.storage.db import _init_db
 
 

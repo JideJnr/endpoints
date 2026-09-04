@@ -75,35 +75,14 @@ def predict_and_record_enriched(
         })
         return prediction
 
-    # Use LLM pipeline if requested, available, and not disabled by operator
-    if use_llm_pipeline:
-        from app.ai.llm_pipeline import run_llm_pipeline
-        from app.config.config import get_settings as _gs
-        _settings = _gs()
-        if not _settings.llm_pipeline_enabled:
-            # Operator has set PREDICTX_LLM_PIPELINE_ENABLED=false — skip LLM
-            # and fall through to the deterministic ensemble below.
-            pass
-        elif _settings.openrouter_api_key:
-            prediction = run_llm_pipeline(doc, attach_brain=attach_brain)
-            prediction["audit"] = build_prediction_audit(prediction, doc)
-            resolved_match_id = str(
-                match_id
-                or prediction.get("match_id")
-                or doc.get("sportybet_id")
-                or doc.get("id")
-                or ""
-            )
-            record_prediction({
-                **prediction,
-                "match_id": resolved_match_id,
-                "sportybet_id": prediction.get("sportybet_id") or resolved_match_id,
-                "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
-                "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
-                "source": source,
-                "engine": "ai_llm",
-            })
-            return prediction
+    # NOTE: the use_llm_pipeline=True path (which called run_llm_pipeline —
+    # the old 7-call sequential specialist pipeline) has been removed.
+    # run_ai_prediction_with_fallback in orchestration.py is the canonical
+    # AI path: it runs 6 evidence steps in parallel + 1 decider call and
+    # passes a prebuilt_prediction here so the branch above handles recording.
+    # Keeping the old llm_pipeline branch here would fire a second,
+    # independent 7-call pipeline on the same match after orchestration
+    # already completed — that was the primary source of duplicate API calls.
 
     prediction = predict_enriched_match(doc)
     if attach_brain:

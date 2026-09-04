@@ -14,8 +14,7 @@ from app.market.season_stage import detect_season_stage
 from app.utils.time_context import match_time_context
 
 
-from app.utils.primitives import _to_float
-from app.competition.competition_special import _parse_datetime
+from app.utils.primitives import _to_float, _parse_datetime
 from app.utils.doc_helpers import _impact
 
 _LINEUP_KEYS = ("lineups", "starting_xi", "confirmed_lineups", "home_lineup", "away_lineup")

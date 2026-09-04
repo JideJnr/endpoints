@@ -29,9 +29,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from app.storage.db import db_conn
+from app.storage.db import db_conn, _init_db
 from app.storage.db import DB_PATH
-from app.storage.league_memory import _init_db
 
 
 # ── Table ─────────────────────────────────────────────────────────────────────

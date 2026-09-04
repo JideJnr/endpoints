@@ -4,12 +4,6 @@ from statistics import mean
 from typing import Any
 
 
-COUNTRY_STRENGTH: dict[str, int] = {}
-COMPETITION_STRENGTH: dict[str, int] = {}
-DIVISION_OFFSETS: dict[str, int] = {}
-LOWER_CONTEXT_OFFSETS: dict[str, int] = {}
-
-
 def league_strength_score(name: str | None) -> dict[str, Any]:
     if not _clean(name):
         return {"name": name, "score": 55, "country": None, "basis": "unknown league"}
@@ -76,20 +70,6 @@ def league_strength_edge(
         "home_recent_league_strength": home,
         "away_recent_league_strength": away,
     }
-
-
-def _country_base(text: str) -> tuple[str | None, int]:
-    for country, score in COUNTRY_STRENGTH.items():
-        if country in text:
-            return country, score
-    return None, 58
-
-
-def _division_offset(text: str) -> tuple[str | None, int]:
-    for division, offset in DIVISION_OFFSETS.items():
-        if division in text:
-            return division, offset
-    return None, -6
 
 
 def _clean(value: str | None) -> str:

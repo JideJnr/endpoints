@@ -24,7 +24,6 @@ _FINAL_MODEL = "openrouter"
 
 _TIMEOUT_SPECIALIST = 30
 _TIMEOUT_FINAL = 45
-_TIMEOUT_BRAIN = 30
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
@@ -109,28 +108,6 @@ Return ONLY valid JSON:
     "models": "<one sentence>",
     "verdict": "<one sentence final summary>"
   }}
-}}"""
-
-_BRAIN_REVIEW_PROMPT = """You are PredictX AI Brain, a cautious football prediction reviewer.
-
-PREDICTION:
-{prediction_summary}
-
-MEMORY CONTEXT:
-{memory_context}
-
-Rules:
-- If a signal has 65%+ historical win rate, trust it more
-- If a signal has <40% win rate, flag it as a risk
-- confidence_adjustment must be an integer from -8 to +8
-
-Return ONLY valid JSON:
-{{
-  "status": "approved | caution | pass",
-  "verdict": "<same as prediction or adjusted>",
-  "confidence_adjustment": 0,
-  "risks": ["<risk 1>"],
-  "reasons": ["<reason 1>"]
 }}"""
 
 
@@ -426,41 +403,19 @@ def run_final_synthesis(
         return {"status": "error", "message": str(exc)}
 
 
-def run_brain_review(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:
-    picks = prediction.get("picks") or [{}]
-    pred_summary = {
-        "match": prediction.get("name"),
-        "prediction": picks[0],
-        "top_signals": [s.get("name") for s in (prediction.get("signals") or [])[:5]],
-        "confidence": picks[0].get("confidence"),
-    }
-    memory_context = _build_memory_context(doc)
-    prompt = _BRAIN_REVIEW_PROMPT.format(
-        prediction_summary=json.dumps(pred_summary, default=str),
-        memory_context=memory_context,
-    )
-    try:
-        raw = _call_llm(_REASONING_MODEL, prompt, timeout=_TIMEOUT_BRAIN)
-        result = _parse_safe(raw)
-        if not result:
-            return {"status": "error", "provider": "openrouter", "message": "Failed to parse brain JSON"}
-        return {
-            "status": result.get("status") or "approved",
-            "provider": "openrouter",
-            "model": get_settings().openrouter_model,
-            "verdict": result.get("verdict"),
-            "confidence_adjustment": _safe_int(result.get("confidence_adjustment"), 0),  # noqa: F821
-            "risks": result.get("risks") or [],
-            "reasons": result.get("reasons") or [],
-        }
-    except Exception as exc:
-        return {"status": "error", "provider": "openrouter", "message": str(exc)}
-
-
 # ── Main entry points ──────────────────────────────────────────────────────────
 
 def run_llm_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str, Any]:
-    """Run the full multi-stage OpenRouter prediction pipeline."""
+    """Run the full multi-stage OpenRouter prediction pipeline.
+
+    NOTE: attach_brain is accepted for backward-compatibility but no longer
+    fires a brain-review LLM call here. The canonical brain review is
+    oversee_prediction() in ai_brain.py, called by _attach_brain_review() in
+    prediction_flow.py after the prebuilt_prediction is recorded. Removing it
+    here eliminates the duplicate second brain-review call that this path
+    previously fired before the result reached prediction_flow.py's own brain
+    attachment step.
+    """
     settings = get_settings()
     if not settings.openrouter_api_key:
         return {"status": "openrouter_unavailable", "message": "OPENROUTER_API_KEY is not set in .env"}
@@ -489,22 +444,10 @@ def run_llm_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str
     logger.info("[pipeline] running final synthesis")
     final = run_final_synthesis(doc, specialist_results, model_summary, memory_context)
 
-    brain = None
-    if attach_brain and final.get("status") == "predicted":
-        try:
-            brain = run_brain_review(final, doc)
-            logger.info("[pipeline] brain: %s adj=%+d", brain.get("status"), brain.get("confidence_adjustment", 0))
-        except Exception as exc:
-            logger.warning("[pipeline] brain failed: %s", exc)
-
-    confidence = final.get("confidence")
-    if brain and brain.get("confidence_adjustment"):
-        confidence = max(1, min(99, (confidence or 50) + brain["confidence_adjustment"]))
-
     return {
         "status": final.get("status", "error"),
         "recommendation": final.get("recommendation"),
-        "confidence": confidence,
+        "confidence": final.get("confidence"),
         "value_bet": final.get("value_bet"),
         "key_factors": final.get("key_factors") or [],
         "reasoning": final.get("reasoning") or {},
@@ -516,7 +459,7 @@ def run_llm_pipeline(doc: dict[str, Any], attach_brain: bool = True) -> dict[str
         "model": settings.openrouter_model,
         "specialist_results": specialist_results,
         "aggregation": final.get("aggregation") or {},
-        "brain_review": brain,
+        "brain_review": None,  # brain review now handled by ai_brain.oversee_prediction only
     }
 
 

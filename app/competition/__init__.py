@@ -37,10 +37,6 @@ from app.competition.competition_registry import (  # noqa: F401
 
 # ── league_strength — pure logic, no circular deps ────────────────────────────
 from app.competition.league_strength import (  # noqa: F401
-    COUNTRY_STRENGTH,
-    COMPETITION_STRENGTH,
-    DIVISION_OFFSETS,
-    LOWER_CONTEXT_OFFSETS,
     league_strength_score,
     history_league_strength,
     league_strength_edge,

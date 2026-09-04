@@ -22,8 +22,6 @@ from app.data_clients.sofascore_client import (  # noqa: F401
 
 # SofaScore grades
 from app.data_clients.sofascore_grades import (  # noqa: F401
-    extract_team_grades,
-    store_match_grades,
     get_team_rating_trend,
     grade_signal_for_match,
 )

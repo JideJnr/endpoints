@@ -161,21 +161,15 @@ def _opponent_bucket(position: int | None, total_teams: int | None) -> str:
 
 
 def _league_tier(name: str) -> int:
-    try:
-        from app.monitoring.self_learner import get_tournament_priority
+    """Map a league name to a difficulty tier (1=elite … 4=low) via league_strength_score."""
+    from app.competition.league_strength import league_strength_score
 
-        learned = get_tournament_priority(name)
-        if not learned.get("known"):
-            return 3
-        priority = int(learned.get("priority", 4))
-    except Exception:
-        return 3
-
-    if priority <= 1:
+    score = league_strength_score(name).get("score", 55)
+    if score >= 77:
         return 1
-    if priority <= 3:
+    if score >= 61:
         return 2
-    if priority <= 5:
+    if score >= 45:
         return 3
     return 4
 

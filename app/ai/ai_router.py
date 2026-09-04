@@ -97,12 +97,8 @@ class AIRouter:
     def call_analysis(self, prompt: str) -> str:
         """
         Full match analysis → JSON prediction.
-        Primary: OpenRouter Pipeline  →  OpenRouter free model
+        Primary: OpenRouter free model
         """
-        # Try pipeline first if we have a doc context (passed via prompt prefix)
-        pipeline_result = self._try_pipeline_from_prompt(prompt)
-        if pipeline_result is not None:
-            return pipeline_result
         return self._dispatch(prompt, task="analysis", timeout=self._timeout_analysis)
 
     def call_reasoning(self, prompt: str) -> str:
@@ -204,52 +200,7 @@ class AIRouter:
         chain = [e["model"] for e in OPENROUTER_MODELS]
         return chain
 
-    def _try_pipeline_from_prompt(self, prompt: str) -> str | None:
-        """
-        If the prompt contains a JSON doc prefix (sent by openrouter_agent),
-        try running the full pipeline instead of a single large-context call.
-        Returns the pipeline result as a JSON string, or None if pipeline not applicable.
-        """
-        # Check if prompt starts with a JSON object (doc summary format)
-        prompt_stripped = prompt.strip()
-        if not prompt_stripped.startswith("{"):
-            return None
-
-        try:
-            # Try to parse the prefix as JSON to extract doc info
-            # The prompt format is: SYSTEM_PROMPT + "\n\n" + doc_summary
-            # We look for the doc summary part
-            parts = prompt.split("\n\n", 1)
-            if len(parts) < 2:
-                return None
-
-            doc_summary = parts[1]
-            # Try to extract key fields from the summary
-            doc = {}
-            for line in doc_summary.split("\n"):
-                if "=" in line:
-                    key, _, value = line.partition("=")
-                    doc[key.strip()] = value.strip()
-
-            # Only use pipeline if we have minimal match info
-            if not doc.get("sportybet_name") and not doc.get("name"):
-                return None
-
-            # Run pipeline
-            result = self.call_pipeline(doc)
-            if result.get("status") == "predicted":
-                return json.dumps(result.get("reasoning") or result)
-            return None
-        except Exception:
-            return None
-
     def _dispatch(self, prompt: str, task: str, timeout: int) -> str:
-        # Try pipeline first for analysis tasks if doc context is present
-        if task == "analysis":
-            pipeline_result = self._try_pipeline_from_prompt(prompt)
-            if pipeline_result is not None:
-                return pipeline_result
-
         for model in self._ordered_chain(task):
             if not self.is_available(model):
                 logger.debug("ai_router: %s unavailable, skipping", model)

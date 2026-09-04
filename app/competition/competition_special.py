@@ -17,7 +17,7 @@ from app.market.season_stage import (
     season_aware_table_weight,
 )
 from app.utils.doc_helpers import _band
-from app.utils.primitives import _optional_int, _safe_num
+from app.utils.primitives import _optional_int, _parse_datetime, _safe_num
 from app.utils.goal_timing import extract_goal_timing_from_detail as _extract_goal_timing
 
 logger = logging.getLogger(__name__)
@@ -511,9 +511,29 @@ def sync_competition_fixtures(
     }
 
 
-def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> dict[str, Any]:
+def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200, skip_mirror: bool = False, lite: bool = False) -> dict[str, Any]:
+    """skip_mirror=True skips the ensure_competition_main_buffer() write-mirror
+    pass below -- that mirror already runs every ~5 min via the background
+    competition_special job, so a single-competition detail view calling this
+    normally (skip_mirror=False, the default) gets a cheap freshness nudge.
+    But competition_dashboard_summary() calls this once per tracked
+    competition on every dashboard load; without skip_mirror that meant every
+    page view re-wrote every buffered match for every competition back into
+    match_buffer -- ~1600 redundant writes per load, the actual reason that
+    endpoint was slow (see composite.py's /competition-special/dashboard).
+
+    lite=True builds each row via _buffer_row(lite=True) -- the minimal
+    fields _competition_summary() actually reads, skipping the expensive
+    full match_facts enrichment for unmerged rows -- and omits `matches`
+    from the response entirely, since competition_dashboard_summary() only
+    ever uses `count`/`summary` and discards the full match list. This is
+    the other half of the dashboard-slowness fix: skip_mirror alone stopped
+    the redundant writes, but building a fully enriched doc for every one of
+    up to ~1500 matches just to produce a count was still slow enough to
+    stall the whole app for the duration of the request."""
     _init_db()
-    ensure_competition_main_buffer(key)
+    if not skip_mirror:
+        ensure_competition_main_buffer(key)
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
@@ -533,19 +553,33 @@ def list_competition_buffer(key: str = "world-cup-2026", limit: int = 200) -> di
             """,
             (key, limit),
         ).fetchall()
-    matches = [_buffer_row(row) for row in rows]
-    return {
+    matches = [_buffer_row(row, lite=lite) for row in rows]
+    result = {
         "status": "success",
         "competition": get_competition_settings(key),
         "count": len(matches),
         "summary": _competition_summary(matches),
-        "matches": matches,
     }
+    if not lite:
+        result["matches"] = matches
+    return result
 
 
-def competition_status(key: str = "world-cup-2026") -> dict[str, Any]:
+def competition_status(key: str = "world-cup-2026", skip_mirror: bool = False) -> dict[str, Any]:
+    # skip_mirror: the dashboard summary (competition_dashboard_summary) calls
+    # this once per enabled competition -- ensure_competition_main_buffer() is
+    # a WRITE (re-mirrors every buffered match for the competition into
+    # match_buffer), not a read, and it already runs on its own ~5 min
+    # background cycle. Doing it again here, per competition, per dashboard
+    # load, was the second (and bigger) copy of the same redundant-write
+    # problem list_competition_buffer's skip_mirror already fixed -- with the
+    # dashboard now fanning out over competitions in parallel threads, 31
+    # of these firing at once is what was causing "database is locked"
+    # errors and 150+ second load times. Single-competition detail views
+    # (frontend.py) don't pass this, so they keep the original eager refresh.
     _init_db()
-    ensure_competition_main_buffer(key)
+    if not skip_mirror:
+        ensure_competition_main_buffer(key)
     with db_conn() as conn:
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
@@ -963,20 +997,38 @@ def disable_dynamic_competitions() -> dict[str, Any]:
 
 def _ensure_catalogue_settings(conn: sqlite3.Connection) -> None:
     """Seed catalogue rows once, preserving all operator configuration."""
-    for default in (DEFAULT_WORLD_CUP, *TOP_30_COMPETITIONS):
-        conn.execute(
-            """
-            insert into competition_special_settings
-                (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
-            values (?, ?, 1, ?, ?, ?, ?, ?)
-            on conflict(key) do nothing
-            """,
-            (
-                default["key"], default["name"], default["unique_tournament_id"],
-                default.get("season_id"), default.get("start_date", ""), default.get("end_date", ""),
-                json.dumps({"source": "sofascore", "mode": "competition_special"}),
-            ),
-        )
+    catalogue = (DEFAULT_WORLD_CUP, *TOP_30_COMPETITIONS)
+    # This used to run the full 31-row INSERT loop unconditionally on every
+    # single call -- get_competition_settings/competition_status/
+    # competition_dashboard_summary all call this on every request, and the
+    # dashboard fans out across ~31 competitions on parallel threads, so one
+    # page load meant dozens of write transactions all fighting for SQLite's
+    # single writer lock at once (on top of the background scheduler's own
+    # writes running concurrently). That write pressure -- not the two
+    # redundant buffer-mirror calls already fixed above -- turned out to be
+    # the real remaining cause of "database is locked" errors on the
+    # dashboard. A cheap read-only count lets the overwhelmingly common case
+    # (catalogue already seeded) skip every INSERT statement.
+    (existing_count,) = conn.execute(
+        "select count(*) from competition_special_settings where key in (%s)"
+        % ",".join("?" for _ in catalogue),
+        [entry["key"] for entry in catalogue],
+    ).fetchone()
+    if existing_count < len(catalogue):
+        for default in catalogue:
+            conn.execute(
+                """
+                insert into competition_special_settings
+                    (key, name, enabled, unique_tournament_id, season_id, start_date, end_date, metadata_json)
+                values (?, ?, 1, ?, ?, ?, ?, ?)
+                on conflict(key) do nothing
+                """,
+                (
+                    default["key"], default["name"], default["unique_tournament_id"],
+                    default.get("season_id"), default.get("start_date", ""), default.get("end_date", ""),
+                    json.dumps({"source": "sofascore", "mode": "competition_special"}),
+                ),
+            )
     # One-time historic catalogue-ID correction. This used to run on every
     # call (every GET to the competitions list/settings/status endpoints),
     # and _purge_wrong_competition_key_rows() scans and json.loads()s every
@@ -1064,38 +1116,6 @@ def _purge_wrong_competition_key_rows(conn: sqlite3.Connection, key: str, expect
     main_placeholders = ",".join("?" for _ in prefixed)
     conn.execute(f"delete from match_buffer where match_id in ({main_placeholders})", prefixed)
     return int(removed or 0)
-
-
-def purge_misclassified_competition_rows() -> dict[str, int]:
-    """Remove regenerable rows created by the historic Brasileirão→MLS mix-up."""
-    _init_db()
-    removed_special = removed_main = 0
-    with db_conn() as conn:
-        conn.row_factory = sqlite3.Row
-        init_competition_tables(conn)
-        rows = conn.execute("""select match_id, raw_event from competition_special_buffer
-                               where competition_key = 'brasileirao'""").fetchall()
-        wrong_ids = []
-        for row in rows:
-            try:
-                event = json.loads(row["raw_event"] or "{}")
-            except Exception:
-                continue
-            if _event_unique_tournament_id(event) == 242:
-                wrong_ids.append(str(row["match_id"]))
-        if wrong_ids:
-            placeholders = ",".join("?" for _ in wrong_ids)
-            removed_special = conn.execute(
-                f"delete from competition_special_buffer where competition_key = 'brasileirao' and match_id in ({placeholders})",
-                wrong_ids,
-            ).rowcount
-            prefixed = [f"competition:brasileirao:{item}" for item in wrong_ids]
-            main_placeholders = ",".join("?" for _ in prefixed)
-            removed_main += conn.execute(
-                f"delete from match_buffer where match_id in ({main_placeholders})", prefixed
-            ).rowcount
-        conn.commit()
-    return {"competition_rows": removed_special, "main_buffer_rows": removed_main}
 
 
 def _loaded_until(key: str) -> date | None:
@@ -1304,7 +1324,33 @@ def _save_competition_detail(
         conn.commit()
 
 
-def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
+def _event_category_name(event: dict[str, Any]) -> str:
+    """Real country/category for a SofaScore event (e.g. "England" for the
+    Premier League) -- read the same way app/data_clients/sofa_pipeline.py
+    already does it for the normal ingest path. Falls back to "World" only
+    when SofaScore genuinely has no category (true international
+    competitions) or the field is missing.
+
+    This used to be hardcoded to the literal string "World" everywhere a
+    tracked-competition match doc got built, regardless of the real country
+    -- so a competition_special-tracked Premier League match and a normal
+    SportyBet-ingested Premier League match carried different `category`
+    values for the exact same competition. The frontend's
+    parseCountryLeague() (football_frontend/src/pages/main/country/page.tsx)
+    groups matches by `category` first, so this showed up as two separate
+    sections -- "World / Premier League" and "England / Premier League" --
+    for one real league.
+    """
+    try:
+        raw_event = event.get("raw_event") or {}
+        category = (raw_event.get("tournament") or {}).get("category") or {}
+        name = category.get("name")
+        return str(name) if name else "World"
+    except Exception:
+        return "World"
+
+
+def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any], *, skip_facts_enrichment: bool = False) -> dict[str, Any]:
     start = event.get("start_timestamp") or detail.get("start_timestamp")
     match_date = datetime.fromtimestamp(float(start), tz=timezone.utc).date().isoformat() if start else date.today().isoformat()
     markets = _special_markets(detail)
@@ -1312,6 +1358,7 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
     intelligence = _competition_intelligence_context(key, event, detail, {})
     main_id = _main_buffer_match_id(event.get("id"))
     legacy_id = _prefixed_match_id(key, event.get("id"))
+    category_name = _event_category_name(event)
     doc = {
         "id": main_id,
         "match_id": main_id,
@@ -1325,7 +1372,7 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
         "home_team": event.get("home_team"),
         "away_team": event.get("away_team"),
         "tournament": (event.get("tournament") or {}).get("name"),
-        "category": "World",
+        "category": category_name,
         "match_date": match_date,
         "start_time": int(float(start or 0) * 1000) if start else None,
         "period": (event.get("status") or {}).get("description") or "Not started",
@@ -1342,7 +1389,7 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
             "home_team": event.get("home_team"),
             "away_team": event.get("away_team"),
             "tournament": (event.get("tournament") or {}).get("name"),
-            "category": "World",
+            "category": category_name,
             "period": (event.get("status") or {}).get("description") or "Not started",
             "start_time": int(float(start or 0) * 1000) if start else None,
             "markets": markets,
@@ -1389,12 +1436,21 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
     # provider_live_capabilities that every SportyBet-ingested match gets.
     # This brings competition-tracked matches (predictions AND the mirrored
     # match_buffer row's raw_enriched) up to the same baseline.
-    try:
-        from app.match_facts import enrich_match_facts
-        doc = enrich_match_facts(doc)
-    except Exception as exc:
-        from app.utils.health_counters import record_health_event
-        record_health_event("competition_special", "match_facts_enrichment_error", exc)
+    #
+    # skip_facts_enrichment: the competition dashboard summary rebuilds this
+    # doc once per unmerged match just to classify its live/finished state
+    # and count it -- it never reads half_time_score, live_statistics, or
+    # goal_timing, so paying for this normalization there (x up to ~1500
+    # matches per dashboard load) was pure waste and a big share of why that
+    # endpoint could take minutes and stall the whole app. See
+    # competition_dashboard_summary()/list_competition_buffer(lite=True).
+    if not skip_facts_enrichment:
+        try:
+            from app.match_facts import enrich_match_facts
+            doc = enrich_match_facts(doc)
+        except Exception as exc:
+            from app.utils.health_counters import record_health_event
+            record_health_event("competition_special", "match_facts_enrichment_error", exc)
     return doc
 
 
@@ -1456,12 +1512,46 @@ def _settings_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _buffer_row(row: sqlite3.Row) -> dict[str, Any]:
-    event = json.loads(row["raw_event"] or "{}")
+def _buffer_row(row: sqlite3.Row, *, lite: bool = False) -> dict[str, Any]:
     main_doc = _json_row_value(row, "main_raw_enriched")
-    detail = json.loads(row["raw_detail"] or "null") if row["raw_detail"] else None
     prediction = (main_doc or {}).get("prediction") or (json.loads(row["prediction_json"] or "null") if row["prediction_json"] else None)
     importance = json.loads(row["importance_context_json"] or "{}")
+
+    if lite:
+        # Dashboard-summary path (competition_dashboard_summary via
+        # list_competition_buffer(..., lite=True)): _competition_summary()
+        # only ever reads match_state/enriched/predicted/importance_context/
+        # group off of this dict. Building the full event/prediction/
+        # competition_intelligence payload and -- worse -- running every
+        # unmerged match through _competition_doc()'s full enrichment
+        # (goal timing, live-stat normalization, none of which the summary
+        # reads) for up to ~1500 matches per dashboard load is what made
+        # this endpoint take minutes and freeze the whole app meanwhile.
+        # When the row is already merged into match_buffer (main_doc
+        # present, the common case) we can classify state straight off that
+        # without touching raw_event/raw_detail at all.
+        if main_doc:
+            doc = main_doc
+        else:
+            event = json.loads(row["raw_event"] or "{}")
+            detail = json.loads(row["raw_detail"] or "null") if row["raw_detail"] else None
+            doc = (
+                _competition_doc(row["competition_key"], event, detail or {}, skip_facts_enrichment=True)
+                if detail else {"sofascore_event": event, "period": row["status"], "start_time": row["start_time"]}
+            )
+        state = classify_match_state(doc)
+        return {
+            "competition_key": row["competition_key"],
+            "match_id": str(_row_get(row, "main_match_id") or _main_buffer_match_id(row["match_id"])),
+            "group": row["group_name"],
+            "match_state": state,
+            "enriched": bool(main_doc or row["raw_detail"]),
+            "predicted": bool(prediction),
+            "importance_context": importance,
+        }
+
+    event = json.loads(row["raw_event"] or "{}")
+    detail = json.loads(row["raw_detail"] or "null") if row["raw_detail"] else None
     doc = main_doc or (_competition_doc(row["competition_key"], event, detail or {}) if detail else {"sofascore_event": event, "period": row["status"], "start_time": row["start_time"]})
     intelligence = (detail or {}).get("competition_intelligence") if isinstance(detail, dict) else None
     if not intelligence:
@@ -1609,16 +1699,6 @@ def _mark_competition_cycle(key: str) -> None:
         conn.commit()
 
 
-def _parse_datetime(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except Exception:
-        return None
 
 
 def _prefixed_match_id(key: str, match_id: Any) -> str:
@@ -1812,7 +1892,7 @@ def _competition_raw_sporty(key: str, event: dict[str, Any], match_date: str, im
         "home_team": event.get("home_team"),
         "away_team": event.get("away_team"),
         "tournament": (event.get("tournament") or {}).get("name"),
-        "category": "World",
+        "category": _event_category_name(event),
         "match_date": match_date,
         "start_time": int((event.get("start_timestamp") or 0) * 1000),
         "period": status.get("description") or status.get("type") or "Not start",
@@ -2611,68 +2691,88 @@ def _team_watcher_context(key: str, team: dict[str, Any]) -> dict[str, Any]:
         return {"available": False, "team_id": team_id, "team_name": team_name, "error": str(exc)}
 
 def competition_dashboard_summary(buffer_limit: int = 200) -> dict[str, Any]:
-    """Return a lightweight summary for every tracked competition.
+    """Return a lightweight summary for every ENABLED tracked competition.
 
-    Covers all competitions in competition_special_settings — both the curated
-    catalogue and any dynamically discovered via ingest.
+    Was iterating every row in competition_special_settings (both the curated
+    catalogue and every dynamically-discovered-but-disabled competition ever
+    seen via ingest -- 281 rows in production vs. 31 actually enabled),
+    sequentially, with each iteration calling list_competition_buffer() which
+    itself unconditionally re-wrote every buffered match for that competition
+    back into match_buffer (a WRITE, not a read) via ensure_competition_main_buffer().
+    One dashboard page load meant ~281 sequential DB round-trips plus ~1600
+    redundant writes -- this is why the endpoint was slow. Fixed three ways:
+    only the enabled competitions get a full summary built (disabled ones
+    have nothing meaningful to show anyway); list_competition_buffer is
+    called with skip_mirror=True since the mirror already runs on its own
+    ~5 min cycle via the background competition_special job; and the
+    per-competition work now runs concurrently instead of one at a time.
+    `total_tracked` still reports the true settings-table count so nothing
+    about competition management/admin visibility is lost.
     """
     _init_db()
     with db_conn(timeout=30) as conn:
         init_competition_tables(conn)
         _ensure_catalogue_settings(conn)
+        total_tracked = conn.execute("select count(*) from competition_special_settings").fetchone()[0]
         rows = conn.execute(
-            "select key from competition_special_settings order by enabled desc, name asc"
+            "select key from competition_special_settings where enabled = 1 order by name asc"
         ).fetchall()
-    all_keys = [row[0] for row in rows]
+    enabled_keys = [row[0] for row in rows]
     summaries: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
-    for key in all_keys:
-        try:
-            settings = get_competition_settings(key)
-            buffer = list_competition_buffer(key, limit=buffer_limit)
-            status = competition_status(key)
+    def _build_one(key: str) -> dict[str, Any]:
+        settings = get_competition_settings(key)
+        buffer = list_competition_buffer(key, limit=buffer_limit, skip_mirror=True, lite=True)
+        status = competition_status(key, skip_mirror=True)
 
-            with db_conn(timeout=30) as conn:
-                init_competition_tables(conn)
-                from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
-                init_competition_analysis_table(conn)
-                latest_analysis = get_latest_analysis(key, conn)
+        with db_conn(timeout=30) as conn:
+            init_competition_tables(conn)
+            from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
+            init_competition_analysis_table(conn)
+            latest_analysis = get_latest_analysis(key, conn)
 
-            summary = {
-                "key": key,
-                "name": settings.get("name") or key,
-                "enabled": bool(settings.get("enabled")),
-                "unique_tournament_id": settings.get("unique_tournament_id"),
-                "settings": settings,
-                "buffer_summary": buffer.get("summary", {}),
-                "buffer_status": status.get("buffer", {}),
-                "latest_analysis": latest_analysis,
-                "match_count": buffer.get("count", 0),
-                "error": None,
-            }
-            summaries.append(summary)
-        except Exception as exc:
-            errors.append({"key": key, "error": str(exc)})
-            summaries.append({
-                "key": key,
-                "name": key,
-                "enabled": False,
-                "unique_tournament_id": 0,
-                "settings": {"key": key, "name": key, "enabled": False},
-                "buffer_summary": {},
-                "buffer_status": {},
-                "latest_analysis": None,
-                "match_count": 0,
-                "error": str(exc),
-            })
+        return {
+            "key": key,
+            "name": settings.get("name") or key,
+            "enabled": bool(settings.get("enabled")),
+            "unique_tournament_id": settings.get("unique_tournament_id"),
+            "settings": settings,
+            "buffer_summary": buffer.get("summary", {}),
+            "buffer_status": status.get("buffer", {}),
+            "latest_analysis": latest_analysis,
+            "match_count": buffer.get("count", 0),
+            "error": None,
+        }
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(enabled_keys)))) as pool:
+        futures = {pool.submit(_build_one, key): key for key in enabled_keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                summaries.append(future.result())
+            except Exception as exc:
+                errors.append({"key": key, "error": str(exc)})
+                summaries.append({
+                    "key": key,
+                    "name": key,
+                    "enabled": False,
+                    "unique_tournament_id": 0,
+                    "settings": {"key": key, "name": key, "enabled": False},
+                    "buffer_summary": {},
+                    "buffer_status": {},
+                    "latest_analysis": None,
+                    "match_count": 0,
+                    "error": str(exc),
+                })
 
     # Sort: enabled first, then by match count descending
     summaries.sort(key=lambda s: (not s["enabled"], -s.get("match_count", 0)))
 
     return {
         "status": "success",
-        "total_tracked": len(all_keys),
+        "total_tracked": total_tracked,
         "enabled_count": sum(1 for s in summaries if s["enabled"]),
         "competitions": summaries,
         "errors": errors,
@@ -2685,16 +2785,5 @@ def _real_sportybet_match_id(doc: dict[str, Any]) -> str:
     if not value or value.startswith("sofascore:") or value.startswith("competition:"):
         return ""
     return value
-
-
-def list_all_competition_summaries(
-    buffer_limit: int = 200,
-    analysis_limit: int = 1,
-) -> dict[str, Any]:
-    """Compatibility wrapper for the composite competition dashboard endpoint."""
-    _ = analysis_limit
-    return competition_dashboard_summary(buffer_limit=buffer_limit)
-
-
 
 

@@ -1257,13 +1257,19 @@ def get_team_performance_notes_endpoint(
     return {"status": "success", "team_key": team_key, "count": len(notes), "notes": notes}
 
 
+def _guard_competition_key(competition_key: str) -> None:
+    """Raise 404 for unknown competition keys."""
+    from app.competition.competition_special import DEFAULT_WORLD_CUP, TOP_30_COMPETITIONS
+    valid = frozenset(entry["key"] for entry in TOP_30_COMPETITIONS) | {DEFAULT_WORLD_CUP["key"]}
+    if competition_key not in valid:
+        raise HTTPException(status_code=404, detail=f"Unknown competition key: {competition_key}")
+
+
 @router.get("/competition-special/{competition_key}/analysis/latest")
 def get_competition_analysis_latest(competition_key: str):
     """Most recent post-matchday LLM analysis for a competition."""
-    import sqlite3
+    _guard_competition_key(competition_key)
     from app.competition.competition_analyser import get_latest_analysis, init_competition_analysis_table
-    from app.storage.db import DB_PATH
-    from app.storage.league_memory import _init_db
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -1290,10 +1296,8 @@ def get_competition_analysis_history(
     limit: int = Query(default=10, ge=1, le=100),
 ):
     """Paginated post-matchday analysis history for a competition."""
-    import sqlite3
+    _guard_competition_key(competition_key)
     from app.competition.competition_analyser import get_analysis_history, init_competition_analysis_table
-    from app.storage.db import DB_PATH
-    from app.storage.league_memory import _init_db
 
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -1306,6 +1310,7 @@ def get_competition_analysis_history(
 @router.post("/competition-special/{competition_key}/analysis/trigger")
 def trigger_competition_analysis(competition_key: str):
     """Manually trigger post-matchday LLM analysis for a competition."""
+    _guard_competition_key(competition_key)
     from app.competition.competition_analyser import run_competition_analysis
 
     return run_competition_analysis(competition_key)

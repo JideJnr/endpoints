@@ -139,13 +139,10 @@ def get_competition_special_dashboard(
     failures are captured in the `errors` array so the page still renders
     with partial data.
     """
-    from app.competition.competition_special import list_all_competition_summaries
+    from app.competition.competition_special import competition_dashboard_summary
 
     try:
-        result = list_all_competition_summaries(
-            buffer_limit=buffer_limit,
-            analysis_limit=analysis_limit,
-        )
+        result = competition_dashboard_summary(buffer_limit=buffer_limit)
         return result
     except Exception as exc:
         _logger.error("composite/competition-special/dashboard failed: %s", exc)

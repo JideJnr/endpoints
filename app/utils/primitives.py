@@ -7,12 +7,14 @@ Single source of truth for:
   - _to_int, _to_float, _safe_float, _safe_num
   - _safe_json, _loads
   - _optional_int, _first_present
+  - _parse_datetime
 
 All modules should import from here instead of defining local copies.
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -99,3 +101,23 @@ def _first_present_key(mapping: dict[str, Any], *keys: str) -> Any:
         if isinstance(mapping, dict) and mapping.get(key) is not None:
             return mapping.get(key)
     return None
+
+
+# ── Datetime parsing ──────────────────────────────────────────────────────────
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    """Parse an ISO-8601 string (or None) into a UTC-aware datetime.
+
+    Handles both ``+00:00`` and trailing ``Z`` suffixes.  Returns ``None``
+    for falsy input or unparseable strings rather than raising.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
