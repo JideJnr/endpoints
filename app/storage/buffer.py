@@ -698,14 +698,20 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
     """
     Fast update of score/period for live matches already in the buffer.
     When a match transitions to finished, archives to MongoDB and removes from buffer.
+
+    All writes are collected into one transaction and committed once at the end.
+    Archive calls (_try_archive_finished) are deferred until after the write lock
+    is released so they never hold SQLite locked during the MongoDB/external call.
     """
     if not matches:
         return 0
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
 
+    # IDs of matches that finished this cycle — archived after the single commit
+    to_archive: list[str] = []
+
     with _conn() as conn:
-        _init_buffer_table(conn)
         count = 0
         for m in matches:
             match_id = str(m.get("id") or "")
@@ -718,8 +724,7 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
             is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
 
             if is_finished:
-                # write final score into both raw_sporty and raw_enriched before archiving
-                # write final score into both raw_sporty and raw_enriched before archiving
+                # Write final score into raw_sporty first
                 conn.execute(
                     """
                     update match_buffer set
@@ -735,6 +740,7 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                         match_id,
                     ),
                 )
+                # Also stamp final score into raw_enriched so the archive doc is accurate
                 row = conn.execute(
                     "select raw_enriched from match_buffer where match_id = ?", (match_id,)
                 ).fetchone()
@@ -752,22 +758,15 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                     except Exception:
                         pass
 
-                # Resolve any open live-timeline snapshots for THIS match now that
-                # it's finished. These snapshots were written with source="sportybet"
-                # (see observe_matches("sportybet", matches) in job_ingest_live) using
-                # SportyBet's own match_id. The old resolution path only ever ran via
-                # a separate SofaScore "finished today" scan under source="sofascore",
-                # which used a different id namespace and so could never match these
-                # rows — match_snapshots/late_goal_snapshots accumulated writes but
-                # were almost never resolved, starving the per-league goal-timing
-                # memory of any real sample size. Resolving here, at the exact place
-                # a sportybet match_id is first confirmed finished, closes that gap.
+                # Resolve open live-timeline snapshots for this match now that it's
+                # finished. Snapshots were written under source="sportybet" using
+                # SportyBet's own match_id; resolving here closes the gap where the
+                # old SofaScore-keyed path could never match them.
                 try:
                     from app.storage.league_memory.crud import (
                         _resolve_snapshots,
                         _aggregate_resolved_snapshots,
                     )
-
                     final_home = int(str(score.get("home") or 0) or 0)
                     final_away = int(str(score.get("away") or 0) or 0)
                     _resolve_snapshots(conn, "sportybet", match_id, final_home, final_away)
@@ -775,8 +774,8 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                 except Exception:
                     logger.warning("snapshot resolution failed for %s", match_id, exc_info=True)
 
-                conn.commit()
-                _try_archive_finished(match_id)
+                # Defer archive until after the single commit below
+                to_archive.append(match_id)
                 count += 1
                 continue
 
@@ -833,7 +832,14 @@ def patch_live_scores(matches: list[dict[str, Any]]) -> int:
                 )
             _sync_enriched_sporty_fields(conn, "match_buffer", match_id, m, _date_from_start_time(m.get("start_time")), is_live, is_finished)
             count += 1
+        # Single commit for all matches — one write transaction instead of one per finished match
         conn.commit()
+
+    # Archive finished matches AFTER releasing the write lock so MongoDB/external
+    # calls never hold SQLite locked.
+    for match_id in to_archive:
+        _try_archive_finished(match_id)
+
     return count
 
 
@@ -1100,13 +1106,13 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
                 break
     if not row:
         return None
+    sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
     if row["raw_enriched"]:
         doc = json.loads(row["raw_enriched"])
-        sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else {}
         return _finalize_buffer_doc(_ensure_country_fields(doc, sporty), sporty)
-    doc = _sporty_to_summary(json.loads(row["raw_sporty"]))
+    doc = _sporty_to_summary(sporty)
     doc["match_date"] = row["match_date"]
-    return _finalize_buffer_doc(doc, json.loads(row["raw_sporty"]))
+    return _finalize_buffer_doc(doc, sporty)
 
 
 def bulk_get_buffered_matches(match_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -1211,8 +1217,10 @@ def refresh_sporty_buffer_scope(scope: str = "upcoming", limit: int = 500) -> di
         ingested += ingest_matches(rows, match_date)
 
     snapshotted = 0
+    match_ids = [str(match.get("id") or "") for match in matches if match.get("id")]
+    docs_by_id = bulk_get_buffered_matches(match_ids)
     for match in matches:
-        doc = get_buffered_match(str(match.get("id") or ""))
+        doc = docs_by_id.get(str(match.get("id") or ""))
         if doc:
             try:
                 snapshotted += 1 if snapshot_odds(doc) else 0
@@ -1390,116 +1398,106 @@ def purge_ghost_matches() -> int:
 
 
 def get_buffer_stats() -> dict[str, Any]:
-    """Counts for monitoring."""
+    """Counts for monitoring.
+
+    Single aggregation pass over match_buffer instead of 16 separate
+    COUNT(*)/MAX() scans (each of the original queries held a read lock over
+    the whole table for its own full scan).
+
+    Also fixes a real correctness bug found while consolidating: the pending
+    count's retry-cooldown check used
+    `coalesce(cast(json_extract(...) as real), 0) <= strftime('%s','now')`
+    -- the same coalesce()-wrapped-inline-strftime pattern already proven
+    buggy elsewhere in this codebase (see the job_ai_prediction_queue fix
+    from the Sep 4 2026 session): SQLite silently mis-compares that specific
+    combination, so a match still inside its 3h SofaScore retry cooldown was
+    incorrectly counted as "pending" (due-now) instead of excluded. Fixed by
+    binding the current time as a Python-computed parameter instead, the
+    same safe pattern used everywhere else in this file.
+    """
     _init_db()
-    from datetime import date
+    from datetime import date, datetime as _dt, timezone as _tz
     today = date.today().isoformat()
+    now_ts = _dt.now(_tz.utc).timestamp()
     with _conn() as conn:
         _init_buffer_table(conn)
-        total       = conn.execute("select count(*) from match_buffer").fetchone()[0]
-        today_count = conn.execute("select count(*) from match_buffer where match_date = ?", (today,)).fetchone()[0]
-        live_count  = conn.execute("select count(*) from match_buffer where is_live = 1").fetchone()[0]
-        enriched    = conn.execute("select count(*) from match_buffer where enriched_at is not null").fetchone()[0]
-        pending     = conn.execute(
+        row = conn.execute(
             """
-            select count(*) from match_buffer
-            where is_finished = 0 and (
-                enriched_at is null
-                or sofascore_id is null
-                or sofascore_id = ''
-            )
-              and (
-                json_extract(raw_enriched, '$.sofascore_match_status') is null
-                or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
-                or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= strftime('%s','now')
-              )
-            """
-        ).fetchone()[0]
+            select
+              count(*) as total,
+              sum(case when match_date = ? then 1 else 0 end) as today_count,
+              sum(case when is_live = 1 then 1 else 0 end) as live_count,
+              sum(case when enriched_at is not null then 1 else 0 end) as enriched,
+              sum(case when is_finished = 0 and (
+                    enriched_at is null or sofascore_id is null or sofascore_id = ''
+                  ) and (
+                    json_extract(raw_enriched, '$.sofascore_match_status') is null
+                    or json_extract(raw_enriched, '$.sofascore_match_status') != 'no_match'
+                    or coalesce(cast(json_extract(raw_enriched, '$.sofascore_retry_after_ts') as real), 0) <= ?
+                  ) then 1 else 0 end) as pending,
+              max(ingested_at) as last_ingest,
+              max(enriched_at) as last_enrich,
+              sum(case when is_finished = 0
+                    and json_extract(raw_enriched, '$.sofascore_match_status') = 'no_match'
+                  then 1 else 0 end) as no_sofa_match,
+              sum(case when is_finished = 0 and enriched_at is null then 1 else 0 end) as needs_enrichment,
+              sum(case when is_finished = 0
+                    and json_extract(raw_enriched, '$.sofascore_detail') is not null
+                    and json_extract(raw_enriched, '$.prediction_error') is null
+                  then 1 else 0 end) as ready,
+              sum(case when is_finished = 0
+                    and json_extract(raw_enriched, '$.prediction_error') is not null
+                  then 1 else 0 end) as deferred,
+              sum(case when is_finished = 0 and is_live = 1 and (
+                    ingested_at is null or datetime(ingested_at) < datetime('now', '-5 minutes')
+                  ) then 1 else 0 end) as stale_live,
+              sum(case when is_finished = 0 and is_live = 0
+                    and (start_time is null or cast(start_time as real) <= (strftime('%s','now') + 86400) * 1000)
+                    and (start_time is null or cast(start_time as real) > (strftime('%s','now') - 7200) * 1000)
+                  then 1 else 0 end) as hot_upcoming,
+              sum(case when is_finished = 0 and is_live = 0
+                    and start_time is not null
+                    and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
+                  then 1 else 0 end) as future_buffered,
+              sum(case when is_finished = 0 and is_live = 0
+                    and enriched_at is not null
+                    and start_time is not null
+                    and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
+                  then 1 else 0 end) as future_enriched,
+              sum(case when is_finished = 0 and is_live = 0 and (
+                    enriched_at is null or sofascore_id is null or sofascore_id = ''
+                  ) and start_time is not null
+                    and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
+                  then 1 else 0 end) as future_pending
+            from match_buffer
+            """,
+            (today, now_ts),
+        ).fetchone()
 
-        last_ingest = conn.execute("select max(ingested_at) from match_buffer").fetchone()[0]
-        last_enrich = conn.execute("select max(enriched_at) from match_buffer").fetchone()[0]
-        no_sofa_match = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and json_extract(raw_enriched, '$.sofascore_match_status') = 'no_match'
-            """
-        ).fetchone()[0]
-        needs_enrichment = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and enriched_at is null
-            """
-        ).fetchone()[0]
-        ready = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and json_extract(raw_enriched, '$.sofascore_detail') is not null
-              and json_extract(raw_enriched, '$.prediction_error') is null
-            """
-        ).fetchone()[0]
-        deferred = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and json_extract(raw_enriched, '$.prediction_error') is not null
-            """
-        ).fetchone()[0]
-        stale_live = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and is_live = 1
-              and (
-                ingested_at is null
-                or datetime(ingested_at) < datetime('now', '-5 minutes')
-              )
-            """
-        ).fetchone()[0]
-        hot_upcoming = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and is_live = 0
-              and (start_time is null or cast(start_time as real) <= (strftime('%s','now') + 86400) * 1000)
-              and (start_time is null or cast(start_time as real) > (strftime('%s','now') - 7200) * 1000)
-            """
-        ).fetchone()[0]
-        future_buffered = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and is_live = 0
-              and start_time is not null
-              and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
-            """
-        ).fetchone()[0]
-        future_enriched = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and is_live = 0
-              and enriched_at is not null
-              and start_time is not null
-              and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
-            """
-        ).fetchone()[0]
-        future_pending = conn.execute(
-            """
-            select count(*) from match_buffer
-            where is_finished = 0
-              and is_live = 0
-              and (
-                enriched_at is null
-                or sofascore_id is null
-                or sofascore_id = ''
-              )
-              and start_time is not null
-              and cast(start_time as real) > (strftime('%s','now') + 86400) * 1000
-            """
-        ).fetchone()[0]
+    (total, today_count, live_count, enriched, pending, last_ingest, last_enrich,
+     no_sofa_match, needs_enrichment, ready, deferred, stale_live,
+     hot_upcoming, future_buffered, future_enriched, future_pending) = row
+
+    # SUM() over zero matching rows returns NULL (not 0) in SQLite -- an
+    # empty buffer table would otherwise turn every count field into None
+    # and break the arithmetic below. Count fields are always non-negative
+    # so None unambiguously means "zero rows"; last_ingest/last_enrich are
+    # MAX(text) timestamps where NULL is a legitimate "no data yet" value
+    # and must stay None, not become the int 0.
+    total = total or 0
+    today_count = today_count or 0
+    live_count = live_count or 0
+    enriched = enriched or 0
+    pending = pending or 0
+    no_sofa_match = no_sofa_match or 0
+    needs_enrichment = needs_enrichment or 0
+    ready = ready or 0
+    deferred = deferred or 0
+    stale_live = stale_live or 0
+    hot_upcoming = hot_upcoming or 0
+    future_buffered = future_buffered or 0
+    future_enriched = future_enriched or 0
+    future_pending = future_pending or 0
 
     return {
         "total_buffered": total,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import time
@@ -38,6 +39,66 @@ from app.ai.prediction_pipeline.teams import TeamBehaviourProfile, derive_team_p
 from app.ai.prediction_pipeline.markets import MarketCandidate, shortlist_markets
 
 logger = logging.getLogger(__name__)
+
+# ── Per-match decision cache ───────────────────────────────────────────────────
+# The ai_prediction_queue runs every 5 minutes. Without a cache the same match
+# re-runs all 6 evidence steps + the decider on every cycle until the cooldown
+# in prediction_flow._recent_ungraded_prediction() (3 h for prematch, 2 min for
+# live) finally blocks it. That's up to 36 unnecessary LLM calls per prematch
+# match per hour.
+#
+# Cache key: SHA-256 of match_id + match_date + tournament. Stable across
+# queue cycles for the same fixture; changes naturally if the match is
+# rescheduled or re-ingested with a different date.
+#
+# TTL: 20 minutes — long enough to span several queue cycles, short enough
+# that a match whose enrichment data materially changes (live score update,
+# fresh odds snapshot) will get a new pipeline run.
+#
+# Max size: 500 entries. Each entry holds the full decision dict (~1 KB),
+# so worst case is ~500 KB of process heap. Eviction is LRU-style (pop the
+# oldest key when full) identical to team_watcher_engine._AI_MODEL_CACHE.
+_DECISION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_DECISION_CACHE_TTL = 1200   # 20 minutes
+_DECISION_CACHE_MAX_SIZE = 500
+
+
+def _decision_cache_key(doc: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {
+            "match_id": doc.get("match_id") or doc.get("sportybet_id") or doc.get("id") or "",
+            "match_date": doc.get("match_date") or "",
+            "tournament": doc.get("tournament") or doc.get("league_name") or "",
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _decision_cache_get(doc: dict[str, Any]) -> dict[str, Any] | None:
+    key = _decision_cache_key(doc)
+    entry = _DECISION_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, decision = entry
+    if time.monotonic() - ts >= _DECISION_CACHE_TTL:
+        _DECISION_CACHE.pop(key, None)
+        return None
+    return decision
+
+
+def _decision_cache_set(doc: dict[str, Any], decision: dict[str, Any]) -> None:
+    key = _decision_cache_key(doc)
+    now = time.monotonic()
+    if len(_DECISION_CACHE) >= _DECISION_CACHE_MAX_SIZE:
+        # Evict all expired entries first; if still full, drop the oldest.
+        expired = [k for k, (ts, _) in _DECISION_CACHE.items() if now - ts >= _DECISION_CACHE_TTL]
+        for k in expired:
+            _DECISION_CACHE.pop(k, None)
+        while len(_DECISION_CACHE) >= _DECISION_CACHE_MAX_SIZE:
+            _DECISION_CACHE.pop(next(iter(_DECISION_CACHE)), None)
+    _DECISION_CACHE[key] = (now, decision)
+
 
 
 @dataclass
@@ -209,95 +270,136 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             return result
         doc["low_value_odds"] = _best_odds(doc) < 1.3
         logger.info("AI pipeline match=%s sportybet_id=%s tier=%s odds=%s low_value=%s", _name(doc), doc.get("sportybet_id"), classify_tournament_tier(_tournament(doc)), _best_odds(doc), doc["low_value_odds"])
-        _init_db()
-        competition_context: str | None = None
-        competition_analysis_key: str | None = None
-        with db_conn(timeout=20) as conn:
-            home, away = _teams(doc); hp, ap = derive_team_profile(home, conn), derive_team_profile(away, conn)
-            persist_team_profile(hp, conn); persist_team_profile(ap, conn); conn.commit()
-            competition_context = _get_competition_context(doc, conn)
-            if competition_context:
-                competition_analysis_key = (
-                    (doc.get("competition_special") or {}).get("key")
-                    or (doc.get("known_competition") or {}).get("key")
-                )
-        # Structured table/form/team-watcher edge (same source now feeding
-        # the ensemble) -- independent of and in addition to the free-text
-        # competition_context above, so this pipeline sees the real numbers
-        # even on a match where no free-text analysis has been generated.
-        competition_intelligence = _get_structured_competition_intelligence(doc)
-        # Run all 5 evidence steps in parallel — they are fully independent.
-        # Sequential execution was the single biggest AI pipeline bottleneck
-        # (5 x 20s timeout = up to 100s; parallel = ~20-25s worst case).
-        #
-        # IMPORTANT: each step's own `timeout=` only bounds urllib's socket
-        # connect/read calls. DNS resolution (getaddrinfo) happens BEFORE the
-        # socket exists and is NOT covered by that timeout at all in the
-        # stdlib — on a flaky resolver (seen in practice on Windows) a step
-        # can hang far past its stated timeout with no way to interrupt it.
-        # Two defenses against that here:
-        #   1. `as_completed(..., timeout=EVIDENCE_STEPS_DEADLINE)` bounds how
-        #      long we personally wait, instead of waiting for every future.
-        #   2. `_pool.shutdown(wait=False, cancel_futures=True)` instead of a
-        #      `with`-block (which calls shutdown(wait=True) and would just
-        #      re-introduce the same unbounded hang on exit).
-        # A step that's still running when we give up keeps running in its
-        # thread in the background (Python can't force-kill a thread) but no
-        # longer blocks this request or the app.
-        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed, TimeoutError as _FutureTimeoutError
-        EVIDENCE_STEPS_DEADLINE = 35  # slightly above the slowest single step's own 25s timeout
-        DECIDER_DEADLINE = 40  # slightly above call_analysis's own 30s timeout
-        _steps = [
-            (_step_h2h,             H2H_FALLBACK,     0),
-            (_step_common_opponent, COMMON_FALLBACK,  1),
-            (_step_form,            FORM_FALLBACK,    2),
-            (_step_odds,            ODDS_FALLBACK,    3),
-            (_step_similar_matches, SIMILAR_FALLBACK, 4),
-            (_step_team_history,     "Team previous-match history unavailable.", 5),
-        ]
-        chain = [fallback for _, fallback, _ in _steps]  # pre-fill with fallbacks
-        _pool = ThreadPoolExecutor(max_workers=len(_steps))
-        try:
-            _futures = {
-                _pool.submit(fn, doc, model): (fallback, idx)
-                for fn, fallback, idx in _steps
-            }
+
+        # ── Decision cache check ───────────────────────────────────────────
+        # If an identical match already went through the full 7-call pipeline
+        # within the last 20 minutes, reuse the cached decision instead of
+        # re-firing all 6 evidence steps + decider. The prediction_flow cooldown
+        # gate (3 h prematch / 2 min live) prevents double-recording regardless,
+        # but by the time it fires the LLM calls have already happened and been
+        # billed. Checking the cache here short-circuits before any network call.
+        cached_decision = _decision_cache_get(doc)
+        if cached_decision is not None:
+            logger.debug("AI pipeline decision cache hit match=%s", _name(doc))
+            # Re-enter from the build step — chain and profiles aren't needed
+            # because we're replaying a previously validated decision.
+            decision = cached_decision["decision"]
+            chain = cached_decision["chain"]
+            hp = cached_decision["hp"]
+            ap = cached_decision["ap"]
+            competition_context = cached_decision.get("competition_context")
+            competition_analysis_key = cached_decision.get("competition_analysis_key")
+            competition_intelligence = cached_decision.get("competition_intelligence")
+            specialist_weights = cached_decision["specialist_weights"]
+            # Jump straight to the build step below — skip all LLM calls.
+            _use_cached = True
+        else:
+            _use_cached = False
+
+        if not _use_cached:
+            _init_db()
+            competition_context = None
+            competition_analysis_key = None
+            with db_conn(timeout=20) as conn:
+                home, away = _teams(doc); hp, ap = derive_team_profile(home, conn), derive_team_profile(away, conn)
+                persist_team_profile(hp, conn); persist_team_profile(ap, conn); conn.commit()
+                competition_context = _get_competition_context(doc, conn)
+                if competition_context:
+                    competition_analysis_key = (
+                        (doc.get("competition_special") or {}).get("key")
+                        or (doc.get("known_competition") or {}).get("key")
+                    )
+            # Structured table/form/team-watcher edge (same source now feeding
+            # the ensemble) -- independent of and in addition to the free-text
+            # competition_context above, so this pipeline sees the real numbers
+            # even on a match where no free-text analysis has been generated.
+            competition_intelligence = _get_structured_competition_intelligence(doc)
+            # Run all 5 evidence steps in parallel — they are fully independent.
+            # Sequential execution was the single biggest AI pipeline bottleneck
+            # (5 x 20s timeout = up to 100s; parallel = ~20-25s worst case).
+            #
+            # IMPORTANT: each step's own `timeout=` only bounds urllib's socket
+            # connect/read calls. DNS resolution (getaddrinfo) happens BEFORE the
+            # socket exists and is NOT covered by that timeout at all in the
+            # stdlib — on a flaky resolver (seen in practice on Windows) a step
+            # can hang far past its stated timeout with no way to interrupt it.
+            # Two defenses against that here:
+            #   1. `as_completed(..., timeout=EVIDENCE_STEPS_DEADLINE)` bounds how
+            #      long we personally wait, instead of waiting for every future.
+            #   2. `_pool.shutdown(wait=False, cancel_futures=True)` instead of a
+            #      `with`-block (which calls shutdown(wait=True) and would just
+            #      re-introduce the same unbounded hang on exit).
+            # A step that's still running when we give up keeps running in its
+            # thread in the background (Python can't force-kill a thread) but no
+            # longer blocks this request or the app.
+            from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed, TimeoutError as _FutureTimeoutError
+            EVIDENCE_STEPS_DEADLINE = 35  # slightly above the slowest single step's own 25s timeout
+            DECIDER_DEADLINE = 40  # slightly above call_analysis's own 30s timeout
+            _steps = [
+                (_step_h2h,             H2H_FALLBACK,     0),
+                (_step_common_opponent, COMMON_FALLBACK,  1),
+                (_step_form,            FORM_FALLBACK,    2),
+                (_step_odds,            ODDS_FALLBACK,    3),
+                (_step_similar_matches, SIMILAR_FALLBACK, 4),
+                (_step_team_history,     "Team previous-match history unavailable.", 5),
+            ]
+            chain = [fallback for _, fallback, _ in _steps]  # pre-fill with fallbacks
+            _pool = ThreadPoolExecutor(max_workers=len(_steps))
             try:
-                for _future in _as_completed(_futures, timeout=EVIDENCE_STEPS_DEADLINE):
-                    _fallback, _idx = _futures[_future]
-                    try:
-                        sentence = _future.result()
-                        chain[_idx] = sentence or _fallback
-                        logger.debug("AI step idx=%d: %s", _idx, chain[_idx])
-                    except Exception as exc:
-                        logger.warning("AI step idx=%d failed: %s", _idx, exc)
-            except _FutureTimeoutError:
-                logger.warning(
-                    "AI evidence steps exceeded %ss deadline; proceeding with fallback text for whichever steps didn't finish",
-                    EVIDENCE_STEPS_DEADLINE,
-                )
-        finally:
-            _pool.shutdown(wait=False, cancel_futures=True)
-        markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
-        specialist_weights = get_specialist_weights(league=_tournament(doc))
-        # Same DNS-hang risk applies to the single decider call — bound it
-        # with its own throwaway single-worker pool so a stuck call can be
-        # abandoned (raising, which the outer except already falls back on)
-        # instead of hanging the request forever.
-        _decider_pool = ThreadPoolExecutor(max_workers=1)
-        try:
-            _decider_future = _decider_pool.submit(
-                _call_decider, chain, hp, ap, markets, [], _name(doc), model,
-                competition_context=competition_context,
-                competition_intelligence=competition_intelligence,
-                specialist_weights=specialist_weights,
-            )
+                _futures = {
+                    _pool.submit(fn, doc, model): (fallback, idx)
+                    for fn, fallback, idx in _steps
+                }
+                try:
+                    for _future in _as_completed(_futures, timeout=EVIDENCE_STEPS_DEADLINE):
+                        _fallback, _idx = _futures[_future]
+                        try:
+                            sentence = _future.result()
+                            chain[_idx] = sentence or _fallback
+                            logger.debug("AI step idx=%d: %s", _idx, chain[_idx])
+                        except Exception as exc:
+                            logger.warning("AI step idx=%d failed: %s", _idx, exc)
+                except _FutureTimeoutError:
+                    logger.warning(
+                        "AI evidence steps exceeded %ss deadline; proceeding with fallback text for whichever steps didn't finish",
+                        EVIDENCE_STEPS_DEADLINE,
+                    )
+            finally:
+                _pool.shutdown(wait=False, cancel_futures=True)
+            markets = shortlist_markets(hp, ap); logger.debug("Response chain: %s", chain)
+            specialist_weights = get_specialist_weights(league=_tournament(doc))
+            # Same DNS-hang risk applies to the single decider call — bound it
+            # with its own throwaway single-worker pool so a stuck call can be
+            # abandoned (raising, which the outer except already falls back on)
+            # instead of hanging the request forever.
+            _decider_pool = ThreadPoolExecutor(max_workers=1)
             try:
-                decision = _decider_future.result(timeout=DECIDER_DEADLINE)
-            except _FutureTimeoutError as exc:
-                raise RuntimeError(f"AI decider exceeded {DECIDER_DEADLINE}s deadline") from exc
-        finally:
-            _decider_pool.shutdown(wait=False, cancel_futures=True)
+                _decider_future = _decider_pool.submit(
+                    _call_decider, chain, hp, ap, markets, [], _name(doc), model,
+                    competition_context=competition_context,
+                    competition_intelligence=competition_intelligence,
+                    specialist_weights=specialist_weights,
+                )
+                try:
+                    decision = _decider_future.result(timeout=DECIDER_DEADLINE)
+                except _FutureTimeoutError as exc:
+                    raise RuntimeError(f"AI decider exceeded {DECIDER_DEADLINE}s deadline") from exc
+            finally:
+                _decider_pool.shutdown(wait=False, cancel_futures=True)
+
+            # Store the fresh result in the decision cache so subsequent queue
+            # cycles for the same match skip all LLM calls for the next 20 min.
+            _decision_cache_set(doc, {
+                "decision": decision,
+                "chain": chain,
+                "hp": hp,
+                "ap": ap,
+                "competition_context": competition_context,
+                "competition_analysis_key": competition_analysis_key,
+                "competition_intelligence": competition_intelligence,
+                "specialist_weights": specialist_weights,
+            })
+
         reasoning_context = {
             **asdict(ReasoningContext(_name(doc), *chain)),
             "response_chain": chain,

@@ -8,11 +8,6 @@ trafilatura
 pymongo[srv]
 apscheduler
 rapidfuzz
-# Optional OpenRouter/LangChain agent extras. The core scheduler and rules/learning
-# pipeline run without these; install manually only when OPENROUTER_API_KEY is used.
-# langchain
-# langchain-core
-# langchain-openrouter
 numpy
 scipy
 scikit-learn

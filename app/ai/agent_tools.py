@@ -1,14 +1,15 @@
 """
-LangChain Agent Tools
----------------------
+Agent Tools
+-----------
 Ported from migrated predictz/tools.py.
-These are the tools the LangChain prediction agent can call during reasoning.
-
-Requires: langchain, openrouter API key
+Plain functions called directly by the prediction pipeline (evidence.py,
+routers/sporty.py). These used to be wrapped for a LangChain agent to call
+during reasoning, but nothing in this codebase runs that agent anymore --
+every caller invokes them as ordinary Python functions, so the langchain
+`@tool` wrapper was dead weight (and the source of a BaseTool.__call__
+deprecation warning in the logs). Removed; requires only openrouter API key.
 """
 from __future__ import annotations
-
-from langchain.tools import tool
 
 from app.models.poisson import run_poisson
 from app.market.market import get_movement, get_all_movements
@@ -29,7 +30,7 @@ from app.data_clients.sportybet_client import (
 )
 
 
-@tool
+
 def get_scheduled_matches(date: str) -> dict:
     """Get all football matches scheduled for a given date (YYYY-MM-DD) across all tournaments."""
     try:
@@ -38,7 +39,7 @@ def get_scheduled_matches(date: str) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_event_detail(event_id: int, date: str) -> dict:
     """Get full match detail for a SofaScore event — includes h2h, pregame form, managers,
     featured players, odds, and standings. Use this as the primary tool for any match analysis.
@@ -53,7 +54,7 @@ def get_event_detail(event_id: int, date: str) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_team_history(team_id: int, page: int = 0) -> dict:
     """Get a team's last 30 match results. page=0 is most recent."""
     try:
@@ -62,7 +63,7 @@ def get_team_history(team_id: int, page: int = 0) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_standings(tournament_id: int, season_id: int) -> dict:
     """Get the full league table for a tournament and season."""
     try:
@@ -72,7 +73,7 @@ def get_standings(tournament_id: int, season_id: int) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_event_h2h(event_id: int) -> dict:
     """Get head-to-head record between the two teams in a given event."""
     try:
@@ -81,7 +82,7 @@ def get_event_h2h(event_id: int) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_pregame_form(event_id: int) -> dict:
     """Get recent form, league position, and avg rating for both teams before a match."""
     try:
@@ -90,7 +91,7 @@ def get_pregame_form(event_id: int) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_event_odds(event_id: int) -> dict:
     """Get all available pre-match odds markets for an event."""
     try:
@@ -99,7 +100,7 @@ def get_event_odds(event_id: int) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_featured_odds(event_id: int) -> dict:
     """Get the 3 key odds markets (1X2, Asian Handicap, Full Time) for a match."""
     try:
@@ -108,7 +109,7 @@ def get_featured_odds(event_id: int) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_live_matches() -> dict:
     """Get all currently live matches from SportyBet Nigeria with scores and betting markets."""
     try:
@@ -118,7 +119,7 @@ def get_live_matches() -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_all_sportybet_matches() -> dict:
     """Get all live and upcoming matches from SportyBet Nigeria including pre-match."""
     try:
@@ -128,7 +129,7 @@ def get_all_sportybet_matches() -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def poisson_model(home_team_id: int, away_team_id: int) -> dict:
     """Run the Poisson goal model for a match using team history.
     Returns home win %, draw %, away win %, over 2.5 %, btts %, and top scorelines.
@@ -140,7 +141,7 @@ def poisson_model(home_team_id: int, away_team_id: int) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_odds_movement(sportybet_id: str) -> dict:
     """Get odds movement analysis for a match — compares opening odds vs current odds.
     Returns sharp money signals, line movement direction (shortened/drifted/stable).
@@ -151,7 +152,7 @@ def get_odds_movement(sportybet_id: str) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def get_all_odds_movements(match_date: str) -> dict:
     """Get odds movement for all tracked matches on a given date (YYYY-MM-DD)."""
     try:
@@ -160,7 +161,7 @@ def get_all_odds_movements(match_date: str) -> dict:
         return {"status": "error", "detail": str(exc)}
 
 
-@tool
+
 def strength_of_schedule(home_team_id: int, away_team_id: int) -> dict:
     """Analyse and compare both teams' recent form weighted by opponent quality.
     Solves the key problem: a team that lost 5 in a row against top sides is NOT

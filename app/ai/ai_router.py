@@ -246,9 +246,19 @@ class AIRouter:
 
     @staticmethod
     def _check_openrouter(model: str) -> bool:
+        # Check the API key is present first — no network call needed.
+        # The module-level is_llm_available() does the real HTTP ping; calling
+        # it here created a ping-inside-a-cached-call loop: is_available() →
+        # _check_openrouter() → is_llm_available() → HTTP POST every single
+        # time the TTL-cached is_available() was bypassed.
+        # Now: key-present = tentatively available; the first real _call_llm()
+        # will surface any connectivity problem through normal error handling,
+        # and the availability cache will be invalidated on failure (_dispatch
+        # calls self._availability_cache.pop on exception).
         try:
-            from app.ai.ai_router import is_llm_available
-            return is_llm_available(model)
+            from app.config.config import get_settings
+            settings = get_settings()
+            return bool(settings.openrouter_api_key)
         except Exception:
             return False
 

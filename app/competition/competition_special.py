@@ -683,6 +683,7 @@ def enrich_predict_competition(key: str = "world-cup-2026", limit: int = 12, all
             """
             select * from competition_special_buffer
             where competition_key = ?
+              and sportybet_match_id is null
               and (
                 raw_detail is null
                 or prediction_json is null
@@ -697,6 +698,26 @@ def enrich_predict_competition(key: str = "world-cup-2026", limit: int = 12, all
             """,
             (key, limit),
         ).fetchall()
+        # sportybet_match_id is null: once a tracked-competition match is
+        # linked to its real SportyBet match (sort_enriched_doc_into_competition,
+        # called from the normal ingest path in buffer.py, sets this the
+        # moment SofaScore data resolves for that SportyBet match), the
+        # SportyBet-side match_buffer row becomes the canonical, fully merged
+        # record for that fixture -- and it gets its own prediction from the
+        # normal deterministic+LLM ensemble, which sees strictly more data
+        # (real odds, SportyBet history) than this SofaScore-only path ever
+        # does. Before this filter, this function kept generating and
+        # refreshing its own independent prediction for every tracked match
+        # forever, oblivious to that link -- so a match like Premier
+        # League's Newcastle vs Bournemouth ended up with two live,
+        # differently-confidenced predictions under two different match ids
+        # (competition_special:premier-league's "sofascore:X" and the real
+        # "sr:match:Y"), and both could get pulled into the same bet-builder
+        # slip as if they were different games. Once linked, this loop now
+        # leaves the row alone entirely -- the merged match_buffer row is
+        # already being kept fresh by the normal ingest/enrichment pipeline,
+        # so there is nothing left for this SofaScore-only path to usefully
+        # do for it.
 
     for row in rows:
         processed += 1
@@ -892,7 +913,42 @@ def sort_enriched_doc_into_competition(doc: dict[str, Any]) -> None:
             tournament_id = int(tournament_id)
         except (TypeError, ValueError):
             return
-        key = _tournament_key(tournament_id, tournament)
+
+        # Resolve the SAME key a curated tracked competition already uses
+        # (e.g. "premier-league"), not a freshly-generated dynamic slug like
+        # "premier-league-17". _tournament_key() used to be called
+        # unconditionally here, so every SportyBet-side match got its
+        # sportybet_match_id link written onto a phantom dynamic-key row
+        # that enrich_predict_competition("premier-league", ...) never
+        # reads from -- the real curated row never learned the match was
+        # already covered by SportyBet, so it kept generating its own
+        # independent prediction for the same real match forever (this is
+        # exactly why Newcastle vs Bournemouth had two live predictions
+        # under two different match ids). Mirrors the catalogue-first,
+        # DB-fallback-second key resolution apply_known_competition_context()
+        # already uses elsewhere in this file for the same tournament_id.
+        key = None
+        catalogue_entry = next(
+            (item for item in TOP_30_COMPETITIONS if str(item["unique_tournament_id"]) == str(tournament_id)),
+            None,
+        )
+        if catalogue_entry:
+            key = catalogue_entry["key"]
+        if not key:
+            try:
+                with db_conn(timeout=5) as lookup_conn:
+                    init_competition_tables(lookup_conn)
+                    existing_row = lookup_conn.execute(
+                        "select key from competition_special_settings where unique_tournament_id = ? limit 1",
+                        (tournament_id,),
+                    ).fetchone()
+                if existing_row:
+                    key = existing_row[0]
+            except Exception:
+                pass
+        if not key:
+            key = _tournament_key(tournament_id, tournament)
+
         name = str(tournament.get("name") or key)
         match_date = doc.get("match_date") or _event_match_date(event, date.today().isoformat())
         sportybet_match_id = _real_sportybet_match_id(doc)
@@ -1322,6 +1378,156 @@ def _save_competition_detail(
         )
         _mirror_competition_event_to_main_buffer(conn, key, event, _event_match_date(event, date.today().isoformat()), importance, enriched_doc=doc)
         conn.commit()
+
+
+def backfill_category_labels() -> dict[str, Any]:
+    """One-time cleanup for the "World" category bug fixed alongside this
+    function: every match_buffer row mirrored in by competition_special
+    (sofascore_only=1) before the fix was permanently stamped with the
+    literal string "World" instead of its real country, because
+    _competition_doc()/_competition_raw_sporty() hardcoded it. New/refreshed
+    matches now get the real country via _event_category_name(); this
+    backfill relabels the ones already written to disk using the same
+    event data already stored in their own raw_enriched/raw_sporty JSON --
+    no re-fetch from SofaScore needed. Only ever touches sofascore_only=1
+    rows, so a correctly-labeled row from the normal SportyBet ingest path
+    can never be affected.
+
+    Run via the app's own db_conn() (in-process, same machine as the DB
+    file) rather than from an external script -- earlier attempts to do
+    this write from outside the running app hit repeated "disk I/O error"
+    failures against the live WAL file and never completed.
+    """
+    _init_db()
+    updated = 0
+    skipped = 0
+    candidates = 0
+    with db_conn(timeout=60) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select match_id, raw_enriched, raw_sporty
+            from match_buffer
+            where sofascore_only = 1
+              and (
+                json_extract(raw_enriched, '$.category') = 'World'
+                or json_extract(raw_sporty, '$.category') = 'World'
+              )
+            """
+        ).fetchall()
+        candidates = len(rows)
+
+        for row in rows:
+            match_id = row["match_id"]
+            try:
+                enriched = json.loads(row["raw_enriched"]) if row["raw_enriched"] else None
+            except Exception:
+                enriched = None
+            try:
+                sporty = json.loads(row["raw_sporty"]) if row["raw_sporty"] else None
+            except Exception:
+                sporty = None
+
+            event_for_lookup = None
+            if isinstance(enriched, dict):
+                event_for_lookup = enriched.get("sofascore_event") or enriched.get("raw_sofascore_event")
+            new_category = _event_category_name(event_for_lookup) if isinstance(event_for_lookup, dict) else None
+
+            if not new_category or new_category == "World":
+                skipped += 1
+                continue
+
+            changed = False
+            if isinstance(enriched, dict) and enriched.get("category") != new_category:
+                enriched["category"] = new_category
+                if isinstance(enriched.get("raw_sporty"), dict):
+                    enriched["raw_sporty"]["category"] = new_category
+                changed = True
+            if isinstance(sporty, dict) and sporty.get("category") != new_category:
+                sporty["category"] = new_category
+                changed = True
+
+            if not changed:
+                skipped += 1
+                continue
+
+            conn.execute(
+                "update match_buffer set raw_enriched = ?, raw_sporty = ? where match_id = ?",
+                (
+                    json.dumps(enriched) if enriched is not None else row["raw_enriched"],
+                    json.dumps(sporty) if sporty is not None else row["raw_sporty"],
+                    match_id,
+                ),
+            )
+            updated += 1
+
+    return {"status": "success", "candidates": candidates, "updated": updated, "skipped": skipped}
+
+
+def cleanup_duplicate_competition_predictions(dry_run: bool = True) -> dict[str, Any]:
+    """One-time cleanup for the duplicate-prediction bug fixed alongside
+    sort_enriched_doc_into_competition()'s key resolution: before that fix,
+    a tracked-competition match (e.g. Premier League) that also has a real
+    SportyBet match ended up with two independent, live predictions under
+    two different match ids -- one from this competition_special pipeline
+    (source LIKE 'competition_special:%'), one from the normal
+    deterministic+LLM ensemble -- and both could be pulled into the same
+    bet-builder slip as if they were different games.
+
+    This removes the stale competition_special-side prediction_history rows
+    for matches that are CONFIRMED already covered by a properly merged
+    SportyBet match (match_buffer.data_source = 'both' for the same
+    sofascore_id) -- the merged match's own prediction is strictly
+    better-informed (real odds, more history) and is what should be used
+    going forward. Only ever touches UNGRADED rows (graded_at is null) --
+    anything already graded is real historical/learning data and is never
+    touched, matching how every other cleanup this session has treated
+    graded history. dry_run=true (default) makes no changes, just reports
+    what would be removed.
+    """
+    _init_db()
+    with db_conn(timeout=60) as conn:
+        conn.row_factory = sqlite3.Row
+        merged_sofascore_ids = {
+            str(row[0])
+            for row in conn.execute(
+                "select distinct sofascore_id from match_buffer "
+                "where data_source = 'both' and sofascore_id is not null and sofascore_id != ''"
+            ).fetchall()
+        }
+        if not merged_sofascore_ids:
+            return {"status": "success", "candidates": 0, "removed": 0, "dry_run": dry_run, "examples": []}
+
+        stale_rows = conn.execute(
+            """
+            select id, match_id, match_name, source, sofascore_id, created_at
+            from prediction_history
+            where source like 'competition_special:%'
+              and graded_at is null
+              and sofascore_id is not null and sofascore_id != ''
+            """
+        ).fetchall()
+
+        candidates = [
+            dict(row) for row in stale_rows
+            if str(row["sofascore_id"]) in merged_sofascore_ids
+        ]
+
+        if not dry_run and candidates:
+            ids = [c["id"] for c in candidates]
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(f"delete from prediction_history where id in ({placeholders})", ids)
+
+    return {
+        "status": "success",
+        "candidates": len(candidates),
+        "removed": len(candidates) if not dry_run else 0,
+        "dry_run": dry_run,
+        "examples": [
+            {"match_id": c["match_id"], "match_name": c["match_name"], "source": c["source"], "created_at": c["created_at"]}
+            for c in candidates[:15]
+        ],
+    }
 
 
 def _event_category_name(event: dict[str, Any]) -> str:

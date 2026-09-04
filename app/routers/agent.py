@@ -93,6 +93,36 @@ def post_backfill_merge_orphaned_matches(dry_run: bool = Query(default=True)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.post("/competition/cleanup-duplicate-predictions")
+def post_cleanup_duplicate_competition_predictions(dry_run: bool = Query(default=True)):
+    """One-time cleanup: remove stale, ungraded competition_special-side
+    predictions for matches that are already covered by a properly merged
+    SportyBet match (see cleanup_duplicate_competition_predictions in
+    competition_special.py) -- the duplicate-legs-in-bet-builder bug.
+    dry_run=true (default) makes no writes, just reports what would be
+    removed. Never touches graded rows. Safe to call more than once."""
+    try:
+        from app.competition.competition_special import cleanup_duplicate_competition_predictions
+        return cleanup_duplicate_competition_predictions(dry_run=dry_run)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/competition/backfill-category-labels")
+def post_backfill_category_labels():
+    """One-time cleanup: relabel match_buffer rows that competition_special
+    mirrored in with the hardcoded literal "World" category instead of the
+    real country (see _event_category_name in competition_special.py). Only
+    ever touches sofascore_only=1 rows, so it can't affect a correctly
+    labeled row from the normal SportyBet ingest path. Idempotent — a
+    second call finds nothing left to fix."""
+    try:
+        from app.competition.competition_special import backfill_category_labels
+        return backfill_category_labels()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.post("/buffer/archive-stale-sofascore-only")
 def post_archive_stale_sofascore_only(
     dry_run: bool = Query(default=True),

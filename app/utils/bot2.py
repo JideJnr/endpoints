@@ -61,7 +61,6 @@ Output ONLY the JSON array. No text outside it."""
 def _run_bot2_llm(predictions: list[dict], match_date: str) -> list[dict]:
     """Use LLM to curate picks. Falls back to rules on any error."""
     from app.ai.llm import get_fast_llm
-    from langchain_core.messages import HumanMessage, SystemMessage
 
     llm = get_fast_llm()
     user_prompt = (
@@ -73,8 +72,8 @@ def _run_bot2_llm(predictions: list[dict], match_date: str) -> list[dict]:
     )
 
     response = llm.invoke([
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=user_prompt),
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
     ])
 
     raw = response.content.strip()
