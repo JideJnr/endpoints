@@ -2265,7 +2265,9 @@ def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | No
         from app.competition.competition_special import apply_known_competition_context
         from app.utils.primitives import _safe_num
         apply_known_competition_context(doc)
-    except Exception:
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("enriched_prediction", "competition_intelligence_signal_error", exc)
         return None
 
     known = doc.get("known_competition") or {}

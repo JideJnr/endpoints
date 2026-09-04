@@ -13,6 +13,7 @@ from typing import Any
 from app.config.config import get_settings
 
 from app.utils.primitives import _safe_float
+from app.ai.ai_router import _call_llm
 
 logger = logging.getLogger(__name__)
 
@@ -250,12 +251,6 @@ def _format_memory_context(context: dict[str, Any]) -> str:
     return "\n".join(parts) or "No memory context available"
 
 
-def _call_llm(prompt: str, timeout: int = 30) -> str:
-    """Route through AIRouter — single call site for all pipeline LLM calls."""
-    from app.ai.ai_router import _call_llm as _router_call_llm
-    return _router_call_llm("openrouter", prompt, timeout=timeout)
-
-
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -306,7 +301,7 @@ def run_form_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         away_form=", ".join(away_form) or "N/A",
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        raw = _call_llm(_SPECIALIST_MODEL, prompt, timeout=_TIMEOUT_SPECIALIST)
         result = _parse_safe(raw) or {}
         result["specialist"] = "form"
         return result
@@ -323,7 +318,7 @@ def run_h2h_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         draws=duel.get("draws", 0),
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        raw = _call_llm(_SPECIALIST_MODEL, prompt, timeout=_TIMEOUT_SPECIALIST)
         result = _parse_safe(raw) or {}
         result["specialist"] = "h2h"
         return result
@@ -339,7 +334,7 @@ def run_odds_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         away_odds=odds.get("away", "N/A"),
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        raw = _call_llm(_SPECIALIST_MODEL, prompt, timeout=_TIMEOUT_SPECIALIST)
         result = _parse_safe(raw) or {}
         result["specialist"] = "odds"
         return result
@@ -358,7 +353,7 @@ def run_standings_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         away_pts=away_row.get("points", "N/A"),
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        raw = _call_llm(_SPECIALIST_MODEL, prompt, timeout=_TIMEOUT_SPECIALIST)
         result = _parse_safe(raw) or {}
         result["specialist"] = "standings"
         return result
@@ -382,7 +377,7 @@ def run_model_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         e_away=float(elo.get("away_win_probability") or 33),
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_SPECIALIST)
+        raw = _call_llm(_SPECIALIST_MODEL, prompt, timeout=_TIMEOUT_SPECIALIST)
         result = _parse_safe(raw) or {}
         result["specialist"] = "models"
         return result
@@ -405,7 +400,7 @@ def run_final_synthesis(
         memory_context=memory_context or "No memory context",
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_FINAL)  # noqa: F821
+        raw = _call_llm(_FINAL_MODEL, prompt, timeout=_TIMEOUT_FINAL)
         result = _parse_safe(raw)
         if not result:
             return {"status": "error", "message": "Failed to parse synthesis JSON", "raw": raw[:200]}
@@ -445,7 +440,7 @@ def run_brain_review(prediction: dict[str, Any], doc: dict[str, Any]) -> dict[st
         memory_context=memory_context,
     )
     try:
-        raw = _call_llm(prompt, timeout=_TIMEOUT_BRAIN)
+        raw = _call_llm(_REASONING_MODEL, prompt, timeout=_TIMEOUT_BRAIN)
         result = _parse_safe(raw)
         if not result:
             return {"status": "error", "provider": "openrouter", "message": "Failed to parse brain JSON"}

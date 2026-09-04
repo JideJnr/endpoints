@@ -29,24 +29,12 @@ from typing import Any
 from app.storage.db import db_conn, _init_db
 from app.utils.match_helpers import _played_seconds
 
-# Mirrors app.match_facts.LIVE_STAT_NAMES keys. Kept as an explicit tuple
-# (rather than importing that dict directly) so a rename over there can't
-# silently rename a live database column here without a human noticing —
-# the two are expected to be kept in sync by hand.
-STAT_KEYS: tuple[str, ...] = (
-    "ball_possession",
-    "shots_on_target",
-    "shots_off_target",
-    "total_shots",
-    "corner_kicks",
-    "big_chances",
-    "xg",
-    "attacks",
-    "dangerous_attacks",
-    "fouls",
-    "yellow_cards",
-    "red_cards",
-)
+# Derive STAT_KEYS from the single authoritative source in match_facts.py so
+# a rename or addition there is automatically reflected here without needing
+# manual sync.  The tuple order matches the original hand-written list, which
+# matches LIVE_STAT_NAMES insertion order (Python 3.7+ dicts are ordered).
+from app.match_facts import LIVE_STAT_NAMES as _LIVE_STAT_NAMES
+STAT_KEYS: tuple[str, ...] = tuple(_LIVE_STAT_NAMES.keys())
 
 
 def _ensure_live_stat_tables(conn: sqlite3.Connection) -> None:

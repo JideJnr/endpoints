@@ -8,18 +8,15 @@ This is an OPTIONAL enhancement on top of the existing rules-based prediction_ag
 Falls back gracefully if OPENROUTER_API_KEY is not set.
 
 Usage:
-    from app.ai.llm_analysis import run_llm_predictions
-    results = run_llm_predictions(match_date="2026-05-16", docs=enriched_docs)
+    from app.ai.llm_analysis import run_llm_match_analysis
+    result = run_llm_match_analysis(doc)
 """
 from __future__ import annotations
 
 import json
 import logging
-from datetime import date as dt, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
-
-from app.storage.league_memory import record_prediction
-from app.ai.ai_router import _call_llm, is_llm_available
 
 logger = logging.getLogger(__name__)
 from app.market.season_stage import detect_season_stage
@@ -53,35 +50,6 @@ Output format:
     "verdict": "<one sentence final summary>"
   }
 }"""
-
-# LangChain-escaped version for use inside ChatPromptTemplate (agent mode)
-_SYSTEM_PROMPT_LANGCHAIN = SYSTEM_PROMPT.replace("{", "{{").replace("}", "}}")
-
-
-# ── Agent builder ─────────────────────────────────────────────────────────────
-
-def _build_agent():
-    from langchain.agents import create_tool_calling_agent, AgentExecutor
-    from langchain_core.prompts import ChatPromptTemplate
-    from app.ai.llm import get_llm
-    from app.ai.agent_tools import ALL_TOOLS
-    from datetime import datetime, timezone
-
-    @__import__("langchain.tools", fromlist=["tool"]).tool
-    def get_current_time() -> dict:
-        """Returns the current UTC time. Use to check if a match has already started."""
-        now = datetime.now(timezone.utc)
-        return {"utc": now.isoformat(), "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M")}
-
-    tools = ALL_TOOLS + [get_current_time]
-    llm = get_llm()
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", _SYSTEM_PROMPT_LANGCHAIN),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ])
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    return AgentExecutor(agent=agent, tools=tools, verbose=False, max_iterations=8, handle_parsing_errors=True)
 
 
 # ── Single match prediction ───────────────────────────────────────────────────
@@ -233,33 +201,6 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
     )
 
 
-def _predict_one(executor: Any, doc: dict[str, Any]) -> dict[str, Any]:
-    from app.competition.competition_special import apply_known_competition_context
-    apply_known_competition_context(doc)
-    match_input = _summarise_doc(doc)
-
-    try:
-        result = executor.invoke({"input": match_input})
-        raw = result["output"]
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        parsed = json.loads(raw.strip())
-        parsed["sportybet_id"] = doc.get("sportybet_id")
-        parsed["match_id"] = doc.get("sportybet_id")
-        parsed["source"] = "llm_analysis"
-        return parsed
-    except Exception as exc:
-        return {
-            "match": doc.get("sportybet_name") or doc.get("name"),
-            "sportybet_id": doc.get("sportybet_id"),
-            "status": "error",
-            "error": str(exc),
-            "source": "llm_analysis",
-        }
-
-
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def run_llm_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
@@ -322,78 +263,4 @@ def run_llm_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
         "source": "ai_router",
         "provider": active_provider,
         "model": active_model,
-    }
-
-
-def run_llm_predictions(
-    match_date: str | None = None,
-    docs: list[dict[str, Any]] | None = None,
-    limit: int = 50,
-) -> dict[str, Any]:
-    """
-    Run the LLM analysis agent over enriched match documents.
-
-    Args:
-        match_date: YYYY-MM-DD, defaults to today
-        docs:       pre-loaded enriched docs (skips DB fetch if provided)
-        limit:      max matches to predict in one call
-
-    Returns:
-        summary dict with predictions list
-    """
-    from app.ai.ai_router import get_router
-    if not get_router().any_available():
-        return {"status": "ai_unavailable", "message": "No AI provider available. Set OPENROUTER_API_KEY or enable a fallback provider."}
-
-    target_date = match_date or dt.today().isoformat()
-
-    if docs is None:
-        from app.storage.league_memory import get_enriched_matches
-        docs = get_enriched_matches(target_date, limit=limit)
-
-    if not docs:
-        return {"status": "no_matches", "date": target_date, "predictions": []}
-
-    docs = docs[:limit]
-    print(f"[llm_analysis] predicting {len(docs)} matches for {target_date}")
-
-    try:
-        executor = _build_agent()
-    except Exception as exc:
-        return {"status": "agent_build_failed", "error": str(exc)}
-
-    predictions = []
-    value_bets = 0
-    errors = 0
-
-    for i, doc in enumerate(docs, 1):
-        name = doc.get("sportybet_name") or doc.get("name") or "unknown"
-        print(f"[llm_analysis] [{i}/{len(docs)}] {name}")
-        pred = _predict_one(executor, doc)
-        predictions.append(pred)
-
-        if pred.get("status") == "error":
-            errors += 1
-        elif pred.get("status") == "predicted":
-            try:
-                record_prediction({
-                    **pred,
-                    "match_id": str(doc.get("sportybet_id") or ""),
-                    "match_date": target_date,
-                    "source": "llm_analysis",
-                })
-            except Exception:
-                pass
-            if pred.get("value_bet"):
-                value_bets += 1
-
-    return {
-        "status": "success",
-        "date": target_date,
-        "total": len(predictions),
-        "predicted": len([p for p in predictions if p.get("status") == "predicted"]),
-        "skipped": len([p for p in predictions if p.get("status") in ("skipped", "low_confidence")]),
-        "errors": errors,
-        "value_bets": value_bets,
-        "predictions": predictions,
     }

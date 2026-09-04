@@ -14,6 +14,7 @@ from typing import Any
 
 from app.config.config import get_settings
 from app.ai.ai_router import _call_llm, is_llm_available
+from app.ai.llm_analysis import SYSTEM_PROMPT
 
 OPENROUTER_MODELS = {
     "openrouter/free": {
@@ -22,32 +23,6 @@ OPENROUTER_MODELS = {
         "emoji": "🥇",
     },
 }
-
-SYSTEM_PROMPT = """You are a football prediction expert. Analyse the match data and output a prediction as valid JSON only — no text outside the JSON block.
-
-Consider: form (W/L/D), H2H record, league standings, 1x2 odds, and any web context provided.
-Only predict if confidence >= 0.60, otherwise set status to "low_confidence".
-
-Output format:
-{
-  "match": "<home> vs <away>",
-  "status": "predicted | low_confidence | skipped",
-  "prediction": "Home Win | Away Win | Draw",
-  "odds": "<decimal odds string>",
-  "confidence": <0.0-1.0>,
-  "value_bet": <true if confidence>=0.70 and odds>=2.5>,
-  "btts": "Yes | No | Unknown",
-  "over_2_5": "Yes | No | Unknown",
-  "market_signal": "sharp HOME | sharp AWAY | stable | unavailable",
-  "key_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],
-  "reasoning": {
-    "form": "<one sentence>",
-    "h2h": "<one sentence>",
-    "standings": "<one sentence>",
-    "odds_signal": "<one sentence>",
-    "verdict": "<one sentence final summary>"
-  }
-}"""
 
 
 def _parse_response(raw: str) -> dict[str, Any]:
@@ -94,7 +69,7 @@ def run_llm_match_analysis(
         return {"status": "error", "message": f"Failed to summarise doc: {exc}", "model": model}
 
     try:
-        raw = _call_llm(model, summary)
+        raw = _call_llm(model, f"{SYSTEM_PROMPT}\n\n{summary}")
         result = _parse_response(raw)
     except json.JSONDecodeError as exc:
         return {"status": "error", "message": f"Model returned non-JSON: {exc}", "model": model}

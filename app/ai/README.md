@@ -16,7 +16,7 @@ This domain contains all AI and LLM-powered logic. It manages provider routing (
 | `chat_agent.py` | Conversational agent for interactive prediction queries via chat interface |
 | `agentic_prediction.py` | Agentic loop that iteratively refines predictions using tool calls and self-critique |
 | `prediction_agent.py` | Single-shot prediction agent that wraps enriched context into a structured LLM prompt |
-| `ai_prediction_pipeline.py` | End-to-end AI prediction pipeline integrating all agent stages |
+| `ai_prediction_pipeline.py` | Backward-compatible facade for the pipeline — real implementation now lives in `prediction_pipeline/` (weights, evidence, teams, markets, orchestration) |
 | `ai_betbuilder.py` | AI-driven bet-builder that constructs multi-leg accumulators from individual predictions |
 | `ai_router.py` | Provider routing logic with fallback chain and cost/latency optimisation |
 | `agent_tools.py` | Tool definitions (function-calling schemas) available to agentic loops |

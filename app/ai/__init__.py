@@ -19,6 +19,6 @@ Or import the module object itself:
     from app.ai import ai_router
 """
 # Sub-modules available in this package:
-#   ai_brain, ai_router, llm, llm_agent, llm_pipeline, llm_model_manager,
+#   ai_brain, ai_router, llm, llm_agent, llm_pipeline,
 #   llm_analysis, chat_agent, agentic_prediction, prediction_agent,
 #   ai_prediction_pipeline, ai_betbuilder, agent_tools

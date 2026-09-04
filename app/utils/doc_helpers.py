@@ -17,15 +17,6 @@ def _context_source(home_stats: dict[str, Any], away_stats: dict[str, Any]) -> s
     return "model_fetch"
 
 
-def _is_live_doc(doc: dict[str, Any]) -> bool:
-    return bool(classify_match_state(doc).get("is_live"))
-
-
-def _is_finished_doc(doc: dict[str, Any]) -> bool:
-    state = classify_match_state(doc)
-    return bool(doc.get("is_finished") or state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
-
-
 def _is_not_started_period(period: str | None) -> bool:
     if not period:
         return True

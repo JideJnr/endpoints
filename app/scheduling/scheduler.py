@@ -146,8 +146,14 @@ def job_ingest_upcoming(limit: int = 500) -> dict[str, Any]:
         from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("sportybet_ingest_upcoming"):
             return {"status": "skipped", "job": "ingest_upcoming", "reason": "pipeline_disabled"}
-    except Exception:
-        pass
+    except Exception as exc:
+        # Fail-safe: if we can't confirm this pipeline should run, don't run
+        # it. Previously logged-and-ran-anyway, which is backwards -- a
+        # broken guard should never be read as "pipeline enabled".
+        _logger.warning(
+            "Pipeline guard check failed for sportybet_ingest_upcoming — skipping this cycle: %s", exc
+        )
+        return {"status": "skipped", "job": "ingest_upcoming", "reason": "pipeline_state_unavailable", "error": str(exc)}
     record_activity("Fetching upcoming SportyBet matches", job="ingest_upcoming", status="running")
     matches = fetch_upcoming_matches_post()[:limit]
     groups = _group_matches_by_local_date(matches)
@@ -189,8 +195,11 @@ def job_ingest_live(limit: int = 200) -> dict[str, Any]:
         from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("sportybet_ingest_live"):
             return {"status": "skipped", "job": "ingest_live", "reason": "pipeline_disabled"}
-    except Exception:
-        pass
+    except Exception as exc:
+        _logger.warning(
+            "Pipeline guard check failed for sportybet_ingest_live — skipping this cycle: %s", exc
+        )
+        return {"status": "skipped", "job": "ingest_live", "reason": "pipeline_state_unavailable", "error": str(exc)}
     record_activity("Fetching live SportyBet matches", job="ingest_live", status="running")
     matches = fetch_live_matches_post()[:limit]
 
@@ -583,8 +592,11 @@ def job_unified_upcoming() -> dict[str, Any]:
         from app.scheduling.pipeline_registry import is_pipeline_enabled
         if not is_pipeline_enabled("unified_upcoming"):
             return {"status": "skipped", "job": "unified_upcoming", "reason": "pipeline_disabled"}
-    except Exception:
-        pass
+    except Exception as exc:
+        _logger.warning(
+            "Pipeline guard check failed for unified_upcoming — skipping this cycle: %s", exc
+        )
+        return {"status": "skipped", "job": "unified_upcoming", "reason": "pipeline_state_unavailable", "error": str(exc)}
 
     from app.data_clients.sportybet_client import fetch_upcoming_matches_post
     from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_event_detail
@@ -862,6 +874,90 @@ def reset_deferred_predictions_and_repredict() -> dict[str, Any]:
     result = job_unified_upcoming()
     result["reset_count"] = reset_count
     return result
+
+
+def retry_deferred_predictions(cooldown_minutes: int = 180, limit: int = 25) -> dict[str, Any]:
+    """
+    Self-heal a bounded batch of "matched but permanently deferred" matches.
+
+    prediction_readiness() can defer a match even after it was successfully
+    matched to SofaScore -- e.g. a promoted team with fewer than 3 finished
+    matches in its SofaScore history yet. That's a real gap: once
+    enriched_at + sofascore_id are both set, get_unenriched_batch() never
+    re-selects that row again (its eligibility check only looks at those
+    two columns, plus live staleness) -- so unlike a genuine no_match
+    (which already has its own sofascore_retry_after_ts cooldown baked into
+    that same query), a "matched but thin" deferral was previously
+    permanent. Nothing ever tried it again.
+
+    This mirrors the no_match cooldown for the deferred case: resets a
+    bounded batch of deferred matches (soonest-kicking-off first) so they
+    re-enter the enrichment queue, stamping each with its own
+    deferred_retry_after_ts so the same still-thin match isn't reset again
+    every guardian pass -- only once the cooldown elapses.
+
+    Deliberately does NOT call job_unified_upcoming() directly the way
+    reset_deferred_predictions_and_repredict() (the manual admin endpoint)
+    does -- that pipeline is paused by default (pipeline_registry.py) and
+    would silently no-op there. Whichever prematch lane is actually active
+    (enrich_worker, ticking every 30s regardless of which toggle owns it)
+    picks the reset rows up on its own next cycle, exactly like any
+    newly-ingested match -- no forced synchronous call needed.
+    """
+    _init_db()
+    from app.storage.buffer import _init_buffer_table
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    next_retry_ts = now_ts + max(30, cooldown_minutes) * 60
+
+    with _conn() as conn:
+        _init_buffer_table(conn)
+        rows = conn.execute(
+            """
+            select match_id
+            from match_buffer
+            where is_finished = 0
+              and raw_enriched is not null
+              and json_extract(raw_enriched, '$.prediction_error') is not null
+              and (
+                json_extract(raw_enriched, '$.deferred_retry_after_ts') is null
+                or cast(json_extract(raw_enriched, '$.deferred_retry_after_ts') as real) <= ?
+              )
+            order by coalesce(cast(start_time as real), 9e18) asc
+            limit ?
+            """,
+            (now_ts, limit),
+        ).fetchall()
+
+        reset_count = 0
+        for row in rows:
+            match_id = row["match_id"]
+            conn.execute(
+                f"""
+                update match_buffer set
+                    enriched_at = null,
+                    sofascore_id = null,
+                    raw_enriched = json_set(
+                        json_remove(raw_enriched, {_RESET_REMOVE_EXPR}),
+                        '$.deferred_retry_after_ts', ?
+                    )
+                where match_id = ?
+                """,
+                (next_retry_ts, match_id),
+            )
+            reset_count += 1
+
+        conn.commit()
+
+    if reset_count:
+        record_activity(
+            f"Deferred-prediction self-heal: reset {reset_count} match(es) for re-enrichment "
+            f"(next retry not before {cooldown_minutes}m from now if still deferred)",
+            job="retry_deferred_predictions",
+            status="ok",
+            details={"reset_count": reset_count, "cooldown_minutes": cooldown_minutes, "limit": limit},
+        )
+    return {"status": "ok", "job": "retry_deferred_predictions", "reset_count": reset_count}
 
 
 def _require_pipeline_enabled(engine_id: str) -> dict[str, Any] | None:
@@ -1190,19 +1286,6 @@ def job_grade_predictions() -> dict[str, Any]:
         except Exception as exc:
             clv_result = {"error": str(exc)}
 
-        # Trim odds-snapshot history for matches that are done: keep only the
-        # opening snapshot + the true closing line, delete the movement
-        # history in between. Only for dates strictly before today — a
-        # match dated "today" may still be live, and CLV above must run
-        # first so the closing-line row it needs is never the one deleted.
-        # Restricted to the same 4-day grading window as everything else in
-        # this job; a match graded later than that keeps its full history.
-        try:
-            from app.market.market import cleanup_odds_for_date
-            odds_cleanup_result = {"by_date": [{"date": d, **cleanup_odds_for_date(d)} for d in target_dates[1:]]}
-        except Exception as exc:
-            odds_cleanup_result = {"error": str(exc)}
-
         try:
             from app.storage.mongo_store import cleanup_buffer
             cleanup_result = cleanup_buffer()
@@ -1223,11 +1306,141 @@ def job_grade_predictions() -> dict[str, Any]:
                 "metrics": metrics, "elo_updated": elo_updated,
                 "calibration": cal_result, "patterns": pattern_result,
                 "clv": clv_result, "learning": learn_result, "cleanup": cleanup_result,
-                "odds_cleanup": odds_cleanup_result,
                 "overdue": overdue_result, "betbuilder": betbuilder_result}
     except Exception as exc:
         print(f"[scheduler] grade_predictions failed: {exc}")
         return {"status": "error", "error": str(exc)}
+
+
+_AUTO_SUGGEST_DEDUP_HOURS = 5
+_AUTO_SUGGEST_OVERLAP_THRESHOLD = 0.7
+
+
+def job_auto_suggest_bet_builder(candidate_limit: int = 50) -> dict[str, Any]:
+    """Automatically generate + track a smart bet-builder slip purely to feed
+    the slip-level learning loop (learned_slip_risk / learned_thresholds,
+    app.monitoring.self_learner) with real graded history, instead of
+    waiting for a human or API caller to request a suggestion before
+    anything gets tracked and eventually graded.
+
+    This does NOT stake any money and does NOT place a real bet. It calls
+    the same run_smart_bet() a human-triggered /betbuilder/smart request
+    uses -- conviction-only selection, no target odds, no LLM calls -- with
+    request_code=False so it never even asks SportyBet for a shareable bet
+    code. The SportyBet lookup inside run_smart_bet resolves public market
+    odds to build a booking payload; it is a read, not a wager, and this job
+    never surfaces that payload to anyone. The only side effect is a row in
+    betbuilder_history (already auto-tracked by track_suggested_slip inside
+    run_smart_bet) that the existing grading job picks up once the covered
+    matches finish, same as any other suggested slip.
+
+    Guards against flooding betbuilder_history with near-duplicate slips: if
+    the newly suggested slip covers mostly the same matches as the last
+    auto-generated one from within the last _AUTO_SUGGEST_DEDUP_HOURS hours,
+    the just-created row is deleted again rather than kept. Without this,
+    a quiet run of candidates that doesn't change between ticks would get
+    tracked and (eventually) graded multiple times for the same real-world
+    outcome, which would bias get_learned_slip_risk's win rates toward
+    whatever result that one repeated match set happened to have, rather
+    than reflecting genuinely independent evidence.
+    """
+    from app.bet_builder.smart_builder import run_smart_bet
+
+    try:
+        result = run_smart_bet(candidate_limit=candidate_limit, request_code=False)
+    except Exception as exc:
+        print(f"[scheduler] auto_suggest_bet_builder failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+    status = result.get("status")
+    betbuilder_id = result.get("betbuilder_id")
+    if status not in {"success", "booking_failed"} or not betbuilder_id:
+        # no_candidates / no_smart_bet / synthesis_failed -- nothing cleared
+        # the learned conviction bar, so nothing was tracked. This is
+        # expected and not an error -- same "won't force a pick" philosophy
+        # as the human-triggered endpoint.
+        print(f"[scheduler] auto_suggest_bet_builder: {status}, nothing tracked")
+        return {"status": status, "tracked": False}
+
+    match_ids = sorted({
+        str(item.get("match_id") or item.get("sportybet_id") or "")
+        for item in (result.get("selections") or [])
+        if item.get("match_id") or item.get("sportybet_id")
+    })
+
+    if _is_duplicate_auto_suggestion(match_ids):
+        _delete_betbuilder_slip(betbuilder_id)
+        print(f"[scheduler] auto_suggest_bet_builder: skipped duplicate of a recent auto slip (discarded id={betbuilder_id})")
+        return {"status": "skipped_duplicate", "tracked": False, "match_ids": match_ids}
+
+    _record_auto_suggestion_event(betbuilder_id, match_ids)
+    print(f"[scheduler] auto_suggest_bet_builder: tracked slip id={betbuilder_id} legs={len(match_ids)} status={status}")
+    return {"status": status, "tracked": True, "betbuilder_id": betbuilder_id, "match_ids": match_ids}
+
+
+def _is_duplicate_auto_suggestion(match_ids: list[str]) -> bool:
+    if not match_ids:
+        return False
+    try:
+        from app.monitoring.self_learner import _init_learner_tables
+        with db_conn(timeout=10) as conn:
+            _init_learner_tables(conn)
+            row = conn.execute("""
+                select detail_json, created_at from system_events
+                where event_type = 'auto_bet_builder_suggested'
+                order by datetime(created_at) desc
+                limit 1
+            """).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    try:
+        created = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds() / 3600
+    except Exception:
+        return False
+    if age_hours > _AUTO_SUGGEST_DEDUP_HOURS:
+        return False
+    try:
+        import json as _json
+        prev_ids = set((_json.loads(row[0] or "{}") or {}).get("match_ids") or [])
+    except Exception:
+        return False
+    if not prev_ids:
+        return False
+    overlap = len(prev_ids & set(match_ids)) / max(1, len(set(match_ids)))
+    return overlap >= _AUTO_SUGGEST_OVERLAP_THRESHOLD
+
+
+def _record_auto_suggestion_event(betbuilder_id: int | None, match_ids: list[str]) -> None:
+    try:
+        import json as _json
+        from app.monitoring.self_learner import _init_learner_tables
+        with db_conn(timeout=10) as conn:
+            _init_learner_tables(conn)
+            conn.execute("""
+                insert into system_events(event_type, league_key, pick_type, detail_json, created_at)
+                values ('auto_bet_builder_suggested', '__global__', 'smart', ?, ?)
+            """, (
+                _json.dumps({"betbuilder_id": betbuilder_id, "match_ids": match_ids}),
+                datetime.now(timezone.utc).isoformat(),
+            ))
+            conn.commit()
+    except Exception as exc:
+        print(f"[scheduler] auto_suggest_bet_builder: failed to record system_event: {exc}")
+
+
+def _delete_betbuilder_slip(betbuilder_id: int) -> None:
+    try:
+        with db_conn(timeout=10) as conn:
+            conn.execute("delete from betbuilder_leg_history where bet_id = ?", (betbuilder_id,))
+            conn.execute("delete from betbuilder_history where id = ?", (betbuilder_id,))
+            conn.commit()
+    except Exception as exc:
+        print(f"[scheduler] auto_suggest_bet_builder: failed to delete duplicate slip {betbuilder_id}: {exc}")
 
 
 def job_regenerate_research_stats() -> dict[str, Any]:
@@ -1507,6 +1720,15 @@ def job_autopilot_guardian() -> dict[str, Any]:
         enrich_on = is_pipeline_enabled("sportybet_enrich_live") or is_pipeline_enabled("sportybet_enrich_prematch")
         if enrich_on:
             guarded("enrich_worker", lambda: run_job_with_guard(job_enrich_worker))
+
+    # Deferred-prediction self-heal: "matched but permanently deferred" rows
+    # (see retry_deferred_predictions' docstring) are invisible to
+    # hot_pending_enrichment/_needs_enrichment_nudge above, so they need
+    # their own trigger here. Cooldown-gated inside the function itself, so
+    # calling it every 5-minute guardian pass is cheap -- only matches whose
+    # deferred_retry_after_ts has actually elapsed get reset.
+    if int(stats.get("deferred") or 0) > 0:
+        guarded("retry_deferred_predictions", lambda: retry_deferred_predictions())
 
     if _job_stale("system_supervisor", 5 * 60):
         actions.append({
@@ -1807,6 +2029,22 @@ def start_scheduler():
         coalesce=True,
         misfire_grace_time=900,
         next_run_time=now + timedelta(minutes=8),
+    )
+
+    # auto-suggest bet-builder slip — every 3 hours, purely to feed the
+    # slip-level learning loop (learned_slip_risk) with tracked/graded
+    # history. Never stakes money, never places a real bet — see
+    # job_auto_suggest_bet_builder's docstring.
+    scheduler.add_job(
+        _safe(job_auto_suggest_bet_builder),
+        IntervalTrigger(hours=3),
+        id="auto_suggest_bet_builder",
+        name="Auto-suggest + track a smart bet-builder slip (learning data only)",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+        next_run_time=now + timedelta(minutes=12),
     )
 
     # regenerate research_stats — daily at 03:00 server time

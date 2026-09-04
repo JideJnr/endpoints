@@ -14,6 +14,8 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
+from app.utils.match_helpers import _team_name
+
 logger = logging.getLogger(__name__)
 
 _TEAM_HISTORY_CACHE_DAYS = 7
@@ -269,13 +271,6 @@ def _rate(hits: Any, samples: int) -> float | None:
     if hits is None or not samples:
         return None
     return round((hits or 0) / samples, 3)
-
-
-def _team_name(match: dict[str, Any], side: str) -> str | None:
-    team = match.get(f"{side}_team")
-    if isinstance(team, dict):
-        return team.get("name")
-    return team
 
 
 def _safe_json(value: Any, fallback: Any) -> Any:
@@ -852,6 +847,75 @@ def build_sporty_doc(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _grade_live_next_or_no_goal(row: Any, final_home: int, final_away: int) -> str | None:
+    """Grade live_next_goal/live_no_goal (and their "_grid"-suffixed variants)
+    for prediction_history rows, using the score AT PICK TIME.
+
+    Unlike every other market grading_reason/grade_market_intent handles,
+    "does a/no team score NEXT" cannot be resolved from the final score
+    alone -- it needs the score at the moment the pick was made. That score
+    is not recoverable from grade_market_intent's inputs (see the comment
+    on the live_next_goal/live_no_goal fallthrough in
+    app/market/market_intent.py), so those two markets have always graded
+    "void" for prediction_history rows even though the analogous
+    prediction_candidate_history rows grade correctly via
+    _grade_candidate_row (app/storage/league_memory/queries.py), which has
+    pick-time score through context_json.
+
+    This mirrors that _grade_candidate_row logic exactly, reading pick-time
+    score from live_context_json's score_home/score_away fields (added
+    alongside this fix -- see signal_combinations._normalise_live_context).
+    Kept as its own copy rather than a shared import: queries.py imports
+    from this module at load time, so importing queries.py back from here
+    would be circular.
+
+    Returns None -- not "void" -- when there is no usable pick-time score
+    (rows recorded before this fix, or a live_context that never carried a
+    score). The caller falls through to grading_reason/grade_market_intent
+    in that case, which is where "void" is actually decided, same as
+    before this fix existed.
+    """
+    pick_type = str(row["pick_type"] or "").lower()
+    pt_base = pick_type[:-5] if pick_type.endswith("_grid") else pick_type
+    if pt_base not in {"live_next_goal", "live_no_goal"}:
+        return None
+    try:
+        live_context_json = row["live_context_json"]
+    except (IndexError, KeyError):
+        return None
+    try:
+        context = json.loads(live_context_json or "{}")
+    except Exception:
+        context = {}
+    if not isinstance(context, dict) or "score_home" not in context or "score_away" not in context:
+        return None
+    selection = row["selection"]
+    sel = str(selection or "").lower()
+    start_home = _to_int(context.get("score_home"), 0)
+    start_away = _to_int(context.get("score_away"), 0)
+    start_total = start_home + start_away
+    final_total = final_home + final_away
+    if pt_base == "live_no_goal" or "no more goal" in sel or "no goal" in sel or sel.strip() in {"none", "no more goals"}:
+        return "win" if final_total == start_total else "loss"
+    side = _side_from_selection_and_match(sel, row["match_name"])
+    if side in ("home", "away"):
+        home_delta = final_home - start_home
+        away_delta = final_away - start_away
+        picked_delta = home_delta if side == "home" else away_delta
+        other_delta = away_delta if side == "home" else home_delta
+        if picked_delta > 0 and other_delta == 0:
+            return "win"
+        if picked_delta == 0 and other_delta > 0:
+            return "loss"
+        return "void"
+    if "next goal" in sel:
+        # Legacy generic phrasing with no identifiable team in the selection
+        # text -- keep the old "did any goal happen" behaviour as a last
+        # resort rather than voiding rows we used to grade.
+        return "win" if final_total > start_total else "loss"
+    return "void"
+
+
 def grade_prediction_row(
     row: Any,
     final_home: int,
@@ -865,7 +929,23 @@ def grade_prediction_row(
     ``_grade_pick_for_match`` call here — that was a duplicate path that
     could produce different win/loss labels for the same pick depending on
     which code path reached it.
+
+    live_next_goal/live_no_goal (and "_grid" variants) are special-cased
+    ahead of grading_reason via _grade_live_next_or_no_goal, above -- see
+    its docstring. Every other pick_type is unaffected.
     """
+    live_result = _grade_live_next_or_no_goal(row, final_home, final_away)
+    if live_result is not None:
+        from app.market.market_intent import classify_market_intent as _classify_market_intent
+        grade_info = {
+            "version": "grading_reason_v1",
+            "result": live_result,
+            "final_score": {"home": final_home, "away": final_away, "total": final_home + final_away},
+            "market_intent": _classify_market_intent(row["pick_type"], row["selection"]),
+            "reason": "graded from live_context_json score-at-pick-time",
+            "graded_via": "live_context_score_delta",
+        }
+        return live_result, grade_info
     from app.monitoring.prediction_audit import grading_reason as _grading_reason
     grade_info = _grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
     result = grade_info["result"]
@@ -911,6 +991,50 @@ def _odds_band(odds: float | None) -> str:
     if odds < 3.00:
         return "2.00-2.99"
     return "3.00+"
+
+
+# ── Slip-level risk bands (learned_slip_risk) ───────────────────────────────
+#
+# Two different odds banding schemes exist on purpose: _odds_band above is
+# for a SINGLE leg's own price (rarely above ~5.0 for a leg worth including
+# at all). _combined_odds_band below is for a whole slip's multiplied-out
+# price, which realistically ranges from ~1.5 (a two-leg slip of favourites)
+# into the thousands (many legs stacked, or a couple of long-shot legs
+# multiplied together) -- a single leg's banding scheme would put almost
+# every real slip in the same "3.00+" bucket and learn nothing useful.
+
+_LEG_COUNT_BANDS: tuple[tuple[int, str], ...] = (
+    (1, "1"), (3, "2-3"), (6, "4-6"), (9, "7-9"),
+)
+
+
+def _leg_count_band(leg_count: int | None) -> str:
+    n = int(leg_count or 0)
+    for ceiling, band in _LEG_COUNT_BANDS:
+        if n <= ceiling:
+            return band
+    return "10+"
+
+
+_COMBINED_ODDS_BANDS: tuple[tuple[float, str], ...] = (
+    (3.0, "<3"), (10.0, "3-10"), (50.0, "10-50"), (200.0, "50-200"), (1000.0, "200-1000"),
+)
+
+
+def _combined_odds_band(combined_odds: float | None) -> str:
+    if combined_odds is None or combined_odds <= 0:
+        return "unknown"
+    for ceiling, band in _COMBINED_ODDS_BANDS:
+        if combined_odds < ceiling:
+            return band
+    return "1000+"
+
+
+# Natural risk ordering for each dimension's bands, lowest-risk first. Used
+# to walk the learned win rates in order and find where they fall off a
+# cliff, rather than comparing band labels as strings.
+LEG_COUNT_BAND_ORDER: tuple[str, ...] = ("1", "2-3", "4-6", "7-9", "10+")
+COMBINED_ODDS_BAND_ORDER: tuple[str, ...] = ("<3", "3-10", "10-50", "50-200", "200-1000", "1000+")
 
 
 def _infer_betbuilder_pick_type(selection: str) -> str:

@@ -502,8 +502,9 @@ def _grade_ai_specialist_contributions(row: sqlite3.Row, result: str) -> None:
             league=row["league_name"] if "league_name" in row.keys() else None,
             pick_type=row["pick_type"] if "pick_type" in row.keys() else None,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("league_memory", "grade_ai_specialist_contributions_error", exc)
 
 
 def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> str:
@@ -596,6 +597,12 @@ def _grade_candidate_row(row: sqlite3.Row, final_home: int, final_away: int) -> 
         return "void"
     if pt_base == "live_match_winner":
         return _grade_pick_for_match("match_result", selection, final_home, final_away, row["match_name"])
+    if pt_base == "live_double_chance":
+        # Double chance is fully determined by the final score alone (no
+        # pick-time context needed, unlike next-goal/no-goal/totals above),
+        # so this can go straight through the same team-name-aware grader
+        # the plain "double_chance" pick type already uses.
+        return _grade_pick_for_match("double_chance", selection, final_home, final_away, row["match_name"])
     if pt_base == "live_double_chance":
         return _grade_pick_for_match("double_chance", selection, final_home, final_away, row["match_name"])
     if pt_base in {"live_btts", "btts"}:

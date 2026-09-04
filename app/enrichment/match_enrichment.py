@@ -14,8 +14,9 @@ from app.data_clients.sportradar_client import fetch_match_intelligence
 from app.utils.time_context import match_time_context
 from app.enrichment.web_context import search_league_sentiment, search_match_context
 from app.storage.buffer import _data_sources
-from app.utils.doc_helpers import _is_finished_doc, _is_live_doc
+from app.utils.match_state import is_finished_match, is_live_match
 from app.utils.match_helpers import _extract_1x2
+from app.utils.match_view import home_team as _home_team, away_team as _away_team
 
 
 class MatchEnrichmentError(Exception):
@@ -40,7 +41,7 @@ def enrich_buffered_match(sportybet_id: str, *, auto_predict: bool = True) -> di
         can_use_buffer_fallback = (
             refresh_state.get("reason") == "not_found_in_fresh_sporty"
             and bool(existing_doc.get("raw_sporty") or existing_doc.get("sportybet_id") or existing_doc.get("id"))
-            and not _is_finished_doc(existing_doc)
+            and not is_finished_match(existing_doc)
         )
         if can_use_buffer_fallback:
             sporty_fallback_used = True
@@ -192,11 +193,11 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
         # ID directly when an older document does not contain the saved event.
         sofa = doc.get("sofascore_event") if isinstance(doc.get("sofascore_event"), dict) else None
         if not sofa or str(sofa.get("id") or "") != str(saved_sofa_id):
-            sofa = _find_sofascore_event(str(saved_sofa_id), match_date, _is_live_doc(doc))
+            sofa = _find_sofascore_event(str(saved_sofa_id), match_date, is_live_match(doc))
         score = _candidate_score(sofa, doc) if sofa else float(doc.get("match_score") or 1.0)
         return sofa, score, "saved"
 
-    if not _is_live_doc(doc):
+    if not is_live_match(doc):
         try:
             from app.storage.buffer import _with_search_fallback_candidates
 
@@ -208,12 +209,12 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
             pass
 
     try:
-        sofa_events = fetch_live_events() if _is_live_doc(doc) else fetch_all_scheduled_events(match_date)
+        sofa_events = fetch_live_events() if is_live_match(doc) else fetch_all_scheduled_events(match_date)
         sofa_events = [
             event for event in sofa_events
-            if is_usable_event_for_mode(event, live=_is_live_doc(doc))
+            if is_usable_event_for_mode(event, live=is_live_match(doc))
         ]
-        if not _is_live_doc(doc):
+        if not is_live_match(doc):
             from app.storage.buffer import _with_search_fallback_candidates
 
             sofa_events = _with_search_fallback_candidates(sporty, sofa_events, live=False)
@@ -221,7 +222,7 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
         sofa_events = []
 
     sofa, score = _fuzzy_match(sporty, sofa_events)
-    live_doc = _is_live_doc(doc)
+    live_doc = is_live_match(doc)
     threshold = 0.62 if live_doc else FUZZY_THRESHOLD
     llm_threshold = 0.55 if live_doc else LLM_FALLBACK_THRESHOLD
     source = "auto"
@@ -239,10 +240,16 @@ def _resolve_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_
 def _team_bound_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], match_date: str) -> tuple[dict[str, Any] | None, float, str]:
     try:
         from app.team_watcher.team_watcher import team_watchers_for_match
-    except Exception:
+        watchers = team_watchers_for_match({**doc, **sporty})
+    except Exception as exc:
+        # This used to only guard the import above -- a runtime failure inside
+        # team_watchers_for_match() itself (DB error, bad doc shape, etc.)
+        # propagated straight up to the caller and could crash the whole
+        # match-resolution step for that match. Guard the call too.
+        from app.utils.health_counters import record_health_event
+        record_health_event("match_enrichment", "team_bound_sofascore_match_error", exc)
         return None, 0.0, "team_watcher_unavailable"
 
-    watchers = team_watchers_for_match({**doc, **sporty})
     home_watcher = watchers.get("home") if isinstance(watchers, dict) else None
     away_watcher = watchers.get("away") if isinstance(watchers, dict) else None
     home_sofa_id = str((home_watcher or {}).get("sofascore_team_id") or "").strip()
@@ -251,8 +258,8 @@ def _team_bound_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], mat
         return None, 0.0, "team_watcher_no_sofascore_id"
 
     try:
-        events = fetch_live_events() if _is_live_doc(doc) else fetch_all_scheduled_events(match_date)
-        events = [event for event in events if is_usable_event_for_mode(event, live=_is_live_doc(doc))]
+        events = fetch_live_events() if is_live_match(doc) else fetch_all_scheduled_events(match_date)
+        events = [event for event in events if is_usable_event_for_mode(event, live=is_live_match(doc))]
     except Exception:
         events = []
 
@@ -275,7 +282,7 @@ def _team_bound_sofascore_match(doc: dict[str, Any], sporty: dict[str, Any], mat
 
 def _saved_sofascore_detail(doc: dict[str, Any], sofa: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return reusable pre-match detail only when it belongs to the saved event."""
-    if _is_live_doc(doc) or not sofa:
+    if is_live_match(doc) or not sofa:
         return None
     detail = doc.get("sofascore_detail")
     if not isinstance(detail, dict) or not detail:
@@ -382,31 +389,5 @@ def _candidate_score(event: dict[str, Any] | None, doc: dict[str, Any]) -> float
         home = SequenceMatcher(None, str((event.get("home_team") or {}).get("name") or "").lower(), str(_home_team(doc) or "").lower()).ratio()
         away = SequenceMatcher(None, str((event.get("away_team") or {}).get("name") or "").lower(), str(_away_team(doc) or "").lower()).ratio()
         return round(max(direct, (home + away) / 2), 3)
-
-
-def _home_team(doc: dict[str, Any]) -> str:
-    team = doc.get("home_team")
-    if isinstance(team, dict):
-        return team.get("name") or ""
-    if team:
-        return str(team)
-    return _team_from_name(doc, 0)
-
-
-def _away_team(doc: dict[str, Any]) -> str:
-    team = doc.get("away_team")
-    if isinstance(team, dict):
-        return team.get("name") or ""
-    if team:
-        return str(team)
-    return _team_from_name(doc, 1)
-
-
-def _team_from_name(doc: dict[str, Any], index: int) -> str:
-    name = doc.get("sportybet_name") or doc.get("name") or ""
-    parts = [part.strip() for part in name.split(" vs ", 1)]
-    return parts[index] if len(parts) > index else ""
-
-
 
 

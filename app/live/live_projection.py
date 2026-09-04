@@ -27,11 +27,21 @@ full scoreline probability grid pre-match (`top_scorelines`) from
 happened *this* match so far (goals, and xG if the provider has it), and
 re-runs the same Poisson/Dixon-Coles machinery over the remainder.
 
-STATUS: prototype only. Not imported by `enriched_prediction.py` or anything
-in the live pipeline yet — see the `demo()` function at the bottom for a
-worked example, and `project_live_match()` for the integration entry point
-once this is validated against real live matches and someone decides to wire
-it in.
+STATUS: active — wired into the live pick pipeline.
+`_live_grid_projection_picks()` in `app/enrichment/enriched_prediction.py`
+imports and calls `project_live_match()` on every live-enrichment cycle,
+publishing grid-derived candidates (live_next_goal_grid, live_no_goal_grid,
+live_total_goals_grid, live_match_winner_grid, live_btts_grid) alongside the
+independent heuristic picks.
+
+VALIDATION STATUS: the grid model has NOT yet been validated against a large
+sample of real live outcomes. `app/live/backtest_live_projection.py` is the
+backtest runner — it uses graded `prediction_history.models_json` lambdas +
+`live_stat_snapshots` to compare grid vs naive on historical matches.
+Run it periodically as the live-stat snapshot table grows:
+    python -m app.live.backtest_live_projection
+Until that validation is done, treat grid picks as additive candidates that
+run alongside the existing heuristics, not as replacements for them.
 
 WHAT THIS DOES NOT MODEL (be honest about the limitations)
 -----------------------------------------------------------

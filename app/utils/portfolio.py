@@ -157,8 +157,16 @@ def portfolio_summary(predictions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _normalise_league(name: str) -> str:
-    """Normalise a league/tournament name to a consistent key."""
-    return str(name or '').lower().strip().replace('-', ' ')
+    """Normalise a league/tournament name to a consistent key.
+
+    Delegates to the canonical normalize_league from league_memory._helpers so
+    that portfolio league bucketing produces the same keys as the prediction and
+    learning system.  The old local implementation (lower/strip/replace) produced
+    subtly different keys (e.g. double-spaces, different handling of special
+    characters) causing portfolio league stats to silently mis-attribute picks.
+    """
+    from app.storage.league_memory._helpers import normalize_league
+    return normalize_league(name)
 
 
 def _start_time(pick: dict) -> float | None:

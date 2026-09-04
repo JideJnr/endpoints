@@ -114,6 +114,16 @@ def _normalise_live_context(context: dict[str, Any]) -> dict[str, Any]:
         "minute_bucket": context.get("minute_bucket") or _minute_bucket(minute),
         "score_state": context.get("score_state") or _score_state(home, away),
         "live_stats": bool(context.get("live_stats")),
+        # Raw score at pick time -- score_state above is a coarse bucket
+        # ("one_goal_game", "multi_goal_game", ...) kept deliberately lossy
+        # for signal-combination hashing/learning (see build_signal_combination,
+        # which only pulls score_state out of this dict, never these raw
+        # ints, so adding them here does not change any hash key). Grading
+        # live_next_goal/live_no_goal for prediction_history rows needs the
+        # exact score at pick time, which score_state cannot reconstruct --
+        # see grade_prediction_row in app/storage/league_memory/_helpers.py.
+        "score_home": home,
+        "score_away": away,
     }
 
 

@@ -26,6 +26,21 @@ def get_llm():
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
             temperature=0,
+            # Without an explicit timeout, a hung OpenRouter response can stall
+            # a caller (e.g. the live bet builder's slip-synthesis pass)
+            # indefinitely. The default here is deliberately generous, not
+            # tight: OPENROUTER_MODEL is "openrouter/free" (see predictx/.env)
+            # -- a shared, rate-limited free-tier route that routinely takes
+            # tens of seconds, well beyond what a paid model would. A short
+            # timeout tuned for paid-model latency would make this fall back
+            # to the deterministic path on most calls, quietly defeating the
+            # point of the "AI" mode rather than just being a safety net.
+            # max_retries=1 avoids langchain's default extra retry (each with
+            # its own backoff) compounding that latency further -- callers
+            # that need an LLM decision already have a deterministic fallback
+            # on any exception, so one honest attempt beats a slow retry.
+            timeout=int(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "60")),
+            max_retries=1,
         )
     except ImportError as exc:
         raise ImportError(
@@ -44,6 +59,10 @@ def get_fast_llm():
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
         temperature=0.1,
+        # Same free-tier reasoning as get_llm() above -- 12s was tuned for a
+        # paid model and would fail most calls against openrouter/free.
+        timeout=int(os.getenv("OPENROUTER_FAST_TIMEOUT_SECONDS", "45")),
+        max_retries=1,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -17,6 +18,9 @@ from app.market.season_stage import (
 )
 from app.utils.doc_helpers import _band
 from app.utils.primitives import _optional_int, _safe_num
+from app.utils.goal_timing import extract_goal_timing_from_detail as _extract_goal_timing
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_WORLD_CUP = {
@@ -89,7 +93,8 @@ def _opponent_quality_score(team_id: str, team_name: str) -> float:
     try:
         from app.models.elo import get_elo
         rating = get_elo(team_id)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_opponent_quality_score: ELO lookup failed for team_id=%s (%s) — defaulting to 50", team_id, exc)
         return 50.0
     return max(0.0, min(100.0, 50.0 + (rating - 1500.0) / 8.0))
 
@@ -128,8 +133,8 @@ def _classify_competition(key: str, league_name: str = "") -> str:
             total_samples = sum(int(pt.get("samples") or 0) for pt in lacc.get("by_pick_type") or [])
             if total_samples >= MIN_SAMPLES:
                 return "learned"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_classify_competition: self_learner lookup failed for key=%s — defaulting to unclassified (%s)", key, exc)
     return "unclassified"
 
 
@@ -1307,7 +1312,7 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
     intelligence = _competition_intelligence_context(key, event, detail, {})
     main_id = _main_buffer_match_id(event.get("id"))
     legacy_id = _prefixed_match_id(key, event.get("id"))
-    return {
+    doc = {
         "id": main_id,
         "match_id": main_id,
         "competition_match_id": str(event.get("id") or ""),
@@ -1376,6 +1381,21 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any]) ->
         "team_strength_context": intelligence.get("team_strength"),
         "table_context": intelligence.get("table"),
     }
+    # competition_special never used to go through match_facts' enrichment at
+    # all (it computes goal timing itself via the richer band-based
+    # app.utils.goal_timing module -- that part is fine and untouched by
+    # this), so tracked-competition matches were silently missing
+    # half_time_score, normalized live_statistics, and
+    # provider_live_capabilities that every SportyBet-ingested match gets.
+    # This brings competition-tracked matches (predictions AND the mirrored
+    # match_buffer row's raw_enriched) up to the same baseline.
+    try:
+        from app.match_facts import enrich_match_facts
+        doc = enrich_match_facts(doc)
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("competition_special", "match_facts_enrichment_error", exc)
+    return doc
 
 
 def _special_markets(detail: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -1738,10 +1758,22 @@ def _mirror_competition_event_to_main_buffer(
             is_live = excluded.is_live,
             is_finished = excluded.is_finished,
             ingested_at = excluded.ingested_at,
-            data_source = excluded.data_source,
+            data_source = case
+                when match_buffer.sportybet_id is not null then 'both'
+                else excluded.data_source
+            end,
             sofascore_id = excluded.sofascore_id,
-            sofascore_only = excluded.sofascore_only,
-            sportybet_id = null,
+            sofascore_only = case
+                when match_buffer.sportybet_id is not null then 0
+                else excluded.sofascore_only
+            end,
+            -- Do NOT null this out. A row that was already merged with a
+            -- SportyBet match (sportybet_id set by buffer.py's ingest-time
+            -- or backfill merge) must keep that link -- this mirror runs
+            -- every ~5 min for every tracked competition, and used to
+            -- unconditionally wipe sportybet_id back to null on every pass,
+            -- silently undoing the merge and causing SportyBet's next
+            -- ingest to recreate a duplicate row (see buffer.py re-split fix).
             raw_sporty = excluded.raw_sporty,
             raw_enriched = coalesce(excluded.raw_enriched, match_buffer.raw_enriched),
             enriched_at = coalesce(excluded.enriched_at, match_buffer.enriched_at)
@@ -1795,50 +1827,7 @@ def _competition_raw_sporty(key: str, event: dict[str, Any], match_date: str, im
     }
 
 
-def _extract_goal_timing(detail: dict[str, Any]) -> dict[str, Any]:
-    """Parse goal events from sofascore detail into structured timing data."""
-    incidents = detail.get("incidents") or detail.get("match_incidents") or []
-    goal_minutes: list[int] = []
-    for inc in incidents:
-        if not isinstance(inc, dict):
-            continue
-        inc_type = str(inc.get("incidentType") or inc.get("type") or "").lower()
-        if inc_type not in ("goal", "penalty"):
-            continue
-        minute = inc.get("time") or inc.get("minute")
-        try:
-            goal_minutes.append(int(minute))
-        except (TypeError, ValueError):
-            pass
-
-    goal_minutes.sort()
-    total = len(goal_minutes)
-    first_half = sum(1 for m in goal_minutes if m <= 45)
-    second_half = sum(1 for m in goal_minutes if m > 45)
-
-    intervals: list[float] = []
-    for i in range(1, len(goal_minutes)):
-        intervals.append(float(goal_minutes[i] - goal_minutes[i - 1]))
-    avg_interval = round(sum(intervals) / len(intervals), 2) if intervals else None
-
-    return {
-        "total_goals": total,
-        "first_half_goals": first_half,
-        "second_half_goals": second_half,
-        "band_1_10":  _band(goal_minutes, 1, 10),
-        "band_11_20": _band(goal_minutes, 11, 20),
-        "band_21_30": _band(goal_minutes, 21, 30),
-        "band_31_40": _band(goal_minutes, 31, 40),
-        "band_41_45": _band(goal_minutes, 41, 45),
-        "band_46_55": _band(goal_minutes, 46, 55),
-        "band_56_65": _band(goal_minutes, 56, 65),
-        "band_66_75": _band(goal_minutes, 66, 75),
-        "band_76_85": _band(goal_minutes, 76, 85),
-        "band_86_90": _band(goal_minutes, 86, 90),
-        "first_goal_minute": goal_minutes[0] if goal_minutes else None,
-        "avg_interval_minutes": avg_interval,
-        "goal_minutes": goal_minutes,
-    }
+# _extract_goal_timing is imported from app.utils.goal_timing
 
 
 def _update_competition_goal_stats(
@@ -1846,11 +1835,44 @@ def _update_competition_goal_stats(
     event: dict[str, Any],
     detail: dict[str, Any],
 ) -> None:
-    """Persist per-match goal timing into competition_goal_stats."""
+    """Persist per-match goal timing into competition_goal_stats.
+
+    Timing data is extracted from the sofascore detail via the shared
+    extract_goal_timing_from_detail utility.  If the caller already ran
+    enrich_match_facts() and has doc["goal_timing"] available, that richer
+    result (which includes the same bands) is used directly instead of
+    re-parsing incidents from scratch.
+    """
     status = str(((event.get("status") or {}).get("type") or "")).lower()
     if status not in ("finished", "ended", "after extra time", "after penalties"):
         return
-    timing = _extract_goal_timing(detail)
+
+    # Prefer pre-computed goal_timing from enrich_match_facts if present on detail
+    # (competition special ingest sometimes passes an enriched detail dict).
+    # Fall back to extracting from incidents if not.
+    precomputed = detail.get("goal_timing") if isinstance(detail.get("goal_timing"), dict) else None
+    if precomputed and precomputed.get("goal_count"):
+        # match_facts.goal_timing_summary uses different key names — normalise
+        timing = {
+            "total_goals": precomputed.get("goal_count", 0),
+            "first_half_goals": sum(1 for m in (precomputed.get("goal_minutes") or []) if m <= 45),
+            "second_half_goals": sum(1 for m in (precomputed.get("goal_minutes") or []) if m > 45),
+            "first_goal_minute": (precomputed.get("goal_minutes") or [None])[0],
+            "avg_interval_minutes": precomputed.get("average_interval_minutes"),
+            "goal_minutes": precomputed.get("goal_minutes") or [],
+        }
+        from app.utils.doc_helpers import _band as _gt_band
+        gm = timing["goal_minutes"]
+        for b_key, lo, hi in (
+            ("band_1_10", 1, 10), ("band_11_20", 11, 20), ("band_21_30", 21, 30),
+            ("band_31_40", 31, 40), ("band_41_45", 41, 45), ("band_46_55", 46, 55),
+            ("band_56_65", 56, 65), ("band_66_75", 66, 75), ("band_76_85", 76, 85),
+            ("band_86_90", 86, 90),
+        ):
+            timing[b_key] = _gt_band(gm, lo, hi)
+    else:
+        timing = _extract_goal_timing(detail)
+
     if timing["total_goals"] == 0 and not timing["goal_minutes"]:
         return
     match_id = str(event.get("id") or "")
@@ -1997,6 +2019,10 @@ def _competition_intelligence_context(
 
         ai_team_watchers = team_watchers_for_match(doc)
     except Exception as exc:
+        logger.warning(
+            "_competition_intelligence_context: team_watchers_for_match failed for key=%s — %s",
+            key, exc,
+        )
         ai_team_watchers = {"available": False, "error": str(exc)}
 
     # When standings are unreliable (season not started / beginning),
@@ -2232,11 +2258,33 @@ def _update_team_watchers_for_match(
         return
 
     _init_db()
+    # Fetch the competition goal profile once — shared across all teams in this match
+    # so we don't query the DB once per team.
+    comp_goal_profile = _competition_goal_profile(key)
+
     with db_conn(timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         init_competition_tables(conn)
         _register_competition_teams(conn, key, event)
         for row in rows:
+            # ------------------------------------------------------------------
+            # Check whether the existing DB row already has the same result and
+            # status.  If nothing meaningful changed, skip the profile rebuild to
+            # avoid rebuilding 40 profiles per competition cycle unnecessarily.
+            # ------------------------------------------------------------------
+            existing = conn.execute(
+                """
+                select result, status from competition_team_watcher_matches
+                where competition_key = ? and team_id = ? and match_id = ?
+                """,
+                (key, row["team_id"], row["match_id"]),
+            ).fetchone()
+            row_changed = (
+                existing is None
+                or existing["result"] != row["result"]
+                or existing["status"] != row["status"]
+            )
+
             conn.execute(
                 """
                 insert into competition_team_watcher_matches
@@ -2272,27 +2320,29 @@ def _update_team_watchers_for_match(
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
-            profile = _build_team_watcher_profile(conn, key, row["team_id"])
-            conn.execute(
-                """
-                update competition_team_watchers
-                set profile_json = ?,
-                    match_count = ?,
-                    last_match_id = ?,
-                    last_brief = ?,
-                    updated_at = ?
-                where competition_key = ? and team_id = ?
-                """,
-                (
-                    json.dumps(profile),
-                    int(profile.get("sample_size") or 0),
-                    row["match_id"],
-                    row["brief"],
-                    datetime.now(timezone.utc).isoformat(),
-                    key,
-                    row["team_id"],
-                ),
-            )
+            # Only rebuild the profile when something actually changed.
+            if row_changed:
+                profile = _build_team_watcher_profile(conn, key, row["team_id"], goal_profile=comp_goal_profile)
+                conn.execute(
+                    """
+                    update competition_team_watchers
+                    set profile_json = ?,
+                        match_count = ?,
+                        last_match_id = ?,
+                        last_brief = ?,
+                        updated_at = ?
+                    where competition_key = ? and team_id = ?
+                    """,
+                    (
+                        json.dumps(profile),
+                        int(profile.get("sample_size") or 0),
+                        row["match_id"],
+                        row["brief"],
+                        datetime.now(timezone.utc).isoformat(),
+                        key,
+                        row["team_id"],
+                    ),
+                )
         conn.commit()
 
 
@@ -2359,7 +2409,12 @@ def _team_match_brief(
     return f"{team_name} {result_text} vs {opponent_name} ({venue}, {score_text}).{pick_text}".strip()
 
 
-def _build_team_watcher_profile(conn: sqlite3.Connection, key: str, team_id: str) -> dict[str, Any]:
+def _build_team_watcher_profile(
+    conn: sqlite3.Connection,
+    key: str,
+    team_id: str,
+    goal_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """
@@ -2405,6 +2460,37 @@ def _build_team_watcher_profile(conn: sqlite3.Connection, key: str, team_id: str
     if sample and failed_to_score / sample >= 0.35:
         weaknesses.append("blank_risk")
     preferred_markets = _preferred_team_markets(sample, wins, losses, over_25, btts, clean_sheets, failed_to_score)
+
+    # Enrich preferred markets with competition-level goal-timing intelligence.
+    # If the competition's own goal profile shows a dominant half or a very early/late
+    # peak band, surface that as an additional market suggestion when the team's own
+    # record supports it (sample >= 3).
+    if goal_profile and goal_profile.get("available") and sample >= 3:
+        dominant_half = goal_profile.get("dominant_half")
+        peak_band = goal_profile.get("peak_band")          # e.g. "46-55min"
+        avg_first_goal = goal_profile.get("avg_first_goal_minute")
+        if dominant_half == "second" and gf_avg >= 1.2:
+            if not any(m.get("market") == "second_half_goals" for m in preferred_markets):
+                preferred_markets.append({
+                    "market": "second_half_goals",
+                    "confidence": "low",
+                    "reason": f"competition_dominant_half_{dominant_half}",
+                })
+        elif dominant_half == "first" and gf_avg >= 1.2:
+            if not any(m.get("market") == "first_half_goals" for m in preferred_markets):
+                preferred_markets.append({
+                    "market": "first_half_goals",
+                    "confidence": "low",
+                    "reason": f"competition_dominant_half_{dominant_half}",
+                })
+        if avg_first_goal is not None and avg_first_goal < 25 and gf_avg >= 1.0:
+            if not any(m.get("market") == "early_goal" for m in preferred_markets):
+                preferred_markets.append({
+                    "market": "early_goal",
+                    "confidence": "low",
+                    "reason": f"competition_avg_first_goal_{avg_first_goal}min",
+                })
+    preferred_markets = preferred_markets[:5]
     form = "".join(("W" if row["result"] == "win" else "D" if row["result"] == "draw" else "L") for row in finished[:6])
     recent_briefs = [row["brief"] for row in rows[:5] if row["brief"]]
     return {
@@ -2494,6 +2580,23 @@ def _team_watcher_context(key: str, team: dict[str, Any]) -> dict[str, Any]:
         if not row:
             return {"available": False, "team_id": team_id, "team_name": team_name, "reason": "watcher_not_ready"}
         profile = json.loads(row["profile_json"] or "{}")
+
+        # When the local competition profile is thin (< 3 matches), try to enrich
+        # it with the main team watcher's tournament-scoped profile so we don't
+        # fall back to empty data just because the competition started recently.
+        if int(row["match_count"] or 0) < 3:
+            try:
+                from app.team_watcher.team_watcher import get_watcher as _get_main_watcher
+                from app.team_watcher.team_watcher import _slug as _tw_slug
+                team_key = _tw_slug(team_name)
+                main = _get_main_watcher(team_key, limit=5)
+                tournament_profile = (main.get("tournament_profiles") or {}).get(key)
+                if tournament_profile:
+                    # Merge: local data takes precedence, main tournament profile fills gaps
+                    profile = {**tournament_profile, **profile, "enriched_from_main_watcher": True}
+            except Exception as tw_exc:
+                logger.debug("_team_watcher_context: main watcher enrichment skipped team_id=%s: %s", team_id, tw_exc)
+
         return {
             "available": bool(profile),
             "team_id": row["team_id"],

@@ -23,6 +23,7 @@ from app.competition.league_strength import league_strength_score
 
 from app.utils.doc_helpers import _band
 from app.utils.primitives import _loads, _to_int
+from app.utils.goal_timing import extract_goal_timing_from_doc as _extract_goal_timing_from_doc
 
 logger = logging.getLogger(__name__)
 
@@ -441,7 +442,12 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
 
         for team in teams:
             resolved_key = _resolve_watcher_key(conn, team)
-            _upsert_watcher(conn, team, resolved_key=resolved_key)
+            # _upsert_watcher may create the row under a different key than
+            # `resolved_key` (e.g. team["team_key"] on a brand-new team, when
+            # resolved_key is still None) -- always use the key it actually
+            # wrote, not the pre-upsert guess, or every first-time team hits
+            # a NOT NULL violation on ai_team_watcher_matches.team_key below.
+            resolved_key = _upsert_watcher(conn, team, resolved_key=resolved_key)
             observation = _observation_for_team(match_doc, team, analysis)
             conn.execute(
                 """
@@ -450,7 +456,7 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                      league_name, team_position, opponent_position, table_gap,
                      goals_for, goals_against, result, status, prediction_json, analysis_json,
                      brief, raw_match_json, web_context_json, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(team_key, match_id) do update set
                     match_date = excluded.match_date,
                     team_name = excluded.team_name,
@@ -933,7 +939,7 @@ def team_watchers_for_match(match_doc: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key: str | None = None) -> None:
+def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     existing = _resolve_watcher_row(conn, team["team_key"]) or (_resolve_watcher_row(conn, resolved_key) if resolved_key else None)
     aliases = _merge_aliases(existing, team)
@@ -982,6 +988,7 @@ def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key
             now,
         ),
     )
+    return db_key
 
 
 def _teams_for_doc(doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1067,6 +1074,8 @@ def _observation_for_team(doc: dict[str, Any], team: dict[str, Any], analysis: d
     return {
         "match_date": doc.get("match_date"),
         "team_side": side,
+        "sporty_team_id": team.get("sporty_team_id"),
+        "sofascore_team_id": team.get("sofascore_team_id"),
         "opponent": opponent,
         "venue": doc.get("venue") or raw_sporty.get("venue"),
         "tournament": doc.get("tournament") or raw_sporty.get("tournament"),
@@ -1322,39 +1331,10 @@ def _market_leans(sample: int, wins: int, losses: int, over_25: int, btts: int, 
 
 
 def _extract_goal_timing_from_doc(doc: dict[str, Any]) -> dict[str, Any]:
-    """Extract goal timing from a match doc's sofascore incidents."""
-    detail = doc.get("sofascore_detail") if isinstance(doc.get("sofascore_detail"), dict) else {}
-    incidents = detail.get("incidents") or detail.get("match_incidents") or []
-    goal_minutes: list[int] = []
-    for inc in incidents:
-        if not isinstance(inc, dict):
-            continue
-        inc_type = str(inc.get("incidentType") or inc.get("type") or "").lower()
-        if inc_type not in ("goal", "penalty"):
-            continue
-        minute = inc.get("time") or inc.get("minute")
-        try:
-            goal_minutes.append(int(minute))
-        except (TypeError, ValueError):
-            pass
-    if not goal_minutes:
-        return {}
-    goal_minutes.sort()
-
-    intervals = [float(goal_minutes[i] - goal_minutes[i - 1]) for i in range(1, len(goal_minutes))]
-    return {
-        "total_goals": len(goal_minutes),
-        "first_half_goals": sum(1 for m in goal_minutes if m <= 45),
-        "second_half_goals": sum(1 for m in goal_minutes if m > 45),
-        "band_1_10": _band(goal_minutes, 1, 10), "band_11_20": _band(goal_minutes, 11, 20),
-        "band_21_30": _band(goal_minutes, 21, 30), "band_31_40": _band(goal_minutes, 31, 40),
-        "band_41_45": _band(goal_minutes, 41, 45), "band_46_55": _band(goal_minutes, 46, 55),
-        "band_56_65": _band(goal_minutes, 56, 65), "band_66_75": _band(goal_minutes, 66, 75),
-        "band_76_85": _band(goal_minutes, 76, 85), "band_86_90": _band(goal_minutes, 86, 90),
-        "first_goal_minute": goal_minutes[0],
-        "avg_interval_minutes": round(sum(intervals) / len(intervals), 2) if intervals else None,
-        "goal_minutes": goal_minutes,
-    }
+    # Imported from app.utils.goal_timing — kept as a local alias for
+    # call-site compatibility. All logic lives in the shared module.
+    from app.utils.goal_timing import extract_goal_timing_from_doc as _shared
+    return _shared(doc)
 
 
 def _team_goal_timing(rows: list[sqlite3.Row]) -> dict[str, Any]:
@@ -1752,7 +1732,10 @@ def _table_from_rows(rows: list) -> dict | None:
     """Build a minimal table dict from match rows."""
     if not rows:
         return None
-    return {'rows': list(rows)}
+    # rows are sqlite3.Row objects -- not JSON-serializable as-is (this dict
+    # ends up inside profile_json via json.dumps in observe_match). Convert
+    # each to a plain dict first.
+    return {'rows': [dict(row) for row in rows]}
 
 
 def _matchup_context(home: dict, away: dict, doc: dict) -> dict:
@@ -1884,6 +1867,11 @@ def team_watch_signal(match_doc: dict[str, Any]) -> dict[str, Any] | None:
             },
         }
     except Exception:
+        logger.warning(
+            "team_watch_signal failed for match id=%s: %s",
+            match_doc.get("sportybet_id") or match_doc.get("id") or "unknown",
+            __import__("traceback").format_exc().splitlines()[-1],
+        )
         return None
 
 

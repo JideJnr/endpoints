@@ -21,7 +21,8 @@ from app.storage.buffer import (
 from app.storage.league_memory import list_prediction_history
 from app.market.market import get_movement
 from app.utils.match_state import classify_match_state
-from app.enrichment.match_enrichment import _is_live_doc, _is_finished_doc
+from app.utils.match_state import is_live_match, is_finished_match
+from app.utils.match_view import match_summary, home_team, away_team
 from app.scheduling.scheduler import scheduler_status
 
 try:
@@ -43,7 +44,7 @@ def get_matches_today():
         "status": "success",
         "date": target_date,
         "count": len(docs),
-        "matches": [_match_summary(doc) for doc in docs],
+        "matches": [match_summary(doc) for doc in docs],
     }
 
 
@@ -54,7 +55,7 @@ def get_live_matches():
     return {
         "status": "success",
         "count": len(docs),
-        "matches": [_match_summary(doc) for doc in docs],
+        "matches": [match_summary(doc) for doc in docs],
     }
 
 
@@ -65,7 +66,7 @@ def get_matches_by_date(match_date: str, limit: int = Query(default=500, ge=1, l
         "status": "success",
         "date": match_date,
         "count": len(docs),
-        "matches": [_match_summary(doc) for doc in docs],
+        "matches": [match_summary(doc) for doc in docs],
     }
 
 
@@ -267,7 +268,7 @@ def get_sofascore_candidates(sportybet_id: str):
         raise HTTPException(status_code=404, detail=f"Match {sportybet_id} not found in buffer")
 
     target_date = doc.get("match_date") or dt.today().isoformat()
-    live = _is_live_doc(doc)
+    live = is_live_match(doc)
     raw_sporty = doc.get("raw_sporty") if isinstance(doc.get("raw_sporty"), dict) else {}
     period = doc.get("period") or raw_sporty.get("period")
     if not live and _is_ghost_match(doc.get("start_time"), period):
@@ -398,7 +399,7 @@ def match_sofascore_candidate(
             dates.append(value)
 
     sofa = None
-    if _is_live_doc(doc):
+    if is_live_match(doc):
         try:
             sofa = next((event for event in fetch_live_events() if str(event.get("id")) == str(sofa_id)), None)
         except Exception:
@@ -417,7 +418,7 @@ def match_sofascore_candidate(
         sofa = payload["event"]
     if not sofa:
         raise HTTPException(status_code=404, detail=f"SofaScore event {sofa_id} was not found")
-    if not is_usable_event_for_mode(sofa, live=_is_live_doc(doc)):
+    if not is_usable_event_for_mode(sofa, live=is_live_match(doc)):
         status = sofa.get("status") or {}
         raise HTTPException(
             status_code=400,
@@ -614,7 +615,7 @@ def get_predictions_today():
         p["period"]      = status.get("period") or p.get("period")
         p["is_live"]     = status.get("is_live", False)
         p["is_finished"] = status.get("is_finished", False)
-        if p["is_finished"] or _is_finished_doc(p):
+        if p["is_finished"] or is_finished_match(p):
             continue
 
         # Attach regime info + filter picks that don't meet regime threshold
@@ -690,7 +691,7 @@ def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=100
         match_date = time_context.get("local_date") or doc.get("match_date") or today
         if str(match_date) < today:
             continue
-        if _is_live_doc(doc) or _is_finished_doc(doc):
+        if is_live_match(doc) or is_finished_match(doc):
             continue
         match_id = str(doc.get("sportybet_id") or doc.get("id") or "")
         prediction = latest_by_match.get(match_id)
@@ -698,7 +699,7 @@ def get_upcoming_enriched_predicted(limit: int = Query(default=500, ge=1, le=100
         if prediction and not readiness["ready"]:
             prediction = None
         best_pick = (prediction or {}).get("best_pick") or ((prediction or {}).get("picks") or [{}])[0]
-        summary = _match_summary(doc)
+        summary = match_summary(doc)
         rows.append(
             {
                 **summary,
@@ -1469,6 +1470,16 @@ ENGINE_CATALOG: dict[str, dict[str, Any]] = {
 
 def _engine_row_matches(engine: dict[str, Any], pick_type: str, selection: str, signals: list[dict[str, Any]]) -> bool:
     pick_type = str(pick_type or "")
+    # Shared-grid live picks (live_total_goals_grid, live_btts_grid, ...)
+    # carry a "_grid" suffix -- strip it so they land in the same engine
+    # bucket as their older heuristic counterparts (e.g. live_total_goals_grid
+    # now credits Over/Under Specialist same as live_total_goals already did).
+    # live_no_goal_grid and live_double_chance_grid have no existing engine
+    # bucket to strip into -- that's a real gap, not something this
+    # suffix-stripping alone fixes; leaving them uncredited here rather than
+    # guessing which named engine should claim them.
+    if pick_type.endswith("_grid"):
+        pick_type = pick_type[: -len("_grid")]
     selection_text = str(selection or "").lower()
     if pick_type in engine.get("pick_types", set()):
         if engine.get("name") == "Under Specialist":
@@ -1679,7 +1690,7 @@ def grade_results(hours_back: int = 24):
             """
             select ph.id, ph.match_id, ph.match_name, ph.league_name, ph.country_name,
                    ph.pick_type, ph.selection, ph.confidence, ph.signals_json,
-                   ph.audit_json, ph.result,
+                   ph.audit_json, ph.result, ph.live_context_json,
                    coalesce(mb.match_date, fb.match_date, date(ph.created_at)) as match_date
             from prediction_history ph
             left join match_buffer mb on mb.match_id = ph.match_id
@@ -2736,8 +2747,8 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "sportybet_id": sportybet_id,
         "sofascore_id": doc.get("sofascore_id"),
         "name": doc.get("sportybet_name") or doc.get("name"),
-        "home_team": _home_team(doc),
-        "away_team": _away_team(doc),
+        "home_team": home_team(doc),
+        "away_team": away_team(doc),
         "tournament": doc.get("tournament"),
         "category": doc.get("category"),
         "match_date": doc.get("match_date") or (doc.get("time_context") or {}).get("local_date"),
@@ -2749,7 +2760,7 @@ def _match_detail(doc: dict[str, Any]) -> dict[str, Any]:
         "period": doc.get("period"),
         "played_seconds": doc.get("played_seconds"),
         "is_live": bool(match_state.get("is_live")),
-        "is_finished": bool(match_state.get("is_finished") or _is_finished_doc(doc)),
+        "is_finished": bool(match_state.get("is_finished") or is_finished_match(doc)),
         "match_state": match_state,
         "score": doc.get("score"),
         "venue": doc.get("venue"),
@@ -3082,8 +3093,8 @@ def _candidate_score(event: dict[str, Any], doc: dict[str, Any]) -> float:
             {
                 **sporty,
                 "name": sporty.get("name") or doc.get("sportybet_name") or doc.get("name"),
-                "home_team": sporty.get("home_team") or _home_team(doc),
-                "away_team": sporty.get("away_team") or _away_team(doc),
+                "home_team": sporty.get("home_team") or home_team(doc),
+                "away_team": sporty.get("away_team") or away_team(doc),
                 "tournament": sporty.get("tournament") or doc.get("tournament"),
                 "category": sporty.get("category") or doc.get("category"),
                 "start_time": sporty.get("start_time") or doc.get("start_time"),
@@ -3094,8 +3105,8 @@ def _candidate_score(event: dict[str, Any], doc: dict[str, Any]) -> float:
         sofa_name = event.get("name") or ""
         sporty_name = doc.get("sportybet_name") or doc.get("name") or ""
         direct = SequenceMatcher(None, sofa_name.lower(), sporty_name.lower()).ratio()
-        home = SequenceMatcher(None, ((event.get("home_team") or {}).get("name") or "").lower(), _home_team(doc).lower()).ratio()
-        away = SequenceMatcher(None, ((event.get("away_team") or {}).get("name") or "").lower(), _away_team(doc).lower()).ratio()
+        home = SequenceMatcher(None, ((event.get("home_team") or {}).get("name") or "").lower(), home_team(doc).lower()).ratio()
+        away = SequenceMatcher(None, ((event.get("away_team") or {}).get("name") or "").lower(), away_team(doc).lower()).ratio()
         return round(max(direct, (home + away) / 2), 3)
 
 
@@ -3113,30 +3124,6 @@ def _sort_start(value: Any) -> int:
         return number if number > 1e10 else number * 1000
     except (TypeError, ValueError):
         return 0
-
-
-def _match_summary(doc: dict[str, Any]) -> dict[str, Any]:
-    from app.utils.match_view import match_summary
-
-    return match_summary(doc)
-
-
-def _home_team(doc: dict[str, Any]) -> str:
-    from app.utils.match_view import home_team
-
-    return home_team(doc)
-
-
-def _away_team(doc: dict[str, Any]) -> str:
-    from app.utils.match_view import away_team
-
-    return away_team(doc)
-
-
-def _team_from_name(doc: dict[str, Any], index: int) -> str:
-    from app.utils.match_view import team_from_name
-
-    return team_from_name(doc, index)
 
 
 def _manager_name(managers: dict[str, Any], side: str) -> str | None:

@@ -30,6 +30,7 @@ from app.monitoring.self_learner import (
     get_learned_thresholds,
 )
 from app.utils.primitives import _to_int, _to_float
+from app.team_watcher.team_watcher import _slug as _tw_slug
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,14 @@ logger = logging.getLogger(__name__)
 
 
 def _compute_profile_stats(rows: list) -> dict:
-    """Compute win/draw/loss/goal stats from a list of match rows."""
+    """Compute win/draw/loss/goal stats from engine rows (own_goals/opp_goals columns).
+
+    NOTE: team_watcher.py has an equivalent using goals_for/goals_against column
+    names (different table).  This version is kept here because the engine reads
+    from ai_team_watcher_matches which uses own_goals/opp_goals. Both functions
+    share the same arithmetic — if the schema ever unifies, remove this one and
+    import from team_watcher.py directly.
+    """
     wins = draws = losses = 0
     goals_for = goals_against = 0
     for row in rows or []:
@@ -107,19 +115,23 @@ def init_tw_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS team_watcher_predictions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            team_key    TEXT NOT NULL,
-            match_id    TEXT NOT NULL,
-            pick_type   TEXT NOT NULL,
-            selection   TEXT NOT NULL,
-            confidence  INTEGER NOT NULL,
-            sub_model   TEXT NOT NULL,
-            result      TEXT,
-            created_at  TEXT NOT NULL DEFAULT current_timestamp,
-            graded_at   TEXT
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_key        TEXT NOT NULL,
+            match_id        TEXT NOT NULL,
+            pick_type       TEXT NOT NULL,
+            selection       TEXT NOT NULL,
+            confidence      INTEGER NOT NULL,
+            sub_model       TEXT NOT NULL,
+            result          TEXT,
+            created_at      TEXT NOT NULL DEFAULT current_timestamp,
+            graded_at       TEXT,
+            competition_key TEXT
         )
         """
     )
+    # Idempotent: add competition_key to pre-existing tables that were created
+    # before this column was introduced.
+    _ensure_column(conn, "team_watcher_predictions", "competition_key", "TEXT")
 
     # ------------------------------------------------------------------
     # Per-team, per-model weight table (Requirement 8.2 / 5.4)
@@ -1093,11 +1105,8 @@ def team_watcher_signal(match_doc: dict[str, Any]) -> dict[str, Any]:
         home_name_raw = raw_sporty.get("home_team") or match_doc.get("home_team") or ""
         away_name_raw = raw_sporty.get("away_team") or match_doc.get("away_team") or ""
 
-        def _slug(value: str) -> str:
-            return "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in value).split())
-
-        home_key = _slug(str(home_name_raw).strip()) if home_name_raw else ""
-        away_key = _slug(str(away_name_raw).strip()) if away_name_raw else ""
+        home_key = _tw_slug(str(home_name_raw).strip()) if home_name_raw else ""
+        away_key = _tw_slug(str(away_name_raw).strip()) if away_name_raw else ""
 
         # ------------------------------------------------------------------
         # Load profiles (global + tournament-scoped)
@@ -1186,6 +1195,7 @@ def record_tw_prediction(
     team_key: str,
     match_id: str,
     tw_signal: dict[str, Any],
+    competition_key: str | None = None,
 ) -> dict[str, Any]:
     """Persist a TW_Signal prediction to ``team_watcher_predictions``.
 
@@ -1208,9 +1218,9 @@ def record_tw_prediction(
             conn.execute(
                 """
                 INSERT INTO team_watcher_predictions
-                    (team_key, match_id, pick_type, selection, confidence, sub_model)
+                    (team_key, match_id, pick_type, selection, confidence, sub_model, competition_key)
                 VALUES
-                    (?, ?, ?, ?, ?, ?)
+                    (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     team_key,
@@ -1219,6 +1229,7 @@ def record_tw_prediction(
                     tw_signal["selection"],
                     tw_signal["confidence"],
                     "combined",
+                    competition_key or None,
                 ),
             )
         return {"status": "ok", "inserted": True}
@@ -1514,7 +1525,7 @@ def update_tw_weights(team_key: str) -> dict[str, Any]:
                 win_rate = wins / samples
                 weight_adj = round((win_rate - 0.50) * 2.0, 3)
 
-                # Upsert into team_watcher_weights
+                # Upsert into team_watcher_weights (global)
                 conn.execute(
                     """
                     INSERT INTO team_watcher_weights
@@ -1542,6 +1553,77 @@ def update_tw_weights(team_key: str) -> dict[str, Any]:
                 )
 
                 updated.append({"sub_model": sub_model, "weight_adj": weight_adj})
+
+            # ------------------------------------------------------------------
+            # Tournament-scoped weight updates.
+            # For each competition_key that has >= 5 graded rows, upsert into
+            # team_watcher_weights_tournament so get_team_weights_tournament()
+            # has real data to return.  Uses the same formula as global weights.
+            # ------------------------------------------------------------------
+            tourn_rows = conn.execute(
+                """
+                SELECT
+                    competition_key,
+                    sub_model,
+                    COUNT(*)                                          AS samples,
+                    SUM(CASE WHEN result = 'win'  THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) AS losses
+                FROM team_watcher_predictions
+                WHERE team_key = ?
+                  AND graded_at IS NOT NULL
+                  AND competition_key IS NOT NULL
+                  AND competition_key != ''
+                GROUP BY competition_key, sub_model
+                HAVING COUNT(*) >= 5
+                """,
+                (team_key,),
+            ).fetchall()
+
+            updated_tourn: list[dict[str, Any]] = []
+            for tr in tourn_rows:
+                t_samples = int(tr["samples"])
+                t_wins    = int(tr["wins"])
+                t_losses  = int(tr["losses"])
+                if t_samples == 0:
+                    continue
+                t_win_rate   = t_wins / t_samples
+                t_weight_adj = round((t_win_rate - 0.50) * 2.0, 3)
+                conn.execute(
+                    """
+                    INSERT INTO team_watcher_weights_tournament
+                        (team_key, tournament_key, sub_model, samples, wins, losses, win_rate, weight_adj, last_updated)
+                    VALUES
+                        (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(team_key, tournament_key, sub_model) DO UPDATE SET
+                        samples      = excluded.samples,
+                        wins         = excluded.wins,
+                        losses       = excluded.losses,
+                        win_rate     = excluded.win_rate,
+                        weight_adj   = excluded.weight_adj,
+                        last_updated = current_timestamp
+                    """,
+                    (
+                        team_key,
+                        tr["competition_key"],
+                        tr["sub_model"],
+                        t_samples,
+                        t_wins,
+                        t_losses,
+                        round(t_win_rate, 4),
+                        t_weight_adj,
+                        now,
+                    ),
+                )
+                updated_tourn.append({
+                    "tournament_key": tr["competition_key"],
+                    "sub_model": tr["sub_model"],
+                    "weight_adj": t_weight_adj,
+                })
+            if updated_tourn:
+                logger.debug(
+                    "update_tw_weights team_key=%s updated %d tournament weight rows",
+                    team_key, len(updated_tourn),
+                )
 
         logger.debug("update_tw_weights team_key=%s updated=%d sub_models", team_key, len(updated))
         return {"status": "ok", "updated": updated}

@@ -175,6 +175,18 @@ def grade_market_intent(
             return "win" if home == away else "loss"
         return "void"
 
+    # market in {"live_next_goal", "live_no_goal"} deliberately falls through
+    # to void below, not by omission: unlike every market handled above,
+    # "does a/no team score NEXT" cannot be resolved from the final score
+    # alone -- it needs the score AT PICK TIME, which this function's
+    # signature doesn't carry (grade_market_intent is also used for
+    # pre-match markets, where "at pick time" is meaningless). The real
+    # grader for these two, which does have that context via
+    # prediction_history.context_json, is _grade_candidate_row in
+    # app/storage/league_memory/queries.py. Do not "fix" this by guessing
+    # from the final score -- that's exactly the bug this comment replaces
+    # (the old code treated any goal at all as a live_next_goal win,
+    # regardless of which team or when).
     return "void"
 
 

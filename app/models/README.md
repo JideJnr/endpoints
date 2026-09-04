@@ -13,7 +13,6 @@ This domain contains the statistical and machine-learning scoring engines used t
 | `elo.py` | Elo rating system for relative team strength estimation |
 | `ensemble.py` | Weighted ensemble combiner that merges outputs from individual models |
 | `odds_predictor.py` | Derives implied probabilities from bookmaker odds and applies margin removal |
-| `sporty_only_predictor.py` | Lightweight predictor that operates solely on SportyBet market data |
 | `probability_learner.py` | Online learner that adjusts probability estimates from recent match outcomes |
 | `weight_optimiser.py` | Optimises ensemble model weights by minimising calibration loss on historical data |
 

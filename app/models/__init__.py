@@ -2,7 +2,7 @@
 Models domain package.
 
 Statistical and ML scoring models — Poisson, Dixon-Coles, ELO, ensemble scoring,
-odds-only predictor, SportyBet-only predictor, probability learner, weight optimiser.
+odds-only predictor, probability learner, weight optimiser.
 
 Note: Eager re-exports are intentionally omitted here to prevent circular imports.
 dixon_coles imports from app.models.poisson (shim), which would create a circular loading
@@ -13,9 +13,8 @@ cycle if this __init__.py eagerly imported both. Import sub-modules directly:
     from app.models.elo import get_elo, update_elo, elo_prediction
     from app.models.ensemble import ensemble_prediction, WEIGHTS
     from app.models.odds_predictor import odds_only_prediction
-    from app.models.sporty_only_predictor import predict_from_sporty, extract_sporty_signals
     from app.models.probability_learner import ProbabilityLearner, get_learned_probabilities
-    from app.models.weight_optimiser import optimise_ensemble_weights, get_current_weights
+    from app.models.weight_optimiser import optimise_ensemble_weights
 
 Public symbols by module:
 
@@ -37,14 +36,10 @@ ensemble.py
 odds_predictor.py
     odds_only_prediction, _extract_1x2, _tournament_name
 
-sporty_only_predictor.py
-    predict_from_sporty, extract_sporty_signals
-    _find_market, _outcome_prob, _outcome_odds
-
 probability_learner.py
     ProbabilityLearner, learn_probabilities, get_learned_probabilities
     _signal_pattern_key, _signal_profile
 
 weight_optimiser.py
-    optimise_ensemble_weights, get_current_weights
+    optimise_ensemble_weights
 """

@@ -49,7 +49,7 @@ def build_booking_payload(
     if stake <= 0:
         raise ValueError("stake must be a positive integer in the provider's smallest unit")
 
-    legs = [_resolve_leg(selection, stake, force_refresh=force_refresh) for selection in selections]
+    legs = _resolve_legs(selections, stake, force_refresh=force_refresh)
     return {
         "selections": legs,
         "loadingShareCode": loading_share_code,
@@ -85,6 +85,32 @@ def request_share_code(payload: dict[str, Any]) -> dict[str, Any]:
     if not code:
         raise RuntimeError("SportyBet did not return a share code")
     return {"status": "share_code_created", "share_code": code, "booking_payload": payload}
+
+
+def _resolve_legs(
+    selections: list[dict[str, Any]], stake: int, *, force_refresh: bool = True
+) -> list[dict[str, Any]]:
+    """Resolve every leg concurrently instead of one HTTP round-trip at a
+    time -- each leg is an independent market lookup (and, with
+    force_refresh, an independent live-market refresh call), so a slip with
+    several legs was paying for their latency serially for no reason. Most
+    slips are small (single digits), so one thread per leg is fine.
+
+    Exceptions are surfaced in selection order (the first selection's error
+    wins), matching the plain list-comprehension behaviour this replaces,
+    even though resolution itself no longer happens in that order.
+    """
+    if len(selections) == 1:
+        return [_resolve_leg(selections[0], stake, force_refresh=force_refresh)]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(selections)) as pool:
+        futures = [
+            pool.submit(_resolve_leg, selection, stake, force_refresh=force_refresh)
+            for selection in selections
+        ]
+        return [future.result() for future in futures]
 
 
 def _resolve_leg(selection: dict[str, Any], stake: int, *, force_refresh: bool = True) -> dict[str, Any]:

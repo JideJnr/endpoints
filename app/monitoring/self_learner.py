@@ -76,6 +76,12 @@ MIN_SAMPLES = 15          # historical "trust it fully" sample count.
                           # bias-correction gates further down this file.
 MIN_LEAGUE_SAMPLES = 5
 MIN_COMBINATION_SAMPLES = 12
+MIN_SLIP_RISK_SAMPLES = 12   # graded slips needed in a leg-count/odds band before it's trusted
+# How far a band's win rate can fall below the BEST band on the same
+# dimension before it's flagged "risky". Relative, not an absolute win-rate
+# constant, so this adapts to whatever this system's baseline win rate
+# actually is instead of assuming e.g. "under 45%" is always bad.
+SLIP_RISK_DEGRADATION_TOLERANCE = 0.12
 BLEND_WEIGHT = 0.45       # how much learned accuracy pulls the raw signal weight
                           # 0 = no adjustment, 1 = fully replace with learned rate
 DECAY_FACTOR = 0.92       # older data matters less — applied per 30-day window
@@ -344,6 +350,30 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
         create index if not exists idx_system_events_type_created
         on system_events (event_type, created_at desc)
     """)
+    # Slip-level risk learning: win rate by leg count and by combined odds,
+    # from graded bet_builder tickets (betbuilder_history / betbuilder_leg_history).
+    # Deliberately separate from learned_thresholds above -- that table learns
+    # whether ONE leg clears its own bar; this one learns whether STACKING
+    # legs together (regardless of each leg individually clearing its bar)
+    # still wins. A slip can pass every per-leg threshold and still lose
+    # because it has too many legs or too long a combined price -- that's a
+    # property of the combination, not any single leg, so it needs its own
+    # learned signal. dimension is 'leg_count' or 'combined_odds'; band is
+    # the bucket label (see _leg_count_band / _combined_odds_band).
+    conn.execute("""
+        create table if not exists learned_slip_risk (
+            dimension    text not null,
+            band         text not null,
+            band_order   integer not null default 0,
+            samples      integer not null default 0,
+            wins         integer not null default 0,
+            losses       integer not null default 0,
+            voids        integer not null default 0,
+            win_rate     real,
+            last_updated text not null default current_timestamp,
+            primary key (dimension, band)
+        )
+    """)
 
 
 # ── Main learning cycle ───────────────────────────────────────────────────────
@@ -485,11 +515,18 @@ def run_learning_cycle() -> dict[str, Any]:
     with db_conn(timeout=30) as conn:
         _init_learner_tables(conn)
         now = datetime.now(timezone.utc).isoformat()
-        conn.execute("delete from signal_weights")
-        conn.execute("delete from signal_pick_weights")
-        conn.execute("delete from league_accuracy")
-        conn.execute("delete from learned_model_weights")
-        conn.execute("delete from model_bias_corrections")
+        # ── Crash-safe write strategy ────────────────────────────────────────
+        # Previously this block did DELETE + INSERT, which left the tables empty
+        # if a crash, DB lock, or exception occurred mid-cycle.  The prediction
+        # pipeline reads these tables on every request, so an interrupted learning
+        # cycle would cause the system to treat every signal as neutral (weight=0)
+        # until the next successful full cycle.
+        #
+        # Fix: every insert below uses ON CONFLICT DO UPDATE (already the case),
+        # so we never need to pre-delete.  Stale rows — signals that no longer
+        # appear in the current graded history — are pruned *after* all writes
+        # succeed, not before, using a NOT IN (...) delete that only runs when
+        # the new data is already safely in place.
 
         # Signal weights
         for (signal_name, league_key), stats in signal_stats.items():
@@ -664,10 +701,37 @@ def run_learning_cycle() -> dict[str, Any]:
 
         # -- 9. Learned thresholds ------------------------------------------------
         threshold_updates = _learn_thresholds(conn, rows)
+        slip_risk_updates = _learn_slip_risk(conn)
         outcome_distribution_updates = _populate_league_outcome_distribution(conn, rows)
         context_penalty_updates = _learn_context_penalties(conn, rows)
         drift_events = _detect_and_handle_drift(conn, rows)
         signal_outcome_backfills = _backfill_signal_outcomes(conn, rows)
+
+        # ── Prune stale rows after all writes succeed ────────────────────────
+        # Any signal/league/model that was in the DB from a previous cycle but
+        # no longer appears in the current graded history (e.g. a retired signal
+        # name, a league with no recent graded picks) should be removed — but
+        # only NOW, when the fresh data is safely committed above.
+        if signal_stats:
+            active_sw = list({(sn, lk) for sn, lk in signal_stats})
+            # SQLite doesn't support multi-column NOT IN cleanly with large sets,
+            # so delete by last_updated timestamp: any row not touched this cycle
+            # is stale.  `now` was set at the start of this connection block so
+            # every row written above carries exactly that timestamp.
+            conn.execute(
+                "DELETE FROM signal_weights WHERE last_updated != ?", (now,)
+            )
+            conn.execute(
+                "DELETE FROM signal_pick_weights WHERE last_updated != ?", (now,)
+            )
+        if league_stats:
+            conn.execute(
+                "DELETE FROM league_accuracy WHERE last_updated != ?", (now,)
+            )
+        if direct_model_stats:
+            conn.execute(
+                "DELETE FROM learned_model_weights WHERE last_updated != ?", (now,)
+            )
 
         conn.commit()
         try:
@@ -697,6 +761,7 @@ def run_learning_cycle() -> dict[str, Any]:
         f"{specialist_updates} specialist credits | "
         f"{combination_updates} combination patterns | "
         f"{threshold_updates} learned thresholds | "
+        f"{slip_risk_updates} slip-risk bands | "
         f"{pref_updates} tournament preferences | "
         f"{drift_events} drift events | "
         f"{risk_buckets} risk-control buckets"
@@ -713,6 +778,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "specialist_credits": specialist_updates,
         "combination_updates": combination_updates,
         "threshold_updates": threshold_updates,
+        "slip_risk_updates": slip_risk_updates,
         "tournament_preference_updates": pref_updates,
         "drift_events": drift_events,
         "league_outcome_distribution_updates": outcome_distribution_updates,
@@ -1388,6 +1454,91 @@ def _learn_thresholds(conn: sqlite3.Connection, rows: list) -> int:
     return written
 
 
+def _learn_slip_risk(conn: sqlite3.Connection) -> int:
+    """Learn win rate by leg count and by combined odds from graded
+    bet-builder tickets (betbuilder_history / betbuilder_leg_history).
+
+    This is the slip-level counterpart to _learn_thresholds above:
+    _learn_thresholds learns whether ONE leg clears its own confidence bar.
+    This function learns whether STACKING legs together -- regardless of
+    whether each leg individually cleared its bar -- still wins. A slip can
+    pass every per-leg threshold and still lose because it carries too many
+    legs or too long a combined price; that is a property of the
+    combination, not of any single leg, so it needs its own learned signal.
+    (This gap is exactly what the real SportyBet ticket review that led to
+    this feature surfaced: combination-level risk, not per-leg pick
+    quality, was the dominant driver of real losses.)
+
+    Requires MIN_SLIP_RISK_SAMPLES graded slips in a band before writing a
+    row for it, same "don't learn from noise" discipline as the rest of
+    this module.
+    """
+    from app.storage.league_memory._helpers import _combined_odds_band, _leg_count_band, LEG_COUNT_BAND_ORDER, COMBINED_ODDS_BAND_ORDER
+
+    try:
+        rows = conn.execute("""
+            select h.id, h.combined_odds, h.result,
+                   (select count(*) from betbuilder_leg_history l where l.bet_id = h.id) as leg_count
+            from betbuilder_history h
+            where h.result in ('win', 'loss', 'void')
+        """).fetchall()
+    except sqlite3.OperationalError:
+        # betbuilder_history doesn't exist yet in this environment.
+        return 0
+
+    if not rows:
+        return 0
+
+    def _bump(stats: dict, band: str, result: str) -> None:
+        bucket = stats.setdefault(band, {"samples": 0, "wins": 0, "losses": 0, "voids": 0})
+        bucket["samples"] += 1
+        if result == "win":
+            bucket["wins"] += 1
+        elif result == "loss":
+            bucket["losses"] += 1
+        else:
+            bucket["voids"] += 1
+
+    leg_stats: dict[str, dict[str, int]] = {}
+    odds_stats: dict[str, dict[str, int]] = {}
+    for row in rows:
+        leg_count = int(row["leg_count"] or 0)
+        if leg_count <= 0:
+            continue
+        result = row["result"]
+        _bump(leg_stats, _leg_count_band(leg_count), result)
+        _bump(odds_stats, _combined_odds_band(row["combined_odds"]), result)
+
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for dimension, stats, order in (
+        ("leg_count", leg_stats, LEG_COUNT_BAND_ORDER),
+        ("combined_odds", odds_stats, COMBINED_ODDS_BAND_ORDER),
+    ):
+        for band, bucket in stats.items():
+            samples = bucket["samples"]
+            if samples < MIN_SLIP_RISK_SAMPLES:
+                continue
+            decided = bucket["wins"] + bucket["losses"]
+            win_rate = round(bucket["wins"] / decided, 4) if decided > 0 else None
+            band_order = order.index(band) if band in order else len(order)
+            conn.execute("""
+                insert into learned_slip_risk
+                    (dimension, band, band_order, samples, wins, losses, voids, win_rate, last_updated)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(dimension, band) do update set
+                    band_order   = excluded.band_order,
+                    samples      = excluded.samples,
+                    wins         = excluded.wins,
+                    losses       = excluded.losses,
+                    voids        = excluded.voids,
+                    win_rate     = excluded.win_rate,
+                    last_updated = excluded.last_updated
+            """, (dimension, band, band_order, samples,
+                  bucket["wins"], bucket["losses"], bucket["voids"], win_rate, now))
+            written += 1
+    return written
+
 
 def _decay_weight(created_at: str, now: datetime) -> float:
     try:
@@ -1718,6 +1869,72 @@ def get_learned_thresholds(
         "samples":           int(row["samples"]),
         "source":            source,
     }
+
+
+def get_learned_slip_risk() -> dict[str, Any]:
+    """Return the learned slip-level (multi-leg) risk signal.
+
+    Two independent dimensions are reported, each as a list of bands
+    ordered from least to most risky:
+      - "leg_count": win rate by how many legs the slip has
+      - "combined_odds": win rate by the slip's multiplied-out combined price
+
+    For each dimension, `risky_from_band` names the first band (walking in
+    risk order) whose win rate has fallen SLIP_RISK_DEGRADATION_TOLERANCE or
+    more below that dimension's best-performing band. That band and every
+    riskier one after it should be treated as learned-risky. This is
+    relative to this system's own observed best band rather than a fixed
+    win-rate constant, so it adapts to whatever baseline win rate this
+    dataset actually has instead of assuming a number that might not fit it.
+
+    Returns {"known": False, ...} until enough slips have been graded in at
+    least one band -- callers should keep their existing (non-learned)
+    behaviour in that case rather than acting on too little data.
+    """
+    _init_db()
+    with db_conn(timeout=30) as conn:
+        _init_learner_tables(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            select dimension, band, band_order, samples, wins, losses, voids, win_rate
+            from learned_slip_risk
+            order by dimension, band_order
+        """).fetchall()
+
+    empty_dim = {"bands": [], "best_band_win_rate": None, "risky_from_band": None}
+    if not rows:
+        return {"known": False, "leg_count": dict(empty_dim), "combined_odds": dict(empty_dim)}
+
+    by_dim: dict[str, list[dict[str, Any]]] = {"leg_count": [], "combined_odds": []}
+    for row in rows:
+        dim = row["dimension"]
+        if dim not in by_dim:
+            continue
+        by_dim[dim].append({
+            "band":        row["band"],
+            "band_order":  row["band_order"],
+            "samples":     row["samples"],
+            "wins":        row["wins"],
+            "losses":      row["losses"],
+            "voids":       row["voids"],
+            "win_rate":    float(row["win_rate"]) if row["win_rate"] is not None else None,
+        })
+
+    result: dict[str, Any] = {"known": True}
+    for dim, entries in by_dim.items():
+        best_rate = max((e["win_rate"] for e in entries if e["win_rate"] is not None), default=None)
+        risky_from: str | None = None
+        if best_rate is not None:
+            for e in entries:
+                if e["win_rate"] is not None and e["win_rate"] <= best_rate - SLIP_RISK_DEGRADATION_TOLERANCE:
+                    risky_from = e["band"]
+                    break
+        result[dim] = {
+            "bands": entries,
+            "best_band_win_rate": round(best_rate, 4) if best_rate is not None else None,
+            "risky_from_band": risky_from,
+        }
+    return result
 
 
 def _calibration_verdict(gap: float | None) -> str:

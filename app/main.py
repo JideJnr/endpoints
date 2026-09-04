@@ -15,7 +15,6 @@ from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
 from app.routers import competition_analysis as competition_analysis_router
 from app.scheduling.scheduler import start_scheduler
-from app.ai.llm_model_manager import stop_keep_alive
 
 settings = get_settings()
 
@@ -58,7 +57,6 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await _close_live_websockets()
-        stop_keep_alive()
         from app.scheduling.scheduler import stop_scheduler
         stop_scheduler(wait=False)
 

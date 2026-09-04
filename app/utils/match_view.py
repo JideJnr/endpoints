@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.utils.match_state import classify_match_state
+from app.utils.match_helpers import _extract_1x2 as extract_1x2
 
 
 def match_summary(doc: dict[str, Any]) -> dict[str, Any]:
@@ -44,19 +45,6 @@ def match_summary(doc: dict[str, Any]) -> dict[str, Any]:
         "has_league_sentiment": bool(doc.get("league_sentiment")),
         "lifecycle": doc.get("lifecycle"),
     }
-
-
-def extract_1x2(markets: list[dict[str, Any]]) -> dict[str, Any]:
-    for market in markets:
-        name = (market.get("name") or "").lower()
-        if market.get("id") == "1" or "1x2" in name or name == "match result":
-            odds = {selection.get("name"): selection.get("odds") for selection in market.get("selections", [])}
-            return {
-                "home": odds.get("Home") or odds.get("1"),
-                "draw": odds.get("Draw") or odds.get("X"),
-                "away": odds.get("Away") or odds.get("2"),
-            }
-    return {}
 
 
 def home_team(doc: dict[str, Any]) -> str:

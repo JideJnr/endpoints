@@ -118,7 +118,11 @@ def is_live_match(doc: dict[str, Any] | None) -> bool:
 
 def is_finished_match(doc: dict[str, Any] | None) -> bool:
     state = classify_match_state(doc)
-    return bool(state.get("is_finished") or state.get("state") in {"postponed", "cancelled"})
+    return bool(
+        (doc or {}).get("is_finished")
+        or state.get("is_finished")
+        or state.get("state") in {"postponed", "cancelled"}
+    )
 
 
 def is_prematch(doc: dict[str, Any] | None) -> bool:

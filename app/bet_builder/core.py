@@ -629,7 +629,61 @@ def select_by_conviction(
 
     selected = list(best_per_match.values())
     selected.sort(key=lambda i: float(i.get("conviction_score") or 0), reverse=True)
+    selected = _trim_by_learned_slip_risk(selected)
     return selected
+
+
+def _trim_by_learned_slip_risk(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trim the lowest-conviction legs off a select_by_conviction() slip if
+    its leg count or combined odds has grown into a band the system has
+    learned, from real graded bet-builder history, tends to lose (see
+    learned_slip_risk / get_learned_slip_risk in app.monitoring.self_learner).
+
+    select_by_conviction deliberately has no fixed leg cap or odds ceiling --
+    every leg that clears ITS OWN learned confidence bar gets in. That is
+    correct for per-leg quality, but real ticket history showed the dominant
+    failure mode wasn't any one leg being weak -- it was stacking too many
+    otherwise-fine legs together, or letting the combined price run too long.
+    This is that second, combination-level check: it only ever removes legs
+    (never adds/reorders), and only once there is enough learned history to
+    trust (get_learned_slip_risk returns known=False otherwise, in which case
+    this is a no-op and behaviour is unchanged from before this existed).
+
+    `selected` is assumed already sorted by conviction_score descending, so
+    dropping from the end always removes the weakest leg first.
+    """
+    if len(selected) <= 1:
+        return selected
+    try:
+        from app.monitoring.self_learner import get_learned_slip_risk
+        from app.storage.league_memory._helpers import (
+            _leg_count_band, _combined_odds_band,
+            LEG_COUNT_BAND_ORDER, COMBINED_ODDS_BAND_ORDER,
+        )
+        risk = get_learned_slip_risk()
+    except Exception:
+        return selected
+    if not risk.get("known"):
+        return selected
+
+    def _is_risky(dimension: str, band: str, order: tuple[str, ...]) -> bool:
+        risky_from = (risk.get(dimension) or {}).get("risky_from_band")
+        if not risky_from or risky_from not in order or band not in order:
+            return False
+        return order.index(band) >= order.index(risky_from)
+
+    items = list(selected)
+    while len(items) > 1:
+        leg_band = _leg_count_band(len(items))
+        odds_band = _combined_odds_band(combined_odds(items))
+        if (
+            _is_risky("leg_count", leg_band, LEG_COUNT_BAND_ORDER)
+            or _is_risky("combined_odds", odds_band, COMBINED_ODDS_BAND_ORDER)
+        ):
+            items.pop()  # drop the lowest-conviction leg (list is sorted desc)
+            continue
+        break
+    return items
 
 
 # ---------------------------------------------------------------------------

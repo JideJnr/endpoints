@@ -183,7 +183,12 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                 continue
 
             # Check if a SofaScore-only row already exists for this fixture.
-            # Match by sofascore_id if we have it, otherwise by name+date.
+            # Resolution order: (1) explicit sofascore_id on the sporty payload,
+            # if we ever get one directly, (2) team_watcher's learned
+            # sporty_team_id -> sofascore_team_id mapping for both teams,
+            # (3) name+date fallback, which also teaches team_watcher the
+            # mapping it finds so future ingests of these two teams hit the
+            # faster path (2) instead.
             # If found, merge: adopt the sofascore row's match_id and attach sporty data.
             sofa_match_id: str | None = None
             sofa_row = None
@@ -195,6 +200,9 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                 ).fetchone()
                 if sofa_row:
                     sofa_match_id = sofa_row[0]
+
+            if not sofa_match_id:
+                sofa_match_id = _resolve_sofascore_only_match(conn, m, match_date)
 
             if sofa_match_id:
                 # Merge: update the existing SofaScore-only row with SportyBet data
@@ -224,8 +232,21 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                 count += 1
                 continue
 
+            # This SportyBet match may have already been merged into a
+            # SofaScore-keyed row on a PREVIOUS ingest cycle (that row's
+            # match_id is "sofascore:...", not this match's own id, with
+            # sportybet_id pointing at it). If we don't check for that here
+            # and instead always insert/update by the raw sportybet match_id,
+            # every later ingest of an already-merged match creates a brand
+            # new duplicate row and silently un-merges it.
+            already_merged_row = conn.execute(
+                "select match_id from match_buffer where sportybet_id = ? and match_id != ?",
+                (match_id, match_id),
+            ).fetchone()
+            target_match_id = already_merged_row[0] if already_merged_row else match_id
+
             exists = conn.execute(
-                "select 1 from match_buffer where match_id = ?", (match_id,)
+                "select 1 from match_buffer where match_id = ?", (target_match_id,)
             ).fetchone()
 
             conn.execute(
@@ -256,14 +277,14 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                     ingested_at  = excluded.ingested_at
                 """,
                 (
-                    match_id, match_date,
+                    target_match_id, match_date,
                     m.get("tournament"), m.get("category"), m.get("name"),
                     m.get("start_time"), period,
                     str(score.get("home") or ""), str(score.get("away") or ""),
                     is_live, is_finished, now, "sportybet", match_id, json.dumps(m),
                 ),
             )
-            _sync_enriched_sporty_fields(conn, "match_buffer", match_id, m, match_date, is_live, is_finished)
+            _sync_enriched_sporty_fields(conn, "match_buffer", target_match_id, m, match_date, is_live, is_finished)
             if not exists:
                 count += 1
         conn.commit()
@@ -276,8 +297,188 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     return count
 
 
+def _normalize_team_name_for_match(name: Any) -> str:
+    """Lowercase, strip accents, drop punctuation -- for fuzzy team-name matching.
+
+    Every non-alphanumeric character becomes a word-separating space, EXCEPT
+    real combining accent marks (the ´ that NFKD splits off "é" into "e" +
+    a combining acute) which are simply dropped so accented letters fold to
+    their plain ASCII form. A standalone accent-like symbol that isn't
+    combined with a letter -- e.g. SofaScore sending "M´gladbach" with a
+    bare U+00B4 acute accent instead of an apostrophe -- is NOT a combining
+    mark, so plain `.encode("ascii", "ignore")` used to silently delete it
+    and collapse the name into one token ("mgladbach"), which then never
+    matched SportyBet's "M'gladbach" (plain apostrophe -> "m gladbach", two
+    tokens). Treating it as a separator instead keeps both spellings
+    equivalent.
+    """
+    import unicodedata
+    if isinstance(name, dict):
+        name = name.get("name") or name.get("team_name") or ""
+    decomposed = unicodedata.normalize("NFKD", str(name or ""))
+    chars = []
+    for ch in decomposed:
+        if unicodedata.combining(ch):
+            continue
+        chars.append(ch if (ch.isascii() and ch.isalnum()) else " ")
+    return re.sub(r"\s+", " ", "".join(chars).lower()).strip()
+
+
+def _team_names_match(a: Any, b: Any) -> bool:
+    """True if two team names plausibly refer to the same team.
+
+    Handles the common real-world mismatches between SportyBet and SofaScore
+    naming (e.g. "Nautico PE" vs "Nautico", "KAA Gent" vs "Gent") via exact
+    match, substring containment, or shared significant word token.
+    """
+    na, nb = _normalize_team_name_for_match(a), _normalize_team_name_for_match(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    tokens_a = {t for t in na.split() if len(t) >= 4}
+    tokens_b = {t for t in nb.split() if len(t) >= 4}
+    return bool(tokens_a & tokens_b)
+
+
+def _learn_team_sofascore_id(conn: sqlite3.Connection, sporty_id: str, team_name: str, sofa_id: str) -> None:
+    """Backfill ai_team_watchers with a newly-discovered sporty<->sofascore team
+    ID pairing, so future ingests of these two teams resolve via the fast
+    team-ID lookup in _resolve_sofascore_only_match instead of name matching.
+    Best-effort: the team_watcher tables may not exist yet on a cold DB, and
+    this must never block ingest -- swallow any failure.
+    """
+    if not sofa_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        if sporty_id:
+            updated = conn.execute(
+                """
+                update ai_team_watchers set sofascore_team_id = ?, updated_at = ?
+                where sporty_team_id = ? and (sofascore_team_id is null or sofascore_team_id = '')
+                """,
+                (sofa_id, now, sporty_id),
+            ).rowcount
+            if updated:
+                return
+        key = re.sub(r"[^a-z0-9]+", "-", str(team_name or sporty_id or sofa_id or "").lower().strip()).strip("-")
+        if not key:
+            return
+        conn.execute(
+            """
+            insert into ai_team_watchers (team_key, team_name, sporty_team_id, sofascore_team_id, updated_at)
+            values (?, ?, ?, ?, ?)
+            on conflict(team_key) do update set
+                sporty_team_id    = coalesce(ai_team_watchers.sporty_team_id, excluded.sporty_team_id),
+                sofascore_team_id = coalesce(ai_team_watchers.sofascore_team_id, excluded.sofascore_team_id),
+                updated_at        = excluded.updated_at
+            """,
+            (key, team_name or key, sporty_id or None, sofa_id, now),
+        )
+    except Exception:
+        pass
+
+
+def _resolve_sofascore_only_match(conn: sqlite3.Connection, m: dict[str, Any], match_date: str) -> str | None:
+    """Find an existing sofascore-only match_buffer row for the same real-world
+    fixture as incoming SportyBet match `m`, so ingest_matches() can merge into
+    it instead of creating a duplicate row.
+
+    Two strategies, in order:
+      1. team_watcher's learned sporty_team_id -> sofascore_team_id mapping
+         for BOTH the home and away team (fast, precise, once learned).
+      2. Name matching against sofascore-only rows on the same match_date --
+         also teaches team_watcher the pairing it discovers via
+         _learn_team_sofascore_id, so future ingests of these two teams hit
+         strategy 1 immediately.
+
+    Best-effort throughout: the team_watcher tables may not exist yet on a
+    cold DB, so every lookup is wrapped and a failure just falls through to
+    the next strategy (or gives up and lets ingest_matches insert a fresh row,
+    same as before this function existed).
+    """
+    team_ids = m.get("team_ids") if isinstance(m.get("team_ids"), dict) else {}
+    home_sporty_id = str(team_ids.get("home") or "")
+    away_sporty_id = str(team_ids.get("away") or "")
+    home_name = str(m.get("home_team") or "")
+    away_name = str(m.get("away_team") or "")
+    if not home_name or not away_name:
+        return None
+
+    # ── Strategy 1: team_watcher shared-ID lookup ──────────────────────────
+    home_sofa_id = away_sofa_id = None
+    if home_sporty_id or away_sporty_id:
+        try:
+            rows = conn.execute(
+                """
+                select sporty_team_id, sofascore_team_id from ai_team_watchers
+                where sporty_team_id in (?, ?)
+                  and sofascore_team_id is not null and sofascore_team_id != ''
+                """,
+                (home_sporty_id, away_sporty_id),
+            ).fetchall()
+            by_sporty_id = {r[0]: r[1] for r in rows}
+            home_sofa_id = by_sporty_id.get(home_sporty_id)
+            away_sofa_id = by_sporty_id.get(away_sporty_id)
+        except Exception:
+            pass
+
+    if home_sofa_id and away_sofa_id:
+        try:
+            candidates = conn.execute(
+                "select match_id, raw_sporty from match_buffer where sofascore_only = 1 and match_date = ?",
+                (match_date,),
+            ).fetchall()
+            for cand_id, raw in candidates:
+                try:
+                    event = json.loads(raw or "{}")
+                except Exception:
+                    continue
+                cand_home = str((event.get("homeTeam") or {}).get("id") or "")
+                cand_away = str((event.get("awayTeam") or {}).get("id") or "")
+                if cand_home == str(home_sofa_id) and cand_away == str(away_sofa_id):
+                    return cand_id
+        except Exception:
+            pass
+
+    # ── Strategy 2: name + date fallback ───────────────────────────────────
+    try:
+        candidates = conn.execute(
+            "select match_id, name, raw_sporty from match_buffer where sofascore_only = 1 and match_date = ?",
+            (match_date,),
+        ).fetchall()
+    except Exception:
+        return None
+    for cand_id, cand_name, raw in candidates:
+        cand_home_name = _parse_home_team(cand_name or "").get("name") or ""
+        cand_away_name = _parse_away_team(cand_name or "").get("name") or ""
+        if not cand_home_name or not cand_away_name:
+            continue
+        if _team_names_match(home_name, cand_home_name) and _team_names_match(away_name, cand_away_name):
+            # Learned a new pairing -- teach team_watcher for next time.
+            try:
+                event = json.loads(raw or "{}")
+                cand_home_id = str((event.get("homeTeam") or {}).get("id") or "")
+                cand_away_id = str((event.get("awayTeam") or {}).get("id") or "")
+                _learn_team_sofascore_id(conn, home_sporty_id, home_name, cand_home_id)
+                _learn_team_sofascore_id(conn, away_sporty_id, away_name, cand_away_id)
+            except Exception:
+                pass
+            return cand_id
+    return None
+
+
 def _register_ingest_with_team_watcher(matches: list[dict[str, Any]]) -> None:
-    """Register ingested SportyBet matches with team watcher on first ingest."""
+    """Register ingested SportyBet matches with team watcher on first ingest.
+
+    Best-effort: swallow all errors so a team_watcher problem never blocks
+    ingest. If this ever goes silent again, add a temporary record_activity()
+    call here rather than assuming it's fine -- that's what surfaced the
+    four real bugs (a KeyError, an off-by-one SQL placeholder, a lost DB
+    key, and a non-JSON-serializable Row leak) that used to make this
+    function silently fail on every single call.
+    """
     try:
         from app.team_watcher.team_watcher import observe_match as _tw_observe
         for m in matches:
@@ -326,6 +527,171 @@ def _parse_away_team(name: str) -> dict[str, Any]:
     import re as _re
     parts = _re.split(r"\s+v(?:s)?\.?\s+", name, flags=_re.I)
     return {"name": parts[1].strip()} if len(parts) == 2 else {"name": ""}
+
+
+def backfill_merge_orphaned_matches(dry_run: bool = True, limit: int = 5000) -> dict[str, Any]:
+    """One-time cleanup: merge standalone SportyBet rows that predate the
+    ingest-time merge fix with their matching SofaScore-only row, using the
+    exact same matching logic (_resolve_sofascore_only_match) that new
+    ingests use going forward.
+
+    For every match_buffer row with data_source='sportybet' (i.e. never
+    merged), tries to find a same-fixture sofascore_only=1 row. On a match:
+      - the sofa row is updated with the sportybet row's live fields
+        (sportybet_id, data_source='both', sofascore_only=0, score/period/
+        live/finished, raw_sporty) -- same fields the live merge touches,
+        the sofa row's own raw_enriched/enriched_at is left untouched.
+      - the now-redundant standalone sportybet row is deleted.
+
+    dry_run=True (default) makes no writes -- it only reports what would
+    merge, so counts can be sanity-checked before actually running it.
+    """
+    _init_db()
+    report: dict[str, Any] = {
+        "dry_run": dry_run,
+        "candidates_scanned": 0,
+        "merged": 0,
+        "merged_pairs": [],
+        "errors": 0,
+    }
+    with _conn() as conn:
+        candidates = conn.execute(
+            """
+            select match_id, match_date, name, raw_sporty from match_buffer
+            where data_source = 'sportybet'
+            order by match_date
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+        report["candidates_scanned"] = len(candidates)
+        for cand_id, cand_date, cand_name, raw in candidates:
+            try:
+                m = json.loads(raw or "{}")
+            except Exception:
+                report["errors"] += 1
+                continue
+            if not m:
+                continue
+            try:
+                target = _resolve_sofascore_only_match(conn, m, cand_date)
+            except Exception:
+                report["errors"] += 1
+                continue
+            if not target or target == cand_id:
+                continue
+
+            score = m.get("score") if isinstance(m.get("score"), dict) else {}
+            state = classify_match_state(m)
+            pair_info = {
+                "sportybet_match_id": cand_id,
+                "sofascore_match_id": target,
+                "name": cand_name,
+                "match_date": cand_date,
+            }
+            report["merged_pairs"].append(pair_info)
+            if dry_run:
+                report["merged"] += 1
+                continue
+
+            conn.execute(
+                """
+                update match_buffer set
+                    sportybet_id  = ?,
+                    data_source   = 'both',
+                    sofascore_only = 0,
+                    period        = ?,
+                    score_home    = ?,
+                    score_away    = ?,
+                    is_live       = ?,
+                    is_finished   = ?,
+                    ingested_at   = ?,
+                    raw_sporty    = ?
+                where match_id = ?
+                """,
+                (
+                    cand_id,
+                    m.get("period"),
+                    str(score.get("home") or ""), str(score.get("away") or ""),
+                    1 if state.get("is_live") else 0,
+                    1 if state.get("is_finished") else 0,
+                    datetime.now(timezone.utc).isoformat(),
+                    raw,
+                    target,
+                ),
+            )
+            _sync_enriched_sporty_fields(
+                conn, "match_buffer", target, m, cand_date,
+                1 if state.get("is_live") else 0, 1 if state.get("is_finished") else 0,
+            )
+            conn.execute("delete from match_buffer where match_id = ?", (cand_id,))
+            report["merged"] += 1
+        if not dry_run:
+            conn.commit()
+    return report
+
+
+def archive_stale_sofascore_only_matches(
+    dry_run: bool = True, hours_past_kickoff: int = 6, limit: int = 2000
+) -> dict[str, Any]:
+    """One-time cleanup: archive SofaScore-only rows whose real-world match
+    kicked off long ago but whose is_finished flag was never updated.
+
+    Root cause: enrich_predict_competition() re-processes at most 8 rows per
+    competition per ~5 min cycle, and its priority order always puts brand
+    new not-yet-processed fixtures (prediction_json/raw_detail is null) ahead
+    of already-processed rows. With a steady trickle of freshly-synced future
+    fixtures every cycle (normal for 30+ continuously-tracked competitions),
+    an already-processed row that's since finished can be permanently
+    starved of its refresh turn -- its is_finished flag just never gets
+    updated again, so cleanup_buffer()'s is_finished=1 check never finds it
+    and it sits in match_buffer forever.
+
+    Safety: only rows with is_live=0, is_finished=0, sofascore_only=1, and a
+    start_time more than `hours_past_kickoff` in the past (default 6h --
+    long enough for any match including extra time/penalties/delays) are
+    candidates. That's a heuristic, not a live-confirmed check (deliberately
+    avoids hammering SofaScore's API again), so dry_run=True (default) only
+    reports what would be archived -- call with dry_run=false to apply.
+    """
+    _init_db()
+    cutoff_ms = int((time.time() - hours_past_kickoff * 3600) * 1000)
+    report: dict[str, Any] = {
+        "dry_run": dry_run,
+        "hours_past_kickoff": hours_past_kickoff,
+        "candidates": 0,
+        "archived": 0,
+        "sample": [],
+    }
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            select match_id, match_date, name, start_time from match_buffer
+            where sofascore_only = 1
+              and is_finished = 0
+              and is_live = 0
+              and start_time is not null
+              and cast(start_time as real) < ?
+            order by start_time asc
+            limit ?
+            """,
+            (cutoff_ms, limit),
+        ).fetchall()
+    report["candidates"] = len(rows)
+    report["sample"] = [
+        {"match_id": r[0], "match_date": r[1], "name": r[2], "start_time": r[3]}
+        for r in rows[:20]
+    ]
+    if dry_run:
+        report["archived"] = len(rows)
+        return report
+    for match_id, *_rest in rows:
+        try:
+            _archive_finished_locally(str(match_id))
+            report["archived"] += 1
+        except Exception:
+            pass
+    return report
 
 
 def patch_live_scores(matches: list[dict[str, Any]]) -> int:
@@ -1534,30 +1900,25 @@ def run_enrichment_worker(
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
-        # Pipeline ownership: when the AI Prediction Queue toggle is active, it is
-        # the SOLE predictor for both prematch and live matches — enrichment stops
-        # at data-gathering and leaves the row flagged for job_ai_prediction_queue.
-        # Previously this flag was computed but never actually gated the call below,
-        # so the deterministic path always predicted first and the AI queue's own
-        # cooldown check almost always found a too-recent prediction and skipped —
-        # meaning "AI Prediction Queue" was on in name but rarely actually decided
-        # anything. Caveat: the AI queue's specialists (H2H/form/odds/similar-match/
-        # team-history) are prematch snapshots — they don't see live score or
-        # minute, so a live match in AI-only mode gets one prematch-style decision
-        # rather than the continuous in-play updates the deterministic lane gave it.
+        # Pipeline ownership: the deterministic engine always predicts here when
+        # data allows (enrichment owns this lane) — it no longer steps aside for
+        # the AI Prediction Queue toggle. That exclusivity design (deterministic
+        # skipped entirely whenever AI was "on") turned out to conflict with the
+        # dual-engine arbitration built into record_prediction()/engine_arbitration.py:
+        # each engine now writes its own tagged row (engine='deterministic' vs
+        # 'ai_llm') with its own independent per-engine cooldown, and arbitration
+        # picks which one is shown (is_final) using each engine's own tracked
+        # win rate — defaulting to the deterministic engine, the safe incumbent,
+        # until the AI earns enough graded history to outweigh it. Both keep
+        # grading independently either way, so this lane just needs to flag the
+        # match for the AI queue (job_ai_prediction_queue, its own cron) to also
+        # weigh in — not decide who "wins"; that's arbitration's job now.
         try:
             from app.scheduling.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
-        if (sofa or item.get("is_live")) and ai_queue_enabled:
-            from app.enrichment.enriched_prediction import prediction_readiness
-
-            doc["prediction"] = None
-            doc["prediction_error"] = None
-            doc["prediction_readiness"] = prediction_readiness(doc)
-            doc["ai_prediction_queue_pending"] = True
-        elif sofa or item.get("is_live"):
+        if sofa or item.get("is_live"):
             from app.utils.prediction_flow import apply_prediction_state
 
             state = apply_prediction_state(
@@ -1604,6 +1965,14 @@ def run_enrichment_worker(
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
+            # Overlay: also let the AI queue weigh in on this same match — for
+            # both prematch and live, now that arbitration (not a lockout) is
+            # what reconciles the two engines' calls.
+            if ai_queue_enabled:
+                from app.enrichment.enriched_prediction import prediction_readiness as _pred_readiness
+
+                doc["prediction_readiness"] = _pred_readiness(doc)
+                doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
             from app.enrichment.enriched_prediction import prediction_readiness
 
@@ -1871,23 +2240,19 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         _track_live_data_availability(str(item.get("match_id") or ""), doc)
 
         snapshot_odds(doc)
-        # Pipeline ownership: mirrors run_enrichment_worker above — when the
-        # AI Prediction Queue toggle is active, it is the SOLE predictor for
-        # both prematch and live matches; this lane only gathers data and
-        # flags the row for job_ai_prediction_queue instead of racing it.
+        # Pipeline ownership: mirrors run_enrichment_worker above — the
+        # deterministic engine always predicts here when data allows; it no
+        # longer steps aside for the AI Prediction Queue toggle. See the long
+        # comment in run_enrichment_worker for why: dual-engine arbitration
+        # (record_prediction()/engine_arbitration.py) now reconciles the two
+        # engines' independently-graded rows by tracked win rate, so this lane
+        # just needs to flag the match for the AI queue to also weigh in.
         try:
             from app.scheduling.pipeline_registry import is_pipeline_enabled
             ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
         except Exception:
             ai_queue_enabled = False
-        if (sofa or item.get("is_live")) and ai_queue_enabled:
-            from app.enrichment.enriched_prediction import prediction_readiness
-
-            doc["prediction"] = None
-            doc["prediction_error"] = None
-            doc["prediction_readiness"] = prediction_readiness(doc)
-            doc["ai_prediction_queue_pending"] = True
-        elif sofa or item.get("is_live"):
+        if sofa or item.get("is_live"):
             from app.utils.prediction_flow import apply_prediction_state
 
             state = apply_prediction_state(
@@ -1934,6 +2299,11 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
                     match_id=str(item.get("match_id") or ""),
                     match_name=sporty.get("name"),
                 )
+            if ai_queue_enabled:
+                from app.enrichment.enriched_prediction import prediction_readiness as _pred_readiness
+
+                doc["prediction_readiness"] = _pred_readiness(doc)
+                doc["ai_prediction_queue_pending"] = True
         elif not item.get("is_live") and ai_queue_enabled:
             from app.enrichment.enriched_prediction import prediction_readiness
 

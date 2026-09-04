@@ -309,9 +309,19 @@ def _loss_sample(row: sqlite3.Row) -> dict[str, Any]:
             likely.append("readiness_gap")
     if any(name in signal_names for name in ("market_steam", "odds_progression", "odds_pattern")):
         likely.append("market_signal_misread")
-    if row["pick_type"] in {"goals", "live_goals", "live_total_goals", "live_next_goal"}:
+    # The shared-grid live picks (_live_grid_projection_picks in
+    # enriched_prediction.py) carry a "_grid" suffix on their pick type, so
+    # this exact-string check used to miss all of them -- they'd get NO
+    # miss-reason tag at all rather than being mislabeled, but that just
+    # means this dashboard silently undercounted goal/side misses for the
+    # newer live picks. Stripping the suffix routes them into the same
+    # buckets as their older heuristic counterparts.
+    pick_type_base = str(row["pick_type"] or "")
+    if pick_type_base.endswith("_grid"):
+        pick_type_base = pick_type_base[: -len("_grid")]
+    if pick_type_base in {"goals", "live_goals", "live_total_goals", "live_next_goal", "live_no_goal"}:
         likely.append("goal_market_miss")
-    if row["pick_type"] in {"match_result", "double_chance", "ensemble_1x2", "value_bet"}:
+    if pick_type_base in {"match_result", "double_chance", "ensemble_1x2", "value_bet", "live_match_winner", "live_double_chance"}:
         likely.append("side_market_miss")
     return {
         "id": row["id"],

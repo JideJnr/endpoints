@@ -6,10 +6,13 @@ WHAT "PRESSING" MEANS HERE
 ---------------------------
 dangerous_attacks + total_shots, summed for a half, per side. This was
 chosen over raw possession (a team can dominate the ball without creating
-anything) and over live xG (also tracked separately — see live_xg.py — but
-xG needs a real chance to register, so it lags behind pressure that hasn't
-yet produced a clear opening; dangerous attacks + shots is the earliest
-usable signal that a team is currently camped in the opponent's third).
+anything) and over live xG (xG needs a real chance to register, so it lags
+behind pressure that hasn't yet produced a clear opening; dangerous attacks +
+shots is the earliest usable signal that a team is currently camped in the
+opponent's third). live_xg.py — the reader that surfaced xG from the same
+stat-history table — was removed as dead code (zero callers anywhere); the
+raw xG values are still recorded in live_stat_snapshots by
+live_stat_history.py if this needs rebuilding later.
 
 HOW HALVES ARE SPLIT
 ---------------------

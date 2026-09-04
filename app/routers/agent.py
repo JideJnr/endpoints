@@ -20,7 +20,7 @@ from app.data_clients.sofascore_client import fetch_all_scheduled_events, fetch_
 from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_post, fetch_live_matches_post, fetch_upcoming_matches_post
 
 from app.utils.primitives import _to_int, _to_float
-from app.utils.doc_helpers import _is_finished_doc
+from app.utils.match_state import is_finished_match
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -74,6 +74,37 @@ def post_disable_dynamic_competitions():
     try:
         from app.competition.competition_special import disable_dynamic_competitions
         return {"status": "success", **disable_dynamic_competitions()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/buffer/backfill-merge")
+def post_backfill_merge_orphaned_matches(dry_run: bool = Query(default=True)):
+    """One-time cleanup: merge pre-existing standalone SportyBet rows with
+    their matching SofaScore-only row (same fixture, split into two rows
+    before the ingest-time merge fix existed). dry_run=true (default) makes
+    no writes, just reports what would merge -- call with dry_run=false to
+    actually apply it. Safe to call more than once (already-merged rows are
+    simply not candidates anymore)."""
+    try:
+        from app.storage.buffer import backfill_merge_orphaned_matches
+        return {"status": "success", **backfill_merge_orphaned_matches(dry_run=dry_run)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/buffer/archive-stale-sofascore-only")
+def post_archive_stale_sofascore_only(
+    dry_run: bool = Query(default=True),
+    hours_past_kickoff: int = Query(default=6, ge=2, le=72),
+):
+    """One-time cleanup: archive SofaScore-only match_buffer rows whose
+    is_finished flag never got updated because they were starved of refresh
+    priority by newer fixtures (see archive_stale_sofascore_only_matches
+    docstring). dry_run=true (default) only reports counts/sample."""
+    try:
+        from app.storage.buffer import archive_stale_sofascore_only_matches
+        return {"status": "success", **archive_stale_sofascore_only_matches(dry_run=dry_run, hours_past_kickoff=hours_past_kickoff)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -191,7 +222,7 @@ def get_value_bets(
     # only scan upcoming and live — finished matches have no betting value
     docs = [
         doc for doc in docs
-        if not _is_finished_doc(doc)
+        if not is_finished_match(doc)
     ]
 
     def _scan_doc(doc: dict) -> list[dict]:
