@@ -49,10 +49,8 @@ def _ensure_signal_outcomes_table(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_buffer_tables(conn: sqlite3.Connection) -> None:
-    """Ensure buffer-related tables exist by delegating to ``app.buffer``."""
-    try:
-        from app.storage.buffer import _init_buffer_table
-
-        _init_buffer_table(conn)
-    except Exception:
-        pass
+    """No-op: buffer tables are created once in db.py's _init_db_unlocked at
+    startup (same as the removed app.storage.buffer._init_buffer_table this
+    used to delegate to). Kept as a function since it may still have callers
+    expecting to call it."""
+    pass

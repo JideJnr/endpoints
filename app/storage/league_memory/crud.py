@@ -49,7 +49,16 @@ from ._helpers import (
 
 logger = logging.getLogger(__name__)
 
-def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
+def observe_match(source: str, match: dict[str, Any], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    """Record one match observation.
+
+    conn: pass an already-open connection to fold this call into a caller's
+    own transaction (used by observe_matches() to batch a whole list into a
+    single connection/commit instead of one per match). When omitted, this
+    function opens, commits, and closes its own connection exactly as
+    before -- existing direct callers (e.g. routers/agent.py's single-match
+    endpoint) are unaffected.
+    """
     _init_db()
     match = enrich_match_facts(match)
     league = _league_from_match(match)
@@ -77,12 +86,12 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
     if minute > 0:
         is_live = True
 
-    with _conn(timeout=15) as conn:
-        init_competition_registry_tables(conn)
+    def _record(active_conn: sqlite3.Connection) -> tuple[dict[str, Any], bool, bool, int]:
+        init_competition_registry_tables(active_conn)
         # ── Auto-verify / auto-create the competition ────────────────────────
         try:
             ensure_competition(
-                conn,
+                active_conn,
                 name=league,
                 category=str(match.get("category") or ""),
                 country=str(match.get("country_name") or ""),
@@ -90,14 +99,14 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
         except Exception as _exc:
             logger.debug("ensure_competition failed for league=%s: %s", league, _exc)
 
-        duplicate_info = _detect_duplicate_or_replay(conn, source, match_id, league, match, home_goals, away_goals, minute, is_finished)
-        _upsert_match(conn, source, match_id, league, match, home_goals, away_goals, is_finished)
+        duplicate_info = _detect_duplicate_or_replay(active_conn, source, match_id, league, match, home_goals, away_goals, minute, is_finished)
+        _upsert_match(active_conn, source, match_id, league, match, home_goals, away_goals, is_finished)
         timeline_snapshot_recorded = False
         late_snapshot_recorded = False
         resolved = 0
         if is_live and not duplicate_info.get("is_duplicate"):
             timeline_snapshot_recorded = _insert_match_snapshot(
-                conn,
+                active_conn,
                 source,
                 match_id,
                 league,
@@ -107,11 +116,21 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
                 away_goals,
             )
             if minute >= 70 and abs(home_goals - away_goals) <= 1:
-                late_snapshot_recorded = _insert_late_snapshot(conn, source, match_id, league, minute, total_goals, home_goals - away_goals)
+                late_snapshot_recorded = _insert_late_snapshot(active_conn, source, match_id, league, minute, total_goals, home_goals - away_goals)
         if is_finished:
-            resolved = _resolve_snapshots(conn, source, match_id, home_goals, away_goals)
-            _aggregate_resolved_snapshots(conn)
-        conn.commit()
+            resolved = _resolve_snapshots(active_conn, source, match_id, home_goals, away_goals)
+        return duplicate_info, timeline_snapshot_recorded, late_snapshot_recorded, resolved
+
+    if conn is not None:
+        # Batched path: caller (observe_matches) owns the transaction and
+        # runs _aggregate_resolved_snapshots + commit once for the whole batch.
+        duplicate_info, timeline_snapshot_recorded, late_snapshot_recorded, resolved = _record(conn)
+    else:
+        with _conn(timeout=15) as owned_conn:
+            duplicate_info, timeline_snapshot_recorded, late_snapshot_recorded, resolved = _record(owned_conn)
+            if is_finished:
+                _aggregate_resolved_snapshots(owned_conn)
+            owned_conn.commit()
 
     mongo_archived = False
     if is_finished:
@@ -132,7 +151,25 @@ def observe_match(source: str, match: dict[str, Any]) -> dict[str, Any]:
 
 
 def observe_matches(source: str, matches: list[dict[str, Any]]) -> dict[str, Any]:
-    results = [observe_match(source, match) for match in matches]
+    """Batched version of observe_match: one DB connection/transaction for
+    the whole list instead of one per match. Previously every match opened,
+    committed, and closed its own connection (100-300+ short-lived write
+    transactions per job_archive_finished run), and _aggregate_resolved_snapshots
+    re-ran its own full scan once per finished match in the batch instead of
+    once for the batch. Both fixed here; per-match logic is unchanged
+    (observe_match still does the actual work, just against a shared conn).
+    """
+    if not matches:
+        return {
+            "observed": 0, "recorded": 0, "mongo_archived": 0,
+            "snapshots_recorded": 0, "timeline_snapshots_recorded": 0,
+            "late_snapshots_recorded": 0, "snapshots_resolved": 0,
+        }
+    _init_db()
+    with _conn(timeout=15) as conn:
+        results = [observe_match(source, match, conn=conn) for match in matches]
+        _aggregate_resolved_snapshots(conn)
+        conn.commit()
     return {
         "observed": len(results),
         "recorded": sum(1 for item in results if item.get("recorded")),
@@ -643,25 +680,29 @@ def _record_prediction_candidates(
     if not rows:
         return
     with _conn() as conn:
-        fresh_rows = []
-        for row in rows:
-            existing = conn.execute(
+        # One query for every (pick_type, selection, role) already recorded
+        # for this match in the last 4h, instead of one SELECT per candidate
+        # row (rows is small per call -- a handful of picks per prediction --
+        # but this function runs on every prediction, so it adds up). All
+        # rows here share the same match_id (row[1]), so a single match-scoped
+        # query covers the whole batch. Semantics preserved exactly: this only
+        # dedupes against already-committed history, never against sibling
+        # rows within the same batch (the original per-row loop didn't either,
+        # since all its SELECTs ran before any INSERT).
+        existing_keys = {
+            (existing_pick_type, existing_selection, existing_role)
+            for existing_pick_type, existing_selection, existing_role in conn.execute(
                 """
-                select id
+                select pick_type, selection, role
                 from prediction_candidate_history
                 where match_id = ?
-                  and pick_type = ?
-                  and selection = ?
-                  and role = ?
                   and result is null
                   and datetime(created_at) >= datetime('now', '-4 hours')
-                order by created_at desc
-                limit 1
                 """,
-                (row[1], row[7], row[8], row[11]),
-            ).fetchone()
-            if not existing:
-                fresh_rows.append(row)
+                (match_id,),
+            )
+        }
+        fresh_rows = [row for row in rows if (row[7], row[8], row[11]) not in existing_keys]
         if fresh_rows:
             conn.executemany(
                 """

@@ -551,7 +551,6 @@ def get_predictions_today():
     from datetime import date
     from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db
-    from app.storage.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     today = date.today().isoformat()
@@ -563,7 +562,6 @@ def get_predictions_today():
     try:
         with db_conn(timeout=30) as conn:
             conn.row_factory = _sqlite3.Row
-            _init_buffer_table(conn)
             rows = conn.execute(
                 """
                 select match_id, period, is_live, is_finished, raw_sporty, raw_enriched from match_buffer

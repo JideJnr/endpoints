@@ -7,6 +7,7 @@ code; one must never be invented locally.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
@@ -83,7 +84,23 @@ def request_share_code(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(_provider_error(body, response.status_code))
     code = _find_share_code(body)
     if not code:
-        raise RuntimeError("SportyBet did not return a share code")
+        # response.ok only means HTTP 200-299 -- plenty of providers
+        # (SportyBet included) wrap a real failure inside a 200 response
+        # via their own status field (bizCode/code/success), most commonly
+        # because the request isn't tied to an authenticated SportyBet
+        # session (this module intentionally never logs in -- see the
+        # module docstring). Previously this raised a bare, contentless
+        # "did not return a share code" with the actual body discarded,
+        # which made the real cause (an auth wall, a business-rule
+        # rejection, a changed response shape) impossible to diagnose from
+        # the 502 the user sees. Surface what the provider actually said.
+        provider_message = _provider_error(body, response.status_code) if isinstance(body, dict) else None
+        body_preview = json.dumps(body)[:800] if not isinstance(body, str) else body[:800]
+        detail = provider_message or "no error field present"
+        raise RuntimeError(
+            f"SportyBet did not return a share code (provider message: {detail}). "
+            f"Raw response: {body_preview}"
+        )
     return {"status": "share_code_created", "share_code": code, "booking_payload": payload}
 
 
@@ -115,7 +132,19 @@ def _resolve_legs(
 
 def _resolve_leg(selection: dict[str, Any], stake: int, *, force_refresh: bool = True) -> dict[str, Any]:
     raw_id = str(selection.get("sportybet_id") or selection.get("eventId") or selection.get("match_id") or "")
-    if not raw_id or raw_id.startswith("sofa:") or raw_id.startswith("competition:"):
+    # This guard was checking for the prefix "sofa:", but every SofaScore-
+    # only match id in this codebase actually uses "sofascore:" (e.g.
+    # "sofascore:16363637") -- "sofa:" never appears anywhere, so this check
+    # has never actually caught a real SofaScore-only id. _resolve_sportybet_id
+    # would then treat the numeric tail of a "sofascore:X" id as if it were
+    # a genuine SportyBet event id and send it straight to SportyBet's
+    # booking API, where it doesn't exist -- this is exactly what caused a
+    # real "SportyBet did not return a share code" failure (a stale
+    # competition_special duplicate prediction, "sofascore:16363637",
+    # ended up as a leg in a real booking request). Checking the real
+    # prefix here makes this fail fast with a clear message instead of
+    # silently sending a fabricated event id to SportyBet.
+    if not raw_id or raw_id.startswith("sofa:") or raw_id.startswith("sofascore:") or raw_id.startswith("competition:"):
         raise ValueError(f"Match {raw_id!r} has no SportyBet event ID — cannot book")
     event_id = _resolve_sportybet_id(raw_id)
     if force_refresh:

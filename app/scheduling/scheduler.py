@@ -577,12 +577,10 @@ def job_enrich_future() -> dict[str, Any]:
         return {"status": "shutdown", "job": "enrich_future"}
     from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db
-    from app.storage.buffer import _init_buffer_table
     import sqlite3 as _sqlite3
 
     _init_db()
     with db_conn(timeout=30) as conn:
-        _init_buffer_table(conn)
         pending = conn.execute(
             """
             select count(*) from future_match_buffer
@@ -726,10 +724,8 @@ def reset_deferred_predictions_and_repredict() -> dict[str, Any]:
        re-matches, re-enriches, and re-predicts the affected fixtures.
     """
     _init_db()
-    from app.storage.buffer import _init_buffer_table
 
     with _conn() as conn:
-        _init_buffer_table(conn)
         rows = conn.execute(
             f"""
             select match_id, match_date, name,
@@ -804,13 +800,11 @@ def retry_deferred_predictions(cooldown_minutes: int = 180, limit: int = 25) -> 
     newly-ingested match -- no forced synchronous call needed.
     """
     _init_db()
-    from app.storage.buffer import _init_buffer_table
 
     now_ts = datetime.now(timezone.utc).timestamp()
     next_retry_ts = now_ts + max(30, cooldown_minutes) * 60
 
     with _conn() as conn:
-        _init_buffer_table(conn)
         rows = conn.execute(
             """
             select match_id
@@ -988,6 +982,54 @@ def job_flush_to_mongo() -> dict[str, Any]:
     )
     return {"flush": flush_result, "cleanup": cleanup_result, "ghost_purged": ghost_deleted}
 
+
+# job_grade_predictions (every 6h) and job_grade_overdue_predictions (every
+# 30min, whenever it graded anything -- true on most runs during an active
+# day) both used to run this exact same expensive sequence independently and
+# unconditionally: rebuild_calibration() + run_learning_cycle() (a full
+# graded-history table rescan, no incremental filter) + optimise_ensemble_weights().
+# That meant up to ~48 redundant full recomputes/day just from the 30-min
+# job. Shared + debounced here so at most one real run happens per
+# _LEARNING_REFRESH_MIN_INTERVAL_MINUTES regardless of which job triggers it;
+# a debounced call returns the same dict shape a real run does (status/reason
+# fields only) so callers don't need special-casing.
+_LEARNING_REFRESH_MIN_INTERVAL_MINUTES = 20
+_last_learning_refresh_ts: float = 0.0
+
+
+def _run_learning_refresh() -> dict[str, Any]:
+    global _last_learning_refresh_ts
+    import time as _time
+
+    now = _time.time()
+    elapsed_minutes = (now - _last_learning_refresh_ts) / 60 if _last_learning_refresh_ts else None
+    if elapsed_minutes is not None and elapsed_minutes < _LEARNING_REFRESH_MIN_INTERVAL_MINUTES:
+        skipped = {
+            "status": "skipped",
+            "reason": "debounced",
+            "minutes_since_last_run": round(elapsed_minutes, 1),
+        }
+        return {"calibration": skipped, "learning": skipped}
+
+    _last_learning_refresh_ts = now
+    try:
+        from app.enrichment.confidence_calibrator import rebuild_calibration
+        cal_result = rebuild_calibration()
+    except Exception as exc:
+        cal_result = {"error": str(exc)}
+
+    try:
+        from app.monitoring.self_learner import run_learning_cycle
+        from app.models.weight_optimiser import optimise_ensemble_weights
+        self_learn_result = run_learning_cycle()
+        learn_result = optimise_ensemble_weights()
+        learn_result["self_learner"] = self_learn_result
+    except Exception as exc:
+        learn_result = {"error": str(exc)}
+
+    return {"calibration": cal_result, "learning": learn_result}
+
+
 def job_grade_predictions() -> dict[str, Any]:
     """Auto-grade recent predictions and refresh learning tables."""
     from datetime import date, timedelta
@@ -1027,22 +1069,12 @@ def job_grade_predictions() -> dict[str, Any]:
         betbuilder_result = grade_betbuilder_history(limit=500)
         metrics = get_grading_metrics()
 
-        # Rebuild confidence calibration from updated win/loss history
-        try:
-            from app.enrichment.confidence_calibrator import rebuild_calibration
-            cal_result = rebuild_calibration()
-        except Exception as exc:
-            cal_result = {"error": str(exc)}
-
-        # Run self-learning cycle and optimise ensemble weights.
-        try:
-            from app.monitoring.self_learner import run_learning_cycle
-            from app.models.weight_optimiser import optimise_ensemble_weights
-            self_learn_result = run_learning_cycle()
-            learn_result = optimise_ensemble_weights()
-            learn_result["self_learner"] = self_learn_result
-        except Exception as exc:
-            learn_result = {"error": str(exc)}
+        # Rebuild confidence calibration + run the learning cycle -- shared,
+        # debounced across this job and job_grade_overdue_predictions (see
+        # _run_learning_refresh's docstring).
+        _refresh = _run_learning_refresh()
+        cal_result = _refresh["calibration"]
+        learn_result = _refresh["learning"]
 
         # Grade odds patterns for yesterday
         try:
@@ -1356,18 +1388,14 @@ def job_grade_overdue_predictions() -> dict[str, Any]:
 
         graded = int(result.get("graded") or 0) + int(result.get("candidate_graded") or 0)
         if graded:
-            try:
-                from app.enrichment.confidence_calibrator import rebuild_calibration
-                from app.monitoring.self_learner import run_learning_cycle
-                from app.models.weight_optimiser import optimise_ensemble_weights
-
-                result["calibration"] = rebuild_calibration()
-                # Rebuild signal weights from fresh graded data
-                learn_cycle = run_learning_cycle()
-                opt_result = optimise_ensemble_weights()
-                result["learning"] = {**opt_result, "self_learner": learn_cycle}
-            except Exception as exc:
-                result["learning_error"] = str(exc)
+            # Shared, debounced with job_grade_predictions -- see
+            # _run_learning_refresh's docstring. This job runs every 30min
+            # and graded>0 is true on most runs during an active day, so
+            # without the debounce this alone could re-run the full
+            # calibration/learning rescan up to ~48x/day.
+            _refresh = _run_learning_refresh()
+            result["calibration"] = _refresh["calibration"]
+            result["learning"] = _refresh["learning"]
         result["betbuilder"] = grade_betbuilder_history(limit=300)
         record_activity(
             f"Overdue grading finished: {result.get('graded', 0)} primary, {result.get('candidate_graded', 0)} candidates, {int((result.get('orphaned') or {}).get('graded') or 0)} orphaned",

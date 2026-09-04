@@ -52,7 +52,7 @@ from app.data_clients.sofascore_client import (
     is_terminal_event,
 )
 from app.utils.time_context import match_time_context
-from app.storage.buffer import _init_buffer_table, store_enriched, get_buffered_match, _sofa_live_data
+from app.storage.buffer import store_enriched, get_buffered_match, _sofa_live_data
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,6 @@ def ingest_from_sofascore(
     inserted = updated = skipped = 0
 
     with db_conn(timeout=30) as conn:
-        _init_buffer_table(conn)
         conn.execute("pragma busy_timeout = 30000")
 
         for event in usable:
@@ -319,7 +318,6 @@ def _get_sofa_buffer_matches(
         clauses.append("is_live = 1")
 
     with db_conn(timeout=30) as conn:
-        _init_buffer_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""

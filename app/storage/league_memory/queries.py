@@ -6,12 +6,15 @@ Direct CRUD operations live in crud.py.
 """
 from __future__ import annotations
 
+import logging
 import re
 import json
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from app.storage.db import (
     DB_PATH, _conn, close_db, connect_readonly_db, db_conn, get_db,
@@ -891,12 +894,24 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
             conn.commit()
         _store_signal_outcome_for_row(row, result)
 
-        # Record outcome for the probability learner
+        # Record outcome for the probability learner.
+        #
+        # `row` here is an sqlite3.Row (every connection in app.storage.db
+        # sets row_factory = sqlite3.Row), which does NOT support `.get()` --
+        # only bracket/index access and `.keys()`. Calling `row.get(...)`
+        # raised AttributeError on the very first line below on every single
+        # invocation, and the bare `except Exception: pass` silently ate it.
+        # Confirmed live: prediction_history had 844 graded rows while
+        # probability_patterns/signal_outcome_map (the tables this block is
+        # supposed to populate) had zero -- this call had never once
+        # succeeded. Fixed to use Row-safe access, and to log failures
+        # instead of swallowing them so a future regression is visible.
         try:
             from app.models.probability_learner import learn_probabilities
             from app.enrichment.signal_aggregator import normalize_signal
 
-            signals_json = row.get("signals_json") or "[]"
+            row_keys = row.keys()
+            signals_json = (row["signals_json"] if "signals_json" in row_keys else None) or "[]"
             signals = json.loads(signals_json) if signals_json else []
             normalized_signals = []
             for sig in signals:
@@ -905,15 +920,22 @@ def grade_predictions_for_date(match_date: str, events: list[dict[str, Any]]) ->
                 normalized = normalize_signal(name, value)
                 normalized_signals.append(normalized)
 
+            row_pick_type = row["pick_type"] if "pick_type" in row_keys else None
+            row_confidence = row["confidence"] if "confidence" in row_keys else None
+
             learn_probabilities(
                 signals=normalized_signals,
                 result=result,
-                pick_type=row.get("pick_type") or "match_result",
+                pick_type=row_pick_type or "match_result",
                 league_key="__global__",
-                confidence=float(row.get("confidence") or 0.5),
+                confidence=float(row_confidence or 0.5),
             )
         except Exception:
-            pass
+            logger.warning(
+                "[probability_learner] learn_probabilities failed for match_id=%s",
+                match_id,
+                exc_info=True,
+            )
 
         graded += 1
 

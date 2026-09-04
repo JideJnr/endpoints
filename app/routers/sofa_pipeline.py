@@ -30,7 +30,6 @@ def get_sofa_pipeline_status():
     from app.data_clients.sofa_pipeline import get_sofa_pipeline_mode
     from app.storage.db import DB_PATH
     from app.storage.league_memory import _init_db
-    from app.storage.buffer import _init_buffer_table
     import sqlite3
 
     mode = get_sofa_pipeline_mode()
@@ -39,7 +38,6 @@ def get_sofa_pipeline_status():
     counts: dict[str, int] = {}
     try:
         with db_conn(timeout=10) as conn:
-            _init_buffer_table(conn)
             row = conn.execute(
                 """
                 select

@@ -2009,9 +2009,6 @@ def _mirror_competition_event_to_main_buffer(
     importance: dict[str, Any],
     enriched_doc: dict[str, Any] | None = None,
 ) -> None:
-    from app.storage.buffer import _init_buffer_table
-
-    _init_buffer_table(conn)
     status = event.get("status") or {}
     score = event.get("score") or {}
     state = classify_match_state({
@@ -2024,14 +2021,23 @@ def _mirror_competition_event_to_main_buffer(
     is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
     match_id = _main_buffer_match_id(event.get("id"))
     raw_sporty = _competition_raw_sporty(key, event, match_date, importance)
+    # event's team dicts are already normalized to snake_case with an "id"
+    # field by sofascore_client.py (home_team/away_team, not the raw API's
+    # homeTeam/awayTeam) -- these two columns exist so
+    # buffer.py::_resolve_sofascore_only_match can look up a sofascore-only
+    # row by team ID directly instead of json.loads()-ing raw_sporty for
+    # every candidate row on every SportyBet ingest.
+    home_team_id = str((event.get("home_team") or {}).get("id") or "") or None
+    away_team_id = str((event.get("away_team") or {}).get("id") or "") or None
     conn.execute(
         """
         insert into match_buffer (
             match_id, match_date, tournament, category, name, start_time, period,
             score_home, score_away, is_live, is_finished, ingested_at,
-            data_source, sofascore_id, sofascore_only, raw_sporty, raw_enriched, enriched_at
+            data_source, sofascore_id, sofascore_only, raw_sporty, raw_enriched, enriched_at,
+            sofascore_home_team_id, sofascore_away_team_id
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(match_id) do update set
             match_date = excluded.match_date,
             tournament = excluded.tournament,
@@ -2062,7 +2068,9 @@ def _mirror_competition_event_to_main_buffer(
             -- ingest to recreate a duplicate row (see buffer.py re-split fix).
             raw_sporty = excluded.raw_sporty,
             raw_enriched = coalesce(excluded.raw_enriched, match_buffer.raw_enriched),
-            enriched_at = coalesce(excluded.enriched_at, match_buffer.enriched_at)
+            enriched_at = coalesce(excluded.enriched_at, match_buffer.enriched_at),
+            sofascore_home_team_id = excluded.sofascore_home_team_id,
+            sofascore_away_team_id = excluded.sofascore_away_team_id
         """,
         (
             match_id,
@@ -2083,6 +2091,8 @@ def _mirror_competition_event_to_main_buffer(
             json.dumps(raw_sporty),
             json.dumps(enriched_doc) if enriched_doc else None,
             datetime.now(timezone.utc).isoformat() if enriched_doc else None,
+            home_team_id,
+            away_team_id,
         ),
     )
 

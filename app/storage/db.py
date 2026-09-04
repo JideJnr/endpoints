@@ -799,6 +799,21 @@ def _init_db_unlocked() -> None:
         _ensure_column(conn, "match_buffer", "data_source",    "text not null default 'sportybet'")
         _ensure_column(conn, "match_buffer", "sportybet_id",   "text")
         _ensure_column(conn, "match_buffer", "sofascore_only", "integer not null default 0")
+        # Denormalized SofaScore team IDs for sofascore_only=1 rows, populated
+        # by competition_special.py's mirror on every write. Lets
+        # buffer.py::_resolve_sofascore_only_match match a SportyBet fixture
+        # against a sofascore-only row with a direct indexed lookup instead
+        # of json.loads()-ing every candidate row's raw_sporty blob just to
+        # read two team IDs out of it. NULL on rows written before this
+        # column existed; _resolve_sofascore_only_match falls back to the
+        # JSON-parse path for exactly those (shrinks to ~0 automatically as
+        # the mirror re-writes each tracked competition's rows every ~5 min).
+        _ensure_column(conn, "match_buffer", "sofascore_home_team_id", "text")
+        _ensure_column(conn, "match_buffer", "sofascore_away_team_id", "text")
+        conn.execute(
+            "create index if not exists idx_buffer_sofa_only_teams "
+            "on match_buffer(sofascore_only, match_date, sofascore_home_team_id, sofascore_away_team_id)"
+        )
         # Migrate any remaining future_match_buffer rows into match_buffer then drop the table
         _migrate_future_buffer(conn)
         conn.execute("""

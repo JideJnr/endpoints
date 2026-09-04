@@ -64,10 +64,8 @@ NO_MATCH_MIN_RETRY_LIVE_MINUTES = 15
 
 
 # ── Table init ────────────────────────────────────────────────────────────────
-
-def _init_buffer_table(conn: sqlite3.Connection) -> None:
-    """No-op: buffer tables are now created once in _init_db_unlocked at startup."""
-    pass
+# _init_buffer_table: removed — was a no-op since all buffer tables are created
+# once by _init_db_unlocked at startup. All call sites removed.
 
 
 def _ensure_buffer_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -76,9 +74,7 @@ def _ensure_buffer_column(conn: sqlite3.Connection, table: str, column: str, ddl
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
-def _buffer_table_for(match_date: str | None, is_live: int = 0) -> str:
-    """Always returns match_buffer — single buffer model."""
-    return "match_buffer"
+# _buffer_table_for: removed — always returned "match_buffer" with no logic.
 
 
 # ── Phase 1: Ingest ───────────────────────────────────────────────────────────
@@ -162,7 +158,6 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     today = _date.today().isoformat()
 
     with _conn() as conn:
-        _init_buffer_table(conn)
         count = 0
         for m in matches:
             match_id = str(m.get("id") or "")
@@ -245,9 +240,14 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             ).fetchone()
             target_match_id = already_merged_row[0] if already_merged_row else match_id
 
-            exists = conn.execute(
+            # Detect whether this is a new row by checking existence once before
+            # the upsert. We do it as a scalar (1 or None) rather than fetching
+            # the full row — cheaper than the old SELECT 1 was not, but at least
+            # we're not fetching any data columns. This is the minimal read
+            # needed to return an accurate "new rows inserted" count to the caller.
+            is_new_row = conn.execute(
                 "select 1 from match_buffer where match_id = ?", (target_match_id,)
-            ).fetchone()
+            ).fetchone() is None
 
             conn.execute(
                 """
@@ -285,7 +285,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                 ),
             )
             _sync_enriched_sporty_fields(conn, "match_buffer", target_match_id, m, match_date, is_live, is_finished)
-            if not exists:
+            if is_new_row:
                 count += 1
         conn.commit()
 
@@ -426,19 +426,43 @@ def _resolve_sofascore_only_match(conn: sqlite3.Connection, m: dict[str, Any], m
 
     if home_sofa_id and away_sofa_id:
         try:
-            candidates = conn.execute(
-                "select match_id, raw_sporty from match_buffer where sofascore_only = 1 and match_date = ?",
-                (match_date,),
-            ).fetchall()
-            for cand_id, raw in candidates:
-                try:
-                    event = json.loads(raw or "{}")
-                except Exception:
-                    continue
-                cand_home = str((event.get("homeTeam") or {}).get("id") or "")
-                cand_away = str((event.get("awayTeam") or {}).get("id") or "")
-                if cand_home == str(home_sofa_id) and cand_away == str(away_sofa_id):
-                    return cand_id
+            # Primary: dedicated indexed columns (populated by
+            # competition_special.py's mirror at write time -- see
+            # idx_buffer_sofa_only_teams in db.py). Direct column equality,
+            # no per-row JSON work at all.
+            row = conn.execute(
+                """
+                select match_id from match_buffer
+                where sofascore_only = 1 and match_date = ?
+                  and sofascore_home_team_id = ? and sofascore_away_team_id = ?
+                limit 1
+                """,
+                (match_date, str(home_sofa_id), str(away_sofa_id)),
+            ).fetchone()
+            if row:
+                return row[0]
+            # Fallback for rows written before those columns existed (NULL):
+            # json_extract in SQL still avoids pulling the full raw_sporty
+            # blob into Python and calling json.loads per row. Key path is
+            # home_team.id/away_team.id -- competition_special.py stores
+            # event's ALREADY-normalized snake_case team dicts at the top
+            # level of raw_sporty (sofascore_client.py converts the raw
+            # API's homeTeam/awayTeam to home_team/away_team before this
+            # point), so a homeTeam/awayTeam path here would never match
+            # anything -- confirmed this was the case before this fix.
+            row = conn.execute(
+                """
+                select match_id from match_buffer
+                where sofascore_only = 1 and match_date = ?
+                  and sofascore_home_team_id is null
+                  and cast(json_extract(raw_sporty, '$.home_team.id') as text) = ?
+                  and cast(json_extract(raw_sporty, '$.away_team.id') as text) = ?
+                limit 1
+                """,
+                (match_date, str(home_sofa_id), str(away_sofa_id)),
+            ).fetchone()
+            if row:
+                return row[0]
         except Exception:
             pass
 
@@ -459,8 +483,10 @@ def _resolve_sofascore_only_match(conn: sqlite3.Connection, m: dict[str, Any], m
             # Learned a new pairing -- teach team_watcher for next time.
             try:
                 event = json.loads(raw or "{}")
-                cand_home_id = str((event.get("homeTeam") or {}).get("id") or "")
-                cand_away_id = str((event.get("awayTeam") or {}).get("id") or "")
+                # See the key-path note above: raw_sporty stores event's
+                # already-normalized home_team/away_team, not homeTeam/awayTeam.
+                cand_home_id = str((event.get("home_team") or {}).get("id") or "")
+                cand_away_id = str((event.get("away_team") or {}).get("id") or "")
                 _learn_team_sofascore_id(conn, home_sporty_id, home_name, cand_home_id)
                 _learn_team_sofascore_id(conn, away_sporty_id, away_name, cand_away_id)
             except Exception:
@@ -904,7 +930,6 @@ def get_unenriched_batch(
     tomorrow = (date_cls.today() + timedelta(days=1)).isoformat()
 
     with _conn() as conn:
-        _init_buffer_table(conn)
         if live_only and not future_only:
             live_clause = "and is_live = 1"
         elif exclude_live:
@@ -994,7 +1019,6 @@ def store_enriched(match_id: str, doc: dict[str, Any]) -> None:
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
-        _init_buffer_table(conn)
         row = conn.execute("select raw_sporty, raw_enriched from match_buffer where match_id = ?", (match_id,)).fetchone()
         if row:
             raw_sporty = json.loads(row[0]) if row[0] else {}
@@ -1058,7 +1082,6 @@ def get_buffered_matches(match_date: str | None = None, limit: int = 500) -> lis
     """
     _init_db()
     with _conn() as conn:
-        _init_buffer_table(conn)
         clauses = ["is_finished = 0"]
         params: list[Any] = []
         if match_date:
@@ -1095,7 +1118,6 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
     _init_db()
     lookup_ids = _buffer_lookup_ids(str(match_id))
     with _conn() as conn:
-        _init_buffer_table(conn)
         row = None
         for lookup_id in lookup_ids:
             row = conn.execute(
@@ -1131,7 +1153,6 @@ def bulk_get_buffered_matches(match_ids: list[str]) -> dict[str, dict[str, Any]]
 
     _init_db()
     with _conn() as conn:
-        _init_buffer_table(conn)
         placeholders = ",".join("?" for _ in lookup_to_requested)
         rows = conn.execute(
             f"""
@@ -1173,7 +1194,6 @@ def get_live_buffered_matches(limit: int = 200) -> list[dict[str, Any]]:
     """All currently live matches from the buffer."""
     _init_db()
     with _conn() as conn:
-        _init_buffer_table(conn)
         rows = conn.execute(
             """
             select raw_enriched, raw_sporty
@@ -1317,7 +1337,7 @@ def purge_ghost_matches() -> int:
     kickoff_cutoff_ms = (now_ts - 130 * 60) * 1000
 
     with _conn() as conn:
-        _init_buffer_table(conn)
+        count = 0
 
         # 1. Ghost not-started: kick-off passed but never went live
         r1 = conn.execute(
@@ -1420,7 +1440,6 @@ def get_buffer_stats() -> dict[str, Any]:
     today = date.today().isoformat()
     now_ts = _dt.now(_tz.utc).timestamp()
     with _conn() as conn:
-        _init_buffer_table(conn)
         row = conn.execute(
             """
             select
@@ -1567,6 +1586,220 @@ def _sofa_live_data(detail: dict[str, Any] | None) -> dict[str, Any]:
         "status": detail.get("status"),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _assemble_enrichment_doc(
+    existing: dict[str, Any],
+    sporty: dict[str, Any],
+    item: dict[str, Any],
+    sofa: dict | None,
+    detail: dict | None,
+    sportradar_detail: dict,
+    web_context: dict,
+    league_sentiment: dict,
+    score: float,
+    match_status: str,
+    now: str,
+    time_context: dict,
+    match_state: Any,
+    retry_after_ts: float,
+    *,
+    detail_source: str | None = None,
+    match_source: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build the enriched-match doc dict shared by run_enrichment_worker (parallel,
+    scheduler-driven) and run_date_aware_enrichment (sequential, manual-action-
+    driven). Both callers assemble an (almost) identical ~35-field doc from the
+    same inputs — this is the single source of truth for that shape.
+
+    `detail_source` / `match_source` are date-aware-only extras (how the
+    SofaScore detail was obtained, and how the match itself was resolved —
+    "saved"/"fuzzy"/"llm"). They're omitted from the doc entirely when not
+    supplied, matching run_enrichment_worker's original doc shape exactly.
+    """
+    doc = {
+        **existing,
+        "data_source":       "both" if (sofa or existing.get("sofascore_id")) else "sportybet",
+        "sportybet_id":      sporty.get("id"),
+        "match_id":          item.get("match_id"),
+        "name":              sporty.get("name"),
+        "sportybet_name":    sporty.get("name"),
+        "match_date":        time_context.get("local_date") or item["match_date"],
+        "tournament":        sporty.get("tournament"),
+        "category":          sporty.get("category"),
+        "start_time":        sporty.get("start_time"),
+        "period":            sporty.get("period"),
+        "played_seconds":    sporty.get("played_seconds"),
+        "score":             sporty.get("score"),
+        "venue":             sporty.get("venue"),
+        "sportybet_detail":  _sporty_detail_doc(sporty),
+        "sportybet_data_status": "available",
+        "data_sources":      _data_sources(sofa, detail, sporty, sportradar_detail),
+        "sportradar_detail": sportradar_detail,
+        "sportybet_markets": sporty.get("markets", []),
+        "markets":           sporty.get("markets", []),
+        "live_data_sportybet": _sporty_live_data(sporty) or existing.get("live_data_sportybet") or {},
+        "sofascore_id":      sofa.get("id") if sofa else existing.get("sofascore_id"),
+        "sofascore_name":    sofa.get("name") if sofa else None,
+        "sofascore_event":   sofa,
+        "sofascore_detail":  detail,
+        "live_data_sofascore": _sofa_live_data(detail) or existing.get("live_data_sofascore") or {},
+        "home_last_matches": (detail or {}).get("home_last_matches") or [],
+        "away_last_matches": (detail or {}).get("away_last_matches") or [],
+        "standings":         (detail or {}).get("standings") or [],
+        "league_table":      (detail or {}).get("standings") or [],
+        "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
+        "web_context":       web_context,
+        "league_sentiment":  league_sentiment,
+        "match_score":       round(score, 3),
+        "sofascore_match_status": match_status,
+        "sofascore_candidate_count": int(item.get("sofascore_candidate_count") or 0),
+        "sofascore_best_score": round(score, 3),
+        "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
+        "sofascore_no_match_at": None if sofa else now,
+        "sofascore_retry_after_ts": None if sofa else retry_after_ts,
+        "manual_match":      bool(existing.get("manual_match")),
+        "raw_sporty":        sporty,
+        "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
+        "time_context":      time_context,
+        "match_state":       match_state,
+        "enriched_at":       now,
+    }
+    if detail_source is not None:
+        doc["sofascore_detail_source"] = detail_source
+    if match_source is not None:
+        doc["match_source"] = match_source
+
+    doc["data_sources"] = _data_sources(
+        sofa or ({"id": existing.get("sofascore_id")} if existing.get("sofascore_id") else None),
+        {**(detail or {}), "live_data_sofascore": doc.get("live_data_sofascore") or {}},
+        {**sporty, "live_data_sportybet": doc.get("live_data_sportybet") or {}},
+        sportradar_detail,
+    )
+    doc["data_source_detail"] = doc.get("data_sources") or {}
+    _track_live_data_availability(str(item.get("match_id") or ""), doc)
+
+    snapshot_odds(doc)
+    return doc
+
+
+def _finalize_enrichment_prediction(
+    doc: dict[str, Any],
+    item: dict[str, Any],
+    sporty: dict[str, Any],
+    sofa: dict | None,
+    *,
+    job_tag: str,
+) -> bool:
+    """
+    Run the prediction branch shared by run_enrichment_worker and
+    run_date_aware_enrichment: attempt a deterministic prediction when a
+    SofaScore match (or live match) is available, overlay the AI Prediction
+    Queue flag when that pipeline is enabled, set doc["lifecycle"], and
+    persist via store_enriched.
+
+    Pipeline ownership: the deterministic engine always predicts here when
+    data allows (enrichment owns this lane) — it no longer steps aside for
+    the AI Prediction Queue toggle. That exclusivity design (deterministic
+    skipped entirely whenever AI was "on") turned out to conflict with the
+    dual-engine arbitration built into record_prediction()/engine_arbitration.py:
+    each engine now writes its own tagged row (engine='deterministic' vs
+    'ai_llm') with its own independent per-engine cooldown, and arbitration
+    picks which one is shown (is_final) using each engine's own tracked
+    win rate — defaulting to the deterministic engine, the safe incumbent,
+    until the AI earns enough graded history to outweigh it. Both keep
+    grading independently either way, so this lane just needs to flag the
+    match for the AI queue (job_ai_prediction_queue, its own cron) to also
+    weigh in — not decide who "wins"; that's arbitration's job now.
+
+    Returns True iff a deterministic prediction was made this call.
+    """
+    from app.utils.activity_log import record_activity
+
+    predicted = False
+    try:
+        from app.scheduling.pipeline_registry import is_pipeline_enabled
+        ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
+    except Exception:
+        ai_queue_enabled = False
+
+    if sofa or item.get("is_live"):
+        from app.utils.prediction_flow import apply_prediction_state
+
+        state = apply_prediction_state(
+            doc,
+            match_id=str(item.get("match_id") or ""),
+            use_llm_pipeline=False,
+            attach_brain=True,
+        )
+        readiness = state.get("readiness") or {}
+        if state.get("status") == "predicted":
+            predicted = True
+            record_activity(
+                f"Manual prediction completed for {sporty.get('name') or item['match_id']}",
+                job=job_tag,
+                status="predicted",
+                match_id=str(item.get("match_id") or ""),
+                match_name=sporty.get("name"),
+                details={"sofascore_id": doc.get("sofascore_id"), "assurance": readiness.get("assurance")},
+            )
+        elif state.get("status") == "skipped":
+            record_activity(
+                f"Manual prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
+                job=job_tag,
+                status="skipped",
+                match_id=str(item.get("match_id") or ""),
+                match_name=sporty.get("name"),
+                details={"skip_reason": state.get("skip_reason"), "existing": state.get("existing")},
+            )
+        elif state.get("status") == "deferred":
+            record_activity(
+                f"Manual prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
+                job=job_tag,
+                status="waiting",
+                match_id=str(item.get("match_id") or ""),
+                match_name=sporty.get("name"),
+                details=readiness,
+            )
+        else:
+            print(f"[buffer:{job_tag}] manual prediction failed for {item['match_id']}: {state.get('error')}")
+            record_activity(
+                f"Manual prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
+                job=job_tag,
+                status="error",
+                match_id=str(item.get("match_id") or ""),
+                match_name=sporty.get("name"),
+            )
+        # Overlay: also let the AI queue weigh in on this same match — for
+        # both prematch and live, now that arbitration (not a lockout) is
+        # what reconciles the two engines' calls.
+        if ai_queue_enabled:
+            from app.enrichment.enriched_prediction import prediction_readiness as _pred_readiness
+
+            doc["prediction_readiness"] = _pred_readiness(doc)
+            doc["ai_prediction_queue_pending"] = True
+    elif not item.get("is_live") and ai_queue_enabled:
+        from app.enrichment.enriched_prediction import prediction_readiness
+
+        doc["prediction"] = None
+        doc["prediction_error"] = None
+        doc["prediction_readiness"] = prediction_readiness(doc)
+        doc["ai_prediction_queue_pending"] = True
+    else:
+        from app.enrichment.enriched_prediction import prediction_readiness
+
+        doc["prediction"] = None
+        readiness = prediction_readiness(doc)
+        doc["prediction_readiness"] = readiness
+        doc["prediction_error"] = (
+            "Minimum SportyBet enrichment completed; prediction deferred until a confident SofaScore match is found."
+        )
+
+    doc["lifecycle"] = _lifecycle_state(doc)
+    store_enriched(item["match_id"], doc)
+    return predicted
+
 
 def run_enrichment_worker(
     batch_size: int = 10,
@@ -1840,155 +2073,13 @@ def run_enrichment_worker(
         retry_minutes = NO_MATCH_MIN_RETRY_LIVE_MINUTES if item.get("is_live") else NO_MATCH_RETRY_MINUTES
         retry_after_ts = (datetime.now(timezone.utc) + timedelta(minutes=retry_minutes)).timestamp()
 
-        doc = {
-            **existing,
-            "data_source":       "both" if (sofa or existing.get("sofascore_id")) else "sportybet",
-            "sportybet_id":      sporty.get("id"),
-            "match_id":          item.get("match_id"),
-            "name":              sporty.get("name"),
-            "sportybet_name":    sporty.get("name"),
-            "match_date":        time_context.get("local_date") or item["match_date"],
-            "tournament":        sporty.get("tournament"),
-            "category":          sporty.get("category"),
-            "start_time":        sporty.get("start_time"),
-            "period":            sporty.get("period"),
-            "played_seconds":    sporty.get("played_seconds"),
-            "score":             sporty.get("score"),
-            "venue":             sporty.get("venue"),
-            "sportybet_detail":  _sporty_detail_doc(sporty),
-            "sportybet_data_status": "available",
-            "data_sources":      _data_sources(sofa, detail, sporty, sportradar_detail),
-            "sportradar_detail": sportradar_detail,
-            "sportybet_markets": sporty.get("markets", []),
-            "markets":           sporty.get("markets", []),
-            "live_data_sportybet": _sporty_live_data(sporty) or existing.get("live_data_sportybet") or {},
-            "sofascore_id":      sofa.get("id") if sofa else existing.get("sofascore_id"),
-            "sofascore_name":    sofa.get("name") if sofa else None,
-            "sofascore_event":   sofa,
-            "sofascore_detail":  detail,
-            "live_data_sofascore": _sofa_live_data(detail) or existing.get("live_data_sofascore") or {},
-            "home_last_matches": (detail or {}).get("home_last_matches") or [],
-            "away_last_matches": (detail or {}).get("away_last_matches") or [],
-            "standings":         (detail or {}).get("standings") or [],
-            "league_table":      (detail or {}).get("standings") or [],
-            "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
-            "web_context":       web_context,
-            "league_sentiment":  league_sentiment,
-            "match_score":       round(score, 3),
-            "sofascore_match_status": match_status,
-            "sofascore_candidate_count": int(item.get("sofascore_candidate_count") or 0),
-            "sofascore_best_score": round(score, 3),
-            "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
-            "sofascore_no_match_at": None if sofa else now,
-            "sofascore_retry_after_ts": None if sofa else retry_after_ts,
-            "manual_match":      bool(existing.get("manual_match")),
-            "raw_sporty":        sporty,
-            "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
-            "time_context":      time_context,
-            "match_state":       match_state,
-            "enriched_at":       now,
-        }
-        doc["data_sources"] = _data_sources(
-            sofa or ({"id": existing.get("sofascore_id")} if existing.get("sofascore_id") else None),
-            {**(detail or {}), "live_data_sofascore": doc.get("live_data_sofascore") or {}},
-            {**sporty, "live_data_sportybet": doc.get("live_data_sportybet") or {}},
-            sportradar_detail,
+        doc = _assemble_enrichment_doc(
+            existing, sporty, item, sofa, detail, sportradar_detail,
+            web_context, league_sentiment, score, match_status,
+            now, time_context, match_state, retry_after_ts,
         )
-        doc["data_source_detail"] = doc.get("data_sources") or {}
-        _track_live_data_availability(str(item.get("match_id") or ""), doc)
-
-        snapshot_odds(doc)
-        # Pipeline ownership: the deterministic engine always predicts here when
-        # data allows (enrichment owns this lane) — it no longer steps aside for
-        # the AI Prediction Queue toggle. That exclusivity design (deterministic
-        # skipped entirely whenever AI was "on") turned out to conflict with the
-        # dual-engine arbitration built into record_prediction()/engine_arbitration.py:
-        # each engine now writes its own tagged row (engine='deterministic' vs
-        # 'ai_llm') with its own independent per-engine cooldown, and arbitration
-        # picks which one is shown (is_final) using each engine's own tracked
-        # win rate — defaulting to the deterministic engine, the safe incumbent,
-        # until the AI earns enough graded history to outweigh it. Both keep
-        # grading independently either way, so this lane just needs to flag the
-        # match for the AI queue (job_ai_prediction_queue, its own cron) to also
-        # weigh in — not decide who "wins"; that's arbitration's job now.
-        try:
-            from app.scheduling.pipeline_registry import is_pipeline_enabled
-            ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
-        except Exception:
-            ai_queue_enabled = False
-        if sofa or item.get("is_live"):
-            from app.utils.prediction_flow import apply_prediction_state
-
-            state = apply_prediction_state(
-                doc,
-                match_id=str(item.get("match_id") or ""),
-                use_llm_pipeline=False,
-                attach_brain=True,
-            )
-            readiness = state.get("readiness") or {}
-            if state.get("status") == "predicted":
-                predicted += 1
-                record_activity(
-                    f"Manual prediction completed for {sporty.get('name') or item['match_id']}",
-                    job="enrich_worker",
-                    status="predicted",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                    details={"sofascore_id": doc.get("sofascore_id"), "assurance": readiness.get("assurance")},
-                )
-            elif state.get("status") == "skipped":
-                record_activity(
-                    f"Manual prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
-                    job="enrich_worker",
-                    status="skipped",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                    details={"skip_reason": state.get("skip_reason"), "existing": state.get("existing")},
-                )
-            elif state.get("status") == "deferred":
-                record_activity(
-                    f"Manual prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
-                    job="enrich_worker",
-                    status="waiting",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                    details=readiness,
-                )
-            else:
-                print(f"[buffer] manual prediction failed for {item['match_id']}: {state.get('error')}")
-                record_activity(
-                    f"Manual prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
-                    job="enrich_worker",
-                    status="error",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                )
-            # Overlay: also let the AI queue weigh in on this same match — for
-            # both prematch and live, now that arbitration (not a lockout) is
-            # what reconciles the two engines' calls.
-            if ai_queue_enabled:
-                from app.enrichment.enriched_prediction import prediction_readiness as _pred_readiness
-
-                doc["prediction_readiness"] = _pred_readiness(doc)
-                doc["ai_prediction_queue_pending"] = True
-        elif not item.get("is_live") and ai_queue_enabled:
-            from app.enrichment.enriched_prediction import prediction_readiness
-
-            doc["prediction"] = None
-            doc["prediction_error"] = None
-            doc["prediction_readiness"] = prediction_readiness(doc)
-            doc["ai_prediction_queue_pending"] = True
-        else:
-            from app.enrichment.enriched_prediction import prediction_readiness
-
-            doc["prediction"] = None
-            readiness = prediction_readiness(doc)
-            doc["prediction_readiness"] = readiness
-            doc["prediction_error"] = (
-                "Minimum SportyBet enrichment completed; prediction deferred until a confident SofaScore match is found."
-            )
-        doc["lifecycle"] = _lifecycle_state(doc)
-        store_enriched(item["match_id"], doc)
+        if _finalize_enrichment_prediction(doc, item, sporty, sofa, job_tag="enrich_worker"):
+            predicted += 1
         stored += 1
 
     return {
@@ -2178,148 +2269,14 @@ def run_date_aware_enrichment(count: int = 12) -> dict[str, Any]:
         match_status = "matched" if sofa else "no_match"
         retry_minutes = NO_MATCH_MIN_RETRY_LIVE_MINUTES if item.get("is_live") else NO_MATCH_RETRY_MINUTES
         retry_after_ts = (datetime.now(timezone.utc) + timedelta(minutes=retry_minutes)).timestamp()
-        doc = {
-            **existing,
-            "data_source":       "both" if (sofa or existing.get("sofascore_id")) else "sportybet",
-            "sportybet_id":      sporty.get("id"),
-            "match_id":          item.get("match_id"),
-            "name":              sporty.get("name"),
-            "sportybet_name":    sporty.get("name"),
-            "match_date":        time_context.get("local_date") or item["match_date"],
-            "tournament":        sporty.get("tournament"),
-            "category":          sporty.get("category"),
-            "start_time":        sporty.get("start_time"),
-            "period":            sporty.get("period"),
-            "played_seconds":    sporty.get("played_seconds"),
-            "score":             sporty.get("score"),
-            "venue":             sporty.get("venue"),
-            "sportybet_detail":  _sporty_detail_doc(sporty),
-            "sportybet_data_status": "available",
-            "data_sources":      _data_sources(sofa, detail, sporty, sportradar_detail),
-            "sportradar_detail": sportradar_detail,
-            "sportybet_markets": sporty.get("markets", []),
-            "markets":           sporty.get("markets", []),
-            "live_data_sportybet": _sporty_live_data(sporty) or existing.get("live_data_sportybet") or {},
-            "sofascore_id":      sofa.get("id") if sofa else existing.get("sofascore_id"),
-            "sofascore_name":    sofa.get("name") if sofa else None,
-            "sofascore_event":   sofa,
-            "sofascore_detail":  detail,
-            "sofascore_detail_source": detail_source,
-            "live_data_sofascore": _sofa_live_data(detail) or existing.get("live_data_sofascore") or {},
-            "home_last_matches": (detail or {}).get("home_last_matches") or [],
-            "away_last_matches": (detail or {}).get("away_last_matches") or [],
-            "standings":         (detail or {}).get("standings") or [],
-            "league_table":      (detail or {}).get("standings") or [],
-            "season_stage":      detect_season_stage((detail or {}).get("standings") or []),
-            "web_context":       web_context,
-            "league_sentiment":  league_sentiment,
-            "match_score":       round(score, 3),
-            "match_source":      source,
-            "sofascore_match_status": match_status,
-            "sofascore_candidate_count": int(item.get("sofascore_candidate_count") or 0),
-            "sofascore_best_score": round(score, 3),
-            "sofascore_dates_scanned": _sofascore_date_candidates(sporty, item.get("match_date")),
-            "sofascore_no_match_at": None if sofa else now,
-            "sofascore_retry_after_ts": None if sofa else retry_after_ts,
-            "manual_match":      bool(existing.get("manual_match")),
-            "raw_sporty":        sporty,
-            "raw_sofascore_event": sofa.get("raw_event") if isinstance(sofa, dict) else None,
-            "time_context":      time_context,
-            "match_state":       match_state,
-            "enriched_at":       now,
-        }
-        doc["data_sources"] = _data_sources(
-            sofa or ({"id": existing.get("sofascore_id")} if existing.get("sofascore_id") else None),
-            {**(detail or {}), "live_data_sofascore": doc.get("live_data_sofascore") or {}},
-            {**sporty, "live_data_sportybet": doc.get("live_data_sportybet") or {}},
-            sportradar_detail,
+        doc = _assemble_enrichment_doc(
+            existing, sporty, item, sofa, detail, sportradar_detail,
+            web_context, league_sentiment, score, match_status,
+            now, time_context, match_state, retry_after_ts,
+            detail_source=detail_source, match_source=source,
         )
-        doc["data_source_detail"] = doc.get("data_sources") or {}
-        _track_live_data_availability(str(item.get("match_id") or ""), doc)
-
-        snapshot_odds(doc)
-        # Pipeline ownership: mirrors run_enrichment_worker above — the
-        # deterministic engine always predicts here when data allows; it no
-        # longer steps aside for the AI Prediction Queue toggle. See the long
-        # comment in run_enrichment_worker for why: dual-engine arbitration
-        # (record_prediction()/engine_arbitration.py) now reconciles the two
-        # engines' independently-graded rows by tracked win rate, so this lane
-        # just needs to flag the match for the AI queue to also weigh in.
-        try:
-            from app.scheduling.pipeline_registry import is_pipeline_enabled
-            ai_queue_enabled = is_pipeline_enabled("ai_prediction_queue")
-        except Exception:
-            ai_queue_enabled = False
-        if sofa or item.get("is_live"):
-            from app.utils.prediction_flow import apply_prediction_state
-
-            state = apply_prediction_state(
-                doc,
-                match_id=str(item.get("match_id") or ""),
-                use_llm_pipeline=False,
-                attach_brain=True,
-            )
-            readiness = state.get("readiness") or {}
-            if state.get("status") == "predicted":
-                predicted += 1
-                record_activity(
-                    f"Manual prediction completed for {sporty.get('name') or item['match_id']}",
-                    job="date_aware_enrichment",
-                    status="predicted",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                    details={"sofascore_id": doc.get("sofascore_id"), "assurance": readiness.get("assurance")},
-                )
-            elif state.get("status") == "skipped":
-                record_activity(
-                    f"Manual prediction skipped for {sporty.get('name') or item['match_id']}: {state.get('skip_reason')}",
-                    job="date_aware_enrichment",
-                    status="skipped",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                    details={"skip_reason": state.get("skip_reason"), "existing": state.get("existing")},
-                )
-            elif state.get("status") == "deferred":
-                record_activity(
-                    f"Manual prediction deferred for {sporty.get('name') or item['match_id']}: missing {', '.join(readiness.get('missing') or [])}",
-                    job="date_aware_enrichment",
-                    status="waiting",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                    details=readiness,
-                )
-            else:
-                print(f"[buffer] sequential manual prediction failed for {item['match_id']}: {state.get('error')}")
-                record_activity(
-                    f"Manual prediction failed for {sporty.get('name') or item['match_id']}: {state.get('error')}",
-                    job="date_aware_enrichment",
-                    status="error",
-                    match_id=str(item.get("match_id") or ""),
-                    match_name=sporty.get("name"),
-                )
-            if ai_queue_enabled:
-                from app.enrichment.enriched_prediction import prediction_readiness as _pred_readiness
-
-                doc["prediction_readiness"] = _pred_readiness(doc)
-                doc["ai_prediction_queue_pending"] = True
-        elif not item.get("is_live") and ai_queue_enabled:
-            from app.enrichment.enriched_prediction import prediction_readiness
-
-            doc["prediction"] = None
-            doc["prediction_error"] = None
-            doc["ai_prediction_queue_pending"] = True
-        else:
-            from app.enrichment.enriched_prediction import prediction_readiness
-
-            doc["prediction"] = None
-            readiness = prediction_readiness(doc)
-            doc["prediction_readiness"] = readiness
-            doc["prediction_error"] = (
-                "Minimum SportyBet enrichment completed; prediction deferred until a confident SofaScore match is found."
-            )
-
-        doc["lifecycle"] = _lifecycle_state(doc)
-        store_enriched(item["match_id"], doc)
+        if _finalize_enrichment_prediction(doc, item, sporty, sofa, job_tag="date_aware_enrichment"):
+            predicted += 1
         stored += 1
         processed.append({
             "sportybet_id": item["match_id"],
@@ -2631,7 +2588,6 @@ def _mark_missing_from_sporty(match_id: str) -> None:
     _init_db()
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
-        _init_buffer_table(conn)
         row = conn.execute("select raw_enriched from match_buffer where match_id = ?", (str(match_id),)).fetchone()
         if row and row[0]:
             try:
@@ -2958,7 +2914,6 @@ def _archive_finished_locally(match_id: str) -> None:
     import json as _json
     _init_db()
     with _conn() as conn:
-        _init_buffer_table(conn)
         try:
             conn.execute("alter table finished_matches add column raw_doc text")
         except Exception:
