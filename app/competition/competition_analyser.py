@@ -772,6 +772,15 @@ def job_competition_analysis() -> dict[str, Any]:
             "errors": errors,
         },
     )
+
+    # Rebuild competition stat profiles after every analysis run so the
+    # competition_intelligence signal always has fresh baseline rates.
+    stat_profile_result: dict[str, Any] = {}
+    try:
+        stat_profile_result = rebuild_competition_stat_profiles()
+    except Exception as exc:
+        logger.warning("job_competition_analysis: stat profile rebuild failed: %s", exc)
+
     return {
         "status": final_status,
         "job": "competition_analysis",
@@ -780,5 +789,319 @@ def job_competition_analysis() -> dict[str, Any]:
         "rounds_skipped": rounds_skipped,
         "rounds_deferred": rounds_deferred,
         "catchup_newly_finished": catchup_total,
+        "stat_profiles": stat_profile_result,
         "errors": errors,
     }
+
+
+# ── Competition Stat Profile Builder ─────────────────────────────────────────
+#
+# Computes per-competition structural statistics from the ``matches`` table
+# (all finished matches observed by the league-memory recorder) and writes
+# them into ``competition_stat_profiles``.
+#
+# Call this:
+#   • at the end of ``job_competition_analysis()`` (automatic, wired below)
+#   • manually: ``from app.competition.competition_analyser import
+#                   rebuild_competition_stat_profiles``
+#
+# The profile is then consumed by the ``competition_intelligence`` signal in
+# ``enriched_prediction.py`` to give each league its own baseline rates
+# instead of global defaults.
+
+def rebuild_competition_stat_profiles(
+    min_matches: int = 10,
+    competition_key: str | None = None,
+) -> dict[str, Any]:
+    """Recompute stat profiles for all (or one) competition from finished matches.
+
+    Parameters
+    ----------
+    min_matches:
+        Minimum finished matches required to write a profile row.
+        Competitions with fewer samples get skipped to avoid noisy rates.
+    competition_key:
+        When given, rebuild only that competition. Otherwise rebuild all.
+
+    Returns
+    -------
+    dict with ``profiles_written``, ``profiles_skipped``, ``competition_keys``.
+    """
+    _init_db()
+    profiles_written = 0
+    profiles_skipped = 0
+    competition_keys_done: list[str] = []
+
+    with db_conn(timeout=60) as conn:
+        conn.row_factory = sqlite3.Row
+
+        # ── 1. Discover which competitions to process ─────────────────────
+        if competition_key:
+            league_rows = conn.execute(
+                """
+                select distinct league_key, league_name
+                from matches
+                where is_finished = 1 and league_key = ?
+                """,
+                (competition_key,),
+            ).fetchall()
+        else:
+            league_rows = conn.execute(
+                """
+                select distinct league_key, league_name
+                from matches
+                where is_finished = 1
+                """
+            ).fetchall()
+
+        for league_row in league_rows:
+            lkey  = league_row["league_key"]
+            lname = league_row["league_name"] or lkey
+
+            try:
+                written = _build_one_profile(conn, lkey, lname, min_matches)
+                if written:
+                    profiles_written += 1
+                    competition_keys_done.append(lkey)
+                else:
+                    profiles_skipped += 1
+            except Exception as exc:
+                logger.warning("rebuild_competition_stat_profiles: failed for %s: %s", lkey, exc)
+                profiles_skipped += 1
+
+        conn.commit()
+
+    logger.info(
+        "rebuild_competition_stat_profiles: written=%d skipped=%d",
+        profiles_written, profiles_skipped,
+    )
+    return {
+        "status": "ok",
+        "profiles_written": profiles_written,
+        "profiles_skipped": profiles_skipped,
+        "competition_keys": competition_keys_done,
+    }
+
+
+def _build_one_profile(
+    conn: sqlite3.Connection,
+    league_key: str,
+    league_name: str,
+    min_matches: int,
+) -> bool:
+    """Compute and upsert a single competition's stat profile. Returns True if written."""
+    from app.utils.primitives import _loads, _to_int
+
+    # ── Fetch all finished matches for this competition ───────────────────
+    rows = conn.execute(
+        """
+        select final_home_goals, final_away_goals,
+               half_time_home_goals, half_time_away_goals,
+               goal_times_json
+        from matches
+        where league_key = ? and is_finished = 1
+          and final_home_goals is not null
+          and final_away_goals is not null
+        """,
+        (league_key,),
+    ).fetchall()
+
+    n = len(rows)
+    if n < min_matches:
+        return False
+
+    # ── Accumulators ──────────────────────────────────────────────────────
+    home_wins = draws = away_wins = 0
+    btts = over_15 = over_25 = over_35 = 0
+    total_goals = home_goals_sum = away_goals_sum = 0
+
+    # HT → FT transition buckets
+    # key: (ht_state, ft_state) where state is 'H', 'D', 'A'
+    ht_ft: dict[tuple[str, str], int] = {}
+
+    # Comeback counts
+    home_comebacks = away_comebacks = 0  # lost at HT, won FT
+    matches_with_ht = 0
+
+    # Late goal: goal in minute >= 80
+    late_goal_matches = 0
+    matches_with_goal_times = 0
+
+    for row in rows:
+        fh = _to_int(row["final_home_goals"])
+        fa = _to_int(row["final_away_goals"])
+        ht_h = row["half_time_home_goals"]
+        ht_a = row["half_time_away_goals"]
+        goal_times = _loads(row["goal_times_json"] or "[]", [])
+
+        # FT outcome
+        if fh > fa:
+            home_wins += 1
+        elif fa > fh:
+            away_wins += 1
+        else:
+            draws += 1
+
+        total = fh + fa
+        total_goals += total
+        home_goals_sum += fh
+        away_goals_sum += fa
+
+        if fh > 0 and fa > 0:
+            btts += 1
+        if total >= 2:
+            over_15 += 1
+        if total >= 3:
+            over_25 += 1
+        if total >= 4:
+            over_35 += 1
+
+        # HT → FT transitions (only when HT score is available)
+        if ht_h is not None and ht_a is not None:
+            matches_with_ht += 1
+            ht_h = _to_int(ht_h)
+            ht_a = _to_int(ht_a)
+            ht_state = "H" if ht_h > ht_a else "A" if ht_a > ht_h else "D"
+            ft_state = "H" if fh > fa else "A" if fa > fh else "D"
+            key = (ht_state, ft_state)
+            ht_ft[key] = ht_ft.get(key, 0) + 1
+
+            # Comebacks
+            if ht_state == "A" and ft_state == "H":
+                home_comebacks += 1
+            if ht_state == "H" and ft_state == "A":
+                away_comebacks += 1
+
+        # Late goals — goal_times_json is a list of minute values or dicts
+        if goal_times:
+            matches_with_goal_times += 1
+            had_late = False
+            for gt in goal_times:
+                minute = (
+                    _to_int(gt.get("minute") if isinstance(gt, dict) else gt)
+                )
+                if minute >= 80:
+                    had_late = True
+                    break
+            if had_late:
+                late_goal_matches += 1
+
+    def _rate(num: int, den: int) -> float | None:
+        return round(num / den, 4) if den > 0 else None
+
+    def _ht_rate(ht: str, ft: str, base: str) -> float | None:
+        """P(ft_state | ht_state): conditioned on ht_state = base."""
+        ht_base_total = sum(v for (h, _), v in ht_ft.items() if h == base)
+        return _rate(ht_ft.get((ht, ft), 0), ht_base_total)
+
+    # ── Prediction win rate for this competition ──────────────────────────
+    pred_row = conn.execute(
+        """
+        select count(*) as total,
+               sum(case when result = 'win' then 1 else 0 end) as wins
+        from prediction_history
+        where (league_name = ? or league_name like ?)
+          and graded_at is not null
+          and result in ('win', 'loss')
+          and pick_type != 'no_bet'
+        """,
+        (league_name, f"%{league_key}%"),
+    ).fetchone()
+    pred_total = _to_int(pred_row["total"] if pred_row else 0)
+    pred_wins  = _to_int(pred_row["wins"]  if pred_row else 0)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """
+        insert into competition_stat_profiles (
+            competition_key, competition_name,
+            home_win_rate, draw_rate, away_win_rate,
+            btts_rate, over_1_5_rate, over_2_5_rate, over_3_5_rate,
+            avg_goals_per_match, avg_home_goals, avg_away_goals,
+            ht_home_win_to_ft_win, ht_draw_to_ft_home_win, ht_draw_to_ft_draw,
+            ht_draw_to_ft_away_win, ht_away_win_to_ft_win,
+            home_comeback_rate, away_comeback_rate, late_goal_rate,
+            prediction_win_rate, prediction_samples,
+            sample_size, last_computed
+        ) values (
+            :key, :name,
+            :home_win_rate, :draw_rate, :away_win_rate,
+            :btts_rate, :over_1_5_rate, :over_2_5_rate, :over_3_5_rate,
+            :avg_goals_per_match, :avg_home_goals, :avg_away_goals,
+            :ht_home_win_to_ft_win, :ht_draw_to_ft_home_win, :ht_draw_to_ft_draw,
+            :ht_draw_to_ft_away_win, :ht_away_win_to_ft_win,
+            :home_comeback_rate, :away_comeback_rate, :late_goal_rate,
+            :prediction_win_rate, :prediction_samples,
+            :sample_size, :last_computed
+        )
+        on conflict(competition_key) do update set
+            competition_name        = excluded.competition_name,
+            home_win_rate           = excluded.home_win_rate,
+            draw_rate               = excluded.draw_rate,
+            away_win_rate           = excluded.away_win_rate,
+            btts_rate               = excluded.btts_rate,
+            over_1_5_rate           = excluded.over_1_5_rate,
+            over_2_5_rate           = excluded.over_2_5_rate,
+            over_3_5_rate           = excluded.over_3_5_rate,
+            avg_goals_per_match     = excluded.avg_goals_per_match,
+            avg_home_goals          = excluded.avg_home_goals,
+            avg_away_goals          = excluded.avg_away_goals,
+            ht_home_win_to_ft_win   = excluded.ht_home_win_to_ft_win,
+            ht_draw_to_ft_home_win  = excluded.ht_draw_to_ft_home_win,
+            ht_draw_to_ft_draw      = excluded.ht_draw_to_ft_draw,
+            ht_draw_to_ft_away_win  = excluded.ht_draw_to_ft_away_win,
+            ht_away_win_to_ft_win   = excluded.ht_away_win_to_ft_win,
+            home_comeback_rate      = excluded.home_comeback_rate,
+            away_comeback_rate      = excluded.away_comeback_rate,
+            late_goal_rate          = excluded.late_goal_rate,
+            prediction_win_rate     = excluded.prediction_win_rate,
+            prediction_samples      = excluded.prediction_samples,
+            sample_size             = excluded.sample_size,
+            last_computed           = excluded.last_computed
+        """,
+        {
+            "key":   league_key,
+            "name":  league_name,
+            "home_win_rate":           _rate(home_wins, n),
+            "draw_rate":               _rate(draws, n),
+            "away_win_rate":           _rate(away_wins, n),
+            "btts_rate":               _rate(btts, n),
+            "over_1_5_rate":           _rate(over_15, n),
+            "over_2_5_rate":           _rate(over_25, n),
+            "over_3_5_rate":           _rate(over_35, n),
+            "avg_goals_per_match":     round(total_goals / n, 4) if n else None,
+            "avg_home_goals":          round(home_goals_sum / n, 4) if n else None,
+            "avg_away_goals":          round(away_goals_sum / n, 4) if n else None,
+            # HT → FT hold / swing rates
+            "ht_home_win_to_ft_win":   _ht_rate("H", "H", "H"),
+            "ht_draw_to_ft_home_win":  _ht_rate("D", "H", "D"),
+            "ht_draw_to_ft_draw":      _ht_rate("D", "D", "D"),
+            "ht_draw_to_ft_away_win":  _ht_rate("D", "A", "D"),
+            "ht_away_win_to_ft_win":   _ht_rate("A", "A", "A"),
+            # Comebacks (conditioned on matches that had a HT score)
+            "home_comeback_rate":      _rate(home_comebacks, matches_with_ht),
+            "away_comeback_rate":      _rate(away_comebacks, matches_with_ht),
+            # Late goals (conditioned on matches that had goal-time data)
+            "late_goal_rate":          _rate(late_goal_matches, matches_with_goal_times),
+            # Prediction quality
+            "prediction_win_rate":     _rate(pred_wins, pred_total),
+            "prediction_samples":      pred_total,
+            # Coverage
+            "sample_size":             n,
+            "last_computed":           now,
+        },
+    )
+    return True
+
+
+def get_competition_stat_profile(competition_key: str) -> dict[str, Any] | None:
+    """Return the latest stat profile for a competition, or None if not yet built."""
+    _init_db()
+    with db_conn(timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "select * from competition_stat_profiles where competition_key = ?",
+            (competition_key,),
+        ).fetchone()
+    return dict(row) if row else None

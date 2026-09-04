@@ -374,6 +374,26 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
             primary key (dimension, band)
         )
     """)
+    # ── stat-signal correlation table ─────────────────────────────────────────
+    # Tracks win-rate for each (signal, stat_bucket, pick_type) combination,
+    # e.g. "when league_position_edge fires in a match where home_xg >> away_xg,
+    # what is the win rate vs when home_xg ≈ away_xg?"  Closes the loop
+    # between match statistics and signal weight learning.
+    conn.execute("""
+        create table if not exists signal_stat_correlations (
+            signal_name  text not null,
+            stat_name    text not null,
+            stat_bucket  text not null,
+            pick_type    text not null default '__all__',
+            selection    text not null default '__all__',
+            samples      integer not null default 0,
+            wins         integer not null default 0,
+            losses       integer not null default 0,
+            win_rate     real,
+            updated_at   text not null default current_timestamp,
+            primary key (signal_name, stat_name, stat_bucket, pick_type, selection)
+        )
+    """)
 
 
 # ── Main learning cycle ───────────────────────────────────────────────────────
@@ -706,6 +726,7 @@ def run_learning_cycle() -> dict[str, Any]:
         context_penalty_updates = _learn_context_penalties(conn, rows)
         drift_events = _detect_and_handle_drift(conn, rows)
         signal_outcome_backfills = _backfill_signal_outcomes(conn, rows)
+        stat_correlation_updates = _learn_stat_signal_correlations(conn, rows)
 
         # ── Prune stale rows after all writes succeed ────────────────────────
         # Any signal/league/model that was in the DB from a previous cycle but
@@ -764,7 +785,8 @@ def run_learning_cycle() -> dict[str, Any]:
         f"{slip_risk_updates} slip-risk bands | "
         f"{pref_updates} tournament preferences | "
         f"{drift_events} drift events | "
-        f"{risk_buckets} risk-control buckets"
+        f"{risk_buckets} risk-control buckets | "
+        f"{stat_correlation_updates} stat-signal correlations"
     )
     return {
         "status": "ok",
@@ -784,6 +806,7 @@ def run_learning_cycle() -> dict[str, Any]:
         "league_outcome_distribution_updates": outcome_distribution_updates,
         "context_penalty_updates": context_penalty_updates,
         "signal_outcome_backfills": signal_outcome_backfills,
+        "stat_correlation_updates": stat_correlation_updates,
         "risk_control_buckets": risk_buckets,
     }
 
@@ -2358,3 +2381,242 @@ def _grade_specialists_from_history(rows: list) -> int:
     except Exception:
         pass
     return credited
+
+
+# ── Stat-signal correlation learning ─────────────────────────────────────────
+#
+# Closes the loop between live match statistics and signal weight learning.
+#
+# For every graded prediction, if the corresponding finished match has
+# live_statistics_json (xG, shots-on-target, possession, big chances, etc.),
+# we bucket each stat into "home_dominant / even / away_dominant" and tally
+# wins/losses for each (signal_name, stat_bucket, pick_type) combination.
+#
+# This answers: "signal X fires in matches where home_xg >> away_xg — do
+# those picks actually win, vs when the stats are level?"
+#
+# Results go to `signal_stat_correlations`, queryable for dashboard audits
+# and readable by enriched_prediction.py::_competition_intelligence_signal.
+
+# Stat bucket thresholds: home fraction of total stat value
+_STAT_BUCKET_THRESHOLDS = {
+    # home share > HIGH  → home_dominant
+    # home share < LOW   → away_dominant
+    # otherwise          → even
+    "xg":                 (0.60, 0.40),
+    "shots_on_target":    (0.60, 0.40),
+    "big_chances":        (0.65, 0.35),
+    "ball_possession":    (0.57, 0.43),
+    "total_shots":        (0.60, 0.40),
+    "dangerous_attacks":  (0.60, 0.40),
+}
+
+# Minimum samples before writing a row for a (signal, stat, bucket) triple
+_MIN_STAT_CORR_SAMPLES = 8
+
+
+def _stat_bucket(stat_key: str, home_val: float, away_val: float) -> str | None:
+    """Classify a stat value pair into home_dominant / even / away_dominant."""
+    total = home_val + away_val
+    if total <= 0:
+        return None
+    high, low = _STAT_BUCKET_THRESHOLDS.get(stat_key, (0.60, 0.40))
+    share = home_val / total
+    if share >= high:
+        return "home_dominant"
+    if share <= low:
+        return "away_dominant"
+    return "even"
+
+
+def _learn_stat_signal_correlations(conn: sqlite3.Connection, rows: list) -> int:
+    """Learn win rates per (signal, live-stat-bucket, pick_type) from graded predictions.
+
+    Joins the prediction history rows against the ``matches`` table to pull
+    live_statistics_json, then for every graded row that has both signals and
+    live stats, accumulates wins/losses in ``signal_stat_correlations``.
+
+    The table tells us: "when signal X fires in a match where home xG is
+    dominant, what fraction of those picks win?" — giving the system a
+    stat-aware signal quality measure that goes beyond raw win/loss rate.
+
+    Safe to call on repeated learning cycles — uses ON CONFLICT DO UPDATE.
+    Returns the count of (signal, stat_bucket, pick_type) rows written.
+    """
+    if not rows:
+        return 0
+
+    # ── 1. Batch-load match stats (one query) ─────────────────────────────
+    match_ids = list({str(row["match_id"] or "") for row in rows if row["match_id"]})
+    if not match_ids:
+        return 0
+
+    live_stats_by_match: dict[str, dict] = {}
+    _BATCH = 500
+    for i in range(0, len(match_ids), _BATCH):
+        chunk = match_ids[i : i + _BATCH]
+        placeholders = ",".join("?" * len(chunk))
+        stat_rows = conn.execute(
+            f"select match_id, live_statistics_json from matches where match_id in ({placeholders})",
+            chunk,
+        ).fetchall()
+        for sr in stat_rows:
+            raw = sr[1] if not hasattr(sr, "keys") else sr["live_statistics_json"]
+            mid = sr[0] if not hasattr(sr, "keys") else sr["match_id"]
+            if not raw:
+                continue
+            try:
+                import json as _json
+                parsed = _json.loads(raw)
+                if parsed and isinstance(parsed, dict) and parsed.get("summary"):
+                    live_stats_by_match[mid] = parsed
+            except Exception:
+                pass
+
+    if not live_stats_by_match:
+        return 0
+
+    # ── 2. Accumulate (signal, stat_name, stat_bucket, pick_type, selection) ─
+    # key: (signal_name, stat_name, stat_bucket, pick_type, selection)
+    stats: dict[tuple[str, str, str, str, str], dict[str, int]] = {}
+
+    for row in rows:
+        match_id  = str(row["match_id"] or "")
+        live_stats = live_stats_by_match.get(match_id)
+        if not live_stats:
+            continue  # no live stats for this match — skip
+
+        pick_type = str(row["pick_type"] or "unknown")
+        selection = str(row["selection"] or "unknown")
+        result    = row["result"]  # "win" or "loss"
+
+        summary = live_stats.get("summary", {})
+        signals = _decision_signals_for_row(row)
+        if not signals:
+            continue
+
+        # Compute all stat buckets for this match
+        match_buckets: dict[str, str] = {}
+        for stat_key in _STAT_BUCKET_THRESHOLDS:
+            stat = summary.get(stat_key, {})
+            try:
+                hv = float((stat.get("home") if isinstance(stat, dict) else None) or 0)
+                av = float((stat.get("away") if isinstance(stat, dict) else None) or 0)
+            except (TypeError, ValueError):
+                continue
+            bucket = _stat_bucket(stat_key, hv, av)
+            if bucket:
+                match_buckets[stat_key] = bucket
+
+        if not match_buckets:
+            continue  # no useful stats in this match
+
+        # For each signal × stat × bucket, tally the result
+        for signal in signals:
+            sig_name = str(signal.get("name") or "")
+            if not sig_name:
+                continue
+            for stat_key, bucket in match_buckets.items():
+                for pt_key in ("__all__", pick_type):
+                    sel_key = "__all__" if pt_key == "__all__" else selection
+                    k = (sig_name, stat_key, bucket, pt_key, sel_key)
+                    if k not in stats:
+                        stats[k] = {"samples": 0, "wins": 0, "losses": 0}
+                    stats[k]["samples"] += 1
+                    if result == "win":
+                        stats[k]["wins"] += 1
+                    else:
+                        stats[k]["losses"] += 1
+
+    if not stats:
+        return 0
+
+    # ── 3. Write to DB ────────────────────────────────────────────────────
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    for (sig_name, stat_name, stat_bucket, pt_key, sel_key), s in stats.items():
+        if s["samples"] < _MIN_STAT_CORR_SAMPLES:
+            continue
+        wr = round(s["wins"] / s["samples"], 4) if s["samples"] > 0 else None
+        conn.execute(
+            """
+            insert into signal_stat_correlations
+                (signal_name, stat_name, stat_bucket, pick_type, selection,
+                 samples, wins, losses, win_rate, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(signal_name, stat_name, stat_bucket, pick_type, selection)
+            do update set
+                samples    = excluded.samples,
+                wins       = excluded.wins,
+                losses     = excluded.losses,
+                win_rate   = excluded.win_rate,
+                updated_at = excluded.updated_at
+            """,
+            (sig_name, stat_name, stat_bucket, pt_key, sel_key,
+             s["samples"], s["wins"], s["losses"], wr, now),
+        )
+        written += 1
+
+    return written
+
+
+def get_stat_signal_correlations(
+    signal_name: str | None = None,
+    pick_type: str | None = None,
+    min_samples: int = _MIN_STAT_CORR_SAMPLES,
+) -> list[dict]:
+    """Read back signal-stat correlations.
+
+    Useful for dashboards and for enriched_prediction.py to ask:
+    "Given the live stats of this match, which signals are historically
+    reliable here vs which typically under-perform in this stat profile?"
+
+    Parameters
+    ----------
+    signal_name : filter to one signal, or None for all.
+    pick_type   : filter to one market, or None for all.
+    min_samples : minimum sample threshold (default: _MIN_STAT_CORR_SAMPLES).
+    """
+    _init_db()
+    with db_conn(timeout=15) as conn:
+        _init_learner_tables(conn)
+        conn.row_factory = sqlite3.Row
+        filters = ["samples >= ?"]
+        params: list = [min_samples]
+        if signal_name:
+            filters.append("signal_name = ?")
+            params.append(signal_name)
+        if pick_type:
+            filters.append("pick_type in (?, '__all__')")
+            params.append(pick_type)
+        where = " and ".join(filters)
+        rows = conn.execute(
+            f"""
+            select signal_name, stat_name, stat_bucket, pick_type, selection,
+                   samples, wins, losses, win_rate, updated_at
+            from signal_stat_correlations
+            where {where}
+            order by signal_name, stat_name, stat_bucket, win_rate desc
+            """,
+            params,
+        ).fetchall()
+    return [
+        {
+            "signal_name":  r["signal_name"],
+            "stat_name":    r["stat_name"],
+            "stat_bucket":  r["stat_bucket"],
+            "pick_type":    r["pick_type"],
+            "selection":    r["selection"],
+            "samples":      r["samples"],
+            "wins":         r["wins"],
+            "losses":       r["losses"],
+            "win_rate":     round(float(r["win_rate"] or 0) * 100, 1),
+            "verdict":      (
+                "reliable"   if (r["win_rate"] or 0) >= 0.60
+                else "risky" if (r["win_rate"] or 0) <= 0.40
+                else "neutral"
+            ),
+            "updated_at":   r["updated_at"],
+        }
+        for r in rows
+    ]

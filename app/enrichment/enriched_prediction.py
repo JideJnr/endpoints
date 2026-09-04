@@ -382,7 +382,26 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                     else:
                         elo = {"error": str(exc)}
 
-    best_pick = (rules.get("picks") or [{}])[0]
+    # ── Rules pick extraction for ensemble ───────────────────────────────────
+    # The rules picks list is sorted by confidence (highest first). When the
+    # top pick is a goals/BTTS/live pick its selection string won't contain
+    # "home", "away", or "draw", so ensemble_prediction's string check falls
+    # through and the rules model contributes zero to the blend — even when
+    # every directional signal clearly points one way.
+    #
+    # Fix: prefer the highest-confidence MATCH_RESULT pick for the ensemble
+    # rules slot. Fall back to the top pick only if no match_result pick exists.
+    # This makes the signals' directional opinion actually reach the blend
+    # instead of being silently overridden by a goals pick.
+    all_rules_picks = rules.get("picks") or [{}]
+    _match_result_picks = [
+        p for p in all_rules_picks
+        if str(p.get("type") or p.get("pick_type") or "").lower() == "match_result"
+        and any(kw in str(p.get("selection") or p.get("pick") or "").lower()
+                for kw in ("home", "away", "draw"))
+    ]
+    best_pick = _match_result_picks[0] if _match_result_picks else all_rules_picks[0]
+
     # Computed here (rather than only later, where the signals list is
     # built) so the same competition-intelligence edge that feeds the
     # deterministic signals list also reaches the ensemble blend itself --

@@ -135,6 +135,122 @@ def _ensure_specialist_performance_table(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_specialist_performance_scope on specialist_performance(league_key, pick_type, samples)")
 
 
+def _ensure_prediction_loss_analysis_table(conn: sqlite3.Connection) -> None:
+    """Per-loss audit table: tags every graded loss with its dominance profile
+    and a loss-type taxonomy so post-mortems can distinguish 'correct read,
+    unlucky result' from 'we called the wrong side entirely'.
+    """
+    conn.execute("""
+        create table if not exists prediction_loss_analysis (
+            id                  integer primary key autoincrement,
+            prediction_id       integer,
+            match_id            text not null,
+            league_name         text,
+            country_name        text,
+            pick_type           text,
+            selection           text,
+            confidence          integer,
+            final_home          integer,
+            final_away          integer,
+            -- Statistical dominance at full time
+            dominant_side       text,
+            dominance_gap       real,
+            dominance_confidence text,
+            dominance_basis     text,
+            stats_used_json     text not null default '[]',
+            home_stat_score     real,
+            away_stat_score     real,
+            -- Per-stat raw values for deep inspection
+            home_xg             real,
+            away_xg             real,
+            home_shots_on_target integer,
+            away_shots_on_target integer,
+            home_possession     real,
+            away_possession     real,
+            home_big_chances    integer,
+            away_big_chances    integer,
+            -- Outcome classification
+            actual_winner       text,
+            better_side_won     integer,
+            stat_contradiction  integer not null default 0,
+            loss_type           text,
+            -- loss_type taxonomy:
+            --   'dominant_team_lost'   – we called the stat-dominant side, they lost anyway
+            --   'called_wrong_side'    – we called the weaker stat side
+            --   'stat_blind'           – no live stats available to assess
+            --   'low_confidence_miss'  – confidence < 60, probably a marginal pick
+            --   'overconfident_miss'   – confidence >= 75 and we were wrong
+            --   'correct_stat_wrong_result' – stats were even but pick lost
+            model_disagreement  integer not null default 0,
+            diversity_score     integer,
+            signals_json        text not null default '[]',
+            audit_json          text not null default '{}',
+            recorded_at         text not null default current_timestamp,
+            unique (match_id, pick_type, selection)
+        )
+    """)
+    conn.execute(
+        "create index if not exists idx_loss_analysis_match "
+        "on prediction_loss_analysis(match_id)"
+    )
+    conn.execute(
+        "create index if not exists idx_loss_analysis_scope "
+        "on prediction_loss_analysis(league_name, country_name, pick_type, loss_type)"
+    )
+    conn.execute(
+        "create index if not exists idx_loss_analysis_contradiction "
+        "on prediction_loss_analysis(stat_contradiction, dominance_confidence)"
+    )
+    conn.execute(
+        "create index if not exists idx_loss_analysis_recorded "
+        "on prediction_loss_analysis(recorded_at)"
+    )
+
+
+def _ensure_competition_stat_profiles_table(conn: sqlite3.Connection) -> None:
+    """Per-competition structural statistics learned from finished matches.
+    Powers the competition_intelligence signal with real baseline rates
+    instead of just standings/form.
+    """
+    conn.execute("""
+        create table if not exists competition_stat_profiles (
+            competition_key         text primary key,
+            competition_name        text,
+            -- Outcome base rates (from finished matches in this competition)
+            home_win_rate           real,
+            draw_rate               real,
+            away_win_rate           real,
+            btts_rate               real,
+            over_1_5_rate           real,
+            over_2_5_rate           real,
+            over_3_5_rate           real,
+            avg_goals_per_match     real,
+            avg_home_goals          real,
+            avg_away_goals          real,
+            -- HT → FT transition rates
+            ht_home_win_to_ft_win   real,  -- home winning at HT → win FT  (hold rate)
+            ht_draw_to_ft_home_win  real,
+            ht_draw_to_ft_draw      real,
+            ht_draw_to_ft_away_win  real,
+            ht_away_win_to_ft_win   real,  -- away winning at HT → win FT  (hold rate)
+            -- Comeback & late-goal patterns
+            home_comeback_rate      real,  -- lost at HT, won FT
+            away_comeback_rate      real,
+            late_goal_rate          real,  -- % matches with a goal in 80'+
+            -- Prediction quality in this competition
+            prediction_win_rate     real,
+            prediction_samples      integer not null default 0,
+            -- Coverage
+            sample_size             integer not null default 0,
+            last_computed           text not null default current_timestamp
+        )
+    """)
+    conn.execute(
+        "create index if not exists idx_comp_stat_profiles_key "
+        "on competition_stat_profiles(competition_key)"
+    )
+
+
 
 
 # Backward-compatible underscore alias
@@ -838,6 +954,8 @@ def _init_db_unlocked() -> None:
             )
         """)
         _ensure_specialist_performance_table(conn)
+        _ensure_prediction_loss_analysis_table(conn)
+        _ensure_competition_stat_profiles_table(conn)
         conn.commit()
 
 
@@ -857,6 +975,8 @@ def _init_db() -> None:
                 _ensure_match_fact_columns(conn)
                 _ensure_signal_combination_outcomes_table(conn)
                 _ensure_specialist_performance_table(conn)
+                _ensure_prediction_loss_analysis_table(conn)
+                _ensure_competition_stat_profiles_table(conn)
             _DB_SCHEMA_READY = True
             return
         try:

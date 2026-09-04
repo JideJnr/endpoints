@@ -258,3 +258,123 @@ def _goal_minute_value(goal: dict[str, Any]) -> float:
     return _to_int(goal.get("minute"), 0) + (_to_int(goal.get("added_time"), 0) / 100)
 
 
+# ── Statistical dominance ─────────────────────────────────────────────────────
+
+# Stat weights: higher = more diagnostic of who "should" win
+_DOMINANCE_STAT_WEIGHTS: dict[str, float] = {
+    "xg":                 3.0,
+    "big_chances":        2.5,
+    "shots_on_target":    2.0,
+    "dangerous_attacks":  1.2,
+    "total_shots":        0.8,
+    "ball_possession":    0.7,
+    "attacks":            0.5,
+}
+
+
+def compute_statistical_dominance(
+    live_statistics: dict[str, Any],
+    final_home: int | None,
+    final_away: int | None,
+) -> dict[str, Any]:
+    """Determine which side dominated statistically and whether that side won.
+
+    Parameters
+    ----------
+    live_statistics:
+        The normalised live_statistics dict produced by
+        ``normalize_live_statistics`` (keys: "summary", "periods", "source").
+        Accepts an empty dict gracefully.
+    final_home / final_away:
+        Final score integers. Pass ``None`` when the match is not yet finished;
+        the function will still return dominance info but ``better_side_won``
+        will be ``None``.
+
+    Returns
+    -------
+    dict with:
+    - ``dominant_side``          – "home" | "away" | "even" | None
+    - ``dominance_gap``          – weighted score gap (0.0+ means home ahead)
+    - ``dominance_confidence``   – "high" | "moderate" | "marginal" | "none"
+    - ``dominance_basis``        – which stats were available, or "no_stats"
+    - ``stat_scores``            – raw per-side weighted scores
+    - ``stats_used``             – list of stat keys that contributed
+    - ``actual_winner``          – "home" | "away" | "draw" | None
+    - ``better_side_won``        – True | False | None (None = not finished)
+    - ``stat_contradiction``     – True when dominant side LOST (clear upset)
+    """
+    summary: dict[str, Any] = (live_statistics or {}).get("summary", {})
+    home_score = 0.0
+    away_score = 0.0
+    stats_used: list[str] = []
+
+    for stat_key, weight in _DOMINANCE_STAT_WEIGHTS.items():
+        stat = summary.get(stat_key)
+        if not stat:
+            continue
+        try:
+            home_val = float(stat.get("home") or 0)
+            away_val = float(stat.get("away") or 0)
+        except (TypeError, ValueError):
+            continue
+        total = home_val + away_val
+        if total <= 0:
+            continue
+        home_score += (home_val / total) * weight
+        away_score += (away_val / total) * weight
+        stats_used.append(stat_key)
+
+    if not stats_used:
+        return {
+            "dominant_side": None,
+            "dominance_gap": 0.0,
+            "dominance_confidence": "none",
+            "dominance_basis": "no_stats",
+            "stat_scores": {"home": 0.0, "away": 0.0},
+            "stats_used": [],
+            "actual_winner": _actual_winner(final_home, final_away),
+            "better_side_won": None,
+            "stat_contradiction": False,
+        }
+
+    gap = home_score - away_score
+    abs_gap = abs(gap)
+    dominant = "home" if gap > 0.15 else "away" if gap < -0.15 else "even"
+    confidence = (
+        "high" if abs_gap >= 0.5
+        else "moderate" if abs_gap >= 0.25
+        else "marginal" if abs_gap >= 0.15
+        else "none"
+    )
+
+    actual = _actual_winner(final_home, final_away)
+    better_side_won: bool | None = None
+    stat_contradiction = False
+    if actual is not None and dominant not in ("even", None):
+        better_side_won = dominant == actual
+        stat_contradiction = not better_side_won and confidence in ("high", "moderate")
+
+    return {
+        "dominant_side": dominant,
+        "dominance_gap": round(gap, 4),
+        "dominance_confidence": confidence,
+        "dominance_basis": "weighted_stats",
+        "stat_scores": {"home": round(home_score, 4), "away": round(away_score, 4)},
+        "stats_used": stats_used,
+        "actual_winner": actual,
+        "better_side_won": better_side_won,
+        "stat_contradiction": stat_contradiction,
+    }
+
+
+def _actual_winner(final_home: int | None, final_away: int | None) -> str | None:
+    """Return 'home', 'away', 'draw', or None when score is unavailable."""
+    if final_home is None or final_away is None:
+        return None
+    if final_home > final_away:
+        return "home"
+    if final_away > final_home:
+        return "away"
+    return "draw"
+
+

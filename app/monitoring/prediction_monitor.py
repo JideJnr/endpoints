@@ -13,6 +13,7 @@ from app.storage.league_memory import _init_db, get_grading_metrics, grade_betbu
 
 from app.utils.doc_helpers import _safe_call
 from app.utils.primitives import _loads
+from app.monitoring.post_result_auditor import run_post_result_audit
 
 SNAPSHOT_KEEP_ROWS = 1000
 
@@ -35,6 +36,7 @@ def run_prediction_monitor(*, auto_correct: bool = True) -> dict[str, Any]:
         errors,
     )
     betbuilder = _safe_call("grade_betbuilder_history", lambda: grade_betbuilder_history(limit=500), errors)
+    loss_audit = _safe_call("post_result_audit", lambda: run_post_result_audit(limit=500), errors)
     metrics = _safe_call("get_grading_metrics", get_grading_metrics, errors)
     trend = _safe_call("performance_trend", _performance_trend, errors)
     mismatches = _safe_call("mismatch_report", _mismatch_report, errors)
@@ -74,6 +76,7 @@ def run_prediction_monitor(*, auto_correct: bool = True) -> dict[str, Any]:
         "duration_seconds": round(time.time() - started, 2),
         "grading": grading,
         "betbuilder": betbuilder,
+        "loss_audit": loss_audit,
         "metrics": metrics,
         "trend": trend,
         "mismatches": mismatches,
@@ -410,6 +413,12 @@ def _persist_monitor_snapshot(result: dict[str, Any]) -> None:
         _init_db()
         with db_conn(timeout=20) as conn:
             _init_monitor_table(conn)
+            # Merge loss_audit into the mismatches blob so the extra data
+            # survives to the dashboard without a schema change.
+            mismatches_payload = dict(result.get("mismatches") or {})
+            loss_audit = result.get("loss_audit")
+            if loss_audit:
+                mismatches_payload["loss_audit"] = loss_audit
             conn.execute(
                 """
                 insert into prediction_monitor_snapshots (
@@ -423,7 +432,7 @@ def _persist_monitor_snapshot(result: dict[str, Any]) -> None:
                     result.get("duration_seconds"),
                     json.dumps(result.get("metrics") or {}, default=str),
                     json.dumps(result.get("trend") or {}, default=str),
-                    json.dumps(result.get("mismatches") or {}, default=str),
+                    json.dumps(mismatches_payload, default=str),
                     json.dumps(result.get("pipeline") or {}, default=str),
                     json.dumps(result.get("corrections") or [], default=str),
                     json.dumps(result.get("errors") or [], default=str),
