@@ -93,17 +93,13 @@ def classify_market_intent(
         intent, direction = _double_chance_intent(sel)
         return _intent("double_chance", "double_chance", intent, direction, line, selection)
 
-    if kind in {"match_result", "ensemble_1x2"} or _is_1x2(sel):
+    # A value pick can still be a conventional 1X2 selection (often a team
+    # display name rather than the literal word "home"/"away"). Preserve
+    # that market meaning so the grader can resolve the team against the
+    # match name instead of marking a perfectly valid result as void.
+    if kind in {"match_result", "ensemble_1x2", "value_bet", "market_value", "consensus_longshot_value"} or _is_1x2(sel):
         side = _side_from_text(sel)
         return _intent("outcome", "1x2", f"{side or 'unknown'}_win", side, line, selection)
-
-    if kind in {"value_bet", "market_value", "consensus_longshot_value"}:
-        inferred = classify_market_intent("", selection, {})
-        return {
-            **inferred,
-            "signal_family": "longshot_value" if kind == "consensus_longshot_value" else "market_value",
-            "source_pick_type": kind,
-        }
 
     return _intent(kind or "other", kind or "other", sel or "unknown", None, line, selection)
 

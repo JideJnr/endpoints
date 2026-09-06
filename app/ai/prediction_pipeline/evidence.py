@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from app.storage.db import db_conn
@@ -109,9 +110,23 @@ def sort_gate(matches: list[dict]) -> list[dict]:
 
 def _apply_recency_decay(h2h_matches: list[dict]) -> list[dict]:
     result = []
+    now = datetime.now(timezone.utc)
     for index, match in enumerate(h2h_matches):
         m = dict(match) if isinstance(match, dict) else {}
-        m["weight"] = 1.0 if index < 2 else 0.6 if index < 5 else 0.3
+        stamp = m.get("start_timestamp") or m.get("startTimestamp") or m.get("start_time")
+        try:
+            value = float(stamp)
+            if value > 1e12:
+                value /= 1000
+            age_days = max(0, (now - datetime.fromtimestamp(value, tz=timezone.utc)).days)
+        except (TypeError, ValueError, OSError):
+            age_days = None
+        # Unknown dates retain only weak descriptive weight. Meetings older
+        # than three years are excluded from an analytical H2H conclusion.
+        if age_days is not None and age_days > 1095:
+            continue
+        date_weight = 0.15 if age_days is None else max(0.10, 1.0 - age_days / 730)
+        m["weight"] = date_weight * (1.0 if index < 3 else 0.75)
         result.append(m)
     return result
 
@@ -181,6 +196,30 @@ def _step_h2h(doc: dict, model: str, timeout: int = 20) -> str:
         return H2H_FALLBACK
 
 
+def _opponents_from_last_matches(events: list[dict], team_name: str) -> set[str]:
+    """Extract opponent names from a home_last_matches / away_last_matches array.
+
+    Handles both raw SofaScore API shape (homeTeam/awayTeam) and the pre-parsed
+    shape produced by _parse_event (home_team/away_team dicts with a "name" key).
+    Only finished events are considered.
+    """
+    opponents: set[str] = set()
+    for ev in events:
+        status = (ev.get("status") or {}).get("type", "")
+        if status not in ("finished", "ended"):
+            continue
+        ht = ev.get("homeTeam") or ev.get("home_team") or {}
+        at = ev.get("awayTeam") or ev.get("away_team") or {}
+        hn = (ht.get("name", "") if isinstance(ht, dict) else str(ht)).lower()
+        an = (at.get("name", "") if isinstance(at, dict) else str(at)).lower()
+        tl = team_name.lower()
+        if hn == tl and an:
+            opponents.add(an)
+        elif an == tl and hn:
+            opponents.add(hn)
+    return opponents
+
+
 def _step_common_opponent(doc: dict, model: str, timeout: int = 20) -> str:
     try:
         home, away = _teams(doc)
@@ -194,6 +233,17 @@ def _step_common_opponent(doc: dict, model: str, timeout: int = 20) -> str:
             if str(h).lower() == home.lower(): opponents.add(str(a).lower())
             if str(a).lower() == home.lower(): opponents.add(str(h).lower())
         away_opponents = {str(a).lower() for h, a, *_ in rows if str(h).lower() == away.lower()} | {str(h).lower() for h, a, *_ in rows if str(a).lower() == away.lower()}
+
+        # Fallback: SQLite only contains live-observed matches, so new or rarely-tracked
+        # teams have no rows. Use the SofaScore last_matches arrays already in the doc
+        # (fetched during enrichment) to extract opponents when the DB yields nothing.
+        if not opponents:
+            home_events = doc.get("home_last_matches") or (doc.get("sofascore_detail") or {}).get("home_last_matches") or []
+            opponents = _opponents_from_last_matches(home_events, home)
+        if not away_opponents:
+            away_events = doc.get("away_last_matches") or (doc.get("sofascore_detail") or {}).get("away_last_matches") or []
+            away_opponents = _opponents_from_last_matches(away_events, away)
+
         common = sorted(opponents & away_opponents)
         if not common: return COMMON_FALLBACK
         evidence = f"Both teams have faced common recent opponents: {', '.join(common[:5])}."
@@ -286,7 +336,11 @@ def _step_odds(doc: dict, model: str, timeout: int = 20) -> str:
         if not match_id: return ODDS_FALLBACK
         from app.ai.agent_tools import get_odds_movement
         data = get_odds_movement(match_id) or {}
-        if not data: return ODDS_FALLBACK
+        # data is always a non-empty dict (even with 0 snapshots it contains
+        # keys like "snapshots", "movement", "markets"), so `if not data` never
+        # fires. Check movement explicitly — null means only 1 snapshot was
+        # captured, which carries no signal worth sending to the LLM.
+        if not data or data.get("movement") is None: return ODDS_FALLBACK
         evidence = f"Odds movement: {json.dumps(data, default=str)[:350]}"
         return _call_llm(model, f"State the market signal in one cautious sentence: {evidence}", timeout) or evidence
     except Exception as exc:
@@ -384,7 +438,18 @@ def _team_history_summary(team_name: str, matches: list[dict[str, Any]]) -> str:
 
 def _parse_sofa_last_matches(events: list[dict], team_name: str) -> list[dict[str, Any]]:
     """Convert SofaScore home_last_matches / away_last_matches events to the
-    same normalised format that _team_history_summary expects."""
+    same normalised format that _team_history_summary expects.
+
+    Events may arrive in two shapes:
+      - Raw SofaScore API format: homeScore/awayScore dicts with a "current" key,
+        homeTeam/awayTeam dicts.
+      - Pre-parsed format (output of _parse_event in sofascore_client.py): the
+        score is stored as {"home": N, "away": N} under the "score" key, team
+        names under "home_team"/"away_team" dicts, and status under
+        {"type": "finished", ...}. Trying to read homeScore/awayScore from these
+        events returns None, causing int(None) → TypeError → every event silently
+        dropped. This function handles both shapes.
+    """
     result: list[dict[str, Any]] = []
     for ev in events:
         status = (ev.get("status") or {}).get("type", "")
@@ -394,11 +459,19 @@ def _parse_sofa_last_matches(events: list[dict], team_name: str) -> list[dict[st
         at = ev.get("awayTeam") or ev.get("away_team") or {}
         hn = ht.get("name", "") if isinstance(ht, dict) else str(ht)
         an = at.get("name", "") if isinstance(at, dict) else str(at)
+        # Support both raw API shape (homeScore.current) and pre-parsed shape (score.home)
+        score_dict = ev.get("score") or {}
         hsc = ev.get("homeScore") or {}
         asc = ev.get("awayScore") or {}
         try:
-            hg = int(hsc.get("current") if isinstance(hsc, dict) else hsc)
-            ag = int(asc.get("current") if isinstance(asc, dict) else asc)
+            if score_dict and score_dict.get("home") is not None:
+                # Pre-parsed via _parse_event: score = {"home": N, "away": N}
+                hg = int(score_dict["home"])
+                ag = int(score_dict["away"])
+            else:
+                # Raw SofaScore API shape: homeScore = {"current": N, ...}
+                hg = int(hsc.get("current") if isinstance(hsc, dict) else hsc)
+                ag = int(asc.get("current") if isinstance(asc, dict) else asc)
         except (TypeError, ValueError):
             continue
         is_home = hn.lower() == team_name.lower()

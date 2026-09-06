@@ -157,6 +157,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
     from datetime import date as _date
     today = _date.today().isoformat()
 
+    merged_match_ids: list[str] = []
     with _conn() as conn:
         count = 0
         for m in matches:
@@ -224,6 +225,7 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
                     ),
                 )
                 _sync_enriched_sporty_fields(conn, "match_buffer", sofa_match_id, m, match_date, is_live, is_finished)
+                merged_match_ids.append(str(sofa_match_id))
                 count += 1
                 continue
 
@@ -288,6 +290,14 @@ def ingest_matches(matches: list[dict[str, Any]], match_date: str) -> int:
             if is_new_row:
                 count += 1
         conn.commit()
+
+    # A SofaScore-only Competition Special prediction was made without real
+    # SportyBet odds/markets.  Once the provider records are merged, rebuild
+    # the mutable buffer prediction from the full combined document.  History
+    # remains append-only for audit/grading; the buffer's current prediction
+    # is deliberately replaced.
+    for merged_match_id in dict.fromkeys(merged_match_ids):
+        _repredict_after_sporty_merge(merged_match_id)
 
     # Register every new match with team watcher using SportyBet ID.
     # This ensures the watcher knows about every match from ingest, even
@@ -469,12 +479,23 @@ def _resolve_sofascore_only_match(conn: sqlite3.Connection, m: dict[str, Any], m
     # ── Strategy 2: name + date fallback ───────────────────────────────────
     try:
         candidates = conn.execute(
-            "select match_id, name, raw_sporty from match_buffer where sofascore_only = 1 and match_date = ?",
-            (match_date,),
+            """
+            select match_id, name, start_time, raw_sporty from match_buffer
+            where sofascore_only = 1
+              and date(match_date) between date(?, '-1 day') and date(?, '+1 day')
+            """,
+            (match_date, match_date),
         ).fetchall()
     except Exception:
         return None
-    for cand_id, cand_name, raw in candidates:
+    sporty_start = _timestamp_seconds(m.get("start_time"))
+    for cand_id, cand_name, cand_start, raw in candidates:
+        candidate_start = _timestamp_seconds(cand_start)
+        # Name aliases are allowed, but a fixture more than six hours apart is
+        # not the same match. This handles provider timezone/date rollovers
+        # without allowing a repeated fixture to merge incorrectly.
+        if sporty_start is not None and candidate_start is not None and abs(sporty_start - candidate_start) > 6 * 3600:
+            continue
         cand_home_name = _parse_home_team(cand_name or "").get("name") or ""
         cand_away_name = _parse_away_team(cand_name or "").get("name") or ""
         if not cand_home_name or not cand_away_name:
@@ -493,6 +514,14 @@ def _resolve_sofascore_only_match(conn: sqlite3.Connection, m: dict[str, Any], m
                 pass
             return cand_id
     return None
+
+
+def _timestamp_seconds(value: Any) -> float | None:
+    try:
+        timestamp = float(value)
+        return timestamp / 1000.0 if timestamp > 1e12 else timestamp
+    except (TypeError, ValueError):
+        return None
 
 
 def _register_ingest_with_team_watcher(matches: list[dict[str, Any]]) -> None:
@@ -580,6 +609,7 @@ def backfill_merge_orphaned_matches(dry_run: bool = True, limit: int = 5000) -> 
         "merged_pairs": [],
         "errors": 0,
     }
+    merged_match_ids: list[str] = []
     with _conn() as conn:
         candidates = conn.execute(
             """
@@ -651,9 +681,13 @@ def backfill_merge_orphaned_matches(dry_run: bool = True, limit: int = 5000) -> 
                 1 if state.get("is_live") else 0, 1 if state.get("is_finished") else 0,
             )
             conn.execute("delete from match_buffer where match_id = ?", (cand_id,))
+            merged_match_ids.append(str(target))
             report["merged"] += 1
         if not dry_run:
             conn.commit()
+    if not dry_run:
+        for merged_match_id in dict.fromkeys(merged_match_ids):
+            _repredict_after_sporty_merge(merged_match_id)
     return report
 
 
@@ -1121,8 +1155,12 @@ def get_buffered_match(match_id: str) -> dict[str, Any] | None:
         row = None
         for lookup_id in lookup_ids:
             row = conn.execute(
-                "select raw_enriched, raw_sporty, match_date from match_buffer where match_id = ?",
-                (lookup_id,),
+                """select raw_enriched, raw_sporty, match_date
+                   from match_buffer
+                   where match_id = ? or sportybet_id = ?
+                   order by case when match_id = ? then 0 else 1 end
+                   limit 1""",
+                (lookup_id, lookup_id, lookup_id),
             ).fetchone()
             if row:
                 break
@@ -2545,6 +2583,12 @@ def _sync_enriched_sporty_fields(
     score = sporty.get("score") or {}
     state = classify_match_state(sporty)
     doc.update({
+        # This is the canonical merged shape.  Do not leave a Competition
+        # Special proxy labelled ``sofascore`` after real SportyBet markets
+        # arrive: readiness, model inputs and the frontend all consume this
+        # document, not just the SQL columns.
+        "data_source": "both" if (doc.get("sofascore_id") or doc.get("sofascore_event") or doc.get("sofascore_detail")) else "sportybet",
+        "sofascore_only": False,
         "sportybet_id": str(sporty.get("id") or doc.get("sportybet_id") or match_id),
         "sportybet_name": sporty.get("name") or doc.get("sportybet_name") or doc.get("name"),
         "name": sporty.get("name") or doc.get("name"),
@@ -2582,6 +2626,33 @@ def _sync_enriched_sporty_fields(
     doc = enrich_match_facts(doc)
     doc["lifecycle"] = _lifecycle_state(doc)
     conn.execute(f"update {table} set raw_enriched = ? where match_id = ?", (json.dumps(doc), match_id))
+
+
+def _repredict_after_sporty_merge(match_id: str) -> None:
+    """Refresh the current buffer prediction after a SofaScore/Sporty merge.
+
+    Best effort by design: a failed re-prediction must never undo the merge.
+    ``allow_repeat=True`` is intentional here because the earlier prediction
+    was built from the SofaScore-only proxy and is no longer the current model
+    input.  The new result overwrites the buffer document while the old row is
+    retained in prediction history for auditability.
+    """
+    try:
+        row = get_buffered_match(match_id)
+        if not row:
+            return
+        doc = row.get("raw_enriched") if isinstance(row.get("raw_enriched"), dict) else row
+        if not isinstance(doc, dict) or not doc:
+            return
+        from app.utils.prediction_flow import apply_prediction_state
+        state = apply_prediction_state(
+            doc, match_id=match_id, match_date=doc.get("match_date"),
+            source="sportybet_merge_reprediction", attach_brain=True, allow_repeat=True,
+        )
+        if state.get("status") in {"predicted", "deferred", "error"}:
+            store_enriched(match_id, doc)
+    except Exception:
+        logger.warning("post-merge prediction refresh failed for %s", match_id, exc_info=True)
 
 
 def _mark_missing_from_sporty(match_id: str) -> None:

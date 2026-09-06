@@ -434,9 +434,21 @@ def record_deferred_prediction_decision(
         return
     league_name = _league_from_match(doc)
     country_name = _country_from_match(doc, league_name)
+    # Competition Special docs have no real SportyBet event ID until the
+    # reconciliation job merges one. The fallback above may resolve to the
+    # sofascore-namespaced match_id ("sofascore:{id}") or a competition-proxy
+    # ID ("competition:{key}:{id}") — neither is a valid SportyBet event ID.
+    _raw_sportybet_id = str(doc.get("sportybet_id") or "")
+    sportybet_id_for_record = (
+        _raw_sportybet_id
+        if _raw_sportybet_id
+        and not _raw_sportybet_id.startswith("sofascore:")
+        and not _raw_sportybet_id.startswith("competition:")
+        else ""
+    )
     prediction = {
         "match_id": match_id,
-        "sportybet_id": match_id,
+        "sportybet_id": sportybet_id_for_record,
         "sofascore_id": doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
         "name": doc.get("sportybet_name") or doc.get("name"),
         "match_date": doc.get("match_date"),

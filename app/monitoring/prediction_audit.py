@@ -276,7 +276,7 @@ def _fallback_grade(pick_type: str | None, selection: str | None, home: int, awa
     """
     sel = str(selection or "").lower()
     pt = str(pick_type or "").lower()
-    if pt in {"match_result", "ensemble_1x2", "live_match_winner"}:
+    if pt in {"match_result", "ensemble_1x2", "live_match_winner", "value_bet", "market_value", "consensus_longshot_value"}:
         if _contains_word(sel, "home"):
             side: str | None = "home"
         elif _contains_word(sel, "away"):
@@ -313,4 +313,3 @@ def _trim(value: Any, *, max_items: int = 8) -> Any:
     if isinstance(value, list):
         return [_trim(item, max_items=max_items) for item in value[:max_items]]
     return value
-

@@ -209,6 +209,9 @@ def predict_sofascore_event(
 ) -> dict[str, Any]:
     home_history = home_history or []
     away_history = away_history or []
+    # Keep the evidence context available to every deterministic sub-signal.
+    # These lists are provider data, not derived predictions.
+    event = {**event, "home_last_matches": home_history, "away_last_matches": away_history}
     home = event.get("home_team") or event.get("homeTeam") or {}
     away = event.get("away_team") or event.get("awayTeam") or {}
     status = event.get("status", {})
@@ -815,11 +818,21 @@ def _form_edge(event: dict[str, Any], home_form: dict[str, Any], away_form: dict
     away_pre = pregame.get("away_team") or {}
     edge = 0.0
 
-    if home_form.get("sample_size") and away_form.get("sample_size"):
+    # Recent records from different divisions/competitions are not directly
+    # comparable. League-strength edge handles that limited cross-competition
+    # context separately; raw form must not make a lower-tier table leader
+    # look stronger than a top-flight side merely by points or rank.
+    home_history = event.get("home_last_matches") or []
+    away_history = event.get("away_last_matches") or []
+    from app.competition.evidence_context import competition_comparability
+    comparability = competition_comparability(event, home_history, away_history)
+    if home_form.get("sample_size") and away_form.get("sample_size") and comparability["same_competition_form"]:
         edge += (home_form.get("form_points", 0) - away_form.get("form_points", 0)) * 0.8
         edge += (home_form.get("avg_goals_for", 0) - away_form.get("avg_goals_for", 0)) * 5
         edge -= (home_form.get("avg_goals_against", 0) - away_form.get("avg_goals_against", 0)) * 3
-        signals.append({"name": "recent_history_edge", "value": round(edge, 2), "impact": round(edge, 2)})
+        signals.append({"name": "recent_history_edge", "value": {"edge": round(edge, 2), "competition_context": comparability}, "impact": round(edge, 2)})
+    elif home_form.get("sample_size") and away_form.get("sample_size"):
+        signals.append({"name": "cross_competition_form_context", "value": comparability, "impact": 0, "role": "background_context"})
 
     home_rating = _to_float(home_pre.get("avg_rating"))
     away_rating = _to_float(away_pre.get("avg_rating"))
@@ -1003,9 +1016,18 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
             meeting_dt = _event_datetime(meeting)
             if meeting_dt:
                 age_days = max(0, (event_dt - meeting_dt).days)
-                weight = max(0.2, 1.0 - (age_days / 1095))
+                # H2H from more than three years ago should not retain a
+                # permanent floor: squads, managers and league membership
+                # change.  It remains descriptive context but gets no vote.
+                if age_days > 1095:
+                    continue
+                weight = max(0.1, 1.0 - (age_days / 730))
             else:
-                weight = 0.35
+                weight = 0.15
+            # Cup/friendly or different-competition H2H cannot dominate a
+            # league prediction. Retain it at half weight only.
+            if _competition_key(meeting) != _competition_key(event):
+                weight *= 0.5
             total_weight += weight
             if hs > as_:
                 weighted_home += weight
@@ -1029,7 +1051,7 @@ def _h2h_edge(event: dict[str, Any], signals: list[dict[str, Any]]) -> float:
                     "away_weighted_wins": round(weighted_away, 2),
                     "weighted_draws": round(weighted_draw, 2),
                     "weighted_sample": round(total_weight, 2),
-                    "decay": "date_weighted_3_year_floor_20pct",
+                    "decay": "date_weighted_two_year_linear; older_than_three_years_excluded; cross_competition_half_weight",
                 },
                 "impact": edge,
             })
@@ -1113,6 +1135,18 @@ def _table_edge(
     standings: list[dict[str, Any]] | None = None,
 ) -> float:
     pregame = event.get("pregame_form") or {}
+    from app.competition.evidence_context import competition_comparability
+    comparability = competition_comparability(
+        event, event.get("home_last_matches") or [], event.get("away_last_matches") or [],
+    )
+    if not comparability["same_competition_form"]:
+        signals.append({
+            "name": "cross_competition_table_context",
+            "value": {**comparability, "reason": "raw league positions are not comparable across divisions"},
+            "impact": 0,
+            "role": "background_context",
+        })
+        return 0.0
     home_position = _to_int((pregame.get("home_team") or {}).get("position"), 0)
     away_position = _to_int((pregame.get("away_team") or {}).get("position"), 0)
     if not home_position or not away_position:

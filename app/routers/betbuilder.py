@@ -15,9 +15,10 @@ matches instead of upcoming ones:
   POST /betbuilder/live/llm     - "AI": LLM-assisted slip synthesis
 
 All endpoints consume predictions already produced by unified upcoming/live.
-They do not generate per-match predictions themselves (the live candidate
-fetch may trigger an on-demand live prediction for a match with no fresh
-stored one, but that's the existing prediction pipeline, not new logic here).
+By default every live request runs a request-time live cycle (Sporty ingest,
+SofaScore matching/enrichment, then prediction) before the mode ranks the
+available picks. They return predictions only; set ``book: true`` to build a
+SportyBet booking payload after reviewing the same route's result.
 """
 from __future__ import annotations
 
@@ -35,12 +36,16 @@ class BetBuilderRequest(BaseModel):
     stake: int = Field(default=100, gt=0)
     candidate_limit: int = Field(default=50, gt=0, le=200)
     request_code: bool = False
+    refresh_live: bool = True
+    book: bool = False
 
 
 class SmartBetRequest(BaseModel):
     stake: int = Field(default=100, gt=0)
     candidate_limit: int = Field(default=50, gt=0, le=200)
     request_code: bool = False
+    refresh_live: bool = True
+    book: bool = False
 
 
 @router.post("/manual")
@@ -119,7 +124,8 @@ def live_manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
     Reads currently in-play matches with a fresh (or freshly generated)
     live prediction from the shared live probability grid, scores and ranks
     them with the same conviction logic as the prematch manual builder, and
-    builds a SportyBet booking slip (force-refreshed against live markets).
+    returns prediction selections. Set ``book=true`` to also build a
+    force-refreshed SportyBet booking payload.
     """
     from app.bet_builder.live_builder import run_live_manual_bet
 
@@ -129,6 +135,8 @@ def live_manual_bet(body: BetBuilderRequest) -> dict[str, Any]:
         stake=body.stake,
         candidate_limit=body.candidate_limit,
         request_code=body.request_code,
+        refresh_live=body.refresh_live,
+        book=body.book,
     )
 
 
@@ -147,6 +155,8 @@ def live_smart_bet(body: SmartBetRequest) -> dict[str, Any]:
         stake=body.stake,
         candidate_limit=body.candidate_limit,
         request_code=body.request_code,
+        refresh_live=body.refresh_live,
+        book=body.book,
     )
 
 
@@ -168,4 +178,6 @@ def live_llm_bet(body: BetBuilderRequest) -> dict[str, Any]:
         stake=body.stake,
         candidate_limit=body.candidate_limit,
         request_code=body.request_code,
+        refresh_live=body.refresh_live,
+        book=body.book,
     )

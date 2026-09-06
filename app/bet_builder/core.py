@@ -157,6 +157,15 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
                 if not buf_doc:
                     _filter_stats["no_buffer"] = _filter_stats.get("no_buffer", 0) + 1
                     continue
+                # Competition Special begins with a SofaScore-only proxy.
+                # It is useful for analysis, but must never enter a Sporty
+                # bet builder until the provider has supplied and the merge
+                # has retained a real event id. Otherwise its numeric Sofa id
+                # can be mistaken for a bookable Sporty event downstream.
+                sportybet_id = str(buf_doc.get("sportybet_id") or "").strip()
+                if not sportybet_id:
+                    _filter_stats["no_sportybet_id"] = _filter_stats.get("no_sportybet_id", 0) + 1
+                    continue
                 if buf_doc.get("is_finished") or buf_doc.get("is_live"):
                     _filter_stats["buffer_live"] = _filter_stats.get("buffer_live", 0) + 1
                     continue
@@ -165,6 +174,7 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
                     _filter_stats["buffer_odds"] = _filter_stats.get("buffer_odds", 0) + 1
                     continue
                 pick = {**pick, "odds": resolved_odds}
+                row = {**row, "sportybet_id": sportybet_id, "bookable": True}
             except Exception as exc:
                 logger.warning("upcoming_prediction_candidates: buffer error for %s: %s", match_id, exc)
                 _filter_stats["buffer_error"] = _filter_stats.get("buffer_error", 0) + 1
@@ -387,6 +397,16 @@ def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
         refreshed, _still_stale = _live_match_prediction_state(limit)
         fresh_by_match.update(refreshed)
 
+    # A Competition Special row keeps its SofaScore-based ``match_id`` after
+    # it merges with SportyBet.  That is the right stable internal key, but
+    # it is not a bookable provider event id.  Resolve the canonical buffered
+    # document once so selections retain the real SportyBet id.
+    try:
+        from app.storage.buffer import bulk_get_buffered_matches
+        buffered = bulk_get_buffered_matches(list(fresh_by_match))
+    except Exception:
+        buffered = {}
+
     candidates: list[dict[str, Any]] = []
     for match_id, row in fresh_by_match.items():
         picks = _loads(row.get("picks_json"), [])
@@ -396,9 +416,14 @@ def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
         odds = pick_decimal_odds(pick)
         if odds is None or odds < 1.30:
             continue
+        buffer_doc = buffered.get(match_id) or {}
+        sportybet_id = str(buffer_doc.get("sportybet_id") or "").strip()
         candidates.append({
             "match_id": match_id,
-            "sportybet_id": match_id,
+            # Keep the SofaScore-keyed match_id for history/analysis but
+            # never pass it to SportyBet booking as an event id.
+            "sportybet_id": sportybet_id or None,
+            "bookable": bool(sportybet_id),
             "match_name": row.get("match_name"),
             "league_name": row.get("league_name"),
             "country_name": row.get("country_name"),

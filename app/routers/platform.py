@@ -291,6 +291,33 @@ def get_predictions_history(limit: int = Query(default=200, ge=1, le=1000), matc
     return {"status": "success", **list_prediction_history(limit=limit, match_id=match_id)}
 
 
+@router.post("/predictions/regrade-voids")
+def regrade_void_predictions(limit: int = Query(default=2000, ge=1, le=10000)):
+    """Revisit legacy void grades after the market-intent parser is improved.
+
+    Only rows that now resolve to a definitive win/loss are changed. Genuine
+    pushes and genuinely unresolvable live picks stay void, so this cannot
+    manufacture training outcomes merely to reduce the void count.
+    """
+    from app.storage.db import db_conn
+    from app.storage.league_memory._helpers import grade_prediction_row, update_prediction_result
+
+    changed = 0
+    with db_conn(timeout=30) as conn:
+        conn.row_factory = __import__("sqlite3").Row
+        rows = conn.execute(
+            "select * from prediction_history where result = 'void' and final_home is not null and final_away is not null order by id desc limit ?",
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            result, info = grade_prediction_row(row, int(row["final_home"]), int(row["final_away"]))
+            if result in {"win", "loss"}:
+                update_prediction_result(conn, row["id"], result, int(row["final_home"]), int(row["final_away"]), info)
+                changed += 1
+        conn.commit()
+    return {"status": "success", "reviewed": len(rows), "regraded": changed, "remaining_void": len(rows) - changed}
+
+
 @router.get("/predictions/decisions")
 def get_prediction_decisions(limit: int = Query(default=200, ge=1, le=1000), match_id: Optional[str] = None):
     from app.storage.league_memory import list_prediction_decisions

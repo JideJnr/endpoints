@@ -64,10 +64,21 @@ def predict_and_record_enriched(
             or doc.get("id")
             or ""
         )
+        # Never store a sofascore-namespaced or competition-proxy ID as
+        # the sportybet_id. Competition Special docs have no real SportyBet
+        # event ID until job_reconcile_competition_sporty() merges one in.
+        _raw_sportybet_id = prediction.get("sportybet_id") or resolved_match_id
+        _stored_sportybet_id = (
+            _raw_sportybet_id
+            if _raw_sportybet_id
+            and not _raw_sportybet_id.startswith("sofascore:")
+            and not _raw_sportybet_id.startswith("competition:")
+            else ""
+        )
         record_prediction({
             **prediction,
             "match_id": resolved_match_id,
-            "sportybet_id": prediction.get("sportybet_id") or resolved_match_id,
+            "sportybet_id": _stored_sportybet_id,
             "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
             "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
             "source": source,
@@ -96,10 +107,21 @@ def predict_and_record_enriched(
         or doc.get("id")
         or ""
     )
+    # Never store a sofascore-namespaced or competition-proxy ID as the
+    # sportybet_id. Competition Special docs have no real SportyBet event ID
+    # until job_reconcile_competition_sporty() merges one in.
+    _raw_sportybet_id = prediction.get("sportybet_id") or resolved_match_id
+    _stored_sportybet_id = (
+        _raw_sportybet_id
+        if _raw_sportybet_id
+        and not _raw_sportybet_id.startswith("sofascore:")
+        and not _raw_sportybet_id.startswith("competition:")
+        else ""
+    )
     record_prediction({
         **prediction,
         "match_id": resolved_match_id,
-        "sportybet_id": prediction.get("sportybet_id") or resolved_match_id,
+        "sportybet_id": _stored_sportybet_id,
         "sofascore_id": prediction.get("sofascore_id") or doc.get("sofascore_id") or ((doc.get("sofascore_detail") or {}).get("id")),
         "match_date": prediction.get("match_date") or match_date or doc.get("match_date"),
         "source": source,

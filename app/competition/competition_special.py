@@ -36,36 +36,44 @@ DEFAULT_WORLD_CUP = {
 # intentionally configuration data rather than prediction logic: each entry
 # uses the same SofaScore-only enrichment and prediction lane below.
 TOP_30_COMPETITIONS: tuple[dict[str, Any], ...] = (
-    {"key": "premier-league", "name": "Premier League", "unique_tournament_id": 17},
-    {"key": "la-liga", "name": "LaLiga", "unique_tournament_id": 8},
-    {"key": "serie-a", "name": "Serie A", "unique_tournament_id": 23},
-    {"key": "bundesliga", "name": "Bundesliga", "unique_tournament_id": 35},
-    {"key": "ligue-1", "name": "Ligue 1", "unique_tournament_id": 34},
-    {"key": "champions-league", "name": "UEFA Champions League", "unique_tournament_id": 7},
-    {"key": "europa-league", "name": "UEFA Europa League", "unique_tournament_id": 679},
-    {"key": "conference-league", "name": "UEFA Conference League", "unique_tournament_id": 329},
-    {"key": "championship", "name": "EFL Championship", "unique_tournament_id": 18},
-    {"key": "eredivisie", "name": "Eredivisie", "unique_tournament_id": 37},
-    {"key": "primeira-liga", "name": "Primeira Liga", "unique_tournament_id": 238},
-    {"key": "super-lig", "name": "Süper Lig", "unique_tournament_id": 52},
-    {"key": "mls", "name": "Major League Soccer", "unique_tournament_id": 242},
-    {"key": "brasileirao", "name": "Brasileirão Série A", "unique_tournament_id": 325},
-    {"key": "argentine-primera", "name": "Argentine Primera División", "unique_tournament_id": 390},
-    {"key": "liga-mx", "name": "Liga MX", "unique_tournament_id": 406},
-    {"key": "saudi-pro-league", "name": "Saudi Pro League", "unique_tournament_id": 203},
-    {"key": "j1-league", "name": "J1 League", "unique_tournament_id": 98},
-    {"key": "k-league-1", "name": "K League 1", "unique_tournament_id": 116},
-    {"key": "liga-profesional", "name": "Liga Profesional Argentina", "unique_tournament_id": 155},
-    {"key": "copa-libertadores", "name": "Copa Libertadores", "unique_tournament_id": 384},
-    {"key": "copa-sudamericana", "name": "Copa Sudamericana", "unique_tournament_id": 480},
-    {"key": "belgian-pro-league", "name": "Belgian Pro League", "unique_tournament_id": 38},
-    {"key": "scottish-premiership", "name": "Scottish Premiership", "unique_tournament_id": 36},
-    {"key": "swiss-super-league", "name": "Swiss Super League", "unique_tournament_id": 215},
-    {"key": "austrian-bundesliga", "name": "Austrian Bundesliga", "unique_tournament_id": 45},
-    {"key": "danish-superliga", "name": "Danish Superliga", "unique_tournament_id": 39},
-    {"key": "eliteserien", "name": "Eliteserien", "unique_tournament_id": 20},
-    {"key": "allsvenskan", "name": "Allsvenskan", "unique_tournament_id": 67},
-    {"key": "colombia-primera-a", "name": "Categoría Primera A", "unique_tournament_id": 11539},
+    # league_strength: curated footballing quality score on a 20–98 scale.
+    # Used as the hardcoded prior in league_strength.py's hybrid scoring.
+    # Tier guide: 1=elite (88–98), 2=top (75–87), 3=strong (62–74),
+    #             4=mid (50–61), 5=lower (38–49), 6=weak (20–37)
+    # ── Tier 1: elite continental / top-5 leagues ────────────────────────
+    {"key": "premier-league",      "name": "Premier League",            "unique_tournament_id": 17,    "league_strength": 95},
+    {"key": "la-liga",             "name": "LaLiga",                    "unique_tournament_id": 8,     "league_strength": 93},
+    {"key": "champions-league",    "name": "UEFA Champions League",     "unique_tournament_id": 7,     "league_strength": 98},
+    {"key": "serie-a",             "name": "Serie A",                   "unique_tournament_id": 23,    "league_strength": 91},
+    {"key": "bundesliga",          "name": "Bundesliga",                "unique_tournament_id": 35,    "league_strength": 90},
+    {"key": "ligue-1",             "name": "Ligue 1",                   "unique_tournament_id": 34,    "league_strength": 86},
+    # ── Tier 2: top domestic + major continental ──────────────────────────
+    {"key": "europa-league",       "name": "UEFA Europa League",        "unique_tournament_id": 679,   "league_strength": 84},
+    {"key": "eredivisie",          "name": "Eredivisie",                "unique_tournament_id": 37,    "league_strength": 78},
+    {"key": "primeira-liga",       "name": "Primeira Liga",             "unique_tournament_id": 238,   "league_strength": 77},
+    {"key": "super-lig",           "name": "Süper Lig",                 "unique_tournament_id": 52,    "league_strength": 76},
+    {"key": "brasileirao",         "name": "Brasileirão Série A",       "unique_tournament_id": 325,   "league_strength": 76},
+    {"key": "copa-libertadores",   "name": "Copa Libertadores",         "unique_tournament_id": 384,   "league_strength": 80},
+    {"key": "conference-league",   "name": "UEFA Conference League",    "unique_tournament_id": 329,   "league_strength": 75},
+    # ── Tier 3: strong second-tier / competitive domestic ────────────────
+    {"key": "championship",        "name": "EFL Championship",          "unique_tournament_id": 18,    "league_strength": 72},
+    {"key": "belgian-pro-league",  "name": "Belgian Pro League",        "unique_tournament_id": 38,    "league_strength": 70},
+    {"key": "scottish-premiership","name": "Scottish Premiership",      "unique_tournament_id": 36,    "league_strength": 67},
+    {"key": "mls",                 "name": "Major League Soccer",       "unique_tournament_id": 242,   "league_strength": 66},
+    {"key": "liga-mx",             "name": "Liga MX",                   "unique_tournament_id": 406,   "league_strength": 66},
+    {"key": "argentine-primera",   "name": "Argentine Primera División","unique_tournament_id": 390,   "league_strength": 68},
+    {"key": "liga-profesional",    "name": "Liga Profesional Argentina","unique_tournament_id": 155,   "league_strength": 65},
+    {"key": "copa-sudamericana",   "name": "Copa Sudamericana",         "unique_tournament_id": 480,   "league_strength": 68},
+    {"key": "swiss-super-league",  "name": "Swiss Super League",        "unique_tournament_id": 215,   "league_strength": 64},
+    {"key": "austrian-bundesliga", "name": "Austrian Bundesliga",       "unique_tournament_id": 45,    "league_strength": 63},
+    {"key": "danish-superliga",    "name": "Danish Superliga",          "unique_tournament_id": 39,    "league_strength": 62},
+    # ── Tier 4: mid-level domestic ───────────────────────────────────────
+    {"key": "saudi-pro-league",    "name": "Saudi Pro League",          "unique_tournament_id": 203,   "league_strength": 60},
+    {"key": "j1-league",           "name": "J1 League",                 "unique_tournament_id": 98,    "league_strength": 58},
+    {"key": "k-league-1",          "name": "K League 1",                "unique_tournament_id": 116,   "league_strength": 55},
+    {"key": "eliteserien",         "name": "Eliteserien",               "unique_tournament_id": 20,    "league_strength": 57},
+    {"key": "allsvenskan",         "name": "Allsvenskan",               "unique_tournament_id": 67,    "league_strength": 56},
+    {"key": "colombia-primera-a",  "name": "Categoría Primera A",       "unique_tournament_id": 11539, "league_strength": 52},
 )
 _CATALOGUE_BY_KEY = {entry["key"]: entry for entry in TOP_30_COMPETITIONS}
 
@@ -1571,6 +1579,12 @@ def _competition_doc(key: str, event: dict[str, Any], detail: dict[str, Any], *,
         "competition_match_id": str(event.get("id") or ""),
         "legacy_competition_id": legacy_id,
         "sofascore_id": event.get("id"),
+        # Explicitly None until job_reconcile_competition_sporty() merges a
+        # real SportyBet event. Leaving this key absent caused downstream
+        # fallback chains (doc.get("sportybet_id") or doc.get("id")) to
+        # resolve to the "sofascore:{id}" match_id and store it as the
+        # sportybet_id in prediction_history and booking requests.
+        "sportybet_id": None,
         "sofascore_match_status": "matched",
         "data_source": "sofascore",
         "sofascore_only": True,
@@ -2021,6 +2035,30 @@ def _mirror_competition_event_to_main_buffer(
     is_finished = 1 if (state.get("is_finished") or state.get("state") in {"postponed", "cancelled"}) else 0
     match_id = _main_buffer_match_id(event.get("id"))
     raw_sporty = _competition_raw_sporty(key, event, match_date, importance)
+    # Reconcile in both directions.  The usual path is Competition Special
+    # first and SportyBet later (handled by buffer.ingest_matches), but a
+    # normal SportyBet ingest can already exist when this mirror runs.  In
+    # that order, retain its real event id and raw market shape instead of
+    # replacing it with the SofaScore proxy.
+    linked = conn.execute(
+        """select sportybet_id, raw_sporty, raw_enriched
+           from match_buffer
+           where sofascore_id = ? and match_id != ?
+             and sportybet_id is not null and sportybet_id != ''
+           order by ingested_at desc limit 1""",
+        (str(event.get("id") or ""), match_id),
+    ).fetchone()
+    linked_sporty_id = str(linked[0] or "") if linked else ""
+    linked_raw_sporty = linked[1] if linked else None
+    linked_enriched = linked[2] if linked else None
+    if linked_raw_sporty:
+        try:
+            raw_sporty = json.loads(linked_raw_sporty)
+        except (TypeError, ValueError):
+            # A malformed legacy payload must not stop the competition
+            # cycle; keep the proxy and let the next Sporty ingest repair it.
+            linked_sporty_id = ""
+            linked_enriched = None
     # event's team dicts are already normalized to snake_case with an "id"
     # field by sofascore_client.py (home_team/away_team, not the raw API's
     # homeTeam/awayTeam) -- these two columns exist so
@@ -2034,10 +2072,10 @@ def _mirror_competition_event_to_main_buffer(
         insert into match_buffer (
             match_id, match_date, tournament, category, name, start_time, period,
             score_home, score_away, is_live, is_finished, ingested_at,
-            data_source, sofascore_id, sofascore_only, raw_sporty, raw_enriched, enriched_at,
+            data_source, sportybet_id, sofascore_id, sofascore_only, raw_sporty, raw_enriched, enriched_at,
             sofascore_home_team_id, sofascore_away_team_id
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(match_id) do update set
             match_date = excluded.match_date,
             tournament = excluded.tournament,
@@ -2054,6 +2092,7 @@ def _mirror_competition_event_to_main_buffer(
                 when match_buffer.sportybet_id is not null then 'both'
                 else excluded.data_source
             end,
+            sportybet_id = coalesce(match_buffer.sportybet_id, excluded.sportybet_id),
             sofascore_id = excluded.sofascore_id,
             sofascore_only = case
                 when match_buffer.sportybet_id is not null then 0
@@ -2066,8 +2105,14 @@ def _mirror_competition_event_to_main_buffer(
             -- unconditionally wipe sportybet_id back to null on every pass,
             -- silently undoing the merge and causing SportyBet's next
             -- ingest to recreate a duplicate row (see buffer.py re-split fix).
-            raw_sporty = excluded.raw_sporty,
-            raw_enriched = coalesce(excluded.raw_enriched, match_buffer.raw_enriched),
+            raw_sporty = case
+                when match_buffer.sportybet_id is not null then match_buffer.raw_sporty
+                else excluded.raw_sporty
+            end,
+            raw_enriched = case
+                when match_buffer.sportybet_id is not null then match_buffer.raw_enriched
+                else coalesce(excluded.raw_enriched, match_buffer.raw_enriched)
+            end,
             enriched_at = coalesce(excluded.enriched_at, match_buffer.enriched_at),
             sofascore_home_team_id = excluded.sofascore_home_team_id,
             sofascore_away_team_id = excluded.sofascore_away_team_id
@@ -2085,11 +2130,12 @@ def _mirror_competition_event_to_main_buffer(
             is_live,
             is_finished,
             datetime.now(timezone.utc).isoformat(),
-            "sofascore",
+            "both" if linked_sporty_id else "sofascore",
+            linked_sporty_id or None,
             str(event.get("id") or ""),
             1,
             json.dumps(raw_sporty),
-            json.dumps(enriched_doc) if enriched_doc else None,
+            linked_enriched or (json.dumps(enriched_doc) if enriched_doc else None),
             datetime.now(timezone.utc).isoformat() if enriched_doc else None,
             home_team_id,
             away_team_id,
@@ -2443,15 +2489,19 @@ def _recent_play_strength(matches: list[dict[str, Any]], team: dict[str, Any], l
         goals_for += own
         goals_against += opp
         goal_diff += own - opp
+        # Win/draw/loss only — not goal difference — so a 1-0 win and a
+        # 5-0 win against the same opponent carry the same weight.
         points += 3 if own > opp else 1 if own == opp else 0
         opponent = away if is_home else home
         opponent_quality += _opponent_quality_score(
             str(opponent.get("id") or ""), str(opponent.get("name") or "")
         )
     ppg = points / sample if sample else 0.0
-    gd_per_match = goal_diff / sample if sample else 0.0
     quality = opponent_quality / sample if sample else 50.0
-    strength_score = max(1, min(99, 45 + ppg * 12 + gd_per_match * 6 + (quality - 50) * 0.25))
+    # Strength score is now purely PPG-based + opponent quality.
+    # Goal difference is intentionally excluded: a narrow win against a
+    # strong opponent is worth the same as a comfortable one.
+    strength_score = max(1, min(99, 45 + ppg * 12 + (quality - 50) * 0.25))
     return {
         "sample_size": sample,
         "points": points,
@@ -3001,5 +3051,3 @@ def _real_sportybet_match_id(doc: dict[str, Any]) -> str:
     if not value or value.startswith("sofascore:") or value.startswith("competition:"):
         return ""
     return value
-
-

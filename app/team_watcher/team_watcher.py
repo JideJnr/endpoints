@@ -1212,7 +1212,7 @@ def _build_profile(
         round(sum(_opp_strength_scores) / len(_opp_strength_scores), 1)
         if _opp_strength_scores else None
     )
-    analyst_score = max(1, min(99, 42 + stats["ppg"] * 13 + (stats["gf_avg"] - stats["ga_avg"]) * 7 + (stats["clean_sheets"] / sample * 7 if sample else 0)))
+    analyst_score = max(1, min(99, 42 + stats["ppg"] * 13 + (stats["clean_sheets"] / sample * 7 if sample else 0)))
     league_name = (
         (team or {}).get("league_name")
         or watcher_profile.get("league_name")
@@ -1402,6 +1402,206 @@ def _team_goal_timing(rows: list[sqlite3.Row]) -> dict[str, Any]:
         "avg_first_goal_minute": round(sum(first_goal_minutes) / len(first_goal_minutes), 1) if first_goal_minutes else None,
         "avg_interval_between_goals": round(sum(avg_intervals) / len(avg_intervals), 1) if avg_intervals else None,
         "band_distribution": band_pct,
+    }
+
+
+def _compute_pressing_profile(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    """Build a pressing / defensive-intensity profile from live_stat_snapshots.
+
+    For each match row in ai_team_watcher_matches we look up the LATEST
+    snapshot in live_stat_snapshots (the cumulative full-match totals) and
+    read the pressing stats we care about, indexed by the team's side
+    (home or away).  We then average across all matches that had stat data.
+
+    Returned block structure
+    ------------------------
+    {
+        "available": bool,          # False when no matches had snapshot data
+        "matches_with_stats": int,  # how many of the last N had live stats
+        "style":  "high_press" | "mid_block" | "low_block" | "unknown",
+        "press_intensity": 0–100,   # composite 0-100 score
+        "recoveries_avg":  float,   # ball recoveries per match
+        "tackles_won_rate": float,  # tackles won / total tackles (0–1)
+        "interceptions_avg": float,
+        "final_third_entries_avg": float,
+        "sprints_avg": float,
+        "accurate_passes_avg": float,   # build-up style proxy
+        "long_ball_rate": float,        # long_balls / accurate_passes (0–1)
+        "clearances_avg": float,        # defensive block depth proxy
+        "press_vs_goals": {
+            "matches": int,
+            "goals_scored_avg": float,   # goals for in pressing matches
+            "goals_conceded_avg": float, # goals against in pressing matches
+        },
+        "vs_high_press": {
+            # how THIS team performs when the OPPONENT was the pressing side
+            "matches": int,
+            "win_rate": float,
+            "goals_scored_avg": float,
+        },
+    }
+    """
+    try:
+        from app.live.live_stat_history import get_stat_history  # local import avoids circular
+    except Exception:
+        return {"available": False, "reason": "live_stat_history_unavailable"}
+
+    # Accumulators
+    n_with_stats = 0
+    recoveries:    list[float] = []
+    tackles_total: list[float] = []
+    tackles_won:   list[float] = []
+    interceptions: list[float] = []
+    ft_entries:    list[float] = []
+    sprints:       list[float] = []
+    acc_passes:    list[float] = []
+    long_balls:    list[float] = []
+    clearances:    list[float] = []
+
+    # "pressing match" = this team had higher pressure score than opponent
+    press_gf: list[float] = []
+    press_ga: list[float] = []
+    # "under press" = opponent had higher pressure score
+    under_results: list[str] = []
+    under_gf:      list[float] = []
+
+    for row in rows:
+        match_id = str(row["match_id"] or "")
+        side     = str(row["team_side"] or "").strip().lower()
+        if not match_id or side not in ("home", "away"):
+            continue
+
+        opp_side = "away" if side == "home" else "home"
+
+        try:
+            snaps = get_stat_history(match_id)
+        except Exception:
+            continue
+        if not snaps:
+            continue
+
+        # Use the last (most complete) snapshot — cumulative full-match totals
+        snap = snaps[-1]
+
+        def _v(key: str, s: str = side) -> float:
+            return float(snap.get(f"{s}_{key}") or 0)
+
+        # Guard: skip if the new columns aren't present yet (pre-migration rows)
+        if snap.get(f"{side}_tackles") is None and snap.get(f"{side}_recoveries") is None:
+            continue
+
+        n_with_stats += 1
+
+        rec  = _v("recoveries")
+        tack = _v("tackles")
+        tw   = _v("tackles_won")
+        icp  = _v("interceptions")
+        fte  = _v("final_third_entries")
+        sp   = _v("sprints")
+        ap   = _v("accurate_passes")
+        lb   = _v("long_balls")
+        cl   = _v("clearances")
+
+        recoveries.append(rec)
+        if tack > 0:
+            tackles_total.append(tack)
+            tackles_won.append(tw)
+        interceptions.append(icp)
+        ft_entries.append(fte)
+        sprints.append(sp)
+        acc_passes.append(ap)
+        long_balls.append(lb)
+        clearances.append(cl)
+
+        # Pressure score: same composite as live_pressure.py but using richer stats
+        # Weight: recoveries + interceptions capture defensive press,
+        #         final_third_entries + dangerous_attacks capture offensive press.
+        da      = _v("dangerous_attacks")
+        shots   = _v("total_shots")
+        opp_da  = _v("dangerous_attacks", opp_side)
+        opp_shots = _v("total_shots", opp_side)
+
+        team_press_score = rec * 0.4 + icp * 0.3 + fte * 0.2 + da * 0.07 + shots * 0.03
+        opp_press_score  = (
+            _v("recoveries", opp_side) * 0.4
+            + _v("interceptions", opp_side) * 0.3
+            + _v("final_third_entries", opp_side) * 0.2
+            + opp_da * 0.07
+            + opp_shots * 0.03
+        )
+
+        gf = float(row["goals_for"]  or 0) if row["goals_for"]  is not None else None
+        ga = float(row["goals_against"] or 0) if row["goals_against"] is not None else None
+
+        if team_press_score > opp_press_score * 1.15:
+            # This team was the pressing side
+            if gf is not None:
+                press_gf.append(gf)
+            if ga is not None:
+                press_ga.append(ga)
+        elif opp_press_score > team_press_score * 1.15:
+            # Opponent was pressing — record how this team handled it
+            if row["result"]:
+                under_results.append(str(row["result"]))
+            if gf is not None:
+                under_gf.append(gf)
+
+    if n_with_stats == 0:
+        return {"available": False, "matches_with_stats": 0}
+
+    def _avg(lst: list[float]) -> float | None:
+        return round(sum(lst) / len(lst), 2) if lst else None
+
+    avg_rec  = _avg(recoveries)   or 0.0
+    avg_icp  = _avg(interceptions) or 0.0
+    avg_fte  = _avg(ft_entries)   or 0.0
+    avg_sp   = _avg(sprints)      or 0.0
+    avg_ap   = _avg(acc_passes)   or 0.0
+    avg_lb   = _avg(long_balls)   or 0.0
+    avg_cl   = _avg(clearances)   or 0.0
+    tw_rate  = round(sum(tackles_won) / sum(tackles_total), 3) if sum(tackles_total) > 0 else None
+
+    # Composite press intensity: 0–100
+    # Anchored so that ~15 recoveries + ~10 interceptions + ~30 FTE = ~60 (high press)
+    raw_intensity = avg_rec * 1.8 + avg_icp * 2.5 + avg_fte * 0.8
+    press_intensity = round(min(100.0, raw_intensity), 1)
+
+    # Style classification
+    if press_intensity >= 60:
+        style = "high_press"
+    elif press_intensity >= 35:
+        style = "mid_block"
+    elif n_with_stats >= 2:
+        style = "low_block"
+    else:
+        style = "unknown"
+
+    # Long-ball rate proxy for build-up style
+    long_ball_rate = round(avg_lb / avg_ap, 3) if avg_ap > 0 else None
+
+    return {
+        "available": True,
+        "matches_with_stats": n_with_stats,
+        "style": style,
+        "press_intensity": press_intensity,
+        "recoveries_avg": avg_rec,
+        "tackles_won_rate": tw_rate,
+        "interceptions_avg": avg_icp,
+        "final_third_entries_avg": avg_fte,
+        "sprints_avg": avg_sp,
+        "accurate_passes_avg": avg_ap,
+        "long_ball_rate": long_ball_rate,
+        "clearances_avg": avg_cl,
+        "press_vs_goals": {
+            "matches": len(press_gf),
+            "goals_scored_avg": _avg(press_gf),
+            "goals_conceded_avg": _avg(press_ga),
+        },
+        "vs_high_press": {
+            "matches": len(under_results),
+            "win_rate": round(under_results.count("win") / len(under_results), 3) if under_results else None,
+            "goals_scored_avg": _avg(under_gf),
+        },
     }
 
 

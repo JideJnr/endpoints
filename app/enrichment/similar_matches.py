@@ -39,6 +39,12 @@ _POOL_LIMIT = 500
 _SAME_LEAGUE_MIN = 50   # fall back to full history if fewer same-league matches
 
 
+def _development_competition(value: str) -> bool:
+    text = str(value or "").lower()
+    markers = ("u17", "u18", "u19", "u20", "u21", "u23", "under 17", "under 19", "under 21", "reserve", "reserves", "premier league 2", " ii", "women")
+    return any(marker in text for marker in markers)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure scoring helpers (no I/O — easily unit and property tested)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,6 +511,7 @@ def find_similar_matches(
     target_league_key = normalize_league(target_tournament) if target_tournament else ""
     target_category_key = normalize_league(target_category) if target_category else ""
     target_name = str(doc.get("sportybet_name") or doc.get("name") or "")
+    target_is_development = _development_competition(target_tournament)
 
     # ── Implied odds for target ───────────────────────────────────────────────
     target_implied = _extract_target_odds_implied(doc)
@@ -624,6 +631,12 @@ def find_similar_matches(
         cand_league_raw = str(c.get("league_name") or "")
         cand_league_key = normalize_league(cand_league_raw) if cand_league_raw else ""
         cand_category = str(c.get("country_name") or "")
+        # A senior fixture must never use youth/reserve/women's outcomes as
+        # comparable evidence just because odds or ELO happen to be close.
+        # These pools have materially different team strength and scoring
+        # distributions. Keep like-for-like development pools available.
+        if _development_competition(cand_league_raw) != target_is_development:
+            continue
         league_bonus = _compute_league_bonus(
             target_league_key, target_category_key,
             cand_league_key, cand_category,

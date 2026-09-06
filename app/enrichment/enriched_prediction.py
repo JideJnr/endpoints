@@ -28,6 +28,7 @@ from app.storage.league_memory._helpers import build_pick, build_sporty_doc
 # ── Imports from extracted sub-modules ───────────────────────────────────────
 from app.enrichment.signal_aggregator import (  # noqa: F401
     calculate_win_probabilities as _calculate_signal_probabilities,
+    normalize_signal as _normalize_aggregator_signal,
     global_signal_stats as _global_signal_stats,
     prefetch_signal_stats as _prefetch_signal_stats,
     reset_signal_stats_cache as _reset_signal_stats_batch_cache,
@@ -157,6 +158,97 @@ def _signal_aggregator_pick_adjustment(pick: dict[str, Any], context: dict[str, 
     confidence = float(context.get("confidence") or 0)
     edge = float(probability or 0) - 0.45
     return max(-4, min(4, round(edge * confidence * 20)))
+
+
+def _apply_preselection_learning(
+    ensemble: dict[str, Any],
+    doc: dict[str, Any],
+    signals: list[dict[str, Any]],
+    *,
+    is_live: bool,
+    minute: int | float | None,
+) -> dict[str, Any]:
+    """Make proven contextual learning part of the 1X2 decision, safely.
+
+    Poisson/Dixon-Coles, Elo and rules remain the primary outcome models.  The
+    signal aggregator and learned signal-combination memory used to run only
+    during confidence calibration, after ``_market_selector_picks`` had
+    already chosen a side.  That meant they could report that a pick was weak
+    but could never prevent a close wrong-winner call.
+
+    This function applies only small, normalized adjustments before selection.
+    It will not move a clear model favourite (12+ points ahead), and a sparse
+    combination has almost no influence because the memory reader already
+    dampens it by sample size.
+    """
+    probabilities = (ensemble or {}).get("probabilities") or {}
+    outcomes = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
+    try:
+        outcomes = {key: max(0.0, float(probabilities.get(key) or 0.0)) for key in outcomes}
+    except (TypeError, ValueError):
+        return {"applied": False, "reason": "invalid_ensemble_probabilities"}
+    total = sum(outcomes.values())
+    if total <= 0:
+        return {"applied": False, "reason": "empty_ensemble_probabilities"}
+    outcomes = {key: value / total * 100.0 for key, value in outcomes.items()}
+    ranked = sorted(outcomes.values(), reverse=True)
+    if len(ranked) >= 2 and ranked[0] - ranked[1] >= 12.0:
+        return {"applied": False, "reason": "clear_model_favourite", "probabilities": outcomes}
+
+    league = doc.get("tournament") or doc.get("category") or "__global__"
+    if isinstance(league, dict):
+        league = league.get("name") or "__global__"
+    context = _calculate_signal_probabilities(
+        _aggregator_signals(signals), league_key=str(league or "__global__"),
+        match_context=doc, pick_type="match_result", prediction_mode="live" if is_live else "prematch",
+        live_context=live_context_from_doc(doc, minute),
+    )
+    aggregator_probs = {
+        "home_win": float(context.get("home_prob") or 0.0) * 100.0,
+        "draw": float(context.get("draw_prob") or 0.0) * 100.0,
+        "away_win": float(context.get("away_prob") or 0.0) * 100.0,
+    }
+    directional_count = sum(
+        1 for sig in _aggregator_signals(signals)
+        if _normalize_aggregator_signal(str(sig.get("name") or ""), sig.get("value")).get("direction")
+    )
+    # The aggregator's league distribution is only trusted when it is backed
+    # by per-league history (rather than its generic 45/30/25 fallback) and
+    # there are several independent directional observations.
+    if context.get("base_probs_source") == "learned" and directional_count >= 3:
+        for key in outcomes:
+            outcomes[key] = outcomes[key] * 0.90 + aggregator_probs[key] * 0.10
+
+    combination_adjustments: dict[str, int] = {}
+    try:
+        from app.storage.league_memory import weighted_signal_combination_memory
+        selections = {"home_win": "Home Win", "draw": "Draw", "away_win": "Away Win"}
+        live_context = live_context_from_doc(doc, minute)
+        for outcome, selection in selections.items():
+            memory = weighted_signal_combination_memory(
+                doc, signals, "match_result", selection,
+                prediction_mode="live" if is_live else "prematch", live_context=live_context,
+            )
+            # Keep direction changes conservative even with a well-performing
+            # pattern: this is a secondary calibration signal, not a model.
+            combination_adjustments[outcome] = max(-4, min(4, int(memory.get("adjustment") or 0)))
+            outcomes[outcome] += combination_adjustments[outcome]
+    except Exception:
+        combination_adjustments = {}
+
+    total = sum(max(0.1, value) for value in outcomes.values())
+    adjusted = {key: round(max(0.1, value) / total * 100.0, 1) for key, value in outcomes.items()}
+    ensemble["probabilities"] = adjusted
+    ensemble["prediction"] = max(adjusted, key=adjusted.get).replace("_", " ").title()
+    ensemble["confidence"] = adjusted[max(adjusted, key=adjusted.get)]
+    ensemble["preselection_learning"] = {
+        "applied": True,
+        "signal_aggregator_used": context.get("base_probs_source") == "learned" and directional_count >= 3,
+        "aggregator_base_probs_source": context.get("base_probs_source"),
+        "directional_signal_count": directional_count,
+        "signal_combination_adjustments": combination_adjustments,
+    }
+    return ensemble["preselection_learning"]
 
 
 NOISY_SUPPORT_SIGNALS = {
@@ -429,11 +521,9 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
     # These are appended to the signals list later, after it is initialised.
     _team_hist_signals = _team_history_signals(doc, detail)
 
-    value_bets = _value_bets(
-        doc,
-        dixon if dixon and not dixon.get("error") else poisson,
-        ensemble,
-    )
+    # Value bets are calculated after preselection learning below so their
+    # edge uses the same final 1X2 probabilities as the selected winner.
+    value_bets: list[dict[str, Any]] = []
     signals = list(rules.get("signals") or [])
     signals.extend(_team_hist_signals)
     signals.extend(_source_quality_signals(doc, readiness))
@@ -685,6 +775,25 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
         (doc.get("tournament") or "") + " " + (doc.get("category") or "")
     )
 
+    try:
+        preselection_learning = _apply_preselection_learning(
+            ensemble, doc, signals, is_live=is_live, minute=minute,
+        )
+        signals.append({
+            "name": "preselection_learning",
+            "value": preselection_learning,
+            "impact": 0,
+            "role": "supporting_evidence",
+        })
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("enriched_prediction", "preselection_learning_failed", exc)
+
+    value_bets = _value_bets(
+        doc,
+        dixon if dixon and not dixon.get("error") else poisson,
+        ensemble,
+    )
     market_picks = _market_selector_picks(doc, ensemble, poisson, dixon, finished_memory, rules)
     market_longshot_signal = _consensus_longshot_market_pick_signal(doc, market_picks, odds_movement)
     if market_longshot_signal and not (
@@ -1947,8 +2056,9 @@ def _venue_form_context(doc: dict[str, Any], detail: dict[str, Any]) -> dict[str
     away_venue = _venue_record(away_history, away_id, "away")
     sample_ok = home_venue["sample"] >= 3 and away_venue["sample"] >= 3
     ppg_edge = home_venue["points_per_game"] - away_venue["points_per_game"]
-    gd_edge = home_venue["goal_diff_per_game"] - away_venue["goal_diff_per_game"]
-    edge = ppg_edge * 7.0 + gd_edge * 3.5
+    # Edge is PPG-only — goal difference removed. A 1-0 home win and a
+    # 4-0 home win both count as 3 points; margin doesn't change the edge.
+    edge = ppg_edge * 7.0
     if home_venue["loss_rate"] >= 0.5:
         edge -= 3.0
     if away_venue["loss_rate"] <= 0.25 and away_venue["sample"] >= 4:
@@ -5475,8 +5585,5 @@ class EnrichedPrediction:
             ValueError: when the document is not yet ready (missing data fields).
         """
         return predict_enriched_match(self._doc)
-
-
-
 
 

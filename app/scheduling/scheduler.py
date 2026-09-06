@@ -23,13 +23,14 @@ from datetime import date as dt, datetime, timedelta, timezone
 from typing import Any
 
 from app.storage.db import db_conn, _conn
-from app.data_clients.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post
+from app.data_clients.sportybet_client import fetch_live_matches_post, fetch_upcoming_matches_post, fetch_matches_post
 from app.storage.buffer import (
     ingest_matches,
     patch_live_scores,
     run_enrichment_worker,
     get_buffer_stats,
     purge_ghost_matches,
+    backfill_merge_orphaned_matches,
 )
 from app.utils.activity_log import record_activity
 from app.ai.ai_prediction_pipeline import job_ai_prediction_queue
@@ -69,6 +70,7 @@ SCHEDULER_INTERVAL_DEFAULTS: dict[str, dict[str, Any]] = {
     "unified_upcoming": {"label": "Unified upcoming pipeline", "default": 300, "min": 60, "max": 600, "pipeline_id": "unified_upcoming"},
     "unified_live": {"label": "Unified live pipeline", "default": 60, "min": 30, "max": 300, "pipeline_id": "unified_live"},
     "competition_special": {"label": "Competition special lane", "default": 300, "min": 60, "max": 3600, "pipeline_id": None},
+    "competition_sporty_reconcile": {"label": "Competition ↔ Sporty reconciliation", "default": 300, "min": 60, "max": 3600, "pipeline_id": None},
     "competition_analysis": {"label": "Competition analysis job", "default": 86400, "min": 3600, "max": 86400 * 7, "pipeline_id": "competition_analysis"},
     "regenerate_research_stats": {"label": "Research stats regeneration", "default": 86400, "min": 3600, "max": 86400 * 7, "pipeline_id": None},
 }
@@ -88,6 +90,7 @@ _DB_WRITE_JOB_IDS = {
     "grade_predictions",
     "enrich_future",
     "competition_special",
+    "competition_sporty_reconcile",
     "competition_analysis",
     "sofa_pipeline",
     "unified_upcoming",
@@ -109,6 +112,7 @@ _JOB_STALE_SECONDS = {
     "grade_predictions": 3600,
     "autopilot_guardian": 900,
     "competition_special": 1800,
+    "competition_sporty_reconcile": 1800,
     "competition_analysis": 90000,
     "sofa_pipeline": 600,
     "unified_upcoming": 480,
@@ -946,6 +950,83 @@ def job_competition_special() -> dict[str, Any]:
     return {"job": "competition_special", **result}
 
 
+def _competition_unlinked_count() -> int:
+    """Count SofaScore-backed Competition Special rows that cannot be booked."""
+    try:
+        with db_conn(timeout=10) as conn:
+            row = conn.execute(
+                """
+                select count(*) from match_buffer
+                where (sofascore_only = 1 or data_source = 'sofascore'
+                       or json_extract(raw_sporty, '$.competition_special_proxy') = 1)
+                  and coalesce(trim(sportybet_id), '') = ''
+                  and coalesce(is_finished, 0) = 0
+                """
+            ).fetchone()
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+def job_reconcile_competition_sporty() -> dict[str, Any]:
+    """Continuously attach real Sporty event IDs to Competition Special rows.
+
+    The job deliberately uses the same ``ingest_matches`` path as normal
+    Sporty ingestion. That path performs the vetted team-id/name/date match,
+    preserves the SofaScore internal identity, and writes one canonical shape:
+    ``match_id=sofascore:<id>``, ``sofascore_id=<id>``, and
+    ``sportybet_id=<real provider event id>`` with genuine Sporty markets.
+    It also runs the orphan backfill to repair rows created before the
+    ingest-time reconciliation existed.
+    """
+    if is_shutting_down():
+        return {"status": "shutdown", "job": "competition_sporty_reconcile"}
+
+    before = _competition_unlinked_count()
+    record_activity(
+        "Competition Special ↔ SportyBet reconciliation starting",
+        job="competition_sporty_reconcile", status="running",
+        details={"unlinked_before": before},
+    )
+    try:
+        # Bypass the short list cache: this lane is specifically responsible
+        # for discovering newly listed provider fixtures, not merely replaying
+        # the regular ingest's last response.
+        upcoming = fetch_matches_post(is_live=False, bypass_cache=True)
+        live = fetch_matches_post(is_live=True, bypass_cache=True)
+        matches = {str(item.get("id") or ""): item for item in upcoming + live if item.get("id")}
+        grouped = _group_matches_by_local_date(list(matches.values()))
+        ingested = sum(ingest_matches(group, match_date) for match_date, group in grouped.items())
+        # Covers legacy standalone Sporty rows too.  Current rows normally
+        # merge during ingest, making this an inexpensive safety net.
+        backfill = backfill_merge_orphaned_matches(dry_run=False, limit=2000)
+        after = _competition_unlinked_count()
+        linked = max(0, before - after)
+        result = {
+            "status": "ok",
+            "job": "competition_sporty_reconcile",
+            "sporty_upcoming_fetched": len(upcoming),
+            "sporty_live_fetched": len(live),
+            "sporty_ingested_or_updated": ingested,
+            "legacy_backfill_merged": int(backfill.get("merged") or 0),
+            "unlinked_before": before,
+            "unlinked_after": after,
+            "linked_this_run": linked,
+        }
+        record_activity(
+            f"Competition Sporty reconciliation finished: {linked} linked, {after} still awaiting Sporty listing",
+            job="competition_sporty_reconcile", status="ok", details=result,
+        )
+        return result
+    except Exception as exc:
+        record_activity(
+            f"Competition Sporty reconciliation failed: {exc}",
+            job="competition_sporty_reconcile", status="error",
+            details={"unlinked_before": before},
+        )
+        return {"status": "error", "job": "competition_sporty_reconcile", "error": str(exc), "unlinked_before": before}
+
+
 def job_archive_finished(match_date: str | None = None, limit: int = 1000) -> dict[str, Any]:
     """Archive finished matches to MongoDB via SofaScore."""
     from app.storage.mongo_store import store_scheduled_matches
@@ -1781,6 +1862,21 @@ def start_scheduler():
         coalesce=True,
         misfire_grace_time=180,
         next_run_time=now + timedelta(minutes=3),
+    )
+
+    # Run just after the Competition Special mirror.  This keeps every
+    # provider-listed special fixture in the same canonical combined shape
+    # before a user can ask the bet builder to book it.
+    scheduler.add_job(
+        _safe(job_reconcile_competition_sporty),
+        IntervalTrigger(seconds=_scheduler_interval("competition_sporty_reconcile")),
+        id="competition_sporty_reconcile",
+        name="Reconcile Competition Special fixtures with SportyBet IDs",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=180,
+        next_run_time=now + timedelta(minutes=4),
     )
 
     scheduler.add_job(

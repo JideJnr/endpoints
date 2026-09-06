@@ -8,18 +8,36 @@ from typing import Any
 from app.utils.primitives import _first_present_key as _first_present, _optional_int, _to_int
 
 LIVE_STAT_NAMES = {
-    "ball_possession": ("ball possession", "possession"),
-    "shots_on_target": ("shots on target",),
-    "shots_off_target": ("shots off target",),
-    "total_shots": ("total shots", "shots"),
-    "corner_kicks": ("corner kicks", "corners"),
-    "big_chances": ("big chances",),
-    "xg": ("expected goals", "xg"),
-    "attacks": ("attacks",),
+    # ── Existing attack / possession stats ────────────────────────────────
+    "ball_possession":   ("ball possession", "possession"),
+    "shots_on_target":   ("shots on target",),
+    "shots_off_target":  ("shots off target",),
+    "total_shots":       ("total shots", "shots"),
+    "corner_kicks":      ("corner kicks", "corners"),
+    "big_chances":       ("big chances",),
+    "xg":                ("expected goals", "xg"),
+    "attacks":           ("attacks",),
     "dangerous_attacks": ("dangerous attacks",),
-    "fouls": ("fouls",),
-    "yellow_cards": ("yellow cards",),
-    "red_cards": ("red cards",),
+    "fouls":             ("fouls",),
+    "yellow_cards":      ("yellow cards",),
+    "red_cards":         ("red cards",),
+    # ── Pressing / defensive intensity ────────────────────────────────────
+    # These are served by SofaScore for most top-tier matches. They feed
+    # into the pressing_profile built in team_watcher._compute_pressing_profile()
+    # and into the richer half-pressure verdict in live_pressure.py.
+    # New entries extend live_stat_snapshots automatically (columns are
+    # derived from this dict at table-creation time in live_stat_history.py).
+    "tackles":            ("total tackles", "tackles"),
+    "tackles_won":        ("tackles won",),
+    "interceptions":      ("interceptions",),
+    "recoveries":         ("recoveries", "ball recoveries"),
+    "aerial_duels_won":   ("aerial duels won", "aerial duels"),
+    "final_third_entries":("final third entries", "final third phase"),
+    "sprints":            ("number of sprints", "sprints"),
+    "accurate_passes":    ("accurate passes",),
+    "long_balls":         ("long balls",),
+    "clearances":         ("clearances",),
+    "goalkeeper_saves":   ("goalkeeper saves", "total saves"),
 }
 
 

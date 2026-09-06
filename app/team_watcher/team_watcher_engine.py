@@ -550,12 +550,13 @@ def _rules_model(
     # â”€â”€ Matchup strength scores â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Each market gets a home_score and away_score; the gap drives the pick.
 
-    # Match result: weighted combination of win_rate, form, and goal differential
+    # Match result: win_rate + form only — goal differential removed.
+    # A narrow win against a strong opponent counts the same as a rout.
+    # The 0.25 weight previously on goal diff is redistributed to win_rate.
     def _result_score(s: dict[str, Any]) -> float:
         return (
-            s["win_rate"]   * 0.50
+            s["win_rate"]   * 0.75
             + s["form_score"] * 0.25
-            + min(1.0, max(0.0, (s["gf_avg"] - s["ga_avg"]) / 3.0 + 0.5)) * 0.25
         )
 
     home_result_score = _result_score(home_stats)

@@ -380,6 +380,11 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
     stored_best = picks[0] if picks else {}
     models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
     result = row["result"] if "result" in row.keys() else None
+    grading_reason = _safe_json(row["grading_reason_json"] if "grading_reason_json" in row.keys() else "{}", {})
+    # Old rows predate post_match_analysis_v1. Build the same read-only view
+    # on demand so every settled match remains explainable after deployment.
+    if result in ("win", "loss", "void") and not grading_reason.get("post_match_analysis"):
+        grading_reason["post_match_analysis"] = _post_match_analysis(row, grading_reason)
     passed_models = _get_passed_models(models, result) if result in ("win", "loss") else []
     return {
         "id": row["id"],
@@ -405,7 +410,11 @@ def _prediction_row(row: sqlite3.Row) -> dict[str, Any]:
         "signal_combination_key": row["signal_combination_key"] if "signal_combination_key" in row.keys() else None,
         "signal_combination": _safe_json(row["signal_combination_json"] if "signal_combination_json" in row.keys() else "{}", {}),
         "live_context": _safe_json(row["live_context_json"] if "live_context_json" in row.keys() else "{}", {}),
-        "grading_reason": _safe_json(row["grading_reason_json"] if "grading_reason_json" in row.keys() else "{}", {}),
+        "grading_reason": grading_reason,
+        "result": result,
+        "final_home": row["final_home"] if "final_home" in row.keys() else None,
+        "final_away": row["final_away"] if "final_away" in row.keys() else None,
+        "graded_at": row["graded_at"] if "graded_at" in row.keys() else None,
         "created_at": row["created_at"],
     }
 
@@ -945,6 +954,7 @@ def grade_prediction_row(
             "reason": "graded from live_context_json score-at-pick-time",
             "graded_via": "live_context_score_delta",
         }
+        grade_info["post_match_analysis"] = _post_match_analysis(row, grade_info)
         return live_result, grade_info
     from app.monitoring.prediction_audit import grading_reason as _grading_reason
     grade_info = _grading_reason(row["pick_type"], row["selection"], final_home, final_away, row["match_name"])
@@ -952,7 +962,125 @@ def grade_prediction_row(
     # Keep "void" out of prediction_history — treat as "void" rather than
     # forcing a spurious win/loss by falling back further.
     grade_info["result"] = result
+    # Keep the explanation next to the grade that produced it.  This makes a
+    # historical result reproducible from the evidence available at pick time,
+    # rather than re-analysing a match with today's learned weights.
+    grade_info["post_match_analysis"] = _post_match_analysis(row, grade_info)
     return result, grade_info
+
+
+def _post_match_analysis(row: Any, grade_info: dict[str, Any]) -> dict[str, Any]:
+    """Create a stable, UI-ready account of why a pick settled as it did.
+
+    ``impact`` is not universally directional, so we deliberately do not
+    claim that a positive signal backed the home side.  The favourite is only
+    inferred from explicit pre-match model probabilities; when those are not
+    available it remains unknown rather than guessed from the final score.
+    """
+    signals = _safe_json(row["signals_json"] if "signals_json" in row.keys() else "[]", [])
+    models = _safe_json(row["models_json"] if "models_json" in row.keys() else "{}", {})
+    combo = _safe_json(row["signal_combination_json"] if "signal_combination_json" in row.keys() else "{}", {})
+    picks = _safe_json(row["picks_json"] if "picks_json" in row.keys() else "[]", [])
+    home, away = _match_teams(str(row["match_name"] or ""))
+    final = grade_info.get("final_score") or {}
+    final_home, final_away = final.get("home"), final.get("away")
+
+    contributors = []
+    risks = []
+    net_impact = 0.0
+    for signal in signals if isinstance(signals, list) else []:
+        if not isinstance(signal, dict):
+            continue
+        try:
+            impact = float(signal.get("impact") or 0)
+        except (TypeError, ValueError):
+            impact = 0.0
+        net_impact += impact
+        item = {"name": signal.get("name") or "Unnamed signal", "impact": round(impact, 2), "value": signal.get("value")}
+        if impact > 0:
+            contributors.append(item)
+        elif impact < 0:
+            risks.append(item)
+    contributors.sort(key=lambda item: item["impact"], reverse=True)
+    risks.sort(key=lambda item: item["impact"])
+
+    favourite = _model_favourite(models, home, away)
+    favourite_outcome = None
+    better_team_lost = False
+    if favourite and final_home is not None and final_away is not None:
+        if final_home == final_away:
+            favourite_outcome = "drew"
+        elif (favourite["side"] == "home" and final_home > final_away) or (favourite["side"] == "away" and final_away > final_home):
+            favourite_outcome = "won"
+        else:
+            favourite_outcome = "lost"
+            better_team_lost = True
+
+    result = grade_info.get("result")
+    pick = picks[0] if isinstance(picks, list) and picks else {}
+    settlement = grade_info.get("reason") or "The final score was recorded and the pick was settled."
+    if result == "win":
+        summary = f"Success: {settlement}"
+    elif result == "loss":
+        summary = f"Failure: {settlement}"
+    else:
+        summary = settlement
+    if better_team_lost:
+        summary += f" Pre-match favourite {favourite['team']} lost the match."
+
+    return {
+        "version": "post_match_analysis_v1",
+        "summary": summary,
+        "pick": {"type": pick.get("type") or row["pick_type"], "selection": pick.get("selection") or row["selection"]},
+        "signal_combination": {
+            "key": row["signal_combination_key"] if "signal_combination_key" in row.keys() else None,
+            "payload": combo,
+            "signals_considered": len(signals) if isinstance(signals, list) else 0,
+            "net_impact": round(net_impact, 2),
+            "top_contributors": contributors[:5],
+            "top_risks": risks[:5],
+        },
+        "better_team": {
+            "status": "identified" if favourite else "unknown",
+            "side": favourite.get("side") if favourite else None,
+            "team": favourite.get("team") if favourite else None,
+            "probability": favourite.get("probability") if favourite else None,
+            "source": favourite.get("source") if favourite else None,
+            "outcome": favourite_outcome,
+            "lost": better_team_lost,
+        },
+    }
+
+
+def _match_teams(match_name: str) -> tuple[str | None, str | None]:
+    parts = re.split(r"\s+(?:vs\.?|v)\s+", match_name, maxsplit=1, flags=re.IGNORECASE)
+    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else (None, None)
+
+
+def _model_favourite(models: Any, home: str | None, away: str | None) -> dict[str, Any] | None:
+    if not isinstance(models, dict):
+        return None
+    # The ensemble is the combined signal/model decision, so it is the only
+    # valid definition of "better team" for this feature.
+    candidates = [("ensemble", models.get("ensemble"))] if isinstance(models.get("ensemble"), dict) else []
+    candidates.extend((str(name), model) for name, model in models.items() if name != "ensemble")
+    for source, model in candidates:
+        if not isinstance(model, dict):
+            continue
+        probs = model.get("probabilities") or model.get("probability")
+        if not isinstance(probs, dict):
+            continue
+        try:
+            home_prob = float(probs.get("home_win", probs.get("home", 0)) or 0)
+            away_prob = float(probs.get("away_win", probs.get("away", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if max(home_prob, away_prob) <= 0 or home_prob == away_prob:
+            continue
+        scale = 100 if max(home_prob, away_prob) > 1 else 1
+        side = "home" if home_prob > away_prob else "away"
+        return {"side": side, "team": home if side == "home" else away, "probability": round(max(home_prob, away_prob) / scale, 4), "source": source}
+    return None
 
 
 def update_prediction_result(
@@ -1116,4 +1244,3 @@ def _betbuilder_learning_summary(legs: list[dict[str, Any]], slip_result: str) -
             for leg in losses
         ],
     }
-

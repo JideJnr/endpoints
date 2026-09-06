@@ -168,7 +168,7 @@ def run_llm_bet(
     )
 
     selections = [{
-        "sportybet_id": i.get("match_id") or i.get("sportybet_id"),
+        "sportybet_id": i.get("sportybet_id") or i.get("match_id"),
         "type": i.get("type") or i.get("pick_type"),
         "selection": i.get("selection"),
         "marketId": i.get("marketId"),

@@ -174,3 +174,71 @@ def _elo_doc_context(doc: dict[str, Any] | None) -> dict[str, Any]:
         "has_standings": has_standings,
         "has_markets": has_markets,
     }
+
+
+def get_elo_league_strength(league_name: str, min_teams: int = 4) -> dict[str, Any]:
+    """Derive a league strength score (20–98 scale) from the average ELO of
+    teams that have played in that league, as recorded in ai_team_watcher_matches.
+
+    Strategy:
+    - Join elo_ratings (keyed by team_id/sofascore_team_id) with the distinct
+      set of teams seen playing in this league via ai_team_watcher_matches.
+    - Only teams with at least 3 matches in this league are included, to
+      avoid one-off cup appearances inflating/deflating the average.
+    - Requires min_teams distinct teams; returns {"available": False} when
+      not enough ELO-rated teams exist for this league yet.
+
+    Mapping avg_elo → score:
+      avg_elo 1800+ → 98   (elite/CL level)
+      avg_elo 1700  → ~90
+      avg_elo 1600  → ~82
+      avg_elo 1500  → ~74  (baseline — mid-table in a known league)
+      avg_elo 1400  → ~66
+      avg_elo 1300  → ~58
+      avg_elo 1200  → ~50
+      avg_elo 1100  → ~42
+      Formula: score = 74 + (avg_elo - 1500) * 0.08, clamped [20, 98]
+    """
+    if not league_name:
+        return {"available": False, "reason": "no_league_name"}
+    _init_db()
+    try:
+        with db_conn(timeout=10) as conn:
+            _init_elo_table(conn)
+            rows = conn.execute(
+                """
+                select e.rating
+                from elo_ratings e
+                inner join (
+                    select sofascore_team_id, count(*) as appearances
+                    from ai_team_watcher_matches
+                    where league_name = ?
+                      and sofascore_team_id is not null
+                      and sofascore_team_id != ''
+                    group by sofascore_team_id
+                    having appearances >= 3
+                ) league_teams on e.team_id = league_teams.sofascore_team_id
+                where e.matches_played >= 3
+                """,
+                (league_name,),
+            ).fetchall()
+    except Exception as exc:
+        return {"available": False, "reason": f"db_error: {exc}"}
+
+    if len(rows) < min_teams:
+        return {
+            "available": False,
+            "reason": "insufficient_rated_teams",
+            "rated_teams": len(rows),
+            "min_required": min_teams,
+        }
+
+    ratings = [float(row[0]) for row in rows]
+    avg_elo = sum(ratings) / len(ratings)
+    score = max(20, min(98, round(74 + (avg_elo - 1500) * 0.08)))
+    return {
+        "available": True,
+        "avg_elo": round(avg_elo, 1),
+        "rated_teams": len(ratings),
+        "score": score,
+    }
