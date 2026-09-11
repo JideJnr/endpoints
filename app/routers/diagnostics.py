@@ -10,6 +10,10 @@ from app.storage.db import db_conn
 from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
 
 
@@ -46,7 +50,8 @@ def live_prediction_gaps() -> dict[str, Any]:
         for row in rows:
             try:
                 doc = json.loads(row["raw_enriched"] or "{}")
-            except Exception:
+            except Exception as exc:
+                logger.debug("diagnostics: raw doc parse failed for %s: %s", row["match_id"], exc)
                 doc = {}
             readiness = prediction_readiness(doc)
             gaps.append({

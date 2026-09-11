@@ -971,16 +971,37 @@ def _competition_unlinked_count() -> int:
 def job_reconcile_competition_sporty() -> dict[str, Any]:
     """Continuously attach real Sporty event IDs to Competition Special rows.
 
-    The job deliberately uses the same ``ingest_matches`` path as normal
-    Sporty ingestion. That path performs the vetted team-id/name/date match,
-    preserves the SofaScore internal identity, and writes one canonical shape:
-    ``match_id=sofascore:<id>``, ``sofascore_id=<id>``, and
-    ``sportybet_id=<real provider event id>`` with genuine Sporty markets.
-    It also runs the orphan backfill to repair rows created before the
+    Per-competition via SportyBet's pcEvents endpoint (fetch_tournament_events),
+    scoped by the exact unique_tournament_id already stored for each curated
+    competition -- confirmed live (2026-09-06 browser inspection of
+    sportybet.com's own competition filter) that SportyBet and SofaScore pass
+    through the same raw Sportradar tournament number for these leagues, so
+    there is no name/date guessing involved in finding the right competition.
+
+    This replaced the previous approach of trawling SportyBet's site-wide
+    "top ~300 by order" homepage feed (wapConfigurableEventsByOrder via
+    fetch_matches_post): that feed only surfaces popular leagues, so niche
+    curated competitions could go entire cycles without a single one of
+    their fixtures appearing in it, staying unlinked indefinitely. Fetching
+    each competition directly means every enabled curated league gets its
+    own full fixture list every run, and the eventual team/name+date match
+    inside ingest_matches() (see buffer.py::_resolve_sofascore_only_match)
+    has a far smaller, single-competition candidate pool to search instead
+    of the whole site's live+upcoming feed -- both more complete and less
+    error-prone.
+
+    Still uses the same ``ingest_matches`` merge path as normal Sporty
+    ingestion, which preserves the SofaScore internal identity and writes
+    one canonical shape: ``match_id=sofascore:<id>``, ``sofascore_id=<id>``,
+    and ``sportybet_id=<real provider event id>`` with genuine Sporty
+    markets. Also runs the orphan backfill to repair rows created before
     ingest-time reconciliation existed.
     """
     if is_shutting_down():
         return {"status": "shutdown", "job": "competition_sporty_reconcile"}
+
+    from app.competition.competition_special import list_top_competitions
+    from app.data_clients.sportybet_client import fetch_tournament_events
 
     before = _competition_unlinked_count()
     record_activity(
@@ -989,13 +1010,26 @@ def job_reconcile_competition_sporty() -> dict[str, Any]:
         details={"unlinked_before": before},
     )
     try:
-        # Bypass the short list cache: this lane is specifically responsible
-        # for discovering newly listed provider fixtures, not merely replaying
-        # the regular ingest's last response.
-        upcoming = fetch_matches_post(is_live=False, bypass_cache=True)
-        live = fetch_matches_post(is_live=True, bypass_cache=True)
-        matches = {str(item.get("id") or ""): item for item in upcoming + live if item.get("id")}
-        grouped = _group_matches_by_local_date(list(matches.values()))
+        competitions = [
+            c for c in list_top_competitions()
+            if c.get("enabled") and c.get("unique_tournament_id")
+        ]
+        all_matches: dict[str, dict[str, Any]] = {}
+        fetch_errors: list[dict[str, str]] = []
+        for comp in competitions:
+            try:
+                # Bypass the short per-tournament cache: this lane is
+                # specifically responsible for discovering newly listed
+                # provider fixtures, not merely replaying the last response.
+                events = fetch_tournament_events(comp["unique_tournament_id"], bypass_cache=True)
+            except Exception as exc:
+                fetch_errors.append({"competition": comp["key"], "error": str(exc)})
+                continue
+            for item in events:
+                match_id = str(item.get("id") or "")
+                if match_id:
+                    all_matches[match_id] = item
+        grouped = _group_matches_by_local_date(list(all_matches.values()))
         ingested = sum(ingest_matches(group, match_date) for match_date, group in grouped.items())
         # Covers legacy standalone Sporty rows too.  Current rows normally
         # merge during ingest, making this an inexpensive safety net.
@@ -1005,8 +1039,9 @@ def job_reconcile_competition_sporty() -> dict[str, Any]:
         result = {
             "status": "ok",
             "job": "competition_sporty_reconcile",
-            "sporty_upcoming_fetched": len(upcoming),
-            "sporty_live_fetched": len(live),
+            "competitions_scanned": len(competitions),
+            "competitions_failed_to_fetch": fetch_errors,
+            "sporty_events_fetched": len(all_matches),
             "sporty_ingested_or_updated": ingested,
             "legacy_backfill_merged": int(backfill.get("merged") or 0),
             "unlinked_before": before,
@@ -1177,6 +1212,34 @@ def job_grade_predictions() -> dict[str, Any]:
         except Exception as exc:
             cleanup_result = {"error": str(exc)}
 
+        # Odds-market retention -- keep odds_market_changes bounded instead
+        # of growing forever. cleanup_odds_for_date() (opening tick + true
+        # pre-kickoff closing line, per app/market/market.py) already
+        # existed and its own docstring claimed this function calls it, but
+        # nothing in this file ever actually did -- found 2026-09-09 while
+        # investigating why the table kept growing (~380MB/day) despite this
+        # cleanup existing. target_dates[0] is today (still-live matches, no
+        # closing line yet -- use the simpler first/last prune instead);
+        # target_dates[1:] are yesterday and older (safe for the real
+        # closing-line cleanup). Both are idempotent, so re-running every 6h
+        # for dates already cleaned is cheap.
+        try:
+            from app.market.market import cleanup_odds_for_date, prune_odds_market_changes_keep_first_last
+            odds_cleanup_result = {
+                "by_date": [{"date": d, **cleanup_odds_for_date(d)} for d in target_dates[1:]],
+                "today_prune": prune_odds_market_changes_keep_first_last(target_dates[0]),
+            }
+        except Exception as exc:
+            odds_cleanup_result = {"error": str(exc)}
+
+        odds_pruned_total = 0
+        if "error" not in odds_cleanup_result:
+            odds_pruned_total = sum(
+                d.get("odds_market_changes", 0) + d.get("odds_snapshots", 0)
+                for d in odds_cleanup_result.get("by_date", [])
+            )
+            odds_pruned_total += odds_cleanup_result.get("today_prune", {}).get("odds_market_changes", 0)
+
         print(
             f"[scheduler] grade_predictions: graded={total_graded} skipped={total_skipped} "
             f"elo_updated={elo_updated} win_rate={metrics.get('win_percent')}% "
@@ -1185,12 +1248,14 @@ def job_grade_predictions() -> dict[str, Any]:
             f"model_weights={(learn_result.get('self_learner') or {}).get('model_weight_updates', 0)} "
             f"league_profiles={(learn_result.get('self_learner') or {}).get('league_updates', 0)} "
             f"overdue={overdue_result.get('graded', 0)} "
-            f"cleanup_finished={cleanup_result.get('deleted_finished')}"
+            f"cleanup_finished={cleanup_result.get('deleted_finished')} "
+            f"odds_pruned={odds_pruned_total}"
         )
         return {"status": "success", "dates": by_date, "graded": total_graded, "skipped": total_skipped,
                 "metrics": metrics, "elo_updated": elo_updated,
                 "calibration": cal_result, "patterns": pattern_result,
                 "clv": clv_result, "learning": learn_result, "cleanup": cleanup_result,
+                "odds_cleanup": odds_cleanup_result,
                 "overdue": overdue_result, "betbuilder": betbuilder_result}
     except Exception as exc:
         print(f"[scheduler] grade_predictions failed: {exc}")
@@ -1232,7 +1297,23 @@ def job_auto_suggest_bet_builder(candidate_limit: int = 50) -> dict[str, Any]:
     from app.bet_builder.smart_builder import run_smart_bet
 
     try:
-        result = run_smart_bet(candidate_limit=candidate_limit, request_code=False)
+        # kickoff_window_hours=8.0: only this learning-only job passes it.
+        # Reasoning: this job runs every 3h and only needs its OWN slip to
+        # finish before the 6-hourly grading job can grade it. Restricting
+        # candidates to those kicking off within 8h of the earliest one
+        # keeps a slip's legs close together in time, so the whole slip
+        # finishes as one batch (roughly kickoff + ~2h match length) well
+        # inside that grading cycle, instead of straddling matches up to
+        # 48h apart that almost never finish together (see
+        # upcoming_prediction_candidates's docstring for the confirmed
+        # 27/27 pending-slip evidence behind this). Every other caller of
+        # run_smart_bet (manual builder, human /betbuilder/smart requests,
+        # the LLM builder) does not pass this and is unaffected.
+        result = run_smart_bet(
+            candidate_limit=candidate_limit,
+            request_code=False,
+            kickoff_window_hours=8.0,
+        )
     except Exception as exc:
         print(f"[scheduler] auto_suggest_bet_builder failed: {exc}")
         return {"status": "error", "error": str(exc)}
@@ -1261,6 +1342,20 @@ def job_auto_suggest_bet_builder(candidate_limit: int = 50) -> dict[str, Any]:
     _record_auto_suggestion_event(betbuilder_id, match_ids)
     print(f"[scheduler] auto_suggest_bet_builder: tracked slip id={betbuilder_id} legs={len(match_ids)} status={status}")
     return {"status": status, "tracked": True, "betbuilder_id": betbuilder_id, "match_ids": match_ids}
+
+
+def job_post_booking_code() -> dict[str, Any]:
+    """Build a fresh smart-bet booking code and post it as an LLM-written
+    thread to X, multiple times a day as new codes clear the conviction
+    bar. See app.social.poster.run_booking_code_post_job for the full
+    pipeline (build slip -> request share code -> dedup check -> compose
+    -> post-or-dry-run -> log to social_posts). Runs in dry-run mode
+    (composes + logs, never calls the X API) until X_POSTING_ENABLED and
+    the X_API_* credentials are set — see app.config.config.Settings.
+    """
+    from app.social.poster import run_booking_code_post_job
+
+    return run_booking_code_post_job()
 
 
 def _is_duplicate_auto_suggestion(match_ids: list[str]) -> bool:
@@ -1941,6 +2036,24 @@ def start_scheduler():
         coalesce=True,
         misfire_grace_time=1800,
         next_run_time=now + timedelta(minutes=12),
+    )
+
+    # booking-code X poster — every X_POST_INTERVAL_MINUTES (default 2 hrs),
+    # so a fresh high-value slip can go out multiple times a day. Dry-run
+    # (composes + logs, never calls the X API) until X_POSTING_ENABLED and
+    # the X_API_* credentials are configured — see app.social.poster.
+    from app.config.config import get_settings as _get_settings
+    _post_interval_minutes = max(15, _get_settings().x_post_interval_minutes)
+    scheduler.add_job(
+        _safe(job_post_booking_code),
+        IntervalTrigger(minutes=_post_interval_minutes),
+        id="post_booking_code",
+        name="Compose + post booking-code X thread",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+        next_run_time=now + timedelta(minutes=15),
     )
 
     # regenerate research_stats — daily at 03:00 server time

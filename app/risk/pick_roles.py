@@ -7,6 +7,10 @@ from app.storage.db import db_conn
 from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def learned_best_pick(picks: list[dict[str, Any]]) -> dict[str, Any]:
     learned = [pick for pick in picks if pick.get("learned_best")]
@@ -49,7 +53,8 @@ def load_role_memory_rows() -> dict[tuple[str, str], list[dict[str, Any]]]:
             key = (str(data.get("pick_type") or ""), str(data.get("selection") or "").lower())
             index.setdefault(key, []).append(data)
         return index
-    except Exception:
+    except Exception as exc:
+        logger.warning("pick_roles: could not load role memory rows, role learning disabled this call: %s", exc)
         return {}
 
 
@@ -83,7 +88,8 @@ def backfill_role_learning(
             pick["ranking_confidence"] = pick.get("ranking_confidence") or confidence + adjustment
         attach_fast_learned_decision(picks)
         prediction["learned_role_decision"] = (picks[0].get("learned_role_decision") if picks else None)
-    except Exception:
+    except Exception as exc:
+        logger.warning("pick_roles: role-learning backfill failed for match %s: %s", match_id, exc)
         return
 
 

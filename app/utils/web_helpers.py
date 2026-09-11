@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _fetch_web(idx: int, sporty: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     try:
@@ -18,5 +22,6 @@ def _fetch_web(idx: int, sporty: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             if len(parts) == 2:
                 home, away = parts
         return idx, search_match_context(str(home or ""), str(away or ""), str(sporty.get("tournament") or ""))
-    except Exception:
+    except Exception as exc:
+        logger.debug("web_helpers: match context search failed: %s", exc)
         return idx, {}

@@ -85,8 +85,11 @@ def apply_risk_controls(
                     "confidence_cap": controls.confidence_cap,
                     "stake_cap": controls.stake_cap_per_100,
                 })
-        except Exception:
-            pass  # Fall back to static rules if learner fails
+        except Exception as exc:
+            logger.warning(
+                "risk_manager: learned risk controls failed for pick %s, falling back to static rules: %s",
+                idx, exc,
+            )
 
     for idx, pick in enumerate(picks):
         if pick.get("type") == "no_bet":

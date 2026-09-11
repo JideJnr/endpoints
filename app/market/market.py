@@ -14,6 +14,10 @@ from app.config.config import get_settings
 
 from app.utils.primitives import _to_float
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 def snapshot_odds(doc: dict[str, Any]) -> bool:
     _init_db()
     settings = get_settings()
@@ -320,6 +324,69 @@ def cleanup_odds_for_date(match_date: str) -> dict[str, int]:
     return totals
 
 
+def prune_odds_market_changes_keep_first_last(match_date: str) -> dict[str, int]:
+    """
+    Blind time-based retention for odds_market_changes, for matches that
+    haven't finished yet (today's date) -- unlike cleanup_finished_match_odds
+    (which keeps the true pre-kickoff CLOSING LINE, computed from kickoff
+    time), this simply keeps the very first tick ever recorded and the most
+    recently recorded tick for each (match_id, source, market_id, specifier,
+    selection_id) group, deleting everything in between. "Closing line"
+    isn't defined yet for a match that hasn't reached kickoff or is still
+    live, so this is a deliberately simpler MIN(snapshot_time)/MAX(snapshot_time)
+    trim instead.
+
+    Intended to be called every 6h from job_grade_predictions for *today's*
+    date only, alongside cleanup_odds_for_date() for earlier dates -- see
+    that function's docstring. Because this runs repeatedly against a date
+    that's still accumulating new ticks, each run re-collapses the group
+    back down to 2 rows: the original first tick plus whatever was newest
+    at that run. This deliberately trades away mid-match odds-movement
+    granularity (steam-move / in-play pattern detection for today's matches
+    loses resolution between runs) in exchange for bounded table growth --
+    decided 2026-09-09, see project memory (predictx_odds_market_growth).
+
+    Safe to call more than once: a group with 2 or fewer rows already has
+    nothing to delete.
+    """
+    _init_db()
+    deleted = 0
+    with db_conn(timeout=30) as conn:
+        conn.execute("pragma busy_timeout = 30000")
+        _ensure_tables(conn)
+        groups = conn.execute(
+            """
+            select distinct match_id, source, market_id, specifier, selection_id
+            from odds_market_changes where match_date = ?
+            """,
+            (match_date,),
+        ).fetchall()
+        for match_id, source, market_id, specifier, selection_id in groups:
+            rows = conn.execute(
+                """
+                select id from odds_market_changes
+                where match_id = ? and source = ? and market_id = ? and specifier = ? and selection_id = ?
+                order by snapshot_time asc, id asc
+                """,
+                (match_id, source, market_id, specifier, selection_id),
+            ).fetchall()
+            if len(rows) <= 2:
+                continue
+            keep_ids = {rows[0][0], rows[-1][0]}
+            placeholders = ", ".join("?" for _ in keep_ids)
+            cur = conn.execute(
+                f"""
+                delete from odds_market_changes
+                where match_id = ? and source = ? and market_id = ? and specifier = ? and selection_id = ?
+                and id not in ({placeholders})
+                """,
+                (match_id, source, market_id, specifier, selection_id, *keep_ids),
+            )
+            deleted += cur.rowcount
+        conn.commit()
+    return {"odds_market_changes": deleted}
+
+
 def _match_kickoff_iso_for_cleanup(conn: sqlite3.Connection, match_id: str) -> str | None:
     """Same lookup as app.risk.clv._match_kickoff_iso (reused logic, not the
     private function itself, to avoid a market<->risk import cycle): checks
@@ -341,7 +408,8 @@ def _match_kickoff_iso_for_cleanup(conn: sqlite3.Connection, match_id: str) -> s
                         timestamp /= 1000
                     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
                 return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
-            except Exception:
+            except Exception as exc:
+                logger.debug("market: could not parse kickoff timestamp %r: %s", value, exc)
                 return None
     return None
 
@@ -519,16 +587,16 @@ def _market_table_for_match(conn: sqlite3.Connection, match_id: str) -> str:
         ).fetchone()
         if row:
             return "odds_market_changes"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("market table probe: odds_market_changes check failed for %s: %s", match_id, exc)
     try:
         legacy = conn.execute(
             "select 1 from sqlite_master where type='table' and name='odds_market_snapshots'",
         ).fetchone()
         if legacy:
             return "odds_market_snapshots"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("market table probe: legacy-table check failed for %s: %s", match_id, exc)
     return "odds_market_changes"
 
 
@@ -620,8 +688,16 @@ def _save_mongo_snapshot(
     try:
         from app.storage.mongo_store import save_odds_snapshot
 
+        # match_id here can be a SofaScore-derived id when source is
+        # "sofascore" (e.g. sofa_pipeline.py's "sofa:<id>" docs) -- labeling
+        # it "sportybet_id" unconditionally was the same mislabeling bug
+        # found and fixed in match_buffer / sofa_pipeline.py this session,
+        # just in the Mongo odds-history snapshot instead. No other code in
+        # this repo reads this field back out by name (confirmed via grep),
+        # so it's safe to only set it when it's actually a SportyBet id.
         save_odds_snapshot({
-            "sportybet_id": match_id,
+            "match_id": match_id,
+            "sportybet_id": match_id if source == "sportybet" else None,
             "match": match_name,
             "match_date": match_date,
             "snapshot_time": snapshot_time,
@@ -634,14 +710,15 @@ def _save_mongo_snapshot(
             "markets": market_rows,
             "source": source,
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("market: failed to save mongo snapshot for match %s: %s", match_id, exc)
 
 
 def _fractional_to_decimal(value: Any) -> float | None:
     try:
         return round(float(Fraction(str(value))) + 1, 3)
-    except Exception:
+    except Exception as exc:
+        logger.debug("market: could not parse fractional odds %r: %s", value, exc)
         return None
 
 

@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models.probability_learner import ProbabilityLearner
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ── Fallback configuration ──────────────────────────────
@@ -43,6 +45,21 @@ class FallbackHandler:
 
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = {**FALLBACK_CONFIG, **(config or {})}
+        # Deferred import (was a top-level `from app.models.probability_learner
+        # import ProbabilityLearner`): app.models.probability_learner imports
+        # app.enrichment.signal_aggregator, which (via app/enrichment/__init__.py
+        # -> enriched_prediction.py -> app.risk.kelly) pulls in this whole
+        # app.risk package's __init__.py, which imports THIS file, which
+        # imported ProbabilityLearner back -- a real circular import. The live
+        # app happens to import things in an order that never triggers it, but
+        # any script/tool that imports app.models.probability_learner as one
+        # of its first imports (e.g. tools/backfill_probability_learner.py)
+        # hits "ImportError: cannot import name 'ProbabilityLearner' from
+        # partially initialized module" immediately. Found + fixed 2026-09-09.
+        # A local, per-instance import breaks the cycle at import time
+        # without changing behavior (Python caches the module after the
+        # first real import, so this costs nothing on repeated calls).
+        from app.models.probability_learner import ProbabilityLearner
         self._learner = ProbabilityLearner()
 
     def get_fallback_pick(
@@ -238,8 +255,11 @@ class FallbackHandler:
                     "samples": result.get("samples", 0),
                     "adjustment": result.get("adjustment", 0),
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "fallback_logic: proven-history lookup failed for %s/%s @ %s: %s",
+                direction, league_name, odds, exc,
+            )
 
         return None
 

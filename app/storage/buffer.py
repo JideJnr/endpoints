@@ -1765,11 +1765,21 @@ def _finalize_enrichment_prediction(
     if sofa or item.get("is_live"):
         from app.utils.prediction_flow import apply_prediction_state
 
+        # attach_brain was True here, meaning every automatic enrichment
+        # pass (job_enrich_worker every 30s, and job_unified_live on its
+        # own cycle -- both call this same function) fired an extra LLM
+        # "brain review" call on top of the deterministic prediction, for
+        # every live match, every cycle. AI is only supposed to run here
+        # via the separate ai_prediction_queue job (which this function
+        # already flags matches for below via ai_prediction_queue_pending)
+        # or the on-demand match-details/bet-builder endpoint -- never
+        # automatically from enrichment itself. Confirmed live (2026-09-06)
+        # as the primary driver of runaway LLM call volume.
         state = apply_prediction_state(
             doc,
             match_id=str(item.get("match_id") or ""),
             use_llm_pipeline=False,
-            attach_brain=True,
+            attach_brain=False,
         )
         readiness = state.get("readiness") or {}
         if state.get("status") == "predicted":
@@ -2589,7 +2599,21 @@ def _sync_enriched_sporty_fields(
         # document, not just the SQL columns.
         "data_source": "both" if (doc.get("sofascore_id") or doc.get("sofascore_event") or doc.get("sofascore_detail")) else "sportybet",
         "sofascore_only": False,
-        "sportybet_id": str(sporty.get("id") or doc.get("sportybet_id") or match_id),
+        # Don't fall back to match_id blindly: when this is called to sync a
+        # merged SofaScore-only row, match_id is that row's OWN id
+        # ("sofascore:{id}"), not a real SportyBet id. sporty.get("id") is
+        # virtually always present for genuine SportyBet ingest data, so this
+        # only matters as a last-resort guard -- but a sofascore-prefixed
+        # value here is exactly the bug fixed in
+        # app/storage/league_memory/crud.py::_real_sportybet_id (2026-09-07).
+        "sportybet_id": next(
+            (
+                str(candidate)
+                for candidate in (sporty.get("id"), doc.get("sportybet_id"), match_id)
+                if candidate and not str(candidate).startswith("sofascore:") and not str(candidate).startswith("competition:")
+            ),
+            "",
+        ),
         "sportybet_name": sporty.get("name") or doc.get("sportybet_name") or doc.get("name"),
         "name": sporty.get("name") or doc.get("name"),
         "home_team": sporty.get("home_team") or doc.get("home_team"),

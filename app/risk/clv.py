@@ -47,6 +47,10 @@ from app.storage.db import db_conn
 from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 CLV_MIN_SAMPLES = 25
 
 
@@ -339,7 +343,8 @@ def _to_utc_iso(value: Any) -> str | None:
                 timestamp /= 1000
             return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
-    except Exception:
+    except Exception as exc:
+        logger.debug("clv: could not parse timestamp %r: %s", value, exc)
         return None
 
 

@@ -88,7 +88,8 @@ def _ensure_table_on_import() -> None:
             with db_conn() as conn:
                 _ensure_research_stats_table(conn)
             _research_stats_ensured = True
-        except Exception:
+        except Exception as exc:
+            logger.warning("_ensure_table_on_import: table setup failed: %s", exc)
             pass
 
 
@@ -126,7 +127,8 @@ def _get_learned_thresholds(league_key: str = "", pick_type: str = "") -> dict[s
         learned = get_learned_thresholds(league=lk, pick_type=pt)
         if learned.get("samples", 0) >= 20:
             return learned
-    except Exception:
+    except Exception as exc:
+        logger.warning("_get_learned_thresholds: lookup failed, using defaults: %s", exc)
         pass
     return dict(_DEFAULT_LEARNED_THRESHOLDS)
 
@@ -218,7 +220,8 @@ def _dynamic_market_block(
                 """,
                 (dimension, key),
             ).fetchone()
-    except Exception:
+    except Exception as exc:
+        logger.warning("_dynamic_market_block: query failed: %s", exc)
         return None
     if not row:
         return None
@@ -276,7 +279,8 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
         try:
             learned = _get_learned_thresholds(league_key, pick_type)
             min_conf = learned.get("min_confidence", 72.0)
-        except Exception:
+        except Exception as exc:
+            logger.warning("evaluate_pick: learned match_result threshold lookup failed: %s", exc)
             min_conf = 72.0
         if confidence < min_conf:
             return {"blocked": True, "reason": f"research_block:match_result_below_learned_{int(min_conf)}", "trust_boost": 0, "evidence": {"matched_value": confidence, "learned_threshold": min_conf}}
@@ -285,7 +289,8 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
     try:
         learned = _get_learned_thresholds(league_key, pick_type)
         min_conf = learned.get("min_confidence", 50.0)
-    except Exception:
+    except Exception as exc:
+        logger.warning("evaluate_pick: learned min_confidence lookup failed: %s", exc)
         min_conf = 50.0
     if confidence < min_conf:
         return {"blocked": True, "reason": f"research_block:confidence_below_learned_{int(min_conf)}", "trust_boost": 0, "evidence": {"matched_value": confidence, "learned_threshold": min_conf}}
@@ -352,7 +357,8 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
         _nb_thresh = _get_learned_thresholds(league_key, pick_type)
         _nb_lo = int(_nb_thresh.get("noisy_band_lo", 60))
         _nb_hi = int(_nb_thresh.get("noisy_band_hi", 66))
-    except Exception:
+    except Exception as exc:
+        logger.warning("evaluate_pick: learned noisy-band thresholds lookup failed: %s", exc)
         _nb_lo, _nb_hi = 60, 66
     if _nb_lo <= confidence <= _nb_hi:
         caution_conditions.append("noisy_band")
@@ -380,7 +386,8 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
     # Get learned trust boosts for this pick type
     try:
         learned_boosts = _get_learned_trust_boosts(pick_type)
-    except Exception:
+    except Exception as exc:
+        logger.warning("evaluate_pick: learned trust boosts lookup failed: %s", exc)
         learned_boosts = {}
 
     # 3.1 Home or Away selection -> learned boost
@@ -442,7 +449,8 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
     try:
         learned = _get_learned_thresholds(league_key, pick_type)
         trust_cap = learned.get("trust_boost_cap", TRUST_BOOST_CAP)
-    except Exception:
+    except Exception as exc:
+        logger.warning("evaluate_pick: learned trust_boost_cap lookup failed: %s", exc)
         trust_cap = TRUST_BOOST_CAP
     trust_boost = min(trust_boost, int(trust_cap))
 
@@ -450,7 +458,8 @@ def evaluate_pick(pick: dict[str, Any]) -> dict[str, Any]:
     try:
         learned = _get_learned_thresholds(league_key, pick_type)
         conf_cap = learned.get("confidence_cap", PUBLISHED_CONFIDENCE_CAP)
-    except Exception:
+    except Exception as exc:
+        logger.warning("evaluate_pick: learned confidence_cap lookup failed: %s", exc)
         conf_cap = PUBLISHED_CONFIDENCE_CAP
     published_confidence = min(confidence + trust_boost, int(conf_cap))
 
@@ -499,7 +508,8 @@ def _research_filter_candidate(
         try:
             learned = _get_learned_thresholds(league_key, pick_type)
             min_conf = learned.get("min_confidence", 72.0)
-        except Exception:
+        except Exception as exc:
+            logger.warning("_research_filter_candidate: learned match_result threshold lookup failed: %s", exc)
             min_conf = 72.0
         if confidence < min_conf:
             return False
@@ -508,7 +518,8 @@ def _research_filter_candidate(
     try:
         learned = _get_learned_thresholds(league_key, pick_type)
         min_conf = learned.get("min_confidence", 50.0)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_research_filter_candidate: learned min_confidence lookup failed: %s", exc)
         min_conf = 50.0
     for dimension, key in (
         ("odds_bucket", _odds_bucket("draw_odds", draw_odds)),
@@ -538,7 +549,8 @@ def _research_filter_candidate(
     )
     try:
         conf_cap = learned.get("confidence_cap", PUBLISHED_CONFIDENCE_CAP)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_research_filter_candidate: learned confidence_cap lookup failed: %s", exc)
         conf_cap = PUBLISHED_CONFIDENCE_CAP
     published_confidence = min(published_confidence, int(conf_cap))
     if published_confidence < min_conf:
@@ -557,7 +569,8 @@ def _research_filter_candidate(
     try:
         _nb2 = _get_learned_thresholds(league_key, pick_type)
         _nb_lo2, _nb_hi2 = int(_nb2.get("noisy_band_lo", 60)), int(_nb2.get("noisy_band_hi", 66))
-    except Exception:
+    except Exception as exc:
+        logger.warning("_research_filter_candidate: learned noisy-band thresholds lookup failed: %s", exc)
         _nb_lo2, _nb_hi2 = 60, 66
     is_noisy_band = _nb_lo2 <= confidence <= _nb_hi2
     caution_count = 0
@@ -588,7 +601,8 @@ def _research_filter_trust_boost(
 ) -> float:
     try:
         learned_boosts = _get_learned_trust_boosts(pick_type)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_research_filter_trust_boost: learned trust boosts lookup failed: %s", exc)
         learned_boosts = {}
     trust_boost = 0.0
     if selection == "Home or Away" and "home_or_away" in learned_boosts:
@@ -613,7 +627,8 @@ def _research_filter_trust_boost(
     try:
         learned = _get_learned_thresholds("", pick_type)
         trust_cap = learned.get("trust_boost_cap", TRUST_BOOST_CAP)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_research_filter_trust_boost: learned trust_boost_cap lookup failed: %s", exc)
         trust_cap = TRUST_BOOST_CAP
     return min(trust_boost, float(trust_cap))
 
@@ -644,7 +659,8 @@ def get_research_context_for_prompt() -> str:
                 "SELECT dimension, key, wins, losses, total, win_rate, loss_rate FROM research_stats WHERE total >= ? ORDER BY dimension, key",
                 (5,),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("get_research_context_for_prompt: query failed: %s", exc)
         rows = []
 
     if not rows:
@@ -743,7 +759,8 @@ def _get_static_fallback() -> str:
         # Condense: take first ~800 chars
         condensed = section[:800].replace("\n", " ").strip()
         return f"[static snapshot — live stats not yet available] {condensed}"
-    except Exception:
+    except Exception as exc:
+        logger.warning("_get_static_fallback: failed: %s", exc)
         return ""
 
 
@@ -824,7 +841,8 @@ def _get_learned_trust_boosts(pick_type: str) -> dict[str, float]:
             # Scale default by learned adjustment; clamp to [0, default*2]
             learned = default * (1.0 + adj)
             result[name] = max(0.0, min(default * 2.0, round(learned, 2)))
-    except Exception:
+    except Exception as exc:
+        logger.warning("_get_learned_trust_boosts: computation failed: %s", exc)
         pass
 
     _learned_trust_boost_cache[cache_key] = (result, now)

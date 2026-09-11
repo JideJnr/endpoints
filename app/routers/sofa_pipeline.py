@@ -58,6 +58,7 @@ def get_sofa_pipeline_status():
                     "predicted": row[3] or 0,
                 }
     except Exception as exc:
+        _logger.warning("sofa_pipeline status counts failed: %s", exc)
         counts = {"error": str(exc)}
 
     return {

@@ -2,43 +2,31 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from urllib import error, request
 
-from app.config.config import get_settings
 from app.ai.llm_pipeline import _build_memory_context
-from app.config.config import _hf_token
-
-
 from app.utils.primitives import _to_int, _to_float
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 DEFAULT_LLM_MODEL = "llama3.2:3b"
-DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct:fastest"
 
 
 def oversee_prediction(prediction: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     AI supervisor with memory-aware reasoning.
-    Routes through AIRouter then falls back to
+    Routes through AIRouter (OpenRouter) then falls back to
     deterministic rules when no model is available.
     """
     safe_detail = detail if isinstance(detail, dict) else {}
     match_context = _build_match_context(prediction, safe_detail)
     memory_context = _build_memory_context(prediction)
     prompt_payload = _compact_prediction(prediction, safe_detail, memory_context, match_context)
-    # Try AIRouter first (covers all LLM providers in one call)
-    from app.ai.ai_router import get_router
-    if get_router().any_available():
-        ai = _router_review(prompt_payload)
-        if ai:
-            ai["memory_context_used"] = bool(memory_context)
-            return ai
-    # HuggingFace as secondary cloud option
-    settings = get_settings()
-    if settings.hf_token_present:
-        ai = _huggingface_review(prompt_payload)
-        if ai:
-            ai["memory_context_used"] = bool(memory_context)
-            return ai
+    ai = _router_review(prompt_payload)
+    if ai:
+        ai["memory_context_used"] = bool(memory_context)
+        return ai
     return _rule_review(prediction, memory_context)
 
 
@@ -57,15 +45,15 @@ def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | No
         context["known_competition"] = match_doc.get("known_competition")
         context["competition_special"] = match_doc.get("competition_special")
         context["competition_intelligence"] = match_doc.get("competition_intelligence")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("ai_brain: competition context failed: %s", exc)
 
     try:
         from app.team_watcher.team_watcher import team_context_for_match
         team_watchers = team_context_for_match(match_doc)
         context["team_watchers"] = team_watchers
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("ai_brain: team-watcher context failed: %s", exc)
 
     competition_intelligence = context.get("competition_intelligence") or {}
     if isinstance(competition_intelligence, dict):
@@ -76,16 +64,8 @@ def _build_match_context(prediction: dict[str, Any], detail: dict[str, Any] | No
 
 
 
-def _provider_review(provider: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    if provider in {"hf", "huggingface", "hugging-face"}:
-        return _huggingface_review(payload)
-    if provider in {"llm", "auto"}:
-        return _router_review(payload)
-    return None
-
-
 def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Use AIRouter for supervisor review."""
+    """Use AIRouter (OpenRouter) for supervisor review."""
     from app.ai.ai_router import get_router, parse_json_safe
     try:
         messages = _review_messages(payload)
@@ -95,41 +75,9 @@ def _router_review(payload: dict[str, Any]) -> dict[str, Any] | None:
             return None
         model = get_router().best_available() or "openrouter"
         return _review_result("ai_router", model, parsed)
-    except Exception:
+    except Exception as exc:
+        logger.warning("ai_brain: ai_router review failed: %s", exc)
         return None
-
-
-def _huggingface_review(payload: dict[str, Any]) -> dict[str, Any] | None:
-    settings = get_settings()
-    token = _hf_token()
-    if not token:
-        return None
-    model = settings.hf_model or DEFAULT_HF_MODEL
-    body = {
-        "model": model,
-        "messages": _review_messages(payload),
-        "temperature": 0.1,
-        "max_tokens": 350,
-    }
-    try:
-        req = request.Request(
-            settings.hf_url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=settings.ai_timeout_seconds) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (OSError, TimeoutError, ValueError, error.URLError):
-        return None
-
-    choices = data.get("choices") or []
-    content = (((choices[0] if choices else {}).get("message") or {}).get("content") or "").strip()
-    parsed = _parse_json_object(content)
-    if not parsed:
-        return None
-    return _review_result("huggingface", model, parsed)
-
 
 
 def _rule_review(prediction: dict[str, Any], memory_context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -252,24 +200,6 @@ def _review_result(provider: str, model: str, parsed: dict[str, Any]) -> dict[st
         "risks": _as_list(parsed.get("risks")),
         "reasons": _as_list(parsed.get("reasons")),
     }
-
-
-def _parse_json_object(text: str) -> dict[str, Any] | None:
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
-    except ValueError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start : end + 1])
-            return data if isinstance(data, dict) else None
-        except ValueError:
-            return None
 
 
 def _as_list(value: Any) -> list[Any]:

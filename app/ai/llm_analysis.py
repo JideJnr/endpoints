@@ -88,7 +88,8 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
             try:
                 gf, ga = int(gf), int(ga)
                 out.append("W" if gf > ga else "D" if gf == ga else "L")
-            except Exception:
+            except Exception as exc:
+                logger.debug("llm_analysis: form-char parse failed: %s", exc)
                 out.append("?")
         return "".join(out) or "N/A"
 
@@ -175,8 +176,8 @@ def _summarise_doc(doc: dict[str, Any]) -> str:
         research_block = get_research_context_for_prompt()
         if research_block:
             research_section = f"\n## RESEARCH_STATS (live empirical patterns)\n{research_block}\n"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("llm_analysis: research context injection failed: %s", exc)
 
     return (
         f"{doc.get('sportybet_name') or doc.get('name')} | "
@@ -234,6 +235,7 @@ def run_llm_match_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         return {"status": "error", "message": f"Model returned non-JSON: {exc}"}
     except Exception as exc:
+        logger.warning("llm_analysis: analysis call/parse failed: %s", exc)
         return {"status": "error", "message": str(exc)}
 
     if result.get("status") == "error":

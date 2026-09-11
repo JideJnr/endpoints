@@ -57,6 +57,10 @@ from app.models.dixon_coles import _tau, RHO
 from app.models.poisson import _poisson_prob
 from app.live.live_projection import LiveInputs, project
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _prematch_grid(mu: float, lam: float, max_goals: int = 7) -> dict[tuple[int, int], float]:
     grid: dict[tuple[int, int], float] = {}
@@ -119,7 +123,8 @@ def load_backtest_rows() -> list[dict[str, Any]]:
             models = json.loads(d["models_json"])
             dc = models.get("dixon_coles") or {}
             home_lambda, away_lambda = dc.get("home_lambda"), dc.get("away_lambda")
-        except Exception:
+        except Exception as exc:
+            logger.warning("backtest: could not parse models_json for match %s: %s", d.get("match_id"), exc)
             home_lambda = away_lambda = None
         if home_lambda is None or away_lambda is None:
             continue
@@ -132,8 +137,8 @@ def load_backtest_rows() -> list[dict[str, Any]]:
             try:
                 fmd = json.loads(fm["raw_json"])
                 score_at_minute = _score_at_minute(fmd.get("goal_events") or [], d["minute"])
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("backtest: could not reconstruct score for match %s: %s", d.get("match_id"), exc)
         if score_at_minute is None:
             continue  # can't reconstruct the live state this match was in — skip, don't guess
 

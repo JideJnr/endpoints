@@ -19,6 +19,10 @@ from typing import Any
 
 from app.utils.primitives import _to_float
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ── Team / tournament name extraction ────────────────────────────────────────
 
@@ -192,5 +196,6 @@ def _to_datetime_utc(value: Any) -> datetime | None:
         if text.isdigit():
             return _to_datetime_utc(int(text))
         return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
+    except Exception as exc:
+        logger.debug("match_helpers: datetime parse failed: %s", exc)
         return None

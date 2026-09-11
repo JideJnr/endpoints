@@ -259,7 +259,8 @@ class AIRouter:
             from app.config.config import get_settings
             settings = get_settings()
             return bool(settings.openrouter_api_key)
-        except Exception:
+        except Exception as exc:
+            logger.debug("ai_router: openrouter key check failed: %s", exc)
             return False
 
 
@@ -296,7 +297,8 @@ def parse_json_safe(raw: str) -> dict[str, Any] | None:
     """Like parse_json_response but returns None instead of raising."""
     try:
         return parse_json_response(raw)
-    except Exception:
+    except Exception as exc:
+        logger.debug("parse_json_safe: %s", exc)
         return None
 
 
@@ -369,7 +371,8 @@ def is_llm_available(model: str | None = None) -> bool:
         # Hard 15s wall-clock deadline (12s urlopen timeout + margin) even if
         # DNS resolution itself is what's stuck.
         return _bounded(_do_ping, url, payload, headers, model, timeout=15)
-    except Exception:
+    except Exception as exc:
+        logger.debug("ai_router: ping failed: %s", exc)
         return False
 
 

@@ -13,6 +13,10 @@ from app.config.config import get_settings
 
 import sqlite3
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class PredictionDeferred(Exception):
     """Raised when a match does not meet the prediction data contract."""
@@ -218,6 +222,7 @@ def apply_prediction_state(
             "message": message,
         }
     except Exception as exc:
+        logger.warning("prediction_flow: prediction failed for %s: %s", doc.get("sportybet_id") or doc.get("match_id"), exc)
         readiness = doc.get("prediction_readiness") or prediction_readiness(doc)
         doc["prediction_readiness"] = readiness
         message = f"Prediction failed: {exc}"

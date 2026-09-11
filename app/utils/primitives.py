@@ -17,6 +17,10 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ── Numeric conversion ────────────────────────────────────────────────────────
 
@@ -46,7 +50,8 @@ def _safe_float(value: Any) -> float | None:
         if value is None or value == "":
             return None
         return float(value)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_to_float: parse failed for %r: %s", value, exc)
         return None
 
 
@@ -72,7 +77,8 @@ def _safe_json(value: Any, fallback: Any) -> Any:
     """Parse *value* as JSON, returning *fallback* on any failure."""
     try:
         return json.loads(value or json.dumps(fallback))
-    except Exception:
+    except Exception as exc:
+        logger.debug("_safe_json: parse failed: %s", exc)
         return fallback
 
 
@@ -80,7 +86,8 @@ def _loads(value: Any, default: Any) -> Any:
     """Parse *value* as JSON, returning *default* on any failure."""
     try:
         return json.loads(value or "")
-    except Exception:
+    except Exception as exc:
+        logger.debug("_loads: parse failed: %s", exc)
         return default
 
 
@@ -119,5 +126,6 @@ def _parse_datetime(value: Any) -> datetime | None:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
-    except Exception:
+    except Exception as exc:
+        logger.debug("primitives: datetime parse failed: %s", exc)
         return None

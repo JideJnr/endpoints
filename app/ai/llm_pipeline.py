@@ -127,7 +127,8 @@ def _parse_safe(raw: str) -> dict[str, Any] | None:
             if text.startswith("json"):
                 text = text[4:]
         return json.loads(text.strip())
-    except Exception:
+    except Exception as exc:
+        logger.debug("_parse_safe: could not parse LLM output as JSON: %s", exc)
         return None
 
 
@@ -179,8 +180,8 @@ def _build_memory_context(doc: dict[str, Any]) -> dict[str, Any]:
         # Current model weights (auto-tuned)
         context["model_weights"] = get_learned_weights()
 
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_build_memory_context: learned-weights/hot-cold context failed: %s", exc)
 
     try:
         from app.risk.clv import get_clv_summary
@@ -192,8 +193,8 @@ def _build_memory_context(doc: dict[str, Any]) -> dict[str, Any]:
                 "edge_quality": clv.get("edge_quality"),
                 "positive_clv_rate": clv.get("positive_clv_rate"),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_build_memory_context: clv context failed: %s", exc)
 
     try:
         from app.enrichment.confidence_calibrator import get_calibration_table
@@ -204,8 +205,8 @@ def _build_memory_context(doc: dict[str, Any]) -> dict[str, Any]:
                 for c in (cal if isinstance(cal, list) else [])
                 if (c.get("samples") or 0) >= 10
             ][:6]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_build_memory_context: calibration context failed: %s", exc)
 
     return context
 
@@ -283,6 +284,7 @@ def run_form_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         result["specialist"] = "form"
         return result
     except Exception as exc:
+        logger.warning("run_form_specialist failed: %s", exc)
         return {"specialist": "form", "status": "error", "error": str(exc)}
 
 
@@ -300,6 +302,7 @@ def run_h2h_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         result["specialist"] = "h2h"
         return result
     except Exception as exc:
+        logger.warning("run_h2h_specialist failed: %s", exc)
         return {"specialist": "h2h", "status": "error", "error": str(exc)}
 
 
@@ -316,6 +319,7 @@ def run_odds_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         result["specialist"] = "odds"
         return result
     except Exception as exc:
+        logger.warning("run_odds_specialist failed: %s", exc)
         return {"specialist": "odds", "status": "error", "error": str(exc)}
 
 
@@ -335,6 +339,7 @@ def run_standings_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         result["specialist"] = "standings"
         return result
     except Exception as exc:
+        logger.warning("run_standings_specialist failed: %s", exc)
         return {"specialist": "standings", "status": "error", "error": str(exc)}
 
 
@@ -359,6 +364,7 @@ def run_model_specialist(doc: dict[str, Any]) -> dict[str, Any]:
         result["specialist"] = "models"
         return result
     except Exception as exc:
+        logger.warning("run_model_specialist failed: %s", exc)
         return {"specialist": "models", "status": "error", "error": str(exc)}
 
 
@@ -400,6 +406,7 @@ def run_final_synthesis(
             "aggregation": aggregation,
         }
     except Exception as exc:
+        logger.warning("run_final_synthesis failed: %s", exc)
         return {"status": "error", "message": str(exc)}
 
 
@@ -488,6 +495,7 @@ def run_llm_pipeline_batch(
                 value_bets += 1
         except Exception as exc:
             errors += 1
+            logger.warning("run_llm_pipeline_batch: prediction failed for %s: %s", doc.get("sportybet_id"), exc)
             predictions.append({"status": "error", "message": str(exc), "sportybet_id": doc.get("sportybet_id")})
     return {
         "status": "success",

@@ -72,8 +72,28 @@ def track_suggested_slip(
 # Candidate fetching
 # ---------------------------------------------------------------------------
 
-def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
-    """Return upcoming, unstarted, research-gated stored prediction candidates."""
+def upcoming_prediction_candidates(
+    limit: int = 50, kickoff_window_hours: float | None = None
+) -> list[dict[str, Any]]:
+    """Return upcoming, unstarted, research-gated stored prediction candidates.
+
+    kickoff_window_hours (optional, default None = no change from prior
+    behavior): when set, narrows the result to candidates whose kickoff
+    falls within that many hours of the EARLIEST kickoff among them. Added
+    2026-09-09 for job_auto_suggest_bet_builder specifically -- that job's
+    whole purpose is generating slips the slip-level learning loop
+    (learned_slip_risk) can actually learn from, but a slip only counts as
+    a decided sample once EVERY leg's match has finished and graded.
+    Candidates drawn from the full today+tomorrow window (unchanged below)
+    can span up to ~48h apart, so a slip built from all of them rarely
+    finishes as one batch before the next auto-suggest run supersedes it --
+    confirmed live 2026-09-09: 27/27 pending auto-suggested slips were
+    waiting on at least one leg kicking off hours-to-days after the
+    earliest leg in the same slip, and only 8 slips had EVER fully
+    resolved. This does not change behavior for any other caller (manual
+    bet builder, the human-triggered /betbuilder/smart endpoint, the LLM
+    builder) -- they all still see every upcoming candidate; only a caller
+    that explicitly passes this parameter is narrowed."""
     today = date.today()
     tomorrow = today + timedelta(days=1)
     allowed_dates = {today.isoformat(), tomorrow.isoformat()}
@@ -81,7 +101,8 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
     if not rows:
         try:
             rows = list_prediction_history(limit=max(limit, 200)).get("predictions") or []
-        except Exception:
+        except Exception as exc:
+            logger.warning("upcoming_prediction_candidates: history fallback failed: %s", exc)
             rows = []
 
     now_ts = time.time()
@@ -144,7 +165,8 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
     try:
         from app.storage.buffer import bulk_get_buffered_matches
         buffer_map = bulk_get_buffered_matches(match_ids)
-    except Exception:
+    except Exception as exc:
+        logger.warning("upcoming_prediction_candidates: buffer lookup failed: %s", exc)
         buffer_map = {}
 
     candidates = []
@@ -189,7 +211,39 @@ def upcoming_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
         key=lambda r: int((r.get("best_pick") or {}).get("confidence") or 0),
         reverse=True,
     )
+    if kickoff_window_hours is not None and candidates:
+        candidates = _limit_to_kickoff_window(candidates, kickoff_window_hours)
     return candidates[:limit]
+
+
+def _limit_to_kickoff_window(
+    candidates: list[dict[str, Any]], window_hours: float
+) -> list[dict[str, Any]]:
+    """Keep only candidates whose kickoff falls within `window_hours` of the
+    EARLIEST upcoming kickoff among them, so a slip built from this list
+    finishes as one cohesive batch close in time instead of straddling
+    matches that are hours or days apart. A candidate with no parseable
+    start_time is dropped when a window is actually requested -- it's
+    unknown when (or whether) it would ever resolve, so it can't be placed
+    relative to the window; every other caller keeps today's all-candidates
+    behavior unchanged (kickoff_window_hours=None upstream never calls this)."""
+    timed: list[tuple[float, dict[str, Any]]] = []
+    for c in candidates:
+        st = c.get("start_time")
+        if not st:
+            continue
+        try:
+            ts = float(st)
+        except (TypeError, ValueError):
+            continue
+        if ts > 1e12:
+            ts /= 1000
+        timed.append((ts, c))
+    if not timed:
+        return []
+    earliest = min(ts for ts, _ in timed)
+    cutoff = earliest + window_hours * 3600
+    return [c for ts, c in timed if ts <= cutoff]
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +276,22 @@ LIVE_PREDICTION_FRESHNESS_SECONDS = 150
 # beyond this cap that lack a fresh stored prediction are simply skipped
 # for this call -- job_unified_live will pick them up on its own cycle.
 LIVE_ON_DEMAND_GENERATE_LIMIT = 6
+
+# Wall-clock cap on the whole _generate_fresh_live_predictions() batch (not
+# per match -- all targets run in parallel, one worker each, so this is the
+# real worst-case latency it can add to a live bet request). Despite the
+# comment above, nothing actually enforced a deadline here before
+# 2026-09-09 -- as_completed()/future.result() had no timeout=, so one
+# stuck SofaScore call (same DNS-hang risk as the ai-analysis incident,
+# see app/utils/bounded.py) could hang a live bet request forever with
+# genuinely no response. This is the fix.
+#
+# Raised from 20s to 60s the same day alongside REFRESH_LIVE_POOL_TIMEOUT_SECONDS
+# (see that constant's comment in live_builder.py) -- together they add up to
+# the ~5 minute total worst-case wait the user explicitly asked for instead of
+# an early "no_candidates". Still a genuine ceiling (not unbounded): guards
+# against the same uncovered-DNS-hang risk, it's just sized generously now.
+LIVE_ON_DEMAND_BATCH_TIMEOUT_SECONDS = 60.0
 
 
 def _best_live_pick(picks: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -267,7 +337,8 @@ def _live_match_prediction_state(limit: int) -> tuple[dict[str, dict[str, Any]],
                 """,
                 tuple(live_match_ids),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("_live_match_prediction_state: prediction-rows query failed: %s", exc)
         return {}, []
 
     now_ts = time.time()
@@ -278,7 +349,8 @@ def _live_match_prediction_state(limit: int) -> tuple[dict[str, dict[str, Any]],
             continue  # already have this match's freshest row (rows are ordered desc)
         try:
             created_ts = time.mktime(time.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S"))
-        except Exception:
+        except Exception as exc:
+            logger.debug("_live_match_prediction_state: created_at parse failed for %s: %s", row.get("match_id"), exc)
             continue
         if now_ts - created_ts > LIVE_PREDICTION_FRESHNESS_SECONDS:
             continue
@@ -296,7 +368,8 @@ def _row_age_seconds(timestamp: str | None) -> float | None:
         return None
     try:
         created_ts = time.mktime(time.strptime(str(timestamp)[:19], "%Y-%m-%d %H:%M:%S"))
-    except Exception:
+    except Exception as exc:
+        logger.debug("_row_age_seconds: could not parse %r: %s", timestamp, exc)
         return None
     return time.time() - created_ts
 
@@ -346,8 +419,16 @@ def _generate_fresh_live_predictions(match_ids: list[str]) -> None:
     triggered synchronously from a request instead of a scheduler tick).
     A single match's refresh or prediction failing (thin live signal, no
     SofaScore match yet, etc.) must never fail the whole candidate fetch.
+
+    Also bounded by LIVE_ON_DEMAND_BATCH_TIMEOUT_SECONDS wall-clock for the
+    whole batch: since every target gets its own worker, this is the actual
+    latency ceiling this function can add to a live bet request. If that
+    deadline passes, whatever finished in time is already recorded (each
+    worker records its own prediction as soon as it's done); the caller
+    just stops waiting on whichever match(es) are still stuck, rather than
+    hanging forever (see app/utils/bounded.py).
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FutureTimeoutError
 
     from app.storage.buffer import get_buffered_match
     from app.utils.prediction_flow import predict_and_record_enriched, PredictionDeferred
@@ -368,10 +449,25 @@ def _generate_fresh_live_predictions(match_ids: list[str]) -> None:
         except Exception as exc:
             logger.debug("live_prediction_candidates: on-demand prediction failed for %s: %s", match_id, exc)
 
-    with ThreadPoolExecutor(max_workers=min(LIVE_ON_DEMAND_GENERATE_LIMIT, len(targets))) as pool:
+    pool = ThreadPoolExecutor(max_workers=min(LIVE_ON_DEMAND_GENERATE_LIMIT, len(targets)))
+    try:
         futures = [pool.submit(_refresh_and_predict, match_id) for match_id in targets]
-        for future in as_completed(futures):
-            future.result()  # exceptions are already swallowed inside; surfaces anything that isn't
+        try:
+            for future in as_completed(futures, timeout=LIVE_ON_DEMAND_BATCH_TIMEOUT_SECONDS):
+                future.result()  # exceptions are already swallowed inside; surfaces anything that isn't
+        except _FutureTimeoutError:
+            logger.warning(
+                "live_prediction_candidates: on-demand generation for %d match(es) exceeded %ss; "
+                "continuing with whatever finished in time (stuck worker(s) keep running in the "
+                "background but no longer block this request)",
+                len(targets), LIVE_ON_DEMAND_BATCH_TIMEOUT_SECONDS,
+            )
+    finally:
+        # wait=False: do NOT let a still-stuck worker thread delay this
+        # function's return -- that would defeat the timeout above, since
+        # the default ThreadPoolExecutor context-manager exit blocks until
+        # every submitted task finishes.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
@@ -404,7 +500,8 @@ def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
     try:
         from app.storage.buffer import bulk_get_buffered_matches
         buffered = bulk_get_buffered_matches(list(fresh_by_match))
-    except Exception:
+    except Exception as exc:
+        logger.warning("live_prediction_candidates: buffer lookup failed: %s", exc)
         buffered = {}
 
     candidates: list[dict[str, Any]] = []
@@ -418,12 +515,21 @@ def live_prediction_candidates(limit: int = 50) -> list[dict[str, Any]]:
             continue
         buffer_doc = buffered.get(match_id) or {}
         sportybet_id = str(buffer_doc.get("sportybet_id") or "").strip()
+        # A Competition Special match that hasn't merged with a real
+        # SportyBet event yet has no sportybet_id -- drop it here rather
+        # than pass "bookable": False downstream and trust every caller to
+        # check that flag. Confirmed live (2026-09-06) that at least one
+        # downstream consumer (live_builder._to_selections) was NOT
+        # checking it and fell back to match_id (sofascore:<id>) instead,
+        # producing a Sporty booking payload keyed by a Sofa id.
+        if not sportybet_id or sportybet_id.startswith("sofascore:"):
+            continue
         candidates.append({
             "match_id": match_id,
             # Keep the SofaScore-keyed match_id for history/analysis but
             # never pass it to SportyBet booking as an event id.
-            "sportybet_id": sportybet_id or None,
-            "bookable": bool(sportybet_id),
+            "sportybet_id": sportybet_id,
+            "bookable": True,
             "match_name": row.get("match_name"),
             "league_name": row.get("league_name"),
             "country_name": row.get("country_name"),
@@ -472,7 +578,8 @@ def score_pick(item: dict[str, Any]) -> dict[str, Any]:
             item.get("country_name"),
             odds,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("score_pick: proven-history learning lookup failed: %s", exc)
         learning = {"samples": 0, "win_rate": None, "adjustment": 0}
 
     # Learned probability boost
@@ -643,7 +750,8 @@ def select_by_conviction(
             min_conviction = float(
                 get_learned_thresholds(league=league, pick_type=pick_type).get("min_confidence", 72.0)
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("select_by_conviction: learned threshold lookup failed for %s/%s: %s", league, pick_type, exc)
             min_conviction = 72.0
         conviction = float(item.get("conviction_score") or 0)
         if conviction < min_conviction:
@@ -686,7 +794,8 @@ def _trim_by_learned_slip_risk(selected: list[dict[str, Any]]) -> list[dict[str,
             LEG_COUNT_BAND_ORDER, COMBINED_ODDS_BAND_ORDER,
         )
         risk = get_learned_slip_risk()
-    except Exception:
+    except Exception as exc:
+        logger.warning("_trim_by_learned_slip_risk: learned slip risk lookup failed: %s", exc)
         return selected
     if not risk.get("known"):
         return selected
@@ -740,7 +849,8 @@ def _pick_buffer_decimal_odds(pick: dict[str, Any], buf_doc: dict[str, Any]) -> 
         _market, outcome = _find_market_outcome(markets, intent, pick)
         odds = _to_float((outcome or {}).get("odds"))
         return odds if odds and odds > 1 else None
-    except Exception:
+    except Exception as exc:
+        logger.debug("_pick_buffer_decimal_odds: lookup failed: %s", exc)
         return None
 
 
@@ -773,7 +883,8 @@ def _recent_ungraded_prediction_rows(allowed_dates: set[str], limit: int) -> lis
                 """,
                 (*sorted(allowed_dates), int(limit)),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("_recent_ungraded_prediction_rows: query failed: %s", exc)
         return []
 
     predictions: list[dict[str, Any]] = []
@@ -863,6 +974,18 @@ def _rank_analyses(
         scored = score_cache[score_key]
         ranked.append({
             "match_id": item.get("match_id") or item.get("sportybet_id"),
+            # _candidate_to_analysis (manual_builder.py) already resolves this
+            # to the real SportyBet event id (e.g. "sr:match:66299518") when
+            # one exists, distinct from match_id (the app's stable, often
+            # SofaScore-namespaced key, e.g. "sofascore:15168381"). This dict
+            # used to drop that field entirely, so every downstream builder
+            # (manual/llm/smart all call this same function) fell back to
+            # match_id when building the booking payload -- confirmed live
+            # (2026-09-08) as the reason EVERY built slip failed booking with
+            # "has no SportyBet event ID": match_buffer already had the
+            # correct sportybet_id for all of them, it just never survived
+            # past this ranking step.
+            "sportybet_id": item.get("sportybet_id") or item.get("match_id"),
             "match": item.get("match_name") or item.get("match"),
             "league": item.get("league_name"),
             "country": item.get("country_name"),
@@ -911,7 +1034,8 @@ def _learned_prob(item: dict[str, Any], engine_pick: dict[str, Any]) -> dict[str
             league_key=item.get("league_name") or "__global__",
             min_samples=5,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("_learned_prob: lookup failed: %s", exc)
         return None
 
 
@@ -941,6 +1065,38 @@ def _learned_boost(
 
 
 def _league_accuracy_boost(item: dict[str, Any], engine_pick: dict[str, Any]) -> float:
+    """Boost/penalize conviction based on how accurate this league/market has
+    been historically -- e.g. the Spanish league going a genuine 58% off 150
+    graded picks should outrank an unfamiliar league's misleading 80% off 5.
+
+    History of this function's failure modes, in order:
+    1. Originally compared raw win_rate against a flat "samples >= 8" cliff:
+       below 8, zero effect; at/above 8, the FULL raw win rate was trusted
+       regardless of whether that was 8 samples or 800.
+    2. Fixed by reading shrunk_win_rate (self_learner.py's Empirical-Bayes
+       point-estimate shrinkage -- see self_learner._shrink_win_rate) instead
+       of raw win_rate. This is an honest BEST-GUESS estimate, and shrinking
+       toward this system's own measured baseline (not a flat 50%) means it
+       no longer overcorrects thin samples into the mid-50s regardless of
+       context. But a point estimate is not a guarantee: 5 games at 80% can
+       still produce a shrunk estimate that legitimately sits above a deep,
+       reliable league's -- that's correct as an estimate, but it means a
+       thin lucky league could still occasionally outrank an established one
+       here, which isn't what "don't trust an unproven league yet" asks for.
+    3. This version adds a confidence gate on the POSITIVE side only: before
+       granting credit for looking better than average (shrunk_win_rate >
+       65), also require rank_score (self_learner._wilson_lower_bound -- a
+       deliberately pessimistic, confidence-adjusted score) to clear this
+       league's own baseline. A thin sample's rank_score sits far below its
+       point estimate (5 games at 80% might shrink to ~68% but rank_score
+       there is more like ~44%), so it fails this gate and gets capped at
+       neutral (0.0) rather than the credit its point estimate alone would
+       have earned -- it hasn't proven it yet. The negative side is
+       untouched: a league that looks BELOW average keeps the plain
+       shrinkage-based penalty, since shrinkage already handles "don't
+       overreact to a thin bad sample" gently and doesn't need this extra
+       guard.
+    """
     try:
         from app.monitoring.self_learner import get_league_accuracy
         lacc = get_league_accuracy(item.get("league_name") or "")
@@ -949,16 +1105,26 @@ def _league_accuracy_boost(item: dict[str, Any], engine_pick: dict[str, Any]) ->
         pick_type = engine_pick.get("type") or item.get("pick_type") or "match_result"
         for lt in lacc.get("by_pick_type") or []:
             if lt.get("pick_type") in (pick_type, "__all__"):
-                samples = int(lt.get("samples") or 0)
-                wr = float(lt.get("win_rate") or 0)
-                if samples >= 8:
-                    if wr > 65.0:
-                        return min(8.0, (wr - 65.0) / 5.0)
-                    if wr < 50.0:
-                        return max(-10.0, -((50.0 - wr) / 5.0))
+                # Falls back to raw win_rate only for rows written before
+                # shrunk_win_rate existed -- self-heals on the next graded
+                # cycle (run_learning_cycle refreshes every league_accuracy
+                # row it touches).
+                wr = float(lt.get("shrunk_win_rate") if lt.get("shrunk_win_rate") is not None else lt.get("win_rate") or 50.0)
+                if wr > 65.0:
+                    rank_score = lt.get("rank_score")
+                    baseline = lt.get("baseline_win_rate")
+                    if rank_score is not None and baseline is not None and float(rank_score) < float(baseline):
+                        # Looks good, but not yet confidently better than
+                        # this league's own baseline -- withhold the credit,
+                        # don't penalize (it may well be a good league, we
+                        # just don't have enough games to be sure yet).
+                        return 0.0
+                    return min(8.0, (wr - 65.0) / 5.0)
+                if wr < 50.0:
+                    return max(-10.0, -((50.0 - wr) / 5.0))
                 break
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_league_accuracy_boost: lookup failed: %s", exc)
     return 0.0
 
 
@@ -996,8 +1162,8 @@ def _signal_combination_boost(item: dict[str, Any], engine_pick: dict[str, Any])
             item.get("llm_recommendation") or engine_pick.get("selection"),
         )
         return float(memory.get("adjustment") or 0)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_signal_combination_boost: lookup failed: %s", exc)
     return 0.0
 
 
@@ -1012,7 +1178,8 @@ def _research_conviction_adj(
     league = item.get("league_name") or "__global__"
     try:
         learned = get_learned_thresholds(league=league, pick_type=pick_type)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_research_conviction_adj: learned thresholds lookup failed for %s/%s: %s", league, pick_type, exc)
         learned = {}
     adj = 0.0
     if "home or away" in sel_lower or sel_lower == "home_or_away":
@@ -1040,7 +1207,8 @@ def _optimal_profile_score(
         conf_threshold = get_learned_thresholds(league=league, pick_type=pick_type).get(
             "min_confidence", 72.0
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("_optimal_profile_score: learned threshold lookup failed for %s/%s: %s", league, pick_type, exc)
         conf_threshold = 72.0
     score = 0
     if "home or away" in sel_lower or sel_lower == "home_or_away":

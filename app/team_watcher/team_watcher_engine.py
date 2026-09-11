@@ -55,7 +55,8 @@ def _compute_profile_stats(rows: list) -> dict:
         try:
             own = int(row['own_goals'] or 0)
             opp = int(row['opp_goals'] or 0)
-        except Exception:
+        except Exception as exc:
+            logger.debug("_compute_profile_stats: row parse failed: %s", exc)
             continue
         goals_for += own
         goals_against += opp
@@ -635,8 +636,8 @@ def _rules_model(
             (pt, sel, score + float(_sw(pt).get(_SIGNAL_NAME.get(pt, "recent_history_edge"), 0.0)) * 0.05)
             for pt, sel, score in candidates
         ]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_rules_model: signal-weight boost failed: %s", exc)
 
     # Pick the highest-scoring candidate
     best = max(candidates, key=lambda c: c[2])
@@ -658,8 +659,8 @@ def _rules_model(
                     gap_pp = float(entry.get("calibration_gap") or 0)
                     confidence = max(1, min(88, confidence + max(-8, min(8, int(gap_pp * 0.5)))))
                     break
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_rules_model: league-accuracy calibration adjustment failed: %s", exc)
 
     # -- Phase 4c: learned model weight for "rules" ---------------------------
     # Scale confidence proportionally to rules model performance vs base (0.20).
@@ -667,8 +668,8 @@ def _rules_model(
         lw = get_learned_weights()
         scale = max(0.75, min(1.25, float(lw.get("rules", 0.20)) / 0.20))
         confidence = max(1, min(88, int(confidence * scale)))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_rules_model: learned model-weight scaling failed: %s", exc)
 
     # -- Phase 4d: signal combination performance ----------------------------
     # If this exact signal combination has a tracked win_rate, nudge confidence.
@@ -689,8 +690,8 @@ def _rules_model(
         combo_nudge = int(_combo_memory.get("adjustment") or 0)
         if combo_nudge:
             confidence = max(1, min(88, confidence + max(-6, min(6, combo_nudge))))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_rules_model: signal-combination nudge failed: %s", exc)
 
     # -- Phase 4e: learned threshold cap -------------------------------------
     # Clamp confidence to the learned confidence_cap for this league + pick_type.
@@ -698,8 +699,8 @@ def _rules_model(
         _thresh = get_learned_thresholds(league=str(tournament), pick_type=pick_type)
         cap = int(_thresh["confidence_cap"])
         confidence = min(confidence, cap)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_rules_model: learned threshold cap failed: %s", exc)
 
     return {
         "pick_type": pick_type,
@@ -2025,8 +2026,8 @@ def monitor_team_performance(
                     try:
                         pred_correct = _was_prediction_correct(tw_signal, actual_result, own_goals, opp_goals)
                         record_team_prediction_outcome(conn, team_key, competition_key, pred_correct)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("monitor_team_performance: recording prediction outcome failed for %s: %s", team_key, exc)
 
                 for note in notes:
                     try:
@@ -2041,8 +2042,8 @@ def monitor_team_performance(
                             context=note.get("context", {}),
                             severity=note.get("severity", "info"),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("monitor_team_performance: recording a note failed for %s: %s", team_key, exc)
 
         return {"status": "ok", "notes_generated": len(notes), "notes": notes}
 

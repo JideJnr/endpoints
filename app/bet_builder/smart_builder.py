@@ -71,15 +71,24 @@ def run_smart_bet(
     stake: int = 100,
     candidate_limit: int = 50,
     request_code: bool = False,
+    kickoff_window_hours: float | None = None,
 ) -> dict[str, Any]:
     """
     Full smart pipeline: fetch candidates -> conviction-only rank -> book.
     No target odds, no LLM calls at any stage.
+
+    kickoff_window_hours: optional, default None (no change in behavior).
+    Passed straight through to upcoming_prediction_candidates -- see that
+    function's docstring. Used by job_auto_suggest_bet_builder so its
+    learning slips finish as one batch; the human-triggered /betbuilder/smart
+    endpoint and every other caller leave this unset and are unaffected.
     """
     from app.data_clients.sportybet_booking import build_booking_payload, request_share_code
     from app.bet_builder.manual_builder import _candidate_to_analysis
 
-    candidates = upcoming_prediction_candidates(limit=candidate_limit)
+    candidates = upcoming_prediction_candidates(
+        limit=candidate_limit, kickoff_window_hours=kickoff_window_hours
+    )
     if not candidates:
         return {
             "status": "no_candidates",
@@ -94,6 +103,7 @@ def run_smart_bet(
     try:
         synthesis = rank_picks_smart(analyses)
     except Exception as exc:
+        logger.warning("smart builder: synthesis failed: %s", exc)
         return {
             "status": "synthesis_failed",
             "message": str(exc),
@@ -131,6 +141,7 @@ def run_smart_bet(
     try:
         booking_payload = build_booking_payload(selections, stake=stake, force_refresh=False)
     except Exception as exc:
+        logger.warning("smart builder: booking failed: %s", exc)
         return {
             "status": "booking_failed",
             "message": str(exc),
@@ -157,6 +168,7 @@ def run_smart_bet(
         try:
             result["share_code"] = request_share_code(booking_payload)
         except Exception as exc:
+            logger.warning("smart builder: share code request failed: %s", exc)
             result["share_code_error"] = str(exc)
     return result
 

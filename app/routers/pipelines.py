@@ -14,10 +14,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.auth.dependencies import require_admin
 
 _logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/pipelines", tags=["pipelines"])
+# Every endpoint here backs the /pipelines ops page, which is RequireAdmin-gated
+# in the frontend — enforce that server-side too, not just in the UI.
+router = APIRouter(prefix="/pipelines", tags=["pipelines"], dependencies=[Depends(require_admin)])
 
 
 # ── List all pipelines ────────────────────────────────────────────────────────

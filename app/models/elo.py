@@ -8,6 +8,10 @@ from app.storage.db import db_conn
 from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 K_FACTOR = 32
 HOME_ADVANTAGE_ELO = 0
@@ -148,8 +152,8 @@ def elo_prediction(home_id: str, away_id: str, doc: dict[str, Any] | None = None
         })
         home_expected = calibrated["home_win"]
         away_expected = calibrated["away_win"]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("elo: probability calibration failed, using uncalibrated values: %s", exc)
     return {
         "model": "elo",
         "home_elo": round(home_elo),
@@ -223,6 +227,7 @@ def get_elo_league_strength(league_name: str, min_teams: int = 4) -> dict[str, A
                 (league_name,),
             ).fetchall()
     except Exception as exc:
+        logger.warning("elo: league-teams query failed: %s", exc)
         return {"available": False, "reason": f"db_error: {exc}"}
 
     if len(rows) < min_teams:

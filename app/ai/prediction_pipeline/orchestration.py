@@ -21,6 +21,7 @@ from app.ai.prediction_pipeline.evidence import (
     FORM_FALLBACK,
     ODDS_FALLBACK,
     SIMILAR_FALLBACK,
+    TEAM_INTEL_FALLBACK,
     _evidence_status,
     _name,
     _teams,
@@ -34,6 +35,7 @@ from app.ai.prediction_pipeline.evidence import (
     _step_odds,
     _step_similar_matches,
     _step_team_history,
+    _step_team_intel,
 )
 from app.ai.prediction_pipeline.teams import TeamBehaviourProfile, derive_team_profile, persist_team_profile
 from app.ai.prediction_pipeline.markets import MarketCandidate, shortlist_markets
@@ -110,6 +112,7 @@ class ReasoningContext:
     odds_statement: str
     similar_matches_statement: str
     team_history_statement: str
+    team_intel_statement: str
 
 
 def _truncate_competition_context(text: str) -> str:
@@ -191,9 +194,25 @@ def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile,
             f"watcher_edge={ci_value.get('watcher_edge')}, "
             f"net_direction={ci_value.get('direction')} | "
         )
+        # Cross-competition rest/congestion edge (see enriched_prediction.py
+        # ::_team_fixture_load) -- computed by the deterministic signal but,
+        # until now, silently dropped here: the decider only ever saw the
+        # four fields above, never fixture_load, even though it was already
+        # in competition_intelligence["value"].
+        fixture_load = ci_value.get("fixture_load")
+        if fixture_load:
+            home_load = fixture_load.get("home") or {}
+            away_load = fixture_load.get("away") or {}
+            context_block += (
+                f"fixture_load_edge={fixture_load.get('edge')} "
+                f"(home_rest_days={home_load.get('rest_days')}, "
+                f"home_matches_last_7_days={home_load.get('matches_last_7_days')}, "
+                f"away_rest_days={away_load.get('rest_days')}, "
+                f"away_matches_last_7_days={away_load.get('matches_last_7_days')}) | "
+            )
     unavailable = [
         label for label, statement in zip(
-            ("H2H", "common opponents", "form", "odds", "similar matches", "team previous matches"),
+            ("H2H", "common opponents", "form", "odds", "similar matches", "team previous matches", "team intel"),
             response_chain,
         ) if _evidence_status(statement) == "unavailable"
     ]
@@ -202,6 +221,7 @@ def _call_decider(response_chain: list[str], home_profile: TeamBehaviourProfile,
     analyst_labels = [
         "H2H Analyst", "Common Opponent Analyst", "Form Analyst",
         "Market Odds Analyst", "Similar Match Analyst", "Team Previous Matches Analyst",
+        "Team Intel Analyst",
     ]
     weighted_evidence = [
         {
@@ -342,6 +362,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                 (_step_odds,            ODDS_FALLBACK,    3),
                 (_step_similar_matches, SIMILAR_FALLBACK, 4),
                 (_step_team_history,     "Team previous-match history unavailable.", 5),
+                (_step_team_intel,       TEAM_INTEL_FALLBACK, 6),
             ]
             chain = [fallback for _, fallback, _ in _steps]  # pre-fill with fallbacks
             _pool = ThreadPoolExecutor(max_workers=len(_steps))
@@ -406,7 +427,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
             "evidence_availability": {
                 label: _evidence_status(statement)
                 for label, statement in zip(
-                    ("h2h", "common_opponents", "form", "odds", "similar_matches", "team_previous_matches"),
+                    ("h2h", "common_opponents", "form", "odds", "similar_matches", "team_previous_matches", "team_intel"),
                     chain,
                 )
             },
@@ -417,6 +438,7 @@ def run_ai_prediction_with_fallback(doc: dict[str, Any], *, match_id: str | None
                 {"name": "Market Odds Analyst",            "trained_knowledge": "Odds movement, pricing pressure, and market signal quality","finding": chain[3], "evidence_status": _evidence_status(chain[3]), "weight": specialist_weights.get("Market Odds Analyst", 1.0)},
                 {"name": "Similar Match Analyst",          "trained_knowledge": "Tier-comparable historical match outcomes",                 "finding": chain[4], "evidence_status": _evidence_status(chain[4]), "weight": specialist_weights.get("Similar Match Analyst", 1.0)},
                 {"name": "Team Previous Matches Analyst",  "trained_knowledge": "Both teams' full recent finished-match profiles",          "finding": chain[5], "evidence_status": _evidence_status(chain[5]), "weight": specialist_weights.get("Team Previous Matches Analyst", 1.0)},
+                {"name": "Team Intel Analyst",              "trained_knowledge": "Unverified SofaScore/SportyBet team news and captions, source+date labelled", "finding": chain[6], "evidence_status": _evidence_status(chain[6]), "weight": specialist_weights.get("Team Intel Analyst", 1.0)},
             ],
         }
 
@@ -516,6 +538,14 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
             from match_buffer
             where raw_enriched is not null
               and is_finished = 0
+              -- AI Prediction Queue is for upcoming matches only -- live
+              -- matches get AI prediction on demand (match-details /
+              -- bet-builder request), never from this background job.
+              -- Without this, every live match sitting in match_buffer
+              -- (is_live=1, is_finished=0) was also eligible here, so it
+              -- got a full LLM prediction + brain-review call every time
+              -- this job ran (every 5 min), for as long as it stayed live.
+              and is_live = 0
               and json_extract(raw_enriched, '$.sofascore_match_status') != 'srl_skip'
               and (
                     json_extract(raw_enriched, '$.manual_prediction_state') is not null
@@ -552,7 +582,8 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
     for match_id, date, raw in rows:
         try:
             docs.append({**json.loads(raw), "match_id": match_id, "match_date": date})
-        except Exception:
+        except Exception as exc:
+            logger.warning("orchestration: could not parse buffered doc for %s: %s", match_id, exc)
             summary["errors"] += 1
     from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
 
@@ -564,8 +595,8 @@ def job_ai_prediction_queue(batch_size: int = 10) -> dict:
                 refreshed = _get_buffered_match(str(doc.get("match_id") or ""))
                 if refreshed:
                     doc.update(refreshed)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("orchestration: re-enrich failed for %s: %s", doc.get("match_id"), exc)
 
         # Cheap, local, no-network gate BEFORE the expensive work below (team
         # profile derivation, 5 parallel AI evidence steps, the LLM call

@@ -11,6 +11,10 @@ from app.storage.db import db_conn
 from app.storage.db import DB_PATH
 from app.storage.league_memory import _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 _MAX_EVENTS = 120
 _events: deque[dict[str, Any]] = deque(maxlen=_MAX_EVENTS)
@@ -139,8 +143,8 @@ def _persist_events(events: list[dict[str, Any]]) -> None:
                 """
             )
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("activity_log: write failed: %s", exc)
 
 
 def _load_events(limit: int) -> list[dict[str, Any]]:
@@ -158,13 +162,15 @@ def _load_events(limit: int) -> list[dict[str, Any]]:
                 """,
                 (limit,),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("activity_log: query failed: %s", exc)
         return []
     events = []
     for row in rows:
         try:
             details = json.loads(row["details_json"] or "{}")
-        except Exception:
+        except Exception as exc:
+            logger.debug("activity_log: details parse failed: %s", exc)
             details = {}
         events.append({
             "ts": row["ts"],

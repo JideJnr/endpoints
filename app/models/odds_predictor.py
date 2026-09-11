@@ -23,6 +23,10 @@ from typing import Any
 from app.utils.match_helpers import _tournament_name
 from app.storage.buffer import _extract_1x2
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 def odds_only_prediction(doc: dict[str, Any]) -> dict[str, Any] | None:
     """
     Predict using only 1x2 odds from the match doc.
@@ -76,8 +80,8 @@ def odds_only_prediction(doc: dict[str, Any]) -> dict[str, Any] | None:
         if not gate["passed"]:
             return None
         confidence = gate["adjusted_confidence"]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("odds_predictor: regime gate check failed, using unadjusted confidence: %s", exc)
 
     return {
         "match_id":   str(doc.get("sportybet_id") or doc.get("id") or ""),

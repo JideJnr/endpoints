@@ -10,6 +10,10 @@ from app.storage.db import DB_PATH, _conn
 
 from app.utils.primitives import _to_float
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 MIN_CALIBRATION_SAMPLES = 30
 MIN_CLV_SAMPLES = 25
 MAX_CALIBRATION_GAP_POINTS = 12.0
@@ -81,6 +85,7 @@ def evaluate_promotion_gate(doc: dict[str, Any], pick: dict[str, Any]) -> dict[s
             clv = _clv_metrics(conn, market, pick_type, league)
             drawdown = _drawdown_metrics(conn, market, pick_type, league)
     except Exception as exc:
+        logger.warning("validation_gate: unavailable for %s/%s in %s: %s", market, pick_type, league, exc)
         return {
             "allowed": False,
             "status": "blocked",

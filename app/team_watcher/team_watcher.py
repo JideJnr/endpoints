@@ -227,6 +227,13 @@ def init_team_watcher_tables(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "ai_team_watchers", "web_context_json", "text not null default '{}'")
     _ensure_column(conn, "ai_team_watchers", "overview_json", "text not null default '{}'")
     _ensure_column(conn, "ai_team_watchers", "last_web_context_at", "text")
+    # Confirmed-real SofaScore + SportyBet team endpoint data (info/fixtures/
+    # results/news), kept SEPARATE from the generic web-search web_context
+    # above and from each other -- see _fetch_provider_context. Never merged
+    # into one blob so a wrong/stale id on one provider never contaminates
+    # the other provider's data.
+    _ensure_column(conn, "ai_team_watchers", "provider_context_json", "text not null default '{}'")
+    _ensure_column(conn, "ai_team_watchers", "last_provider_context_at", "text")
     _ensure_column(conn, "ai_team_watcher_matches", "league_name", "text")
     _ensure_column(conn, "ai_team_watcher_matches", "team_position", "text")
     _ensure_column(conn, "ai_team_watcher_matches", "opponent_position", "text")
@@ -340,8 +347,8 @@ def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
                     "losses": losses,
                     "win_rate": win_rate,
                 }
-        except Exception:
-            pass  # Engine unavailable — return defaults
+        except Exception as exc:
+            logger.debug("get_watcher: engine profile computation unavailable: %s", exc)
 
     if row is None:
         return {"status": "not_found", "team_key": team_key}
@@ -355,8 +362,8 @@ def get_watcher(team_key: str, limit: int = 30) -> dict[str, Any]:
                 rebuilt = _build_profile(conn2, row["team_key"])
             watcher_data["profile"] = rebuilt
             watcher_data["venue_split"] = rebuilt.get("venue_split") or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("get_watcher: profile rebuild failed: %s", exc)
 
     return {
         "status": "success",
@@ -518,6 +525,8 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                     web_context_json = ?,
                     overview_json = ?,
                     last_web_context_at = ?,
+                    provider_context_json = ?,
+                    last_provider_context_at = ?,
                     match_count = ?,
                     last_match_id = ?,
                     last_analysis_json = ?,
@@ -532,6 +541,8 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
                     json.dumps(profile.get("web_context") or {}),
                     json.dumps(profile.get("overview") or {}),
                     profile.get("last_web_context_at"),
+                    json.dumps(profile.get("provider_context") or {}),
+                    profile.get("last_provider_context_at"),
                     int(profile.get("sample_size") or 0),
                     match_id,
                     json.dumps(analysis) if analysis else None,
@@ -605,12 +616,29 @@ def observe_match(match_doc: dict[str, Any], analysis: dict[str, Any] | None = N
     except Exception as _exc:
         logger.warning("grade_tw_predictions failed for match_id=%s: %s", match_id, _exc)
 
+    # Recompute each involved team's learned TW_Weights from freshly-graded
+    # predictions. update_tw_weights() had correct, idempotent upsert code
+    # (team_watcher_weights / team_watcher_weights_tournament) but zero
+    # callers anywhere in the app -- both tables stayed at 0 rows forever
+    # despite grading above actually working. Found + wired in 2026-09-09.
+    # Per-team try/except so one team's failure or insufficient-samples skip
+    # (needs >=10 graded rows) never blocks the others.
+    try:
+        from app.team_watcher.team_watcher_engine import update_tw_weights  # noqa: PLC0415
+        for team_update in updated:
+            try:
+                update_tw_weights(team_update["team_key"])
+            except Exception as _exc:
+                logger.debug("update_tw_weights failed for team_key=%s: %s", team_update["team_key"], _exc)
+    except Exception as _exc:
+        logger.warning("update_tw_weights import/loop failed: %s", _exc)
+
     try:
         from app.team_watcher.team_watcher_engine import _maybe_generate_weekly_analysis  # noqa: PLC0415
         for team_update in updated:
             _maybe_generate_weekly_analysis(team_update["team_key"])
     except Exception as _exc:
-        pass
+        logger.warning("observe_match: weekly analysis generation failed: %s", _exc)
 
     # ── Post-match AI monitoring: generate context-rich performance notes ──
     try:
@@ -643,7 +671,8 @@ def _analysis_signature(analysis: dict[str, Any] | None) -> str:
         return ""
     try:
         return json.dumps(analysis, sort_keys=True, default=str)[:1000]
-    except Exception:
+    except Exception as exc:
+        logger.debug("_analysis_signature: json dump failed, using str() fallback: %s", exc)
         return str(analysis)[:1000]
 
 
@@ -678,7 +707,9 @@ def rebuild_all_profiles(limit: int = 5000) -> dict[str, Any]:
                     update ai_team_watchers
                     set profile_json = ?, league_name = coalesce(league_name, ?),
                         position = coalesce(position, ?), match_count = ?,
-                        overview_json = ?, updated_at = ?
+                        overview_json = ?,
+                        provider_context_json = ?, last_provider_context_at = ?,
+                        updated_at = ?
                     where team_key = ?
                     """,
                     (
@@ -687,6 +718,8 @@ def rebuild_all_profiles(limit: int = 5000) -> dict[str, Any]:
                         profile.get("position"),
                         int(profile.get("sample_size") or 0),
                         json.dumps(profile.get("overview") or {}),
+                        json.dumps(profile.get("provider_context") or {}),
+                        profile.get("last_provider_context_at"),
                         datetime.now(timezone.utc).isoformat(),
                         team_key,
                     ),
@@ -764,7 +797,8 @@ def _mongo_configured() -> bool:
     try:
         from app.storage.mongo_store import is_configured
         return is_configured()
-    except Exception:
+    except Exception as exc:
+        logger.debug("_mongo_configured: check failed: %s", exc)
         return False
 
 
@@ -773,8 +807,8 @@ def _list_finished_matches_local_or_mongo(limit: int) -> list[dict[str, Any]]:
         try:
             from app.storage.mongo_store import list_finished_matches
             return list_finished_matches(limit=limit)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("_list_finished_matches_local_or_mongo: mongo lookup failed, using local fallback: %s", exc)
     # Local SQLite fallback (used when PREDICTX_LOCAL_STORAGE_ONLY=true)
     try:
         import json as _json
@@ -795,10 +829,11 @@ def _list_finished_matches_local_or_mongo(limit: int) -> list[dict[str, Any]]:
             try:
                 doc = _json.loads(row["raw_doc"])
                 docs.append(doc)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("_list_finished_matches_local_or_mongo: row parse failed: %s", exc)
         return docs
-    except Exception:
+    except Exception as exc:
+        logger.warning("_list_finished_matches_local_or_mongo: local query failed: %s", exc)
         return []
 
 
@@ -845,13 +880,13 @@ def backfill_team_watcher_ids(limit: int = 5000) -> dict[str, Any]:
         from app.storage.buffer import get_buffered_matches
         buf = get_buffered_matches(limit=2000)
         docs.extend(buf)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("backfill_team_watcher_ids: buffer lookup failed: %s", exc)
     try:
         finished = _list_finished_matches_local_or_mongo(limit=2000)
         docs.extend(finished)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("backfill_team_watcher_ids: finished-matches lookup failed: %s", exc)
 
     # Deduplicate by match_id
     seen_ids: set[str] = set()
@@ -876,8 +911,8 @@ def backfill_team_watcher_ids(limit: int = 5000) -> dict[str, Any]:
         processed_matches.add(mid)
         try:
             observe_match(doc)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("backfill_team_watcher_ids: observe_match failed for %s: %s", mid, exc)
 
     # Step 4 — count how many still have missing IDs
     with db_conn() as conn:
@@ -954,12 +989,13 @@ def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key
     table_json = team.get("table_json") or latest_profile.get("table") or {}
     web_context_json = team.get("web_context") or latest_profile.get("web_context") or {}
     overview_json = team.get("overview") or latest_profile.get("overview") or {}
+    provider_context_json = team.get("provider_context") or latest_profile.get("provider_context") or {}
     conn.execute(
         """
         insert into ai_team_watchers
             (team_key, team_name, sporty_team_id, sofascore_team_id, aliases_json, analyst_name,
-             league_name, position, table_json, web_context_json, overview_json, updated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             league_name, position, table_json, web_context_json, overview_json, provider_context_json, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(team_key) do update set
             team_name = excluded.team_name,
             aliases_json = excluded.aliases_json,
@@ -971,6 +1007,7 @@ def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key
             table_json = coalesce(excluded.table_json, ai_team_watchers.table_json),
             web_context_json = coalesce(excluded.web_context_json, ai_team_watchers.web_context_json),
             overview_json = coalesce(excluded.overview_json, ai_team_watchers.overview_json),
+            provider_context_json = coalesce(excluded.provider_context_json, ai_team_watchers.provider_context_json),
             updated_at = excluded.updated_at
         """,
         (
@@ -985,6 +1022,7 @@ def _upsert_watcher(conn: sqlite3.Connection, team: dict[str, Any], resolved_key
             json.dumps(table_json or {}),
             json.dumps(web_context_json or {}),
             json.dumps(overview_json or {}),
+            json.dumps(provider_context_json or {}),
             now,
         ),
     )
@@ -1068,7 +1106,8 @@ def _observation_for_team(doc: dict[str, Any], team: dict[str, Any], analysis: d
     time_context = {}
     try:
         time_context = match_time_context(doc)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_observation_for_team: match_time_context failed: %s", exc)
         time_context = {}
     web_context = _team_web_context(team, doc, team_row, opponent_row)
     return {
@@ -1151,6 +1190,82 @@ def _compute_profile_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
     }
 
 
+def _fetch_provider_context(sofascore_team_id: str | None, sporty_team_id: str | None) -> dict[str, Any]:
+    """Pull the confirmed-real SofaScore + SportyBet team endpoints for one
+    team and hand them back SIDE BY SIDE under "sofascore" / "sportybet"
+    keys -- never merged into one flat dict.
+
+    Why not merge: sofascore_team_id and sporty_team_id are two completely
+    separate id-spaces (this is the exact bug this project shipped live
+    with -- a SofaScore id silently written into a field a caller then
+    read as the SportyBet id). Keeping the two providers' payloads in
+    clearly separate buckets means a wrong/stale id on ONE side just shows
+    up as a missing/empty bucket, instead of contaminating the other
+    provider's genuinely-correct data. Most of the underlying facts (who
+    the team is, upcoming/recent matches) do overlap between the two
+    providers, which is fine -- callers can prefer whichever bucket they
+    trust more for a given field rather than have that choice made for
+    them here.
+
+    SportyBet's /fixtures and /results calls require a tournamentIds
+    param or they reject the whole call (HTTP 200, bizCode 19000
+    "Invalid" -- confirmed live via curl 2026-09-06). We don't guess a
+    tournament id: we reuse the numeric tournament ids SofaScore itself
+    just returned for this team (fetch_team_tournaments), which are
+    confirmed to be the same raw Sportradar tournament numbers SportyBet
+    uses for at least the curated top-30 leagues. For a team in a
+    non-curated league this can legitimately come back empty (SportyBet
+    returns bizCode 10000 success + an empty list for a team/tournament
+    pair that doesn't line up, not an error), so it's a safe thing to
+    attempt rather than skip.
+    """
+    context: dict[str, Any] = {
+        "sofascore": None,
+        "sportybet": None,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if sofascore_team_id:
+        try:
+            from app.data_clients.sofascore_client import fetch_team_detail  # noqa: PLC0415
+            context["sofascore"] = fetch_team_detail(int(sofascore_team_id))
+        except Exception as exc:
+            logger.debug("_fetch_provider_context: sofascore lookup failed: %s", exc)
+            context["sofascore_error"] = str(exc)
+
+    if sporty_team_id:
+        try:
+            from app.data_clients.sportybet_client import (  # noqa: PLC0415
+                fetch_team_info as sporty_team_info,
+                fetch_team_fixtures as sporty_team_fixtures,
+                fetch_team_results as sporty_team_results,
+                fetch_team_news as sporty_team_news,
+            )
+            tournament_ids: list[str] = []
+            sofa_ctx = context.get("sofascore")
+            if isinstance(sofa_ctx, dict):
+                for t in sofa_ctx.get("tournaments") or []:
+                    if isinstance(t, dict) and t.get("id"):
+                        tournament_ids.append(str(t["id"]))
+            tournament_ids = tournament_ids[:5]  # keep the call small; most-relevant first
+
+            info = sporty_team_info(sporty_team_id)
+            fixtures = sporty_team_fixtures(sporty_team_id, tournament_ids=tournament_ids) if tournament_ids else []
+            results = sporty_team_results(sporty_team_id, tournament_ids=tournament_ids) if tournament_ids else []
+            news = sporty_team_news(sporty_team_id)
+            context["sportybet"] = {
+                "info": info,
+                "upcoming_fixtures": fixtures,
+                "recent_results": results,
+                "news": news,
+                "tournament_ids_used": tournament_ids,
+            }
+        except Exception as exc:
+            logger.debug("_fetch_provider_context: sportybet lookup failed: %s", exc)
+            context["sportybet_error"] = str(exc)
+
+    return context
+
+
 def _build_profile(
     conn: sqlite3.Connection,
     team_key: str,
@@ -1231,8 +1346,31 @@ def _build_profile(
                 web_context = fresh_context
                 last_web_context_at = datetime.now(timezone.utc).isoformat()
         except Exception as exc:
+            logger.debug("_build_profile: web context search failed: %s", exc)
             if not web_context:
                 web_context = {"error": str(exc), "query": team_name}
+
+    # ── Confirmed-real SofaScore + SportyBet team endpoint data ──────────
+    # Kept separate from web_context above (that's generic web search;
+    # this is the two providers' own team/{id}/... endpoints). Same
+    # staleness cadence, reusing _should_refresh_web_context since it's
+    # generic (just checks presence + age of whatever dict it's given).
+    provider_context = _loads(watcher["provider_context_json"], {}) if watcher else {}
+    last_provider_context_at = watcher["last_provider_context_at"] if watcher else None
+    watcher_sofa_id = (team or {}).get("sofascore_team_id") or (watcher and watcher["sofascore_team_id"])
+    watcher_sporty_id = (team or {}).get("sporty_team_id") or (watcher and watcher["sporty_team_id"])
+    if (watcher_sofa_id or watcher_sporty_id) and _should_refresh_web_context(
+        {"web_context": provider_context, "last_web_context_at": last_provider_context_at}, sample
+    ):
+        try:
+            fresh_provider_context = _fetch_provider_context(watcher_sofa_id, watcher_sporty_id)
+            provider_context = fresh_provider_context
+            last_provider_context_at = datetime.now(timezone.utc).isoformat()
+        except Exception as exc:
+            logger.debug("_build_profile: provider context lookup failed: %s", exc)
+            if not provider_context:
+                provider_context = {"error": str(exc)}
+
     overview = _build_overview(
         team_name=(team or {}).get("team_name") or (watcher and watcher["team_name"]) or "Team",
         league_name=league_name,
@@ -1295,6 +1433,8 @@ def _build_profile(
         "web_context": web_context,
         "overview": overview,
         "last_web_context_at": last_web_context_at,
+        "provider_context": provider_context,
+        "last_provider_context_at": last_provider_context_at,
         "venue_split": stats["venue_split"],
         "goal_timing": stats["goal_timing"],
         "avg_opponent_league_strength": avg_opponent_league_strength,
@@ -1356,7 +1496,8 @@ def _team_goal_timing(rows: list[sqlite3.Row]) -> dict[str, Any]:
             continue
         try:
             doc = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
+        except Exception as exc:
+            logger.debug("_team_goal_timing: row parse failed: %s", exc)
             continue
         if not isinstance(doc, dict):
             continue
@@ -1443,7 +1584,8 @@ def _compute_pressing_profile(rows: list[sqlite3.Row]) -> dict[str, Any]:
     """
     try:
         from app.live.live_stat_history import get_stat_history  # local import avoids circular
-    except Exception:
+    except Exception as exc:
+        logger.warning("_compute_pressing_profile: live_stat_history import failed: %s", exc)
         return {"available": False, "reason": "live_stat_history_unavailable"}
 
     # Accumulators
@@ -1475,7 +1617,8 @@ def _compute_pressing_profile(rows: list[sqlite3.Row]) -> dict[str, Any]:
 
         try:
             snaps = get_stat_history(match_id)
-        except Exception:
+        except Exception as exc:
+            logger.debug("_compute_pressing_profile: stat history fetch failed for %s: %s", match_id, exc)
             continue
         if not snaps:
             continue
@@ -1709,6 +1852,8 @@ def _watcher_row(row: sqlite3.Row | None) -> dict[str, Any]:
         "overview": _loads(row["overview_json"], {}),
         "venue_split": profile.get("venue_split") or {},
         "last_web_context_at": row["last_web_context_at"],
+        "provider_context": _loads(row["provider_context_json"], {}),
+        "last_provider_context_at": row["last_provider_context_at"],
         "match_count": row["match_count"],
         "last_match_id": row["last_match_id"],
         "last_analysis": _loads(row["last_analysis_json"], None),
@@ -1750,12 +1895,13 @@ def _get_finished_or_buffered_match(match_id: str) -> dict[str, Any] | None:
         doc = get_finished_match(match_id)
         if doc:
             return doc
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_get_finished_or_buffered_match: mongo lookup failed for %s: %s", match_id, exc)
     try:
         from app.storage.buffer import get_buffered_match
         return get_buffered_match(match_id)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_get_finished_or_buffered_match: buffer lookup failed for %s: %s", match_id, exc)
         return None
 
 
@@ -1866,8 +2012,8 @@ def _merge_aliases(existing: object | None, team: dict) -> list:
     if existing:
         try:
             existing_aliases = _json.loads(existing['aliases_json'] or '[]')
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_merge_aliases: existing aliases parse failed: %s", exc)
     new_aliases = team.get('aliases') or []
     seen = {(a.get('provider'), a.get('id')) for a in existing_aliases}
     for alias in new_aliases:
@@ -1915,7 +2061,8 @@ def _position_value(row: object | None) -> int | None:
         return None
     try:
         return int(row['position'] or 0) or None
-    except Exception:
+    except Exception as exc:
+        logger.debug("_position_value: parse failed: %s", exc)
         return None
 
 
@@ -1979,7 +2126,8 @@ def _should_refresh_web_context(watcher: dict, sample: int) -> bool:
         dt = datetime.fromisoformat(str(last_at).replace('Z', '+00:00')).astimezone(timezone.utc)
         age_hours = (datetime.now(tz=timezone.utc) - dt).total_seconds() / 3600
         return age_hours > (6 if sample >= 5 else 24)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_should_refresh_web_context: age check failed, defaulting to refresh: %s", exc)
         return True
 
 
@@ -2213,7 +2361,8 @@ def _goal_timing_edge(rows: list[sqlite3.Row], side: str) -> float:
             continue
         try:
             doc = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
+        except Exception as exc:
+            logger.debug("_goal_timing_edge: row parse failed: %s", exc)
             continue
         if not isinstance(doc, dict):
             continue
@@ -2278,7 +2427,8 @@ def _signal_combo_edge(rows: list[sqlite3.Row], active_signal_names: set[str]) -
             continue
         try:
             pred = json.loads(pred_raw) if isinstance(pred_raw, str) else pred_raw
-        except Exception:
+        except Exception as exc:
+            logger.debug("_signal_combo_edge: row parse failed: %s", exc)
             continue
         if not isinstance(pred, dict):
             continue

@@ -1,3 +1,6 @@
+from app.logging_config import configure_logging
+configure_logging()
+
 from contextlib import asynccontextmanager
 import asyncio
 from pathlib import Path
@@ -7,13 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config.config import get_settings, public_settings
 from app.storage.db import DB_PATH, close_db
 from app.storage.league_memory import _init_db
-from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore, user_behavior, betbuilder
+from app.routers import agent, frontend, mobile_bridge, mongo, platform, sporty, sofascore, user_behavior, betbuilder, public, auth as auth_router
 from app.routers import sofa_pipeline as sofa_pipeline_router
 from app.routers import pipelines as pipelines_router
 from app.routers import scheduler as scheduler_router
 from app.routers import diagnostics as diagnostics_router
 from app.routers import composite as composite_router
 from app.scheduling.scheduler import start_scheduler
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -25,33 +32,35 @@ async def lifespan(app: FastAPI):
         from app.scheduling.pipeline_registry import ensure_default_states
         initialised = ensure_default_states()
         if initialised:
-            print(f"[startup] pipeline defaults set: {initialised}")
+            logger.info("[startup] pipeline defaults set: %s", initialised)
     except Exception as exc:
-        print(f"[startup] pipeline default init failed: {exc}")
+        logger.warning("[startup] pipeline default init failed: %s", exc)
     try:
         from app.storage.mongo_store import cleanup_buffer
         result = cleanup_buffer()
         if result.get("deleted_finished") or result.get("deleted_stale_unenriched"):
-            print(f"[startup] buffer cleanup: removed {result.get('deleted_finished')} finished, {result.get('deleted_stale_unenriched')} stale")
+            logger.info("[startup] buffer cleanup: removed %s finished, %s stale", result.get('deleted_finished'), result.get('deleted_stale_unenriched'))
     except Exception as exc:
-        print(f"[startup] buffer cleanup failed: {exc}")
+        logger.warning("[startup] buffer cleanup failed: %s", exc)
     try:
         from app.scheduling.job_state import recover_abandoned_jobs
         recovery = recover_abandoned_jobs(stale_after_seconds=180)
         if recovery.get("recovered"):
-            print(f"[startup] recovered abandoned jobs: {recovery.get('jobs')}")
+            logger.info("[startup] recovered abandoned jobs: %s", recovery.get('jobs'))
     except Exception as exc:
-        print(f"[startup] job recovery failed: {exc}")
+        logger.warning("[startup] job recovery failed: %s", exc)
     try:
         if settings.environment != "test":
             start_scheduler()
-        print(
+        logger.info(
             "[startup] prediction thresholds: "
-            f"calibration_samples={settings.validation_gate_min_calibration_samples}, "
-            f"clv_samples={settings.validation_gate_min_clv_samples}, "
-            f"volatility_hard_block={settings.risk_manager_volatility_hard_block_threshold}, "
-            f"bootstrap_confidence_ceiling={settings.risk_manager_bootstrap_confidence_ceiling}, "
-            f"clear_winner_gap={settings.clear_winner_probability_gap}"
+            "calibration_samples=%s, clv_samples=%s, volatility_hard_block=%s, "
+            "bootstrap_confidence_ceiling=%s, clear_winner_gap=%s",
+            settings.validation_gate_min_calibration_samples,
+            settings.validation_gate_min_clv_samples,
+            settings.risk_manager_volatility_hard_block_threshold,
+            settings.risk_manager_bootstrap_confidence_ceiling,
+            settings.clear_winner_probability_gap,
         )
         yield
     finally:
@@ -92,6 +101,8 @@ app.include_router(diagnostics_router.router)
 app.include_router(composite_router.router)
 app.include_router(user_behavior.router)
 app.include_router(betbuilder.router)
+app.include_router(public.router)
+app.include_router(auth_router.router)
 
 
 connected_clients: list[WebSocket] = []
@@ -101,8 +112,8 @@ async def _close_live_websockets() -> None:
     for websocket in list(connected_clients):
         try:
             await websocket.close(code=1001)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_close_live_websockets: error closing a websocket: %s", exc)
         finally:
             if websocket in connected_clients:
                 connected_clients.remove(websocket)
@@ -127,6 +138,7 @@ def readiness():
         _init_db()
         checks["database_init"] = True
     except Exception as exc:
+        logger.error("readiness: database init check failed: %s", exc)
         checks["database_init"] = False
         checks["database_error"] = str(exc)
     checks["mongodb_configured"] = bool(settings.mongodb_uri)
@@ -164,7 +176,8 @@ async def websocket_live(websocket: WebSocket):
         if websocket in connected_clients:
             connected_clients.remove(websocket)
         raise
-    except Exception:
+    except Exception as exc:
+        logger.warning("websocket_live: unexpected error, dropping client: %s", exc)
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
@@ -181,5 +194,6 @@ def _is_writable(path: Path) -> bool:
         probe.write_text("ok")
         probe.unlink(missing_ok=True)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.debug("readiness: %s is not writable: %s", path, exc)
         return False

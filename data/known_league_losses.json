@@ -1,0 +1,1722 @@
+[
+  {
+    "id": 35,
+    "match": "RSC Anderlecht vs KRC Genk",
+    "league": "Belgium Pro League",
+    "country": "Belgium",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 62,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-06 09:48:22",
+    "graded_at": "2026-09-06 18:56:44",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "1bcf01951fb5e2f4",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        40.4,
+        "goal_pressure"
+      ],
+      [
+        5.39,
+        "market_steam"
+      ],
+      [
+        5.04,
+        "home_form_trajectory"
+      ],
+      [
+        3.95,
+        "odds_edge"
+      ],
+      [
+        0.0,
+        "web_context"
+      ]
+    ]
+  },
+  {
+    "id": 37,
+    "match": "FC Groningen vs FC Twente Enschede",
+    "league": "Netherlands Eredivisie",
+    "country": "Netherlands",
+    "pick_type": "match_result",
+    "selection": "Away Win",
+    "confidence": 66,
+    "reason": "away avoids defeat profile; upgraded from Away or Draw to Away Win because every side-evidence signal (avg_rating_edge, h2h_edge, league_position_edge, odds_edge, recent_history_edge, venue_form_edge) agreed on away",
+    "final_score": "2-2",
+    "created_at": "2026-09-06 09:49:04",
+    "graded_at": "2026-09-06 12:11:21",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "2c157521845c85e6",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        33.6,
+        "goal_pressure"
+      ],
+      [
+        9.7,
+        "ensemble_model"
+      ],
+      [
+        5.52,
+        "away_form_trajectory"
+      ],
+      [
+        3.23,
+        "model_consensus"
+      ],
+      [
+        1.0,
+        "risk_management"
+      ]
+    ]
+  },
+  {
+    "id": 40,
+    "match": "Coritiba vs Mirassol",
+    "league": "Brazil Brasileirão Betano",
+    "country": "Brazil",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 62,
+    "reason": "home avoids defeat profile",
+    "final_score": "1-2",
+    "created_at": "2026-09-06 09:49:13",
+    "graded_at": "2026-09-06 16:36:14",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "78f3bc5b40eb2c30",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        30.0,
+        "goal_pressure"
+      ],
+      [
+        13.5,
+        "league_position_edge"
+      ],
+      [
+        10.54,
+        "common_opponent_edge"
+      ],
+      [
+        9.7,
+        "recent_history_edge"
+      ],
+      [
+        8.36,
+        "market_steam"
+      ]
+    ]
+  },
+  {
+    "id": 42,
+    "match": "Internacional vs Santos",
+    "league": "Brazil Brasileirão Betano",
+    "country": "Brazil",
+    "pick_type": "goals",
+    "selection": "Under 3.5 goals",
+    "confidence": 56,
+    "reason": "under 3.5 only passes with reduced confidence because goal environment is mixed",
+    "final_score": "2-3",
+    "created_at": "2026-09-06 09:49:20",
+    "graded_at": "2026-09-06 21:05:44",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "16159573f1d82788",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        21.6,
+        "goal_pressure"
+      ],
+      [
+        7.61,
+        "odds_edge"
+      ],
+      [
+        2.4,
+        "h2h_edge"
+      ],
+      [
+        0.0,
+        "web_context"
+      ],
+      [
+        0.0,
+        "source_blend_full"
+      ]
+    ]
+  },
+  {
+    "id": 47,
+    "match": "SC Paderborn 07 vs SC Freiburg",
+    "league": "Germany Bundesliga",
+    "country": "Germany",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 61,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-1",
+    "created_at": "2026-09-06 09:50:12",
+    "graded_at": "2026-09-06 09:54:06",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "064491389840f747",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        37.2,
+        "goal_pressure"
+      ],
+      [
+        10.82,
+        "venue_form_edge"
+      ],
+      [
+        10.0,
+        "market_steam"
+      ],
+      [
+        5.1,
+        "recent_history_edge"
+      ],
+      [
+        3.0,
+        "avg_rating_edge"
+      ]
+    ]
+  },
+  {
+    "id": 48,
+    "match": "SV Werder Bremen vs RB Leipzig",
+    "league": "Germany Bundesliga",
+    "country": "Germany",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 65,
+    "reason": "away avoids defeat profile",
+    "final_score": "3-1",
+    "created_at": "2026-09-06 09:50:14",
+    "graded_at": "2026-09-06 09:54:07",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "211efcf04601914d",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        33.6,
+        "goal_pressure"
+      ],
+      [
+        6.67,
+        "market_steam"
+      ],
+      [
+        4.0,
+        "sofascore_grade"
+      ],
+      [
+        1.68,
+        "league_strength_edge"
+      ],
+      [
+        0.1,
+        "ensemble_model"
+      ]
+    ]
+  },
+  {
+    "id": 163,
+    "match": "Corinthians vs Chapecoense",
+    "league": "Brazil Brasileirão Betano",
+    "country": "Brazil",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 68,
+    "reason": "home avoids defeat profile",
+    "final_score": "1-2",
+    "created_at": "2026-09-06 11:09:59",
+    "graded_at": "2026-09-07 00:34:52",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "97d79c3d86db419b",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        21.2,
+        "goal_pressure"
+      ],
+      [
+        16.84,
+        "odds_edge"
+      ],
+      [
+        13.5,
+        "league_position_edge"
+      ],
+      [
+        12.0,
+        "common_opponent_edge"
+      ],
+      [
+        11.66,
+        "venue_form_edge"
+      ]
+    ]
+  },
+  {
+    "id": 197,
+    "match": "Brøndby IF vs Randers FC",
+    "league": "Denmark Danish Superliga",
+    "country": "Denmark",
+    "pick_type": "goals",
+    "selection": "Under 1.5 goals",
+    "confidence": 61,
+    "reason": "learned 0-0 profile warns against early over 1.5",
+    "final_score": "0-3",
+    "created_at": "2026-09-06 11:16:09",
+    "graded_at": "2026-09-06 18:56:44",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "c09acf53789600c5",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        24.8,
+        "goal_pressure"
+      ],
+      [
+        14.68,
+        "odds_edge"
+      ],
+      [
+        4.5,
+        "league_position_edge"
+      ],
+      [
+        3.2,
+        "h2h_edge"
+      ],
+      [
+        3.2,
+        "away_form_trajectory"
+      ]
+    ]
+  },
+  {
+    "id": 222,
+    "match": "Frosinone vs Venezia FC",
+    "league": "Italy Serie A",
+    "country": "Italy",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 61,
+    "reason": "away avoids defeat profile; capped by publication filter: away_or_draw_requires_market_recent_common_support",
+    "final_score": "3-2",
+    "created_at": "2026-09-06 11:25:13",
+    "graded_at": "2026-09-06 15:12:17",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "106cb907bc448b94",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        34.8,
+        "goal_pressure"
+      ],
+      [
+        2.0,
+        "prediction_memory"
+      ],
+      [
+        1.0,
+        "risk_management"
+      ],
+      [
+        1.0,
+        "prediction_memory"
+      ],
+      [
+        1.0,
+        "learned_signal_adjustment"
+      ]
+    ]
+  },
+  {
+    "id": 223,
+    "match": "Parma Calcio vs Monza",
+    "league": "Italy Serie A",
+    "country": "Italy",
+    "pick_type": "match_result",
+    "selection": "Away Win",
+    "confidence": 60,
+    "reason": "ensemble away-win probability clears draw and home by threshold",
+    "final_score": "1-1",
+    "created_at": "2026-09-06 11:25:17",
+    "graded_at": "2026-09-06 15:12:17",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "8d4a983f25e0b6a9",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        28.4,
+        "goal_pressure"
+      ],
+      [
+        14.0,
+        "league_strength_edge"
+      ],
+      [
+        7.6,
+        "ensemble_model"
+      ],
+      [
+        2.53,
+        "model_consensus"
+      ],
+      [
+        1.0,
+        "prediction_memory"
+      ]
+    ]
+  },
+  {
+    "id": 227,
+    "match": "Malaga CF vs Levante",
+    "league": "Spain LaLiga",
+    "country": "Spain",
+    "pick_type": "match_result",
+    "selection": "Home Win",
+    "confidence": 61,
+    "reason": "ensemble home-win probability clears draw and away by threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-06 11:25:32",
+    "graded_at": "2026-09-06 18:56:45",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "91a2eba3d706d61b",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        30.4,
+        "goal_pressure"
+      ],
+      [
+        14.4,
+        "recent_history_edge"
+      ],
+      [
+        12.0,
+        "venue_form_edge"
+      ],
+      [
+        7.2,
+        "ensemble_model"
+      ],
+      [
+        2.74,
+        "competition_intelligence"
+      ]
+    ]
+  },
+  {
+    "id": 229,
+    "match": "Marseille vs Paris FC",
+    "league": "France Ligue 1",
+    "country": "France",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 69,
+    "reason": "home avoids defeat profile",
+    "final_score": "2-3",
+    "created_at": "2026-09-06 11:25:37",
+    "graded_at": "2026-09-06 20:58:27",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "530663e639fc5082",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        39.2,
+        "goal_pressure"
+      ],
+      [
+        10.0,
+        "market_steam"
+      ],
+      [
+        7.6,
+        "recent_history_edge"
+      ],
+      [
+        7.46,
+        "odds_edge"
+      ],
+      [
+        3.2,
+        "away_form_trajectory"
+      ]
+    ]
+  },
+  {
+    "id": 234,
+    "match": "AEK Athens vs LASK Linz",
+    "league": "International Clubs UEFA Champions League",
+    "country": "International Clubs",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 57,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "1-0",
+    "created_at": "2026-09-06 11:25:59",
+    "graded_at": "2026-09-08 18:42:57",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "f8d9fc02acc200a6",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        36.4,
+        "goal_pressure"
+      ],
+      [
+        10.67,
+        "odds_edge"
+      ],
+      [
+        2.0,
+        "prediction_memory"
+      ],
+      [
+        1.0,
+        "learned_signal_adjustment"
+      ],
+      [
+        0.0,
+        "team_watch"
+      ]
+    ]
+  },
+  {
+    "id": 256,
+    "match": "KV Kortrijk vs SV Zulte Waregem",
+    "league": "Belgium Pro League",
+    "country": "Belgium",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 63,
+    "reason": "home avoids defeat profile",
+    "final_score": "0-2",
+    "created_at": "2026-09-06 13:04:19",
+    "graded_at": "2026-09-06 16:36:15",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "47d88bd9611a13f7",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        32.8,
+        "goal_pressure"
+      ],
+      [
+        12.6,
+        "recent_history_edge"
+      ],
+      [
+        12.0,
+        "venue_form_edge"
+      ],
+      [
+        6.75,
+        "ensemble_model"
+      ],
+      [
+        2.87,
+        "elo_model"
+      ]
+    ]
+  },
+  {
+    "id": 345,
+    "match": "Wrexham vs Burnley",
+    "league": "England Championship",
+    "country": "England",
+    "pick_type": "double_chance",
+    "selection": "Home or Away",
+    "confidence": 74,
+    "reason": "draw risk is low from model and database",
+    "final_score": "1-1",
+    "created_at": "2026-09-06 16:13:38",
+    "graded_at": "2026-09-08 20:44:53",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "696bb0ae17904fea",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        37.2,
+        "goal_pressure"
+      ],
+      [
+        15.9,
+        "recent_history_edge"
+      ],
+      [
+        15.0,
+        "league_position_edge"
+      ],
+      [
+        11.66,
+        "venue_form_edge"
+      ],
+      [
+        9.35,
+        "ensemble_model"
+      ]
+    ]
+  },
+  {
+    "id": 350,
+    "match": "Portsmouth vs Cardiff City",
+    "league": "England Championship",
+    "country": "England",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 64,
+    "reason": "ensemble away-win probability clears draw and home by threshold; downgraded from Away Win to Away or Draw because odds_edge disagreed with away; capped by publication filter: h2h_market_common_opponent_conflict, away_or_draw_requires_market_recent_common_support",
+    "final_score": "2-0",
+    "created_at": "2026-09-06 16:32:26",
+    "graded_at": "2026-09-06 16:36:33",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "8a201925ae0624be",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        37.2,
+        "goal_pressure"
+      ],
+      [
+        10.5,
+        "league_strength_edge"
+      ],
+      [
+        7.1,
+        "ensemble_model"
+      ],
+      [
+        5.2,
+        "home_form_trajectory"
+      ],
+      [
+        4.0,
+        "sofascore_grade"
+      ]
+    ]
+  },
+  {
+    "id": 352,
+    "match": "West Ham United vs Derby County",
+    "league": "England Championship",
+    "country": "England",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 68,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "3-0",
+    "created_at": "2026-09-06 16:32:46",
+    "graded_at": "2026-09-06 16:36:34",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "7baf49eb5c14e067",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        31.2,
+        "goal_pressure"
+      ],
+      [
+        18.27,
+        "odds_edge"
+      ],
+      [
+        9.0,
+        "league_position_edge"
+      ],
+      [
+        8.0,
+        "sofascore_grade"
+      ],
+      [
+        5.25,
+        "venue_form_edge"
+      ]
+    ]
+  },
+  {
+    "id": 356,
+    "match": "Rosenborg BK vs HamKam",
+    "league": "Norway Eliteserien",
+    "country": "Norway",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 68,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "4-0",
+    "created_at": "2026-09-06 16:34:54",
+    "graded_at": "2026-09-06 16:36:13",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "a8d9a7ec8f80a99c",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        36.0,
+        "goal_pressure"
+      ],
+      [
+        19.73,
+        "odds_edge"
+      ],
+      [
+        9.84,
+        "venue_form_edge"
+      ],
+      [
+        8.0,
+        "sofascore_grade"
+      ],
+      [
+        6.39,
+        "common_opponent_edge"
+      ]
+    ]
+  },
+  {
+    "id": 358,
+    "match": "Kristiansund BK vs Tromsø IL",
+    "league": "Norway Eliteserien",
+    "country": "Norway",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 68,
+    "reason": "away avoids defeat profile",
+    "final_score": "2-0",
+    "created_at": "2026-09-06 16:35:12",
+    "graded_at": "2026-09-06 19:15:28",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "fe00de5eb53a4305",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        24.0,
+        "goal_pressure"
+      ],
+      [
+        7.6,
+        "market_steam"
+      ],
+      [
+        3.04,
+        "away_form_trajectory"
+      ],
+      [
+        2.59,
+        "venue_form_edge"
+      ],
+      [
+        2.0,
+        "prediction_memory"
+      ]
+    ]
+  },
+  {
+    "id": 379,
+    "match": "Athletic Club vs Atlético Madrid",
+    "league": "Spain LaLiga",
+    "country": "Spain",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 68,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "3-0",
+    "created_at": "2026-09-06 16:45:38",
+    "graded_at": "2026-09-06 17:15:33",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "5aa0fbc9d424b817",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        34.4,
+        "goal_pressure"
+      ],
+      [
+        5.35,
+        "league_strength_edge"
+      ],
+      [
+        4.0,
+        "sofascore_grade"
+      ],
+      [
+        2.77,
+        "elo_model"
+      ],
+      [
+        2.56,
+        "home_form_trajectory"
+      ]
+    ]
+  },
+  {
+    "id": 439,
+    "match": "Kristiansund BK vs Tromsoe IL",
+    "league": "Norway Eliteserien",
+    "country": "Norway",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 76,
+    "reason": "away avoids defeat profile",
+    "final_score": "2-0",
+    "created_at": "2026-09-06 17:44:56",
+    "graded_at": "2026-09-06 19:15:20",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "8f1857a2e578bded",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        24.0,
+        "goal_pressure"
+      ],
+      [
+        8.0,
+        "ai_brain_review"
+      ],
+      [
+        3.04,
+        "away_form_trajectory"
+      ],
+      [
+        2.59,
+        "venue_form_edge"
+      ],
+      [
+        2.15,
+        "ensemble_model"
+      ]
+    ]
+  },
+  {
+    "id": 457,
+    "match": "Kristiansund BK vs Tromsoe IL",
+    "league": "Norway Eliteserien",
+    "country": "Norway",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 76,
+    "reason": "away avoids defeat profile",
+    "final_score": "2-0",
+    "created_at": "2026-09-06 17:53:58",
+    "graded_at": "2026-09-06 19:15:28",
+    "engine": "deterministic",
+    "prediction_mode": "live",
+    "signal_combination_key": "4e87bd2f595ee0ad",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        24.0,
+        "goal_pressure"
+      ],
+      [
+        8.0,
+        "ai_brain_review"
+      ],
+      [
+        7.6,
+        "market_steam"
+      ],
+      [
+        3.04,
+        "away_form_trajectory"
+      ],
+      [
+        2.59,
+        "venue_form_edge"
+      ]
+    ]
+  },
+  {
+    "id": 516,
+    "match": "RC Lens vs Lorient",
+    "league": "France Ligue 1",
+    "country": "France",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 74,
+    "reason": "home avoids defeat profile",
+    "final_score": "0-1",
+    "created_at": "2026-09-06 19:19:38",
+    "graded_at": "2026-09-06 19:31:27",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "4ed0577e26415f93",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        39.6,
+        "goal_pressure"
+      ],
+      [
+        14.14,
+        "odds_edge"
+      ],
+      [
+        12.0,
+        "league_position_edge"
+      ],
+      [
+        10.68,
+        "venue_form_edge"
+      ],
+      [
+        10.0,
+        "red_card_state"
+      ]
+    ]
+  },
+  {
+    "id": 523,
+    "match": "Columbus Crew vs Colorado Rapids",
+    "league": "USA MLS",
+    "country": "USA",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 64,
+    "reason": "both-side scoring probability is above market threshold; capped by publication filter: h2h_market_common_opponent_conflict",
+    "final_score": "3-0",
+    "created_at": "2026-09-06 19:21:52",
+    "graded_at": "2026-09-06 19:31:28",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "862ce4eed415baaa",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        39.2,
+        "goal_pressure"
+      ],
+      [
+        7.14,
+        "odds_edge"
+      ],
+      [
+        6.09,
+        "venue_form_edge"
+      ],
+      [
+        5.68,
+        "market_steam"
+      ],
+      [
+        4.83,
+        "elo_model"
+      ]
+    ]
+  },
+  {
+    "id": 534,
+    "match": "Fulham vs Crystal Palace",
+    "league": "England Premier League",
+    "country": "England",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 74,
+    "reason": "home avoids defeat profile",
+    "final_score": "2-3",
+    "created_at": "2026-09-06 19:24:43",
+    "graded_at": "2026-09-06 19:31:29",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "4879705ddc2c450e",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        31.6,
+        "goal_pressure"
+      ],
+      [
+        7.32,
+        "venue_form_edge"
+      ],
+      [
+        5.57,
+        "league_strength_edge"
+      ],
+      [
+        4.81,
+        "odds_edge"
+      ],
+      [
+        4.8,
+        "home_form_trajectory"
+      ]
+    ]
+  },
+  {
+    "id": 537,
+    "match": "Nottingham Forest vs Tottenham Hotspur",
+    "league": "England Premier League",
+    "country": "England",
+    "pick_type": "match_result",
+    "selection": "Home Win",
+    "confidence": 68,
+    "reason": "ensemble home-win probability clears draw and away by threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-06 19:24:58",
+    "graded_at": "2026-09-06 19:31:30",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "ca96b2fe796c96ed",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        34.8,
+        "goal_pressure"
+      ],
+      [
+        14.7,
+        "recent_history_edge"
+      ],
+      [
+        9.15,
+        "ensemble_model"
+      ],
+      [
+        7.5,
+        "league_position_edge"
+      ],
+      [
+        6.2,
+        "avg_rating_edge"
+      ]
+    ]
+  },
+  {
+    "id": 538,
+    "match": "Hull City vs Aston Villa",
+    "league": "England Premier League",
+    "country": "England",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 63,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-06 19:25:04",
+    "graded_at": "2026-09-06 19:31:30",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "fa573458b6e4e267",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        34.0,
+        "goal_pressure"
+      ],
+      [
+        15.1,
+        "avg_rating_edge"
+      ],
+      [
+        15.0,
+        "league_position_edge"
+      ],
+      [
+        5.58,
+        "competition_intelligence"
+      ],
+      [
+        4.74,
+        "market_steam"
+      ]
+    ]
+  },
+  {
+    "id": 542,
+    "match": "Estoril Praia vs FC Arouca",
+    "league": "Portugal Liga Portugal Betclic",
+    "country": "Portugal",
+    "pick_type": "goals",
+    "selection": "Over 2.5 goals",
+    "confidence": 61,
+    "reason": "model goals and historical finals both run high",
+    "final_score": "0-0",
+    "created_at": "2026-09-06 19:26:54",
+    "graded_at": "2026-09-08 07:02:42",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "fa9a14b7df9f80fb",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        42.0,
+        "goal_pressure"
+      ],
+      [
+        4.71,
+        "market_steam"
+      ],
+      [
+        4.41,
+        "venue_form_edge"
+      ],
+      [
+        3.04,
+        "odds_edge"
+      ],
+      [
+        2.0,
+        "learned_signal_adjustment"
+      ]
+    ]
+  },
+  {
+    "id": 559,
+    "match": "Aberdeen vs Kilmarnock",
+    "league": "Scotland Scottish Premiership",
+    "country": "Scotland",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 62,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-06 19:30:36",
+    "graded_at": "2026-09-06 19:31:17",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "02748a47778e5e0c",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        34.4,
+        "goal_pressure"
+      ],
+      [
+        12.2,
+        "odds_edge"
+      ],
+      [
+        10.0,
+        "red_card_state"
+      ],
+      [
+        5.18,
+        "venue_form_edge"
+      ],
+      [
+        3.7,
+        "avg_rating_edge"
+      ]
+    ]
+  },
+  {
+    "id": 642,
+    "match": "Vancouver Whitecaps vs St.Louis City",
+    "league": "USA MLS",
+    "country": "USA",
+    "pick_type": "match_result",
+    "selection": "Home Win",
+    "confidence": 68,
+    "reason": "ensemble home-win probability clears draw and away by threshold",
+    "final_score": "1-3",
+    "created_at": "2026-09-06 20:06:01",
+    "graded_at": "2026-09-06 20:11:09",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "0ffa419c81d5efa3",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        32.0,
+        "goal_pressure"
+      ],
+      [
+        15.69,
+        "odds_edge"
+      ],
+      [
+        14.8,
+        "recent_history_edge"
+      ],
+      [
+        12.0,
+        "venue_form_edge"
+      ],
+      [
+        12.0,
+        "common_opponent_edge"
+      ]
+    ]
+  },
+  {
+    "id": 698,
+    "match": "Vélez Sarsfield vs Estudiantes de La Plata",
+    "league": "Argentina Liga Profesional, Clausura",
+    "country": "Argentina",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 64,
+    "reason": "away avoids defeat profile; capped by publication filter: h2h_market_common_opponent_conflict, away_or_draw_requires_market_recent_common_support",
+    "final_score": "1-0",
+    "created_at": "2026-09-06 22:54:26",
+    "graded_at": "2026-09-06 23:03:21",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "59a00815760c3c53",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        20.4,
+        "goal_pressure"
+      ],
+      [
+        12.0,
+        "league_position_edge"
+      ],
+      [
+        4.17,
+        "odds_edge"
+      ],
+      [
+        3.83,
+        "competition_intelligence"
+      ],
+      [
+        2.0,
+        "prediction_memory"
+      ]
+    ]
+  },
+  {
+    "id": 787,
+    "match": "Caykur Rizespor vs Alanyaspor",
+    "league": "Turkiye Super Lig",
+    "country": "Turkiye",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 58,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-1",
+    "created_at": "2026-09-06 23:58:55",
+    "graded_at": "2026-09-08 07:02:53",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "068a00f772ef9bdb",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        32.0,
+        "goal_pressure"
+      ],
+      [
+        9.43,
+        "odds_edge"
+      ],
+      [
+        5.09,
+        "venue_form_edge"
+      ],
+      [
+        3.53,
+        "common_opponent_edge"
+      ],
+      [
+        3.0,
+        "league_position_edge"
+      ]
+    ]
+  },
+  {
+    "id": 788,
+    "match": "Goztepe Izmir vs Gaziantep FK",
+    "league": "Turkiye Super Lig",
+    "country": "Turkiye",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 74,
+    "reason": "home avoids defeat profile",
+    "final_score": "2-4",
+    "created_at": "2026-09-06 23:59:25",
+    "graded_at": "2026-09-08 07:02:53",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "0361fa88c042daff",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        34.0,
+        "goal_pressure"
+      ],
+      [
+        10.75,
+        "venue_form_edge"
+      ],
+      [
+        8.02,
+        "odds_edge"
+      ],
+      [
+        6.9,
+        "recent_history_edge"
+      ],
+      [
+        6.0,
+        "away_form_trajectory"
+      ]
+    ]
+  },
+  {
+    "id": 790,
+    "match": "Malmo vs AIK",
+    "league": "Sweden Allsvenskan",
+    "country": "Sweden",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 59,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-07 00:02:07",
+    "graded_at": "2026-09-08 07:02:55",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "70de62a3d2ab9fcf",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        36.8,
+        "goal_pressure"
+      ],
+      [
+        10.71,
+        "odds_edge"
+      ],
+      [
+        6.09,
+        "venue_form_edge"
+      ],
+      [
+        4.4,
+        "away_form_trajectory"
+      ],
+      [
+        3.2,
+        "h2h_edge"
+      ]
+    ]
+  },
+  {
+    "id": 791,
+    "match": "Mjallby AIF vs IFK Goteborg",
+    "league": "Sweden Allsvenskan",
+    "country": "Sweden",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 74,
+    "reason": "home avoids defeat profile",
+    "final_score": "1-4",
+    "created_at": "2026-09-07 00:03:01",
+    "graded_at": "2026-09-08 07:02:56",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "de89dfbc00b3fe9c",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        34.4,
+        "goal_pressure"
+      ],
+      [
+        14.2,
+        "recent_history_edge"
+      ],
+      [
+        12.0,
+        "common_opponent_edge"
+      ],
+      [
+        7.75,
+        "ensemble_model"
+      ],
+      [
+        3.64,
+        "odds_edge"
+      ]
+    ]
+  },
+  {
+    "id": 806,
+    "match": "Al Hilal SFC vs Neom SC",
+    "league": "Saudi Arabia Saudi Pro League",
+    "country": "Saudi Arabia",
+    "pick_type": "double_chance",
+    "selection": "Home or Draw",
+    "confidence": 74,
+    "reason": "home avoids defeat profile",
+    "final_score": "0-2",
+    "created_at": "2026-09-07 00:23:54",
+    "graded_at": "2026-09-08 07:03:15",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "e2f729c88612519c",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        30.0,
+        "goal_pressure"
+      ],
+      [
+        21.06,
+        "odds_edge"
+      ],
+      [
+        19.5,
+        "recent_history_edge"
+      ],
+      [
+        9.0,
+        "venue_form_edge"
+      ],
+      [
+        9.0,
+        "league_position_edge"
+      ]
+    ]
+  },
+  {
+    "id": 823,
+    "match": "Athletic Club vs Atlético Madrid",
+    "league": "Spain LaLiga",
+    "country": "Spain",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 64,
+    "reason": "away avoids defeat profile; capped by publication filter: away_or_draw_requires_market_recent_common_support",
+    "final_score": "3-0",
+    "created_at": "2026-09-07 00:38:21",
+    "graded_at": "2026-09-07 00:43:33",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "170c732b1b03fe68",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        34.4,
+        "goal_pressure"
+      ],
+      [
+        8.0,
+        "competition_intelligence"
+      ],
+      [
+        5.35,
+        "league_strength_edge"
+      ],
+      [
+        4.0,
+        "sofascore_grade"
+      ],
+      [
+        3.27,
+        "elo_model"
+      ]
+    ]
+  },
+  {
+    "id": 907,
+    "match": "Ulsan HD FC vs FC Seoul",
+    "league": "Republic of Korea K-League 1",
+    "country": "Republic of Korea",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 65,
+    "reason": "away avoids defeat profile",
+    "final_score": "1-0",
+    "created_at": "2026-09-08 09:05:17",
+    "graded_at": "2026-09-08 12:30:32",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "90f5ce5759c05445",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": false,
+    "top_5_signals": [
+      [
+        28.8,
+        "goal_pressure"
+      ],
+      [
+        7.72,
+        "market_steam"
+      ],
+      [
+        2.0,
+        "prediction_memory"
+      ],
+      [
+        2.0,
+        "learned_signal_adjustment"
+      ],
+      [
+        0.75,
+        "ensemble_model"
+      ]
+    ]
+  },
+  {
+    "id": 912,
+    "match": "Al-Ettifaq FC vs Al-Faisaly FC",
+    "league": "Saudi Arabia Saudi Pro League",
+    "country": "Saudi Arabia",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 57,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "0-0",
+    "created_at": "2026-09-08 09:06:27",
+    "graded_at": "2026-09-08 18:41:01",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "8a81f0629656d43c",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        40.4,
+        "goal_pressure"
+      ],
+      [
+        13.5,
+        "league_position_edge"
+      ],
+      [
+        7.64,
+        "odds_edge"
+      ],
+      [
+        6.4,
+        "ensemble_model"
+      ],
+      [
+        6.3,
+        "league_strength_edge"
+      ]
+    ]
+  },
+  {
+    "id": 916,
+    "match": "Al-Hazm vs Al-Taawoun FC",
+    "league": "Saudi Arabia Saudi Pro League",
+    "country": "Saudi Arabia",
+    "pick_type": "double_chance",
+    "selection": "Away or Draw",
+    "confidence": 68,
+    "reason": "away avoids defeat profile",
+    "final_score": "1-0",
+    "created_at": "2026-09-08 09:07:05",
+    "graded_at": "2026-09-08 18:41:03",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "82dd2a28a77a3c00",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        34.8,
+        "goal_pressure"
+      ],
+      [
+        6.09,
+        "venue_form_edge"
+      ],
+      [
+        6.0,
+        "league_position_edge"
+      ],
+      [
+        2.33,
+        "elo_model"
+      ],
+      [
+        2.0,
+        "prediction_memory"
+      ]
+    ]
+  },
+  {
+    "id": 1027,
+    "match": "Rangers vs Motherwell",
+    "league": "Scotland Scottish Premiership",
+    "country": "Scotland",
+    "pick_type": "goals",
+    "selection": "Both teams to score",
+    "confidence": 58,
+    "reason": "both-side scoring probability is above market threshold",
+    "final_score": "1-0",
+    "created_at": "2026-09-08 11:23:01",
+    "graded_at": "2026-09-08 11:30:20",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "a145c99af6db8ac7",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        41.2,
+        "goal_pressure"
+      ],
+      [
+        16.7,
+        "recent_history_edge"
+      ],
+      [
+        16.66,
+        "odds_edge"
+      ],
+      [
+        8.16,
+        "venue_form_edge"
+      ],
+      [
+        8.0,
+        "competition_intelligence"
+      ]
+    ]
+  },
+  {
+    "id": 1043,
+    "match": "FC Utrecht vs Go Ahead Eagles",
+    "league": "Netherlands Eredivisie",
+    "country": "Netherlands",
+    "pick_type": "live_match_winner",
+    "selection": "Go Ahead Eagles live winner",
+    "confidence": 65,
+    "reason": "away side leads; prematch model and live pressure are included",
+    "final_score": "3-3",
+    "created_at": "2026-09-08 13:38:51",
+    "graded_at": "2026-09-08 18:42:47",
+    "engine": "deterministic",
+    "prediction_mode": "live",
+    "signal_combination_key": "134f9b0288775b4a",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        26.0,
+        "goal_pressure"
+      ],
+      [
+        21.0,
+        "live_inplay_state"
+      ],
+      [
+        9.44,
+        "market_steam"
+      ],
+      [
+        8.0,
+        "ai_brain_review"
+      ],
+      [
+        6.09,
+        "venue_form_edge"
+      ]
+    ]
+  },
+  {
+    "id": 1068,
+    "match": "Daejeon Citizen FC vs FC Anyang",
+    "league": "Republic of Korea K-League 1",
+    "country": "Republic of Korea",
+    "pick_type": "goals",
+    "selection": "Under 2.5 goals",
+    "confidence": 57,
+    "reason": "goal model and finished database lean under",
+    "final_score": "3-2",
+    "created_at": "2026-09-08 18:58:16",
+    "graded_at": "2026-09-09 15:13:59",
+    "engine": "deterministic",
+    "prediction_mode": "prematch",
+    "signal_combination_key": "175833e258ec1dd1",
+    "top_signal": "goal_pressure",
+    "side_signal_conflict": true,
+    "top_5_signals": [
+      [
+        19.6,
+        "goal_pressure"
+      ],
+      [
+        13.61,
+        "odds_edge"
+      ],
+      [
+        12.0,
+        "common_opponent_edge"
+      ],
+      [
+        3.0,
+        "league_position_edge"
+      ],
+      [
+        2.0,
+        "learned_signal_adjustment"
+      ]
+    ]
+  }
+]

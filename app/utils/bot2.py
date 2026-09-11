@@ -17,6 +17,10 @@ from typing import Any
 
 from app.storage.league_memory import list_prediction_history
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ── System prompt for Groq mode ───────────────────────────────────────────────
 
@@ -146,7 +150,7 @@ def run_bot2(match_date: str | None = None, limit: int = 200) -> dict[str, Any]:
             picks = _run_bot2_llm(predictions, target_date)
             mode = "openrouter"
     except Exception as exc:
-        print(f"[bot2] OpenRouter failed ({exc}), falling back to rules engine")
+        logger.warning("[bot2] OpenRouter failed (%s), falling back to rules engine", exc)
 
     if not picks:
         picks = _run_bot2_rules(predictions, target_date)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,22 @@ class Settings:
     calibrator_moderate_threshold: float
     calibrator_severe_threshold: float
     poisson_league_avg_goals: float
+    # X (Twitter) booking-code poster
+    x_posting_enabled: bool
+    x_api_key: str
+    x_api_secret: str
+    x_access_token: str
+    x_access_token_secret: str
+    x_post_interval_minutes: int
+    x_post_dedup_hours: int
+    x_post_stake: int
+    x_post_min_confidence: int
+    # Public SEO site
+    public_site_cache_ttl_seconds: int
+    public_site_origin: str
+    # Auth
+    jwt_secret: str
+    jwt_expiry_hours: int
 
 
 _cached_settings: Settings | None = None
@@ -91,10 +108,18 @@ def get_settings() -> Settings:
     global _cached_settings
     if _cached_settings is not None:
         return _cached_settings
+    _public_site_origin = os.getenv("PUBLIC_SITE_ORIGIN", "").strip()
+    _cors_origins = _csv(os.getenv("PREDICTX_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"))
+    if _public_site_origin and _public_site_origin not in _cors_origins:
+        # The public SEO site is a separate deployment (different origin) that
+        # calls this API purely as a client — it needs the same CORS
+        # allowance a local dev frontend gets, without requiring the operator
+        # to duplicate the domain into PREDICTX_CORS_ORIGINS by hand.
+        _cors_origins = [*_cors_origins, _public_site_origin]
     _cached_settings = Settings(
         app_name=os.getenv("PREDICTX_APP_NAME", "PredictX Football Stats Agent"),
         environment=os.getenv("PREDICTX_ENV", "development"),
-        cors_origins=_csv(os.getenv("PREDICTX_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
+        cors_origins=_cors_origins,
         database_path=Path(os.getenv("PREDICTX_DB_PATH", str(BASE_DIR / "data" / "predictx_memory.sqlite3"))),
         ai_provider=os.getenv("PREDICTX_AI_PROVIDER", "openrouter").strip().lower(),
         hf_url=os.getenv("PREDICTX_HF_URL", "https://router.huggingface.co/v1/chat/completions"),
@@ -143,8 +168,44 @@ def get_settings() -> Settings:
         calibrator_moderate_threshold=float(os.getenv("PREDICTX_CALIBRATOR_MODERATE_THRESHOLD", "10.0")),
         calibrator_severe_threshold=float(os.getenv("PREDICTX_CALIBRATOR_SEVERE_THRESHOLD", "20.0")),
         poisson_league_avg_goals=float(os.getenv("PREDICTX_POISSON_LEAGUE_AVG_GOALS", "1.3")),
+        # X (Twitter) booking-code poster — disabled by default; flip on once
+        # X_API_KEY/X_API_SECRET/X_ACCESS_TOKEN/X_ACCESS_TOKEN_SECRET are set
+        # AND X_POSTING_ENABLED=true. Until then the job runs in dry-run mode:
+        # it still composes threads and logs them to social_posts, it just
+        # never calls the X API.
+        x_posting_enabled=_bool_env("X_POSTING_ENABLED", False),
+        x_api_key=os.getenv("X_API_KEY", ""),
+        x_api_secret=os.getenv("X_API_SECRET", ""),
+        x_access_token=os.getenv("X_ACCESS_TOKEN", ""),
+        x_access_token_secret=os.getenv("X_ACCESS_TOKEN_SECRET", ""),
+        x_post_interval_minutes=_int_env("X_POST_INTERVAL_MINUTES", 120),
+        x_post_dedup_hours=_int_env("X_POST_DEDUP_HOURS", 6),
+        x_post_stake=_int_env("X_POST_STAKE", 100),
+        x_post_min_confidence=_int_env("X_POST_MIN_CONFIDENCE", 65),
+        public_site_cache_ttl_seconds=_int_env("PUBLIC_SITE_CACHE_TTL_SECONDS", 60),
+        public_site_origin=_public_site_origin,
+        jwt_secret=_jwt_secret(),
+        jwt_expiry_hours=_int_env("JWT_EXPIRY_HOURS", 720),  # 30 days — mobile app, don't force frequent re-login
     )
     return _cached_settings
+
+
+def _jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET", "").strip()
+    if secret:
+        return secret
+    # No JWT_SECRET configured: fall back to a random secret generated once
+    # per process start, rather than crashing the whole API. This keeps the
+    # existing deployment running, but it means every existing login session
+    # is invalidated on every restart/deploy until a real JWT_SECRET is set
+    # — loud on purpose so it doesn't go unnoticed in production.
+    print(
+        "[config] WARNING: JWT_SECRET is not set — using a random secret for "
+        "this process only. Every login session will be invalidated on the "
+        "next restart. Set JWT_SECRET in your environment before relying on "
+        "auth in production."
+    )
+    return secrets.token_hex(32)
 
 
 def public_settings() -> dict[str, object]:
@@ -185,6 +246,18 @@ def public_settings() -> dict[str, object]:
             "risk_manager_volatility_hard_block_threshold": settings.risk_manager_volatility_hard_block_threshold,
             "risk_manager_bootstrap_confidence_ceiling": settings.risk_manager_bootstrap_confidence_ceiling,
             "clear_winner_probability_gap": settings.clear_winner_probability_gap,
+        },
+        "social": {
+            "x_posting_enabled": settings.x_posting_enabled,
+            "x_credentials_present": bool(
+                settings.x_api_key and settings.x_api_secret
+                and settings.x_access_token and settings.x_access_token_secret
+            ),
+            "post_interval_minutes": settings.x_post_interval_minutes,
+        },
+        "public_site": {
+            "cache_ttl_seconds": settings.public_site_cache_ttl_seconds,
+            "origin": settings.public_site_origin,
         },
     }
 

@@ -11,6 +11,10 @@ from app.data_clients.sofascore_client import fetch_team_history
 from app.utils.doc_helpers import _context_source
 from app.utils.primitives import _to_int
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 MAX_GOALS = 7
 HOME_ADVANTAGE = 1.0
 _TEAM_STATS_CACHE_TTL = 300
@@ -98,7 +102,8 @@ def _team_stats(
     # 1. SofaScore API history (live/recent)
     try:
         events = fetch_team_history(team_id).get("events", [])
-    except Exception:
+    except Exception as exc:
+        logger.warning("poisson: sofascore team history fetch failed for %s: %s", team_id, exc)
         events = []
     sofa_finished = [e for e in events if e.get("status", {}).get("type") == "finished"][:last_n]
 
@@ -108,8 +113,8 @@ def _team_stats(
         from app.storage.mongo_store import get_team_finished_matches, is_configured
         if is_configured():
             mongo_finished = get_team_finished_matches(team_id, limit=last_n)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("poisson: mongo finished-matches fetch failed for %s: %s", team_id, exc)
 
     # 3. SQLite local fallback (when MongoDB not configured)
     local_finished: list[dict[str, Any]] = []
@@ -284,10 +289,12 @@ def _local_team_matches(team_id: str, limit: int) -> list[dict[str, Any]]:
                     "away_team": {"id": doc.get("away_team")},
                     "status": {"type": "finished"},
                 })
-            except Exception:
+            except Exception as exc:
+                logger.debug("poisson: skipping a malformed local match row: %s", exc)
                 continue
         return result
-    except Exception:
+    except Exception as exc:
+        logger.warning("poisson: local finished-matches fetch failed: %s", exc)
         return []
 
 
@@ -300,7 +307,8 @@ def _learned_home_advantage_multiplier() -> float:
         from app.monitoring.self_learner import get_bias_corrections
         bias = get_bias_corrections()
         return max(0.80, min(1.0, float(bias.get("home_advantage_multiplier") or 1.0)))
-    except Exception:
+    except Exception as exc:
+        logger.warning("poisson: learned home-advantage lookup failed: %s", exc)
         return HOME_ADVANTAGE
 
 
@@ -312,7 +320,8 @@ def _apply_bias_corrections(probs: dict[str, float]) -> dict[str, float]:
             key: float(value) * float(bias.get(f"{key}_multiplier") or 1.0)
             for key, value in probs.items()
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("poisson: learned bias-correction lookup failed: %s", exc)
         weighted = dict(probs)
     total = sum(weighted.values())
     if total <= 0:

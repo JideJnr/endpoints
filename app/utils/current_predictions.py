@@ -13,6 +13,10 @@ from app.storage.league_memory import _init_db
 
 from app.utils.primitives import _loads
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 def list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list[dict[str, Any]]:
     """Recent ungraded rows that are still eligible for current-pick views."""
     _init_db()
@@ -33,7 +37,8 @@ def list_recent_dashboard_predictions(hours: int = 36, limit: int = 800) -> list
                 """,
                 (f"-{int(hours)} hours", int(limit)),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("current_predictions: query failed: %s", exc)
         return []
 
     predictions: list[dict[str, Any]] = []

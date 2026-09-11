@@ -15,6 +15,10 @@ from app.enrichment.match_intelligence import build_match_intelligence
 from app.utils.match_state import classify_match_state
 from app.utils.prediction_flow import apply_prediction_state
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 MAX_AGENT_ITERATIONS = 10
 
@@ -750,7 +754,8 @@ def _score_pair(event: dict[str, Any]) -> tuple[int, int] | None:
         if home is None or away is None:
             return None
         return int(home), int(away)
-    except Exception:
+    except Exception as exc:
+        logger.debug("agentic_prediction: could not parse score %r: %s", score, exc)
         return None
 
 
@@ -823,6 +828,7 @@ def _local_llm_plan_advice(
             "advice": raw.get("response"),
         }
     except Exception as exc:
+        logger.warning("_local_reasoning_layer: llm advice failed: %s", exc)
         return {"enabled": False, "provider": "llm", "error": str(exc)}
 
 
@@ -873,6 +879,7 @@ def _local_llm_context_advice(state: dict[str, Any]) -> dict[str, Any]:
             "advice": raw.get("response"),
         }
     except Exception as exc:
+        logger.warning("_local_llm_context_advice: llm advice failed: %s", exc)
         return {
             "enabled": False,
             "provider": "llm",

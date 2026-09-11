@@ -277,6 +277,81 @@ def _engine_for_prediction(prediction: dict[str, Any]) -> str:
     return "deterministic"
 
 
+def _real_sportybet_id(candidate: Any, match_id: str) -> str:
+    """Return a genuine SportyBet event id for storage, or "" if none exists.
+
+    Every INSERT in this module used to write `prediction.get("sportybet_id")
+    or match_id`. For a SofaScore-only or Competition Special match, match_id
+    itself IS a placeholder ("sofascore:{id}" or "competition:{key}:{id}"),
+    not a real SportyBet id -- so as soon as an upstream caller correctly
+    blanked prediction["sportybet_id"] to "" (see
+    app/utils/prediction_flow.py::predict_and_record_enriched and
+    record_deferred_prediction_decision below), that `or match_id` fallback
+    silently substituted the placeholder right back in. Confirmed live
+    (2026-09-07): prediction_history, prediction_candidate_history and
+    prediction_decision_log kept filling up with sofascore:-prefixed
+    "sportybet_id" values because of exactly this, at every insert site in
+    this file, despite the upstream sanitisation already being in place.
+    match_id itself is left untouched everywhere else -- it's a legitimate
+    cross-table lookup key even when it's sofascore-namespaced. Only the
+    sportybet_id column must never hold one of these placeholders.
+    """
+    for value in (candidate, match_id):
+        text = str(value or "")
+        if text and not text.startswith("sofascore:") and not text.startswith("competition:"):
+            return text
+    return ""
+
+
+_LEAKED_SPORTYBET_ID_TABLES = (
+    "prediction_history",
+    "prediction_candidate_history",
+    "prediction_decision_log",
+)
+
+
+def cleanup_leaked_sportybet_ids(dry_run: bool = True, limit_sample: int = 20) -> dict[str, Any]:
+    """One-time cleanup: blank out sofascore:/competition:-prefixed values
+    that were written into the sportybet_id column before _real_sportybet_id
+    existed (see that function's docstring for the root cause -- every
+    INSERT here used to fall back to match_id, which re-substituted the
+    placeholder id the moment an upstream caller had already blanked
+    sportybet_id to ""). match_id itself is left completely untouched; this
+    only clears the sportybet_id column, and only where it currently holds
+    one of those two placeholder prefixes.
+
+    dry_run=True (default) makes no writes -- it only counts affected rows
+    per table and returns a small sample, so the scope can be sanity-checked
+    before actually running it. Safe to call more than once: a second run
+    finds nothing left to clean.
+    """
+    _init_db()
+    report: dict[str, Any] = {"dry_run": dry_run, "tables": {}}
+    with _conn() as conn:
+        for table in _LEAKED_SPORTYBET_ID_TABLES:
+            where = "sportybet_id like 'sofascore:%' or sportybet_id like 'competition:%'"
+            count = conn.execute(f"select count(*) from {table} where {where}").fetchone()[0]
+            sample = [
+                {"id": row[0], "match_id": row[1], "sportybet_id": row[2]}
+                for row in conn.execute(
+                    f"select id, match_id, sportybet_id from {table} where {where} "
+                    f"order by created_at desc limit ?",
+                    (limit_sample,),
+                ).fetchall()
+            ]
+            table_report: dict[str, Any] = {"affected": count, "sample": sample}
+            if not dry_run and count:
+                conn.execute(f"update {table} set sportybet_id = '' where {where}")
+                table_report["cleaned"] = count
+            report["tables"][table] = table_report
+        if not dry_run:
+            conn.commit()
+    report["total_affected"] = sum(t["affected"] for t in report["tables"].values())
+    if not dry_run:
+        report["total_cleaned"] = sum(t.get("cleaned", 0) for t in report["tables"].values())
+    return report
+
+
 def record_prediction(prediction: dict[str, Any]) -> None:
     _init_db()
     match_id = str(prediction.get("match_id") or "")
@@ -368,7 +443,7 @@ def record_prediction(prediction: dict[str, Any]) -> None:
                 json.dumps(audit),
                 country_name,
                 prediction.get("sofascore_id"),
-                prediction.get("sportybet_id") or match_id,
+                _real_sportybet_id(prediction.get("sportybet_id"), match_id),
                 prediction.get("prediction_mode") or "prematch",
                 prediction.get("data_source") or ((prediction.get("data_quality") or {}).get("prediction_readiness") or {}).get("data_source"),
                 json.dumps(prediction.get("live_data_sources") or []),
@@ -517,7 +592,7 @@ def _record_prediction_decision(
                 source,
                 match_id,
                 prediction.get("sofascore_id"),
-                prediction.get("sportybet_id") or match_id,
+                _real_sportybet_id(prediction.get("sportybet_id"), match_id),
                 prediction.get("name"),
                 league_name,
                 country_name,
@@ -555,6 +630,15 @@ def _record_prediction_candidates(
         "data_sources": prediction.get("data_sources") or {},
         "source_assurance": ((prediction.get("data_quality") or {}).get("prediction_readiness") or {}).get("assurance"),
         "has_sportybet_detail": bool(prediction.get("sportybet_detail")),
+        # Match-context tags (e.g. "relegation_pressure", "standard_fixture")
+        # from app.enrichment.contextual_intelligence.build_contextual_intelligence,
+        # already attached to `prediction` as prediction["contextual_intelligence"]
+        # by enriched_prediction.py. Added 2026-09-09 so
+        # self_learner._learn_context_penalties() has real tags to learn
+        # from -- previously this dict never carried them at all, so
+        # context_penalty_adjustments stayed at 0 rows forever (see
+        # predictx_learning_gaps_followup project memory).
+        "tags": (prediction.get("contextual_intelligence") or {}).get("tags") or [],
     }
     audit_json = json.dumps(prediction.get("audit") if isinstance(prediction.get("audit"), dict) else build_prediction_audit(prediction))
     rows: list[tuple[Any, ...]] = []
@@ -593,7 +677,7 @@ def _record_prediction_candidates(
             source,
             match_id,
             prediction.get("sofascore_id"),
-            prediction.get("sportybet_id") or match_id,
+            _real_sportybet_id(prediction.get("sportybet_id"), match_id),
             prediction.get("name"),
             league_name,
             country_name,
@@ -613,7 +697,7 @@ def _record_prediction_candidates(
                 source,
                 match_id,
                 prediction.get("sofascore_id"),
-                prediction.get("sportybet_id") or match_id,
+                _real_sportybet_id(prediction.get("sportybet_id"), match_id),
                 prediction.get("name"),
                 league_name,
                 country_name,
@@ -637,7 +721,7 @@ def _record_prediction_candidates(
             source,
             match_id,
             prediction.get("sofascore_id"),
-            prediction.get("sportybet_id") or match_id,
+            _real_sportybet_id(prediction.get("sportybet_id"), match_id),
             prediction.get("name"),
             league_name,
             country_name,
@@ -670,7 +754,7 @@ def _record_prediction_candidates(
             source,
             match_id,
             prediction.get("sofascore_id"),
-            prediction.get("sportybet_id") or match_id,
+            _real_sportybet_id(prediction.get("sportybet_id"), match_id),
             prediction.get("name"),
             league_name,
             country_name,

@@ -18,6 +18,10 @@ import urllib.request as urllib_request
 from dataclasses import dataclass
 from urllib.error import HTTPError
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _LLMResponse:
@@ -118,5 +122,6 @@ def is_openrouter_available() -> bool:
     try:
         get_llm()
         return True
-    except Exception:
+    except Exception as exc:
+        logger.debug("is_openrouter_available: %s", exc)
         return False

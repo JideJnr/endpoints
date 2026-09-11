@@ -92,7 +92,8 @@ def classify_tournament_tier(tournament_name: str) -> int:
     try:
         from app.monitoring.self_learner import get_tournament_priority
         priority = int(get_tournament_priority(tournament_name).get("priority", 4))
-    except Exception:
+    except Exception as exc:
+        logger.debug("classify_tournament_tier: priority lookup failed for %r: %s", tournament_name, exc)
         priority = 4
     return priority
 
@@ -490,6 +491,107 @@ def _parse_sofa_last_matches(events: list[dict], team_name: str) -> list[dict[st
             "result": "W" if scored > conceded else "D" if scored == conceded else "L",
         })
     return result
+
+
+TEAM_INTEL_FALLBACK = "Provider news/context unavailable for both teams."
+
+
+def _format_sofascore_news(item: dict[str, Any]) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    title = item.get("title")
+    if not title:
+        return None
+    date = item.get("published_date") or "date unknown"
+    excerpt = str(item.get("excerpt") or "")[:140]
+    return f'SofaScore article, published {date} (third-party editorial, not a club statement): "{title}" - {excerpt}'.strip(" -")
+
+
+def _format_sportybet_news(item: dict[str, Any]) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    title = item.get("title") or item.get("description")
+    if not title:
+        return None
+    src_type = item.get("source_type") or "clip"
+    ts = item.get("published_time")
+    date = "date unknown"
+    if ts:
+        try:
+            value = float(ts)
+            if value > 1e12:
+                value /= 1000
+            date = datetime.fromtimestamp(value, tz=timezone.utc).date().isoformat()
+        except (TypeError, ValueError, OSError):
+            pass
+    tagged = item.get("tagged_teams") or []
+    tag_note = f" (tagged teams: {', '.join(tagged[:4])})" if len(tagged) > 1 else ""
+    return f'SportyBet {src_type} caption, {date} (unverified, may be about either side of that clip\'s match){tag_note}: "{title}"'
+
+
+def _team_intel_statement(team_name: str, provider_context: dict[str, Any] | None, max_items: int = 2) -> str:
+    if not team_name or not provider_context:
+        return f"{team_name or 'Team'}: no provider news available."
+    items: list[str] = []
+    sofa = provider_context.get("sofascore") if isinstance(provider_context, dict) else None
+    for raw in ((sofa or {}).get("news") or [])[:max_items]:
+        formatted = _format_sofascore_news(raw)
+        if formatted:
+            items.append(formatted)
+    sporty = provider_context.get("sportybet") if isinstance(provider_context, dict) else None
+    for raw in ((sporty or {}).get("news") or [])[:max_items]:
+        formatted = _format_sportybet_news(raw)
+        if formatted:
+            items.append(formatted)
+    if not items:
+        return f"{team_name}: no provider news available."
+    return f"{team_name} (UNVERIFIED third-party reported content, treat as rumour not fact): " + " || ".join(items)
+
+
+def _step_team_intel(doc: dict, model: str, timeout: int = 20) -> str:
+    """Surfaces the SofaScore/SportyBet team-endpoint news content
+    (provider_context, see team_watcher.py::_fetch_provider_context) that
+    was fetched and stored per-team but, until now, never reached any LLM
+    call in the main prediction pipeline -- confirmed via a full data-flow
+    audit (2026-09-06) that it sat unused in
+    ai_team_watchers.provider_context_json. Deliberately separate from
+    _step_form/_step_team_history (which use structured stats): this step
+    exists only to carry qualitative, unverified news/caption content,
+    explicitly labelled with source and date so the model can't mistake a
+    caption or old article for a confirmed fact (see
+    sofascore_client.py::_parse_sofascore_news_item and
+    sportybet_client.py::_parse_team_news_item for the underlying
+    opponent-tagging and video-caption caveats this framing reflects).
+    """
+    try:
+        home, away = _teams(doc)
+        if not home or not away:
+            return TEAM_INTEL_FALLBACK
+        from app.team_watcher.team_watcher import team_watchers_for_match
+        watchers = team_watchers_for_match(doc) or {}
+        home_ctx = (watchers.get("home") or {}).get("provider_context")
+        away_ctx = (watchers.get("away") or {}).get("provider_context")
+        if not home_ctx and not away_ctx:
+            return TEAM_INTEL_FALLBACK
+        home_statement = _team_intel_statement(home, home_ctx)
+        away_statement = _team_intel_statement(away, away_ctx)
+        if "no provider news available" in home_statement and "no provider news available" in away_statement:
+            return TEAM_INTEL_FALLBACK
+        evidence = home_statement + " | " + away_statement
+        prompt = (
+            "You are a team-news analyst reviewing UNVERIFIED third-party reported content "
+            "(news articles or video-clip captions from data providers, not confirmed club "
+            "statements or official announcements). Some items may actually be about the "
+            "opponent rather than the tagged team -- ignore anything that clearly is. "
+            "Do not present any of this as established fact.\n\n"
+            f"{evidence}\n\n"
+            "In one cautious sentence, note anything relevant to this match (e.g. an injury, "
+            "suspension, or manager comment), or say nothing notable was found."
+        )
+        return _call_llm(model, prompt, timeout) or evidence
+    except Exception as exc:
+        logger.warning("AI step team_intel failed: %s", exc)
+        return TEAM_INTEL_FALLBACK
 
 
 def _step_team_history(doc: dict, model: str, timeout: int = 25) -> str:

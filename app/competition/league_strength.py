@@ -62,16 +62,103 @@ def _build_catalogue() -> dict[str, int]:
     return _CATALOGUE_SCORES
 
 
-def _catalogue_score(name: str) -> int | None:
-    """Return the curated prior score for a league name, or None if not found."""
-    key = _clean(name)
-    if not key:
-        return None
+# Alternate / sponsor-branded names a data provider (SportyBet) stores for
+# a TOP_30_COMPETITIONS entry that don't match its curated "name"/"key"
+# string, even as the full "<country> <league>" string actually stored in
+# prediction_history.league_name. Matched via the same _clean()
+# normalisation used for the catalogue itself.
+#
+# Found 2026-09-09 auditing known-vs-unknown league win rates: these were
+# silently falling through to "unknown league" (score 42) despite being
+# genuinely curated leagues under a different label.
+_ALIASES: dict[str, str] = {
+    "belgium pro league": "belgian-pro-league",         # adjective vs country-noun form
+    "brazil brasileirão betano": "brasileirao",         # sponsor-branded name (Betano)
+    "brasileirão betano": "brasileirao",
+    "portugal liga portugal betclic": "primeira-liga",  # sponsor-branded name (Betclic)
+    "liga portugal betclic": "primeira-liga",
+    "liga portugal": "primeira-liga",
+}
+
+# Catalogue keys whose curated "name" collides with another country's
+# division of the same literal English name (e.g. Russia, Israel, Egypt,
+# Kuwait and Rwanda all have a top flight literally called "Premier
+# League" in English). The 95 score is meant for ENGLAND's Premier League
+# only. When a `country` is supplied to _catalogue_score/league_strength_score
+# and disagrees with the allowed set below, the match is rejected so the
+# caller falls through to ELO/unknown scoring instead of a same-named
+# league elsewhere inheriting England's rating.
+_AMBIGUOUS_KEYS: dict[str, set[str]] = {
+    "premier league": {"england", "united kingdom", "uk", "great britain"},
+}
+
+
+def _catalogue_score(name: str, country: str | None = None) -> int | None:
+    """Return the curated prior score for a league name, or None if not found.
+
+    Handles three real-world mismatches between how TOP_30_COMPETITIONS
+    names a league and how data providers actually label it:
+      1. A trailing stage/group qualifier, e.g. "Liga Profesional,
+         Clausura" -- the part after the first comma is dropped and the
+         remainder re-tried.
+      2. A leading country prefix, e.g. "Italy Serie A" -- when `country`
+         is supplied and the (comma-stripped) name starts with it, the
+         prefix is stripped and the remainder re-tried.
+      3. A sponsor-branded or adjective-form alternate name -- checked via
+         _ALIASES against every candidate produced by (1) and (2), and
+         also against the raw, unmodified name (so callers that don't
+         have a country handy still get the alias fix for free).
+
+    Also enforces _AMBIGUOUS_KEYS so a same-named-but-different league
+    elsewhere in the world doesn't silently inherit a curated score meant
+    for one specific country's competition -- but only when `country` is
+    actually supplied and disagrees; callers that don't pass `country`
+    keep today's exact behaviour (no regression risk).
+    """
     catalogue = _build_catalogue()
-    return catalogue.get(key)
+    raw = name or ""
+    raw_clean = _clean(raw)
+    clean_country = _clean(country) if country else ""
+
+    candidates = [raw]
+    if "," in raw:
+        candidates.append(raw.split(",", 1)[0])
+    if clean_country:
+        for cand in list(candidates):
+            cand_clean = _clean(cand)
+            if cand_clean.startswith(clean_country + " "):
+                candidates.append(cand_clean[len(clean_country) + 1:])
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = _clean(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        resolved_key = key if key in catalogue else None
+        if resolved_key is None:
+            alias_target = _ALIASES.get(key)
+            if alias_target:
+                alias_clean = _clean(alias_target)
+                if alias_clean in catalogue:
+                    resolved_key = alias_clean
+
+        if resolved_key is None:
+            continue
+
+        via_country_strip = key != raw_clean
+        ambiguous_allowed = _AMBIGUOUS_KEYS.get(resolved_key)
+        if ambiguous_allowed is not None and via_country_strip:
+            if not clean_country or clean_country not in ambiguous_allowed:
+                continue
+
+        return catalogue[resolved_key]
+
+    return None
 
 
-def league_strength_score(name: str | None) -> dict[str, Any]:
+def league_strength_score(name: str | None, country: str | None = None) -> dict[str, Any]:
     """Return the hybrid league strength score for *name* on a 20–98 scale.
 
     See module docstring for the full resolution order. The returned dict
@@ -91,7 +178,7 @@ def league_strength_score(name: str | None) -> dict[str, Any]:
         }
 
     # ── Step 1: Hardcoded prior ───────────────────────────────────────────
-    prior = _catalogue_score(str(name))
+    prior = _catalogue_score(str(name), country=country)
 
     # ── Step 2: ELO-derived refinement ───────────────────────────────────
     elo_result: dict[str, Any] = {}

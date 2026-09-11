@@ -32,6 +32,16 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+# Running this as `python tools/backfill_probability_learner.py` puts only
+# `tools/` on sys.path (Python adds the SCRIPT's own directory, not the
+# current working directory) -- so `from app...` failed with
+# ModuleNotFoundError no matter which folder it was run from. Other tools/
+# scripts that import `app` (pilot_test_cockroach_users.py,
+# migrate_to_cockroach.py, etc.) already carry this same fix; this one was
+# missing it. Found 2026-09-09 when the user hit exactly this error.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def main(argv: list[str] | None = None) -> int:

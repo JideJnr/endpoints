@@ -22,6 +22,11 @@ SOFASCORE_EVENT_URL = "https://www.sofascore.com/api/v1/event/{event_id}"
 SOFASCORE_SEARCH_URL = "https://www.sofascore.com/api/v1/search/all?q={query}"
 SOFASCORE_LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 SOFASCORE_TEAM_HISTORY_URL = "https://www.sofascore.com/api/v1/team/{team_id}/events/last/{page}"
+# Discovered via live network inspection of a SofaScore team page.
+SOFASCORE_TEAM_URL = "https://www.sofascore.com/api/v1/team/{team_id}"
+SOFASCORE_TEAM_UPCOMING_URL = "https://www.sofascore.com/api/v1/team/{team_id}/events/next/{page}"
+SOFASCORE_TEAM_NEWS_URL = "https://www.sofascore.com/api/v1/sofascore-news/en/team/{team_id}/posts/{page}"
+SOFASCORE_TEAM_TOURNAMENTS_URL = "https://www.sofascore.com/api/v1/team/{team_id}/unique-tournaments/all"
 SOFASCORE_STANDINGS_URL = "https://www.sofascore.com/api/v1/tournament/{tournament_id}/season/{season_id}/standings/total"
 SOFASCORE_H2H_URL = "https://www.sofascore.com/api/v1/event/{event_id}/h2h"
 SOFASCORE_STATISTICS_URL = "https://www.sofascore.com/api/v1/event/{event_id}/statistics"
@@ -549,6 +554,155 @@ def fetch_team_history(team_id: int, page: int = 0) -> dict:
         "has_next_page": data.get("hasNextPage", False),
         "events": events,
     }
+
+
+def fetch_team_info(team_id: int) -> dict:
+    """Base team profile: name, country, venue, manager, colors. The 'who is
+    this team' node the other team/{id}/... sub-resources hang off of.
+
+    Confirmed live via curl (2026-09-06): response is {"team": {...},
+    "pregameForm": {...}}, two siblings at the top level -- pregameForm
+    (avg rating, current league position, last-2 form) sits OUTSIDE
+    "team", so it must be merged in explicitly or it's silently lost.
+    """
+    url = SOFASCORE_TEAM_URL.format(team_id=team_id)
+    try:
+        data = _get(url).json()
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    team = data.get("team") or {}
+    if data.get("pregameForm"):
+        team = {**team, "pregame_form": data["pregameForm"]}
+    return team
+
+
+def fetch_team_detail(team_id: int) -> dict:
+    """Full-picture team profile: fires every team/{id}/... endpoint we know
+    about in parallel and merges the results, the same composition pattern
+    fetch_event_detail() already uses for matches (one safe() wrapper per
+    call so a single failing endpoint doesn't take the rest down).
+
+    Real API calls only -- no HTML scraping. Distinct from fetch_team_history
+    alone, which only covers past results: this adds upcoming fixtures, news,
+    tournament membership, base profile, and featured players in one shot.
+    """
+    def safe(fn, *args):
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    tasks = {
+        "info":         (fetch_team_info, team_id),
+        "history":      (lambda tid: fetch_team_history(tid).get("events", []), team_id),
+        "upcoming":     (lambda tid: fetch_team_upcoming(tid).get("events", []), team_id),
+        "news":         (fetch_team_news, team_id),
+        "tournaments":  (fetch_team_tournaments, team_id),
+        "featured_players": (fetch_featured_players, team_id),
+    }
+    results: dict = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(safe, fn, *args): key for key, (fn, *args) in tasks.items()}
+        for future in _as_completed(futures):
+            results[futures[future]] = future.result()
+
+    return {
+        "team_id": team_id,
+        "info": results.get("info") or {},
+        "recent_results": results.get("history") or [],
+        "upcoming_fixtures": results.get("upcoming") or [],
+        "news": results.get("news") or [],
+        "tournaments": results.get("tournaments") or [],
+        "featured_players": results.get("featured_players") or {},
+    }
+
+
+def fetch_team_upcoming(team_id: int, page: int = 0) -> dict:
+    """Upcoming fixtures for one SofaScore team id -- the future-facing
+    counterpart to fetch_team_history (which only covers past results).
+    Same raw shape: {"has_next_page": bool, "events": [...]}."""
+    url = SOFASCORE_TEAM_UPCOMING_URL.format(team_id=team_id, page=page)
+    try:
+        data = _get(url).json()
+    except Exception:
+        return {"has_next_page": False, "events": []}
+    events = [_parse_event(e) for e in data.get("events", [])]
+    return {
+        "has_next_page": data.get("hasNextPage", False),
+        "events": events,
+    }
+
+
+def _parse_sofascore_news_item(item: dict) -> dict:
+    """Normalize one SofaScore editorial news item.
+
+    Confirmed live via curl (2026-09-06): the endpoint returns a bare JSON
+    array (not wrapped in "posts"/"news"), and unlike SportyBet's team news
+    (video-clip captions) these are genuine written articles -- match
+    reports, previews, transfer pieces, season features -- each with a
+    real title, a one-paragraph excerpt, and a publish date. Still
+    third-party reported content, not an official club statement, so
+    callers must present it as "SofaScore editorial coverage published on
+    <date>", not as verified fact.
+
+    Same opponent-tagging risk as SportyBet's news: a match-preview or
+    match-report article about this team's next/last opponent gets tagged
+    with BOTH team names (e.g. "Everton vs Manchester United preview"
+    carries an "everton" tag even when fetched for Man Utd's team id), and
+    some articles aren't about a single match at all (transfer news,
+    season-wide features). ``tags``/``categories`` are kept in full so
+    callers can see everything an article references rather than assuming
+    it is squarely about the team it was fetched for.
+    """
+    tags = item.get("tags") or []
+    categories = item.get("categories") or []
+    return {
+        "id": item.get("id"),
+        "slug": item.get("slug"),
+        "title": item.get("title"),
+        "excerpt": item.get("excerpt"),
+        "published_date": item.get("date"),
+        "image_url": item.get("imageUrl"),
+        "tags": [t.get("name") for t in tags if isinstance(t, dict) and t.get("name")],
+        "categories": [c.get("name") for c in categories if isinstance(c, dict) and c.get("name")],
+        "raw_item": item,
+    }
+
+
+def fetch_team_news(team_id: int, page: int = 1) -> list[dict]:
+    """SofaScore editorial news items for one team -- real written articles
+    (match reports/previews, transfer news, features), not verified club
+    statements. See _parse_sofascore_news_item for the opponent-tagging
+    caveat callers must respect before feeding this to the LLM (see
+    app/enrichment/team_news.py)."""
+    url = SOFASCORE_TEAM_NEWS_URL.format(team_id=team_id, page=page)
+    try:
+        payload = _get(url).json()
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        items = payload.get("posts") or payload.get("news") or []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+    return [_parse_sofascore_news_item(item) for item in items if isinstance(item, dict)]
+
+
+def fetch_team_tournaments(team_id: int) -> list[dict]:
+    """Every unique-tournament this team currently competes in, per
+    SofaScore. Useful to confirm a team belongs to a curated competition
+    without an extra standings lookup."""
+    url = SOFASCORE_TEAM_TOURNAMENTS_URL.format(team_id=team_id)
+    try:
+        data = _get(url).json()
+    except Exception:
+        return []
+    groups = data.get("uniqueTournaments") or data.get("groups") or []
+    return groups if isinstance(groups, list) else []
 
 
 def fetch_standings(tournament_id: int, season_id: int) -> list[dict]:

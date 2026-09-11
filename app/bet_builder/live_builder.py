@@ -52,6 +52,27 @@ _NO_LIVE_CANDIDATES_MESSAGE = (
     "winner, over/under, double chance, next-goal-scorer and BTTS)."
 )
 
+# Wall-clock cap on the whole Sporty-ingest -> Sofa-enrich chain below. This
+# chain makes several network calls with no deadline of their own (one per
+# live match in run_enrichment_worker's batch), so a single stuck call used
+# to hang the ENTIRE live-bet request forever -- genuinely no response, not
+# an error -- found 2026-09-09 while investigating exactly that complaint.
+# Timing out here is treated the same as any other refresh failure: fall
+# back to whatever's already buffered (see the docstring below).
+#
+# Raised from 25s to 240s the same day, once live testing showed 25s was too
+# short for genuine work (not a hang): a full slate of live matches ingesting
+# + enriching in one batch legitimately took longer than that and the request
+# came back "no_candidates" even though the pipeline was still actively
+# working, not stuck. User explicitly said they don't mind a longer wait as
+# long as it actually returns real live bets rather than giving up early --
+# 240s here + LIVE_ON_DEMAND_BATCH_TIMEOUT_SECONDS's 60s below add up to the
+# ~5 minute total worst-case wait they asked for. This is still a genuine
+# ceiling, not unbounded -- it exists specifically to guarantee a hung DNS
+# lookup (not covered by any per-request timeout= -- see app/utils/bounded.py)
+# can't freeze the request forever the way it did before this fix existed.
+REFRESH_LIVE_POOL_TIMEOUT_SECONDS = 240.0
+
 
 def refresh_live_prediction_pool(limit: int = 200) -> dict[str, Any]:
     """Run the request-time live lane: Sporty ingest -> Sofa match/enrich -> predict.
@@ -59,24 +80,31 @@ def refresh_live_prediction_pool(limit: int = 200) -> dict[str, Any]:
     It is intentionally best-effort.  A transient provider failure must not
     discard a still-fresh prediction already in the local buffer, but callers
     get the stage summary so they can tell whether a pick came from a newly
-    refreshed or previously available snapshot.
+    refreshed or previously available snapshot. A timeout past
+    REFRESH_LIVE_POOL_TIMEOUT_SECONDS is treated the same way -- returns
+    status "degraded", never blocks the caller indefinitely.
     """
     try:
         from app.data_clients.sportybet_client import fetch_live_matches_post
         from app.scheduling.scheduler import _ingest_and_snapshot_live
         from app.storage.buffer import run_enrichment_worker
+        from app.utils.bounded import bounded_call
 
-        matches = fetch_live_matches_post()
-        ingest = _ingest_and_snapshot_live(matches)
-        # The provider's live response is the authoritative live pool.  Do
-        # not leave matches unprocessed merely because the old scheduler
-        # batch size was small.
-        enrich = run_enrichment_worker(
-            batch_size=max(1, len(matches)),
-            live_only=True,
-            force_live_retry=True,
-            fetch_web_context=False,
-        )
+        def _do_refresh() -> tuple[list[dict], dict[str, Any], dict[str, Any]]:
+            matches = fetch_live_matches_post()
+            ingest = _ingest_and_snapshot_live(matches)
+            # The provider's live response is the authoritative live pool.
+            # Do not leave matches unprocessed merely because the old
+            # scheduler batch size was small.
+            enrich = run_enrichment_worker(
+                batch_size=max(1, len(matches)),
+                live_only=True,
+                force_live_retry=True,
+                fetch_web_context=False,
+            )
+            return matches, ingest, enrich
+
+        matches, ingest, enrich = bounded_call(_do_refresh, timeout=REFRESH_LIVE_POOL_TIMEOUT_SECONDS)
         return {
             "status": "ok",
             "live_fetched": len(matches),
@@ -121,6 +149,7 @@ def run_live_manual_bet(
     try:
         synthesis = rank_picks_deterministic(analyses, target_odds=target_odds, max_total_odds=_max)
     except Exception as exc:
+        logger.warning("manual live builder: synthesis failed: %s", exc)
         return {
             "status": "synthesis_failed",
             "message": str(exc),
@@ -153,6 +182,7 @@ def run_live_manual_bet(
       try:
         booking_payload = build_booking_payload(selections, stake=stake, force_refresh=True)
       except Exception as exc:
+        logger.warning("manual live builder: booking failed: %s", exc)
         return {
             "status": "booking_failed",
             "message": str(exc),
@@ -181,6 +211,7 @@ def run_live_manual_bet(
         try:
             result["share_code"] = request_share_code(booking_payload)
         except Exception as exc:
+            logger.warning("manual live builder: share code request failed: %s", exc)
             result["share_code_error"] = str(exc)
     return result
 
@@ -220,6 +251,7 @@ def run_live_smart_bet(
     try:
         synthesis = rank_picks_smart(analyses)
     except Exception as exc:
+        logger.warning("smart live builder: synthesis failed: %s", exc)
         return {
             "status": "synthesis_failed",
             "message": str(exc),
@@ -253,6 +285,7 @@ def run_live_smart_bet(
       try:
         booking_payload = build_booking_payload(selections, stake=stake, force_refresh=True)
       except Exception as exc:
+        logger.warning("smart live builder: booking failed: %s", exc)
         return {
             "status": "booking_failed",
             "message": str(exc),
@@ -281,6 +314,7 @@ def run_live_smart_bet(
         try:
             result["share_code"] = request_share_code(booking_payload)
         except Exception as exc:
+            logger.warning("smart live builder: share code request failed: %s", exc)
             result["share_code_error"] = str(exc)
     return result
 
@@ -328,6 +362,7 @@ def run_live_llm_bet(
             skip_llm_synthesis=False,
         )
     except Exception as exc:
+        logger.warning("llm live builder: synthesis failed: %s", exc)
         return {
             "status": "synthesis_failed",
             "message": str(exc),
@@ -360,6 +395,7 @@ def run_live_llm_bet(
       try:
         booking_payload = build_booking_payload(selections, stake=stake, force_refresh=True)
       except Exception as exc:
+        logger.warning("llm live builder: booking failed: %s", exc)
         return {
             "status": "booking_failed",
             "message": str(exc),
@@ -392,6 +428,7 @@ def run_live_llm_bet(
         try:
             result["share_code"] = request_share_code(booking_payload)
         except Exception as exc:
+            logger.warning("llm live builder: share code request failed: %s", exc)
             result["share_code_error"] = str(exc)
     return result
 
@@ -401,13 +438,34 @@ def run_live_llm_bet(
 # ---------------------------------------------------------------------------
 
 def _to_selections(picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{
-        # ``match_id`` can be ``sofascore:<id>`` for Competition Special.
-        # Prefer the reconciled provider id so booking never treats a Sofa id
-        # as a SportyBet event id.
-        "sportybet_id": i.get("sportybet_id") or i.get("match_id"),
-        "type": i.get("type") or i.get("pick_type"),
-        "selection": i.get("selection"),
-        "marketId": i.get("marketId"),
-        "outcomeId": i.get("outcomeId"),
-    } for i in picks]
+    """Build SportyBet booking selections from ranked picks.
+
+    ``match_id`` can be ``sofascore:<id>`` for Competition Special rows
+    that haven't merged with a real SportyBet event yet. This function
+    used to fall back to match_id when sportybet_id was missing (`i.get(
+    "sportybet_id") or i.get("match_id")`), which silently handed a Sofa
+    id to SportyBet booking as if it were a real event id -- confirmed
+    live (2026-09-06) as the actual cause of the reported "bet builder
+    doesn't work" bug. live_prediction_candidates() (core.py) now drops
+    unbookable picks before they ever reach ranking, so this should never
+    fire in practice -- but a pick with no real sportybet_id is dropped
+    HERE too rather than silently substituted, so this can never
+    regress into the same bug even if an upstream filter is ever loosened.
+    """
+    selections = []
+    for i in picks:
+        sportybet_id = str(i.get("sportybet_id") or "").strip()
+        if not sportybet_id or sportybet_id.startswith("sofascore:"):
+            logger.warning(
+                "_to_selections: dropping pick with no real sportybet_id (match_id=%s) -- would have booked a Sofa id",
+                i.get("match_id"),
+            )
+            continue
+        selections.append({
+            "sportybet_id": sportybet_id,
+            "type": i.get("type") or i.get("pick_type"),
+            "selection": i.get("selection"),
+            "marketId": i.get("marketId"),
+            "outcomeId": i.get("outcomeId"),
+        })
+    return selections

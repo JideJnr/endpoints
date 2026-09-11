@@ -42,6 +42,10 @@ from app.enrichment.web_context import context_for_match, search_league_sentimen
 
 from app.utils.primitives import _to_int, _to_float
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["platform"])
 
 ENGINES = [
@@ -161,7 +165,8 @@ def get_matches(date: Optional[str] = None, limit: int = Query(default=100, ge=1
         events = fetch_all_scheduled_events(target_date)[:limit]
         observe_matches("sofascore", events)
         return {"status": "success", "date": target_date, "count": len(events), "matches": events}
-    except Exception:
+    except Exception as exc:
+        logger.warning("get_matches: sofascore fetch failed, using memory fallback: %s", exc)
         memory = list_memory_matches(limit=limit)
         return {"status": "success", "date": target_date, "source": "memory_fallback", "count": len(memory["matches"]), **memory}
 
@@ -172,7 +177,8 @@ def get_live_matches(limit: int = Query(default=300, ge=1, le=500)):
         matches = fetch_live_matches_post()[:limit]
         observe_matches("sportybet", matches)
         return {"status": "success", "count": len(matches), "matches": matches}
-    except Exception:
+    except Exception as exc:
+        logger.warning("get_live_matches: sportybet fetch failed, using memory fallback: %s", exc)
         memory = list_memory_matches(limit=limit, source="sportybet")
         return {"status": "success", "source": "memory_fallback", "count": len(memory["matches"]), **memory}
 
@@ -370,8 +376,8 @@ def _prediction_for_match_id(
         doc = get_buffered_match(match_id) or doc
     except MatchEnrichmentError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_prediction_for_match_id: enrichment failed for %s: %s", match_id, exc)
 
     readiness = prediction_readiness(doc)
     if not readiness.get("ready"):
@@ -556,6 +562,7 @@ def get_betbuilder_test_book(sportybet_id: str, stake: int = 100):
         try:
             booking_result = build_booking_payload([selection], stake=stake)
         except Exception as exc:
+            logger.warning("get_betbuilder_test_book: booking payload failed for %s: %s", sportybet_id, exc)
             booking_error = str(exc)
 
     return {
@@ -838,6 +845,7 @@ def post_reset_predictions(
                 )
                 buffer_reset += 1
             except Exception as exc:
+                logger.warning("post_reset_predictions: buffer reset failed for %s: %s", row["match_id"], exc)
                 errors.append(f"{row['match_id']}: {exc}")
 
         # Also clear the in-memory analysis cache in ai_betbuilder
@@ -847,8 +855,8 @@ def post_reset_predictions(
                 _ANALYSIS_CACHE.pop(match_id, None)
             else:
                 _ANALYSIS_CACHE.clear()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("post_reset_predictions: analysis cache clear failed: %s", exc)
 
         if clear_history:
             from datetime import date as _date
@@ -958,8 +966,8 @@ def _safe_predictions_for_date(date: Optional[str], limit: int, include_history:
         dashboard_rows = list_recent_dashboard_predictions(hours=72, limit=max(limit, 200))
         if dashboard_rows:
             return dashboard_rows[:limit]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_safe_predictions_for_date: dashboard rows lookup failed: %s", exc)
 
     # Do not generate new predictions from legacy SofaScore-only fallback here.
     # The enriched buffer is the production contract; history is read-only
@@ -1010,12 +1018,14 @@ def _attach_deep_analysis(prediction: dict[str, Any], detail: dict[str, Any], at
             "impact": round((poisson.get("probabilities", {}).get("home_win", 0) - poisson.get("probabilities", {}).get("away_win", 0)) / 5, 2),
         })
     except Exception as e:
+        logger.debug("_attach_deep_analysis: poisson model failed: %s", e)
         prediction["poisson"] = {"error": str(e)}
     try:
         schedule = compare_schedules(home_id, away_id)
         prediction["strength_of_schedule"] = schedule
         prediction["signals"].append({"name": "strength_of_schedule", "value": schedule.get("verdict"), "impact": 4})
     except Exception as e:
+        logger.debug("_attach_deep_analysis: strength_of_schedule failed: %s", e)
         prediction["strength_of_schedule"] = {"error": str(e)}
     if attach_brain:
         _attach_ai_brain(prediction, detail)
@@ -1152,6 +1162,7 @@ def get_learning_thresholds(league: str = "", pick_type: str = "") -> dict[str, 
             "thresholds": learned,
         }
     except Exception as exc:
+        logger.warning("get_learning_thresholds failed: %s", exc)
         return {
             "status": "error",
             "message": str(exc),
@@ -1183,6 +1194,7 @@ def get_learning_signal_combinations(
             "message": "Signal combination learning is in progress. Check back after more grading cycles.",
         }
     except Exception as exc:
+        logger.warning("get_learning_signal_combinations failed: %s", exc)
         return {
             "status": "error",
             "message": str(exc),
@@ -1206,6 +1218,7 @@ def get_learning_league_performance(
             "performance": lacc,
         }
     except Exception as exc:
+        logger.warning("get_learning_league_performance failed: %s", exc)
         return {
             "status": "error",
             "message": str(exc),
@@ -1225,6 +1238,7 @@ def get_learning_signal_weights(league: str = "") -> dict[str, Any]:
             "weights": weights,
         }
     except Exception as exc:
+        logger.warning("get_learning_signal_weights failed: %s", exc)
         return {
             "status": "error",
             "message": str(exc),
@@ -1243,6 +1257,7 @@ def get_learning_model_weights() -> dict[str, Any]:
             "model_weights": weights,
         }
     except Exception as exc:
+        logger.warning("get_learning_model_weights failed: %s", exc)
         return {
             "status": "error",
             "message": str(exc),
@@ -1261,6 +1276,7 @@ def trigger_learning_cycle() -> dict[str, Any]:
             "result": result,
         }
     except Exception as exc:
+        logger.warning("trigger_learning_cycle failed: %s", exc)
         return {
             "status": "error",
             "message": str(exc),

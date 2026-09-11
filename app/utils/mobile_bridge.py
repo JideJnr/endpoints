@@ -10,6 +10,10 @@ from app.storage.db import connect_db, db_conn
 from app.storage.league_memory import _init_db
 from app.storage.buffer import _date_from_start_time
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def init_mobile_bridge_db(conn: sqlite3.Connection | None = None) -> None:
     owns_conn = conn is None
@@ -138,6 +142,7 @@ def ingest_packet(packet_id: str) -> dict[str, Any]:
         _update_ingest(packet_id, summary.get("status") or "stored", summary, None)
         return summary
     except Exception as exc:
+        logger.warning("mobile_bridge: ingest failed for %s: %s", packet_id, exc)
         summary = {"status": "error", "error": str(exc), "ingested": 0}
         _update_ingest(packet_id, "error", summary, str(exc))
         return summary
@@ -285,5 +290,6 @@ def _json_or_none(value: Any) -> Any:
         return None
     try:
         return json.loads(value)
-    except Exception:
+    except Exception as exc:
+        logger.debug("mobile_bridge: json parse failed, returning raw value: %s", exc)
         return value

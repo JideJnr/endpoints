@@ -87,7 +87,11 @@ def _signal_names(signals: list[dict[str, Any]], *, max_signals: int) -> list[st
     for signal in signals or []:
         if not isinstance(signal, dict):
             continue
-        name = _clean_token(signal.get("name"))
+        # SignalAggregator passes normalized entries that retain the source
+        # name as ``signal_name``.  Accept both shapes so learned combination
+        # memory keys actually contain the model and signal features instead
+        # of silently becoming an empty pattern.
+        name = _clean_token(signal.get("name") or signal.get("signal_name"))
         if not name or name in EXCLUDED_SIGNAL_NAMES:
             continue
         try:

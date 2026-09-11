@@ -22,6 +22,10 @@ from app.data_clients.sportybet_client import fetch_live_and_upcoming_matches_po
 from app.utils.primitives import _to_int, _to_float
 from app.utils.match_state import is_finished_match
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
@@ -119,6 +123,25 @@ def post_backfill_category_labels():
     try:
         from app.competition.competition_special import backfill_category_labels
         return backfill_category_labels()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/predictions/cleanup-leaked-sportybet-ids")
+def post_cleanup_leaked_sportybet_ids(dry_run: bool = Query(default=True)):
+    """One-time cleanup: blank out sofascore:/competition:-prefixed values
+    that leaked into the sportybet_id column of prediction_history,
+    prediction_candidate_history and prediction_decision_log before
+    _real_sportybet_id existed (see that function's docstring in
+    app/storage/league_memory/crud.py — every INSERT there used to fall back
+    to match_id, which re-substituted the placeholder id the moment it had
+    already been blanked). match_id itself is untouched. dry_run=true
+    (default) makes no writes, just reports counts + a sample per table —
+    call with dry_run=false to actually apply it. Safe to call more than
+    once."""
+    try:
+        from app.storage.league_memory import cleanup_leaked_sportybet_ids
+        return {"status": "success", **cleanup_leaked_sportybet_ids(dry_run=dry_run)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -267,7 +290,8 @@ def get_value_bets(
 
         try:
             model = run_poisson(int(home_id), int(away_id))
-        except Exception:
+        except Exception as exc:
+            logger.debug("poisson model failed for %s/%s: %s", home_id, away_id, exc)
             return []
 
         bets = []
@@ -460,4 +484,5 @@ def get_ai_status():
             "message": "AI router ready" if available else "Set OPENROUTER_API_KEY in .env to enable AI routing",
         }
     except Exception as e:
+        logger.warning("ai router status check failed: %s", e)
         return {"status": "error", "ai_available": False, "detail": str(e)}

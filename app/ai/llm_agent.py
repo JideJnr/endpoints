@@ -16,6 +16,10 @@ from app.config.config import get_settings
 from app.ai.ai_router import _call_llm, is_llm_available
 from app.ai.llm_analysis import SYSTEM_PROMPT
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 OPENROUTER_MODELS = {
     "openrouter/free": {
         "label": "OpenRouter Free",
@@ -59,13 +63,14 @@ def run_llm_match_analysis(
     try:
         from app.competition.competition_special import apply_known_competition_context
         apply_known_competition_context(doc)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("llm_agent: competition context failed: %s", exc)
 
     try:
         from app.ai.llm_analysis import _summarise_doc
         summary = _summarise_doc(doc)
     except Exception as exc:
+        logger.warning("llm_agent: doc summarisation failed: %s", exc)
         return {"status": "error", "message": f"Failed to summarise doc: {exc}", "model": model}
 
     try:
@@ -74,6 +79,7 @@ def run_llm_match_analysis(
     except json.JSONDecodeError as exc:
         return {"status": "error", "message": f"Model returned non-JSON: {exc}", "model": model}
     except Exception as exc:
+        logger.warning("llm_agent: llm call/parse failed: %s", exc)
         return {"status": "error", "message": str(exc), "model": model}
 
     try:

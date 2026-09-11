@@ -25,6 +25,44 @@ from app.storage.league_memory import _init_db as lm_init_db
 
 log = logging.getLogger(__name__)
 
+
+def _coerce_model_probabilities(value: Any, *, elo: bool = False) -> dict[str, float] | None:
+    """Convert model output (percent or fraction) to a valid 1X2 triple."""
+    if not isinstance(value, dict):
+        return None
+    if elo:
+        home = value.get("home_win_probability")
+        away = value.get("away_win_probability")
+        draw = value.get("draw_probability")
+    else:
+        # Most model signals wrap their output in a ``probabilities`` member;
+        # goal-model-family members are already direct probability maps.
+        probs = value.get("probabilities") if isinstance(value.get("probabilities"), dict) else value
+        home, draw, away = probs.get("home_win"), probs.get("draw"), probs.get("away_win")
+    try:
+        home_f = float(home or 0)
+        draw_f = float(draw or 0)
+        away_f = float(away or 0)
+    except (TypeError, ValueError):
+        return None
+    total = home_f + draw_f + away_f
+    if total <= 0:
+        return None
+    # Elo may provide only home/away. Allocate a conservative draw residual.
+    if elo and draw_f <= 0:
+        draw_f = max(5.0, 30.0 - abs(home_f - away_f) * 0.25)
+        total = home_f + draw_f + away_f
+    if max(home_f, draw_f, away_f) > 1.0:
+        return {"home": home_f / total, "draw": draw_f / total, "away": away_f / total}
+    return {"home": home_f / total, "draw": draw_f / total, "away": away_f / total}
+
+
+def _looks_like_model_value(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    probs = value.get("probabilities") if isinstance(value.get("probabilities"), dict) else value
+    return any(key in probs for key in ("home_win", "away_win", "home_win_probability", "away_win_probability"))
+
 # ── Signal categories ──────────────────────────────────────────
 
 SIGNAL_CATEGORIES = {
@@ -291,9 +329,17 @@ class SignalAggregator:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for sig in signals:
             name = sig.get("name") or sig.get("signal_name") or ""
-            value = sig.get("impact")
+            # Model signals carry a probability distribution in ``value``.
+            # Do not replace it with their display impact: that was the
+            # historical bug that made Poisson/Dixon/Elo invisible to the
+            # signal decision engine.
+            is_model_signal = str(name) in {
+                "goal_model_family", "poisson_model", "dixon_coles_model",
+                "elo_model", "ensemble_model",
+            } or _looks_like_model_value(sig.get("value"))
+            value = sig.get("value") if is_model_signal else sig.get("impact")
             if value is None:
-                value = sig.get("value") if sig.get("value") is not None else sig.get("signal_value")
+                value = sig.get("signal_value")
             if value is None:
                 value = 0
             source = sig.get("source", "unknown")
@@ -577,7 +623,11 @@ class SignalAggregator:
             # Mixed signals — home win % varies with signal balance
             total_abs = abs(home_score) + abs(away_score) + abs(neutral_score)
             if total_abs == 0:
-                return self._default_probabilities()
+                # Model-only predictions are valid: the model prior below is
+                # the decision input even when no directional hand-built
+                # signal is available yet.
+                home_prob, draw_prob, away_prob, base_probs_source = _get_base_probs(self.league_key)
+                total_abs = 1.0
 
             home_ratio = home_score / total_abs
             away_ratio = away_score / total_abs
@@ -616,8 +666,25 @@ class SignalAggregator:
                     away_prob /= total
                     draw_prob /= total
 
+        # Models are priors, not standalone competing picks.  Blend the
+        # model family with the independently-derived signal distribution at
+        # the probability level, before any caller can select a winner.
+        model_prior, model_sources = self._model_prior()
+        signal_evidence = sum(len(values) for category, values in category_strengths.items() if category != "unknown")
+        signal_weight = min(0.35, 0.08 + signal_evidence * 0.035) if model_prior else 0.0
+        if model_prior and signal_weight:
+            home_prob = model_prior["home"] * (1 - signal_weight) + home_prob * signal_weight
+            draw_prob = model_prior["draw"] * (1 - signal_weight) + draw_prob * signal_weight
+            away_prob = model_prior["away"] * (1 - signal_weight) + away_prob * signal_weight
+        elif model_prior:
+            home_prob, draw_prob, away_prob = model_prior["home"], model_prior["draw"], model_prior["away"]
+
         # Calculate confidence
         confidence = self._calculate_confidence(category_scores, category_strengths)
+        if model_prior:
+            # Model agreement is evidence quality, not an excuse for extreme
+            # certainty. It provides a small bounded confidence contribution.
+            confidence = min(0.90, confidence + min(0.10, 0.025 * len(model_sources)))
         combo_memory = self._combination_memory(home_prob, draw_prob, away_prob)
         combo_adjustment = float(combo_memory.get("probability_adjustment") or 0.0)
         if combo_adjustment:
@@ -653,7 +720,61 @@ class SignalAggregator:
             "learned_signal_combination": combo_memory,
             "dropped_duplicate_count": self._dropped_duplicates,
             "base_probs_source": base_probs_source,
+            "model_prior": {key: round(value, 4) for key, value in (model_prior or {}).items()},
+            "model_sources": model_sources,
+            "signal_blend_weight": round(signal_weight, 4),
         }
+
+    def _model_prior(self) -> tuple[dict[str, float] | None, list[str]]:
+        """Return one normalized prior from every available model signal.
+
+        Poisson and Dixon-Coles are intentionally one goal-model family;
+        ensemble is a meta-model and gets a smaller weight when its component
+        models are present, preventing correlated evidence from being counted
+        as independent votes.
+        """
+        families: list[tuple[str, dict[str, float], float]] = []
+        goal_members: list[dict[str, float]] = []
+        ensemble: dict[str, float] | None = None
+        for sig in self.signals:
+            name = str(sig.get("signal_name") or "")
+            raw = sig.get("raw_value")
+            if name == "goal_model_family" and isinstance(raw, dict):
+                for key in ("poisson", "dixon_coles"):
+                    probs = _coerce_model_probabilities(raw.get(key))
+                    if probs:
+                        goal_members.append(probs)
+            elif name in {"poisson_model", "dixon_coles_model"}:
+                probs = _coerce_model_probabilities(raw)
+                if probs:
+                    goal_members.append(probs)
+            elif name == "elo_model":
+                probs = _coerce_model_probabilities(raw, elo=True)
+                if probs:
+                    families.append(("elo", probs, 0.30))
+            elif name == "ensemble_model":
+                ensemble = _coerce_model_probabilities(raw)
+            elif name.endswith("_model"):
+                # New probability-producing models automatically participate
+                # without requiring a hand-edited category map.
+                probs = _coerce_model_probabilities(raw)
+                if probs:
+                    families.append((name, probs, 0.20))
+        if goal_members:
+            averaged = {key: sum(item[key] for item in goal_members) / len(goal_members) for key in ("home", "draw", "away")}
+            families.append(("goal_model_family", averaged, 0.55))
+        if ensemble:
+            # Meta-model is useful (it includes rules/competition evidence),
+            # but reduced when raw component models are already represented.
+            families.append(("ensemble", ensemble, 0.15 if families else 1.0))
+        if not families:
+            return None, []
+        total_weight = sum(weight for _, _, weight in families)
+        prior = {
+            key: sum(probs[key] * weight for _, probs, weight in families) / total_weight
+            for key in ("home", "draw", "away")
+        }
+        return prior, [name for name, _, _ in families]
 
     def _combination_memory(self, home_prob: float, draw_prob: float, away_prob: float) -> dict[str, Any]:
         selection = self.selection

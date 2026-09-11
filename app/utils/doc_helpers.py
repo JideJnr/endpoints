@@ -5,6 +5,10 @@ from typing import Any, Callable, TypeVar
 
 from app.utils.match_state import classify_match_state
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 T = TypeVar("T")
 
@@ -37,7 +41,8 @@ def _date_from_start_time(start_time: Any) -> str:
         if ts > 1e12:
             ts /= 1000
         return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-    except Exception:
+    except Exception as exc:
+        logger.debug("doc_helpers: start_time parse failed: %s", exc)
         return date_cls.today().isoformat()
 
 
@@ -49,12 +54,14 @@ def _safe_call(func: Callable[..., T] | str, *args: Any, default: T | None = Non
         try:
             return fn()
         except Exception as exc:
+            logger.debug("doc_helpers: %s failed: %s", name, exc)
             if errors is not None:
                 errors.append(f"{name}: {exc}")
             return {}
     try:
         return func(*args, **kwargs)
-    except Exception:
+    except Exception as exc:
+        logger.debug("doc_helpers: safe call failed: %s", exc)
         return default
 
 
@@ -65,7 +72,8 @@ def _band(values: list[int], lo: int, hi: int) -> int:
 def _impact(signal: dict[str, Any]) -> float:
     try:
         return float(signal.get("impact") or 0)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_impact: parse failed: %s", exc)
         return 0.0
 
 

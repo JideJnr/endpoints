@@ -15,3 +15,5 @@ redis
 websockets
 typing_extensions
 cachetools
+requests-oauthlib
+psycopg2-binary

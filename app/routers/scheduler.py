@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-router = APIRouter(prefix="/scheduler", tags=["scheduler"])
+from app.auth.dependencies import require_admin
+
+# Every endpoint here backs the /scheduler ops page, which is RequireAdmin-gated
+# in the frontend — enforce that server-side too, not just in the UI.
+router = APIRouter(prefix="/scheduler", tags=["scheduler"], dependencies=[Depends(require_admin)])
 
 
 class IntervalPatch(BaseModel):

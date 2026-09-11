@@ -36,6 +36,7 @@ from typing import Any
 
 from app.storage.db import db_conn
 from app.storage.db import _init_db
+from app.storage.db import _ensure_column
 from app.storage.league_memory._helpers import _get_passed_models
 
 from app.utils.primitives import _safe_json
@@ -74,7 +75,50 @@ MIN_SAMPLES = 15          # historical "trust it fully" sample count.
                           # Still used as the shrinkage prior strength below
                           # (see _shrink_win_rate) and by the model-weight /
                           # bias-correction gates further down this file.
-MIN_LEAGUE_SAMPLES = 5
+MIN_LEAGUE_SAMPLES = 5    # existence floor -- below this a (league, pick_type)
+                          # row isn't even persisted to league_accuracy. This
+                          # is NOT a trust threshold (see LEAGUE_ACCURACY_
+                          # SHRINKAGE_STRENGTH below for that); it just avoids
+                          # writing a row from 1-4 literal observations.
+LEAGUE_ACCURACY_SHRINKAGE_STRENGTH = 20
+                          # Shrinkage strength (phantom prior observations,
+                          # see _shrink_win_rate) applied to league_accuracy's
+                          # win_rate before anything ranks or prioritizes on
+                          # it. Without this, a league/pick_type combo just
+                          # past the MIN_LEAGUE_SAMPLES=5 existence floor
+                          # could show e.g. 80% off 5 samples and outrank a
+                          # league with a genuinely reliable 58% off 150
+                          # samples -- exactly the failure mode this constant
+                          # exists to prevent. Kept separate from MIN_SAMPLES
+                          # (used for per-signal shrinkage) because a whole
+                          # league's accuracy is a much higher-stakes, more
+                          # visible number (drives bet_builder's league
+                          # accuracy boost and tournament_preferences'
+                          # enrichment priority) than any single signal's
+                          # weight_adj, and 20 was chosen deliberately as a
+                          # slightly more conservative bar than the signal
+                          # default.
+WILSON_Z = 1.645          # ~90% one-sided confidence. Used ONLY to gate the
+                          # POSITIVE side of league accuracy ranking (see
+                          # rank_score / _wilson_lower_bound below) -- the
+                          # user explicitly asked for a guarantee, not just a
+                          # gentle nudge: an established, deep-sample league
+                          # must always outrank an unproven league that only
+                          # LOOKS better, until the unproven one has actually
+                          # earned that with enough games. shrunk_win_rate's
+                          # point-estimate shrinkage alone doesn't guarantee
+                          # this (a thin sample's honest best-guess estimate
+                          # can still land above a deep average league's --
+                          # that's not a bug, it's just not a guarantee), so
+                          # rank_score adds a confidence floor on top: a
+                          # league only gets credit for looking better than
+                          # baseline once we're ~90% confident it actually is,
+                          # not just that it got lucky. See _league_accuracy_
+                          # boost (bet_builder/core.py) and the priority
+                          # cascade in update_tournament_preferences for how
+                          # this gate is applied -- it only ever WITHHOLDS
+                          # positive credit, never adds an extra penalty
+                          # beyond what shrinkage already applies.
 MIN_COMBINATION_SAMPLES = 12
 MIN_SLIP_RISK_SAMPLES = 12   # graded slips needed in a leg-count/odds band before it's trusted
 # How far a band's win rate can fall below the BEST band on the same
@@ -126,6 +170,31 @@ def _shrink_win_rate(win_rate: float, samples: float, strength: float = MIN_SAMP
     return (win_rate * samples + prior * strength) / (samples + strength)
 
 
+def _wilson_lower_bound(wins: float, samples: float, z: float = WILSON_Z) -> float:
+    """Lower bound of the Wilson score confidence interval for a win rate.
+
+    Unlike _shrink_win_rate (which produces an unbiased BEST-GUESS point
+    estimate), this is deliberately pessimistic: "how good are we
+    confident this actually is", not "what's our best guess". A thin
+    sample's Wilson lower bound sits far below its raw rate even when
+    _shrink_win_rate's point estimate would still land comfortably above a
+    deep sample's -- e.g. 4 wins from 5 games is 80% raw, ~68% shrunk
+    toward a 65% system baseline, but only ~44% here, because 5 games
+    genuinely isn't enough to be confident of anything much above a coin
+    flip. Used ONLY to gate the positive side of league ranking (see
+    WILSON_Z's comment) -- never as the headline "accuracy" number shown
+    anywhere, since it deliberately understates the true rate for anyone
+    with a modest sample size.
+    """
+    if samples <= 0:
+        return 0.0
+    p = wins / samples
+    denom = 1 + z * z / samples
+    center = (p + z * z / (2 * samples)) / denom
+    margin = z * ((p * (1 - p) + z * z / (4 * samples)) / samples) ** 0.5 / denom
+    return max(0.0, center - margin)
+
+
 # ── Table setup ───────────────────────────────────────────────────────────────
 
 def _init_learner_tables(conn: sqlite3.Connection) -> None:
@@ -160,18 +229,42 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
     # Per-league model accuracy
     conn.execute("""
         create table if not exists league_accuracy (
-            league_key      text not null,
-            league_name     text,
-            pick_type       text not null,
-            samples         integer not null default 0,
-            wins            integer not null default 0,
-            win_rate        real,
-            avg_confidence  real,
-            calibration_gap real,   -- win_rate - avg_confidence/100 (positive = underconfident)
-            last_updated    text not null default current_timestamp,
+            league_key        text not null,
+            league_name       text,
+            pick_type         text not null,
+            samples           integer not null default 0,
+            wins              integer not null default 0,
+            win_rate          real,
+            shrunk_win_rate   real,   -- BEST-GUESS point estimate: win_rate pulled
+                                      -- toward this pick_type's system-wide baseline
+                                      -- (NOT a flat 50%) by sample size -- see
+                                      -- _shrink_win_rate / LEAGUE_ACCURACY_SHRINKAGE_
+                                      -- STRENGTH / _league_shrinkage_prior. Good for
+                                      -- display ("what do we think this league's
+                                      -- accuracy really is").
+            rank_score        real,   -- CONFIDENCE-ADJUSTED score for ranking/
+                                      -- prioritizing leagues against each other --
+                                      -- see _wilson_lower_bound / WILSON_Z. Always
+                                      -- <= shrunk_win_rate; deliberately pessimistic
+                                      -- so a thin, lucky sample can't outrank a
+                                      -- deep, reliable one just because its point
+                                      -- estimate looks good. Never shown as "the"
+                                      -- accuracy number -- it understates on purpose.
+            baseline_win_rate real,   -- the leave-one-out system baseline rank_score
+                                      -- and shrunk_win_rate were computed against for
+                                      -- THIS row (see _league_shrinkage_prior) --
+                                      -- stored so consumers can compare rank_score
+                                      -- to it without recomputing system-wide stats.
+            avg_confidence    real,
+            calibration_gap   real,   -- win_rate - avg_confidence/100 (positive = underconfident)
+            last_updated      text not null default current_timestamp,
             primary key (league_key, pick_type)
         )
     """)
+    # Older DBs created this table before these columns existed.
+    _ensure_column(conn, "league_accuracy", "shrunk_win_rate", "real")
+    _ensure_column(conn, "league_accuracy", "rank_score", "real")
+    _ensure_column(conn, "league_accuracy", "baseline_win_rate", "real")
     # Auto-tuned ensemble model weights
     conn.execute("""
         create table if not exists learned_model_weights (
@@ -217,13 +310,24 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
     # Dynamic tournament preferences for enrichment priority ordering
     conn.execute("""
         create table if not exists tournament_preferences (
-            league_key      text not null primary key,
-            priority        integer not null default 4,
-            samples         integer not null default 0,
-            win_rate        real,
-            last_updated    text not null default current_timestamp
+            league_key        text not null primary key,
+            priority          integer not null default 4,
+            samples           integer not null default 0,
+            win_rate          real,
+            shrunk_win_rate   real,   -- same shrinkage as league_accuracy.shrunk_win_rate
+                                      -- (see update_tournament_preferences) -- priority's
+                                      -- middle tiers are decided from this, win_rate
+                                      -- stays raw for display.
+            rank_score        real,   -- same confidence-adjusted score as league_accuracy.
+                                      -- rank_score -- gates the TOP priority tiers (0/1),
+                                      -- see update_tournament_preferences.
+            baseline_win_rate real,   -- the leave-one-out system baseline used for this row.
+            last_updated      text not null default current_timestamp
         )
     """)
+    _ensure_column(conn, "tournament_preferences", "shrunk_win_rate", "real")
+    _ensure_column(conn, "tournament_preferences", "rank_score", "real")
+    _ensure_column(conn, "tournament_preferences", "baseline_win_rate", "real")
     # Outcome bias corrections learned from overconfident losses by side.
     conn.execute("""
         create table if not exists model_bias_corrections (
@@ -294,18 +398,16 @@ def _init_learner_tables(conn: sqlite3.Connection) -> None:
             primary key (context_tag, league_key)
         )
     """)
-    conn.execute("""
-        create table if not exists signal_outcomes (
-            id INTEGER primary key autoincrement,
-            signal_name TEXT not null,
-            match_id TEXT not null,
-            tournament TEXT,
-            country TEXT,
-            result TEXT,
-            created_at TEXT,
-            unique(signal_name, match_id)
-        )
-    """)
+    # NOTE: signal_outcomes is intentionally NOT created here. It's owned by
+    # app/storage/db.py / app/storage/league_memory/schema.py (the wide schema
+    # that app/storage/league_memory/crud.py's store_local_signal_outcomes()
+    # actually writes to in production). This function used to also create a
+    # narrower, incompatible copy of the same table name here, which meant
+    # this module's own _backfill_signal_outcomes() could never successfully
+    # insert against the real (wide-schema) table -- see predictx_db_call_audit
+    # project memory for the full story. Removed 2026-09-09 along with the
+    # dead _backfill_signal_outcomes() function (used to live further down
+    # in this file, and the call to it in run_learning_cycle()).
     # AI analysis quality feedback — used to calibrate the LLM model weight (R1)
     conn.execute("""
         create table if not exists ai_analysis_feedback (
@@ -470,6 +572,58 @@ def run_learning_cycle() -> dict[str, Any]:
             league_stats[key]["wins"] += 1
             league_stats[key]["weighted_wins"] += w
 
+    # ── 2b. System-wide baseline win rate, per pick_type ───────────────────────
+    # Used below as the shrinkage PRIOR for league accuracy, instead of a flat
+    # 50%. Shrinking toward "coin flip" is wrong for a system that only ever
+    # publishes picks clearing a confidence bar -- its overall win rate is
+    # very unlikely to actually be 50%, so pulling a thin-sample league all
+    # the way to 50% overcorrects (an 80%-off-5 league would collapse to the
+    # high 50s even though "we don't have much data on this league" should
+    # mean "assume it's about as good as this system usually is", not
+    # "assume it's a coin flip"). Pooled across every OTHER league covering
+    # this pick_type -- deliberately LEAVE-ONE-OUT (the league being shrunk
+    # never contributes to its own prior). Without that, a thin, lucky
+    # league inflates the very baseline it then gets compared against and
+    # can end up looking BETTER than a deep, reliable league after
+    # "shrinkage" -- confirmed by a test case with only two leagues, where
+    # an 80%-off-5 league pulled the pooled average up enough to land above
+    # a 58%-off-150 league. With many leagues in a real system this effect
+    # is negligible per-league, but leave-one-out removes it exactly rather
+    # than relying on scale to dilute it away.
+    global_pick_type_stats: dict[str, dict[str, float]] = {}
+    for (_league_key, pick_type), stats in league_stats.items():
+        g = global_pick_type_stats.setdefault(pick_type, {"wins": 0.0, "total": 0.0})
+        g["wins"] += stats.get("weighted_wins", stats["wins"])
+        g["total"] += stats.get("weighted_total", stats["samples"])
+    _global_all_wins = sum(g["wins"] for g in global_pick_type_stats.values())
+    _global_all_total = sum(g["total"] for g in global_pick_type_stats.values())
+    global_all_win_rate = _global_all_wins / _global_all_total if _global_all_total > 0 else 0.5
+
+    def _league_shrinkage_prior(league_key: str, pick_type: str) -> float:
+        """The baseline this (league, pick_type) gets shrunk toward -- pooled
+        across every OTHER league (leave-one-out, see comment above).
+
+        Prefers this pick_type's own system-wide rate (pooled across every
+        other league), so e.g. over/under leagues shrink toward the
+        system's over/under baseline rather than its match-winner baseline.
+        Falls back to the all-pick-types blended rate (also leave-one-out)
+        when this pick_type doesn't have enough OTHER system-wide volume
+        (< 30 effective samples) to be a trustworthy baseline on its own.
+        """
+        own = league_stats.get((league_key, pick_type)) or {}
+        own_wins = own.get("weighted_wins", own.get("wins", 0.0))
+        own_total = own.get("weighted_total", own.get("samples", 0.0))
+
+        g = global_pick_type_stats.get(pick_type) or {"wins": 0.0, "total": 0.0}
+        pt_total = g["total"] - own_total
+        if pt_total >= 30:
+            return (g["wins"] - own_wins) / pt_total
+
+        all_total = _global_all_total - own_total
+        if all_total > 0:
+            return (_global_all_wins - own_wins) / all_total
+        return global_all_win_rate
+
     # ── 3. Aggregate per-model accuracy from signals ──────────────────────────
     model_signal_map = {
         "goal_model_family": {"goal_model_family", "dixon_coles_model", "poisson_model"},
@@ -612,7 +766,7 @@ def run_learning_cycle() -> dict[str, Any]:
         for (league_key, pick_type), stats in league_stats.items():
             samples = stats["samples"]
             wins = stats["wins"]
-            if samples < 5:
+            if samples < MIN_LEAGUE_SAMPLES:
                 continue
             weighted_total = stats.get("weighted_total", 0.0)
             win_rate = (
@@ -620,23 +774,61 @@ def run_learning_cycle() -> dict[str, Any]:
                 if weighted_total > 0
                 else (wins / samples if samples > 0 else 0.0)
             )
+            # shrunk_win_rate: same Empirical-Bayes shrinkage as signal_weights
+            # above (see _shrink_win_rate), applied here for the first time.
+            # win_rate itself stays raw -- calibration_gap is defined against
+            # the RAW rate on purpose (it's measuring "did we see what we
+            # expected", not "how much do we trust this league"). Everything
+            # that ranks or prioritizes leagues reads shrunk_win_rate instead
+            # (bet_builder._league_accuracy_boost, update_tournament_
+            # preferences below) so a handful of lucky/unlucky picks in a
+            # thin league can't outrank a league with a real track record.
+            #
+            # Shrinks toward this pick_type's system-wide baseline (see
+            # _league_shrinkage_prior above), NOT a flat 50%. A system that
+            # only ever publishes picks clearing a confidence bar is very
+            # unlikely to genuinely run at 50% overall, so pulling a thin
+            # sample all the way to "coin flip" overcorrects -- a league
+            # with no track record yet should be assumed about as good as
+            # this system usually is, not assumed mediocre.
+            effective_n = weighted_total if weighted_total > 0 else samples
+            league_baseline = _league_shrinkage_prior(league_key, pick_type)
+            shrunk_win_rate = _shrink_win_rate(
+                win_rate,
+                effective_n,
+                strength=LEAGUE_ACCURACY_SHRINKAGE_STRENGTH,
+                prior=league_baseline,
+            )
+            # rank_score: confidence-adjusted, for RANKING only -- see
+            # _wilson_lower_bound / WILSON_Z. Computed from the same
+            # (win_rate, effective_n) as shrunk_win_rate so the two are
+            # directly comparable; consumers compare this against
+            # baseline_win_rate, never against a fixed threshold.
+            effective_wins = win_rate * effective_n
+            rank_score = _wilson_lower_bound(effective_wins, effective_n)
             avg_conf = stats["confidence_sum"] / samples
             calibration_gap = round(win_rate - avg_conf / 100, 4)
             conn.execute("""
                 insert into league_accuracy
                     (league_key, league_name, pick_type, samples, wins,
-                     win_rate, avg_confidence, calibration_gap, last_updated)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     win_rate, shrunk_win_rate, rank_score, baseline_win_rate,
+                     avg_confidence, calibration_gap, last_updated)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(league_key, pick_type) do update set
-                    league_name     = excluded.league_name,
-                    samples         = excluded.samples,
-                    wins            = excluded.wins,
-                    win_rate        = excluded.win_rate,
-                    avg_confidence  = excluded.avg_confidence,
-                    calibration_gap = excluded.calibration_gap,
-                    last_updated    = excluded.last_updated
+                    league_name       = excluded.league_name,
+                    samples           = excluded.samples,
+                    wins              = excluded.wins,
+                    win_rate          = excluded.win_rate,
+                    shrunk_win_rate   = excluded.shrunk_win_rate,
+                    rank_score        = excluded.rank_score,
+                    baseline_win_rate = excluded.baseline_win_rate,
+                    avg_confidence    = excluded.avg_confidence,
+                    calibration_gap   = excluded.calibration_gap,
+                    last_updated      = excluded.last_updated
             """, (league_key, stats["league_name"], pick_type, samples, wins,
-                  round(win_rate, 4), round(avg_conf, 2), calibration_gap, now))
+                  round(win_rate, 4), round(shrunk_win_rate, 4), round(rank_score, 4),
+                  round(league_baseline, 4), round(avg_conf, 2),
+                  calibration_gap, now))
             league_updates += 1
 
         # Learned model weights — prefer direct models_json accuracy,
@@ -725,7 +917,6 @@ def run_learning_cycle() -> dict[str, Any]:
         outcome_distribution_updates = _populate_league_outcome_distribution(conn, rows)
         context_penalty_updates = _learn_context_penalties(conn, rows)
         drift_events = _detect_and_handle_drift(conn, rows)
-        signal_outcome_backfills = _backfill_signal_outcomes(conn, rows)
         stat_correlation_updates = _learn_stat_signal_correlations(conn, rows)
 
         # ── Prune stale rows after all writes succeed ────────────────────────
@@ -805,7 +996,6 @@ def run_learning_cycle() -> dict[str, Any]:
         "drift_events": drift_events,
         "league_outcome_distribution_updates": outcome_distribution_updates,
         "context_penalty_updates": context_penalty_updates,
-        "signal_outcome_backfills": signal_outcome_backfills,
         "stat_correlation_updates": stat_correlation_updates,
         "risk_control_buckets": risk_buckets,
     }
@@ -965,7 +1155,8 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
-            select pick_type, samples, wins, win_rate, avg_confidence, calibration_gap
+            select pick_type, samples, wins, win_rate, shrunk_win_rate, rank_score,
+                   baseline_win_rate, avg_confidence, calibration_gap
             from league_accuracy
             where league_key = ?
             order by samples desc
@@ -982,6 +1173,22 @@ def get_league_accuracy(league: str) -> dict[str, Any]:
                 "pick_type":        row["pick_type"],
                 "samples":          row["samples"],
                 "win_rate":         round(float(row["win_rate"] or 0) * 100, 1),
+                # Best-guess point estimate -- pulled toward this pick_type's
+                # system-wide baseline (NOT 50%) the fewer samples this
+                # (league, pick_type) has (see _shrink_win_rate /
+                # LEAGUE_ACCURACY_SHRINKAGE_STRENGTH / _league_shrinkage_prior).
+                # Falls back to the raw win_rate only for rows written before
+                # this column existed (self-heals on the next
+                # run_learning_cycle() pass).
+                "shrunk_win_rate":  round(float(row["shrunk_win_rate"] if row["shrunk_win_rate"] is not None else row["win_rate"] or 0) * 100, 1),
+                # Confidence-adjusted RANKING score (see _wilson_lower_bound /
+                # WILSON_Z) -- always <= shrunk_win_rate, deliberately
+                # pessimistic. Compare against baseline_win_rate, never a
+                # fixed number: "confidently above baseline" is what earns a
+                # positive ranking boost. Falls back to shrunk/raw win_rate
+                # for rows written before this column existed.
+                "rank_score":       round(float(row["rank_score"] if row["rank_score"] is not None else (row["shrunk_win_rate"] if row["shrunk_win_rate"] is not None else row["win_rate"]) or 0) * 100, 1),
+                "baseline_win_rate": round(float(row["baseline_win_rate"] if row["baseline_win_rate"] is not None else 0.5) * 100, 1),
                 "avg_confidence":   round(float(row["avg_confidence"] or 0), 1),
                 "calibration_gap":  round(float(row["calibration_gap"] or 0) * 100, 1),
                 "verdict":          _calibration_verdict(float(row["calibration_gap"] or 0)),
@@ -999,15 +1206,43 @@ def update_tournament_preferences() -> dict[str, Any]:
     overall accuracy to a priority score used by buffer.py for enrichment
     queue ordering.
 
-    Priority mapping (lower = liked, processed first):
-      0 = high accuracy (win_rate >= 60%, samples >= 10)
-      1 = good accuracy (win_rate >= 55%, samples >= 5)
-      2 = decent (win_rate >= 50%, samples >= 5)
-      3 = neutral (win_rate >= 45%, samples >= 5)
-      4 = unknown / insufficient data (default)
-      5 = below average (win_rate >= 40%, samples >= 5)
-      6 = poor (win_rate >= 35%, samples >= 5)
-      7 = avoid (win_rate < 35%, samples >= 5)
+    The priority cascade below used to compare RAW win_rate against fixed
+    thresholds (win_rate >= 0.60, etc.) with only a hard samples>=10/>=5
+    cliff -- so a league with exactly 10 samples at 60% (6/10, one bad grade
+    away from 50%) landed in the same top priority tier as a league with
+    500 samples genuinely averaging 60%. Priority is now decided from
+    shrunk_win_rate (Empirical-Bayes shrinkage toward this system's own
+    overall win rate -- see _shrink_win_rate / LEAGUE_ACCURACY_SHRINKAGE_
+    STRENGTH, and note the prior is the measured system average, NOT a flat
+    50%: a system that only ever publishes picks clearing a confidence bar
+    is very unlikely to genuinely run at 50%, so shrinking a thin sample all
+    the way to "coin flip" overcorrects it) instead -- a thin sample's
+    shrunk rate sits close to that system baseline regardless of how
+    extreme its raw rate looks, so it naturally falls into the middle
+    priority tiers rather than needing a separate samples cliff to catch
+    it. win_rate is still stored (raw) for display/debugging.
+
+    Priority mapping (lower = liked, processed first), read off
+    shrunk_win_rate:
+      0 = high accuracy (shrunk_win_rate >= 60%, samples >= 10)
+      1 = good accuracy (shrunk_win_rate >= 55%, samples >= 5)
+      2 = decent (shrunk_win_rate >= 50%, samples >= 5)
+      3 = neutral (shrunk_win_rate >= 45%, samples >= 5)
+      4 = unknown / insufficient data (default; samples < 5)
+      5 = below average (shrunk_win_rate >= 40%, samples >= 5)
+      6 = poor (shrunk_win_rate >= 35%, samples >= 5)
+      7 = avoid (shrunk_win_rate < 35%, samples >= 5)
+
+    Tiers 0/1 additionally require rank_score (confidence-adjusted, see
+    _wilson_lower_bound / WILSON_Z) to also clear this league's baseline --
+    a league whose shrunk_win_rate looks like tier 0/1 material purely off
+    a thin, lucky sample gets demoted to tier 2 (decent) instead. Point
+    estimates alone don't guarantee a deep, reliable league always
+    outranks a thin, flashy one (a thin sample's honest best guess can
+    legitimately land above a deep average league's); this gate is what
+    turns that into an actual guarantee for the tiers that matter for
+    enrichment priority, without adding any extra penalty to the lower
+    tiers -- it only ever withholds top-tier credit until it's earned.
     """
     _init_db()
     with db_conn(timeout=30) as conn:
@@ -1023,40 +1258,69 @@ def update_tournament_preferences() -> dict[str, Any]:
             group by league_key
         """).fetchall()
 
+        # System-wide baseline (blended across every league/pick_type) --
+        # see the shrinkage note in this function's docstring for why this,
+        # not a flat 0.5, is the correct shrinkage prior here.
+        _system_total_samples = sum(int(row["total_samples"] or 0) for row in rows)
+        _system_total_wins = sum(int(row["total_wins"] or 0) for row in rows)
+
         updates = 0
         for row in rows:
             league_key = row["league_key"]
             samples = row["total_samples"] or 0
             wins = row["total_wins"] or 0
             win_rate = wins / samples if samples > 0 else 0.0
+            # Leave-one-out: this league's own samples/wins are excluded from
+            # the baseline it gets compared against -- otherwise a thin,
+            # lucky league inflates its own prior and can end up looking
+            # BETTER than a deep, reliable league after "shrinkage" (see the
+            # matching leave-one-out comment in run_learning_cycle above).
+            other_total = _system_total_samples - samples
+            other_wins = _system_total_wins - wins
+            league_prior = other_wins / other_total if other_total > 0 else 0.5
+            shrunk_win_rate = _shrink_win_rate(
+                win_rate, samples, strength=LEAGUE_ACCURACY_SHRINKAGE_STRENGTH, prior=league_prior
+            )
+            rank_score = _wilson_lower_bound(wins, samples)
 
-            if samples >= 10 and win_rate >= 0.60:
+            if samples >= 10 and shrunk_win_rate >= 0.60:
                 priority = 0
-            elif samples >= 5 and win_rate >= 0.55:
+            elif samples >= 5 and shrunk_win_rate >= 0.55:
                 priority = 1
-            elif samples >= 5 and win_rate >= 0.50:
+            elif samples >= 5 and shrunk_win_rate >= 0.50:
                 priority = 2
-            elif samples >= 5 and win_rate >= 0.45:
+            elif samples >= 5 and shrunk_win_rate >= 0.45:
                 priority = 3
             elif samples < 5:
                 priority = 4
-            elif win_rate >= 0.40:
+            elif shrunk_win_rate >= 0.40:
                 priority = 5
-            elif win_rate >= 0.35:
+            elif shrunk_win_rate >= 0.35:
                 priority = 6
             else:
                 priority = 7
 
+            # Confidence gate on the top two tiers only -- see docstring.
+            # Demotes to tier 2 ("decent") rather than punishing further:
+            # this withholds unearned top-tier credit, it doesn't penalize.
+            if priority in (0, 1) and rank_score < league_prior:
+                priority = 2
+
             conn.execute("""
                 insert into tournament_preferences
-                    (league_key, priority, samples, win_rate, last_updated)
-                values (?, ?, ?, ?, ?)
+                    (league_key, priority, samples, win_rate, shrunk_win_rate,
+                     rank_score, baseline_win_rate, last_updated)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(league_key) do update set
-                    priority = excluded.priority,
-                    samples = excluded.samples,
-                    win_rate = excluded.win_rate,
-                    last_updated = excluded.last_updated
-            """, (league_key, priority, samples, round(win_rate, 4), now))
+                    priority          = excluded.priority,
+                    samples           = excluded.samples,
+                    win_rate          = excluded.win_rate,
+                    shrunk_win_rate   = excluded.shrunk_win_rate,
+                    rank_score        = excluded.rank_score,
+                    baseline_win_rate = excluded.baseline_win_rate,
+                    last_updated      = excluded.last_updated
+            """, (league_key, priority, samples, round(win_rate, 4), round(shrunk_win_rate, 4),
+                  round(rank_score, 4), round(league_prior, 4), now))
             updates += 1
 
         conn.commit()
@@ -1077,7 +1341,7 @@ def get_tournament_priority(league: str) -> dict[str, Any]:
         _init_learner_tables(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute("""
-            select priority, samples, win_rate, last_updated
+            select priority, samples, win_rate, shrunk_win_rate, last_updated
             from tournament_preferences
             where league_key = ?
         """, (league_key,)).fetchone()
@@ -1090,6 +1354,7 @@ def get_tournament_priority(league: str) -> dict[str, Any]:
         "priority": row["priority"],
         "samples": row["samples"],
         "win_rate": round(float(row["win_rate"] or 0) * 100, 1),
+        "shrunk_win_rate": round(float(row["shrunk_win_rate"] if row["shrunk_win_rate"] is not None else row["win_rate"] or 0) * 100, 1),
         "known": True,
         "last_updated": row["last_updated"],
     }
@@ -2019,21 +2284,31 @@ def _incorporate_ai_analysis(conn: sqlite3.Connection, rows: list) -> int:
         # Extract round_name from audit_json if available (informational only)
         audit = _safe_json_object(row["audit_json"] if "audit_json" in row.keys() else None)
 
-        # Query the most recent competition_analysis row within 30 days
+        # Query the most recent competition_analysis row within 30 days.
+        # competition_analysis's real timestamp column is `generated_at` (see
+        # persist_competition_analysis in app/competition/competition_analyser.py)
+        # -- this query used the non-existent `created_at` instead, which raised
+        # sqlite3.OperationalError on literally every call, silently swallowed
+        # below as "table doesn't exist yet" (it does; just not that column).
+        # Root cause of ai_analysis_feedback staying at 0 rows forever despite
+        # correct insert code further down -- found + fixed 2026-09-09.
         try:
             analysis_row = conn.execute(
                 """
                 SELECT analysis_text
                 FROM competition_analysis
                 WHERE competition_key = ?
-                  AND datetime(created_at) >= datetime('now', '-30 days')
-                ORDER BY datetime(created_at) DESC
+                  AND datetime(generated_at) >= datetime('now', '-30 days')
+                ORDER BY datetime(generated_at) DESC
                 LIMIT 1
                 """,
                 (competition_key,),
             ).fetchone()
         except sqlite3.OperationalError:
-            # competition_analysis table doesn't exist yet
+            # Genuinely missing table/column this time (e.g. a fresh DB before
+            # migrations run) -- log it instead of silently pretending
+            # everything's fine, so a real regression here is visible next time.
+            log.warning("[self_learner] competition_analysis query failed (schema mismatch?)", exc_info=True)
             return 0
 
         if not analysis_row:
@@ -2232,11 +2507,29 @@ def _populate_league_outcome_distribution(conn: sqlite3.Connection, rows: list) 
 
 
 def _learn_context_penalties(conn: sqlite3.Connection, rows: list) -> int:
+    """
+    Note: context_json is only ever real for rows sourced from
+    prediction_candidate_history in UNIQUE_GRADED_HISTORY -- the
+    prediction_history-sourced half hardcodes '{}' as context_json, so
+    those rows always contribute nothing here (by design, not a bug).
+
+    Fixed 2026-09-09: this used to read context.get("match_context",
+    {}).get("tags") -- a nesting that never existed anywhere the
+    context_json payload is actually built (see
+    app/storage/league_memory/crud.py::_record_prediction_candidates,
+    which writes a flat "tags" key sourced from
+    prediction["contextual_intelligence"]["tags"]). Silently no-op'd on
+    every row forever (no error -- tags was just always None here, so
+    "if not isinstance(tags, list): continue" skipped everything).
+    context_penalty_adjustments will still take time to populate even now:
+    it needs real "tags" data flowing in going forward (already-graded
+    history recorded before this fix has context_json = {} regardless of
+    source, since the write-side fix landed the same session).
+    """
     buckets: dict[tuple[str, str], dict[str, int]] = {}
     for row in rows:
         context = _safe_json_object(row["context_json"] if "context_json" in row.keys() else None)
-        match_context = context.get("match_context") if isinstance(context, dict) else {}
-        tags = match_context.get("tags") if isinstance(match_context, dict) else []
+        tags = context.get("tags") if isinstance(context, dict) else []
         if not isinstance(tags, list):
             continue
         league_key = _norm_league(row["league_name"] or "") or "__global__"
@@ -2327,36 +2620,6 @@ def _detect_and_handle_drift(conn: sqlite3.Connection, rows: list) -> int:
         except Exception:
             pass
     return events
-
-
-def _backfill_signal_outcomes(conn: sqlite3.Connection, rows: list) -> int:
-    written = 0
-    for row in rows:
-        match_id = str(row["match_id"] or "")
-        if not match_id:
-            continue
-        exists = conn.execute("select 1 from signal_outcomes where match_id = ? limit 1", (match_id,)).fetchone()
-        if exists:
-            continue
-        for signal in _decision_signals_for_row(row):
-            name = str(signal.get("name") or signal.get("signal_name") or "")
-            if not name:
-                continue
-            cur = conn.execute("""
-                insert into signal_outcomes
-                    (signal_name, match_id, tournament, country, result, created_at)
-                values (?, ?, ?, ?, ?, ?)
-                on conflict(signal_name, match_id) do nothing
-            """, (
-                name,
-                match_id,
-                row["league_name"],
-                row["country_name"],
-                row["result"],
-                row["created_at"],
-            ))
-            written += int(cur.rowcount > 0)
-    return written
 
 
 def _grade_specialists_from_history(rows: list) -> int:

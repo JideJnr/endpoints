@@ -36,6 +36,26 @@ except ImportError:
 SPORTYBET_HOME_URL   = "https://www.sportybet.com/ng/"
 SPORTYBET_POST_URL   = "https://www.sportybet.com/api/ng/factsCenter/wapConfigurableEventsByOrder"
 SPORTYBET_RESULTS_URL = "https://www.sportybet.com/api/ng/factsCenter/eventResultList"
+# Desktop ("pc") per-competition events feed -- discovered via live network
+# inspection of sportybet.com's own competition filter UI. Unlike
+# SPORTYBET_POST_URL (a site-wide "top ~300 by order" homepage feed that
+# only surfaces popular leagues), this takes an explicit tournamentId and
+# returns that competition's own full fixture list. Confirmed live: the
+# tournamentId values SportyBet uses here are the same raw Sportradar
+# tournament numbers already stored as unique_tournament_id in
+# competition_special.TOP_30_COMPETITIONS (e.g. sr:tournament:17 ==
+# Premier League on both SofaScore and SportyBet) -- no name/date
+# guessing needed for these curated competitions.
+SPORTYBET_PC_EVENTS_URL = "https://www.sportybet.com/api/ng/factsCenter/pcEvents"
+# Per-team endpoints -- discovered from sportybet.com's mobile team page
+# (e.g. /ng/m/team-pages/sr:sport:1/sr:competitor:2814/Football/Espanyol/Spain).
+# competitor_id is SportyBet/Sportradar's own team id -- NOT confirmed to
+# equal SofaScore's team id. Any caller that wants to use a SofaScore team
+# id here must verify the returned team name matches before trusting it.
+SPORTYBET_TEAM_INFO_URL      = "https://www.sportybet.com/api/ng/factsCenter/teams/sr:competitor:{competitor_id}"
+SPORTYBET_TEAM_FIXTURES_URL  = "https://www.sportybet.com/api/ng/factsCenter/teams/sr:competitor:{competitor_id}/fixtures"
+SPORTYBET_TEAM_RESULTS_URL   = "https://www.sportybet.com/api/ng/factsCenter/teams/sr:competitor:{competitor_id}/results"
+SPORTYBET_TEAM_NEWS_URL      = "https://www.sportybet.com/api/ng/factsCenter/teams/sr:competitor:{competitor_id}/news"
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -185,6 +205,52 @@ def _post_with_retry(url: str, payload: dict, max_retries: int = 4, timeout: int
     )
 
 
+def _post_json_with_retry(url: str, payload: list | dict, max_retries: int = 4, timeout: int = 20) -> dict:
+    """Same retry/rotation logic as _post_with_retry, for endpoints (like
+    pcEvents) whose body is a JSON array rather than a dict -- _t can't be
+    injected as a dict key on a list payload, and the live-captured
+    requests for this endpoint never send a _t cache-buster anyway."""
+    global _session, _session_warmed
+
+    _warm_session()
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            ua = random.choice(_USER_AGENTS)
+            headers = _browser_headers(ua)
+
+            response = _get_session().post(url, json=payload, headers=headers, timeout=timeout)
+
+            if response.status_code == 403:
+                _session = _new_session()
+                _session_warmed = False
+                wait = 2 ** attempt + random.uniform(1, 3)
+                print(f"[sportybet] 403 on attempt {attempt + 1}, rotating session, waiting {wait:.1f}s")
+                time.sleep(wait)
+                _warm_session()
+                continue
+
+            if response.status_code == 429:
+                wait = 5 * (attempt + 1) + random.uniform(1, 4)
+                print(f"[sportybet] 429 rate-limited on attempt {attempt + 1}, waiting {wait:.1f}s")
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                wait = 1.5 ** attempt + random.uniform(0.5, 2)
+                time.sleep(wait)
+
+    raise RuntimeError(
+        f"SportyBet POST (json) failed after {max_retries} attempts: {last_exc}"
+    )
+
+
 def _get_with_retry(url: str, params: dict, max_retries: int = 4) -> dict:
     """GET with same retry/rotation logic."""
     global _session, _session_warmed
@@ -318,6 +384,215 @@ def parse_events_response(data: dict[str, Any]) -> list[dict]:
             "categoryName": category.get("name") or event.get("categoryName"),
         }))
     return matches
+
+
+_TOURNAMENT_EVENTS_CACHE_TTL = 60
+_tournament_events_cache: dict[str, tuple[float, list]] = {}
+
+
+def fetch_tournament_events(
+    tournament_id: str | int,
+    market_ids: str = "1,18,10,29,11,26,36,14",
+    bypass_cache: bool = False,
+) -> list[dict]:
+    """Fetch every SportyBet event for ONE competition via the pcEvents
+    endpoint, keyed by the raw Sportradar tournament id (e.g. 17 for
+    Premier League) -- the same unique_tournament_id already stored in
+    competition_special.TOP_30_COMPETITIONS. No name/date matching needed
+    to find the right competition; unlike fetch_matches_post's site-wide
+    ~300-event feed, this returns the competition's own full list so niche
+    curated leagues aren't starved by more popular ones crowding them out.
+    """
+    tid = str(tournament_id)
+    cache_key = f"{tid}:{market_ids}"
+    if not bypass_cache:
+        cached = _tournament_events_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < _TOURNAMENT_EVENTS_CACHE_TTL:
+            return cached[1]
+
+    payload = [{
+        "sportId": "sr:sport:1",
+        "marketId": market_ids,
+        "tournamentId": [[f"sr:tournament:{tid}"]],
+    }]
+    data = _post_json_with_retry(SPORTYBET_PC_EVENTS_URL, payload, max_retries=2, timeout=8)
+    tournaments = data.get("data") if isinstance(data, dict) else None
+    matches: list[dict] = []
+    if isinstance(tournaments, list):
+        for tournament in tournaments:
+            if not isinstance(tournament, dict):
+                continue
+            group = {"name": tournament.get("name"), "categoryName": None}
+            for event in tournament.get("events") or []:
+                parsed = _parse_event(event, group)
+                # pcEvents nests the real category (country) under each
+                # event's own sport.category, not on the tournament group.
+                if not parsed.get("category"):
+                    event_category = ((event.get("sport") or {}).get("category") or {})
+                    parsed["category"] = event_category.get("name")
+                parsed["sofascore_id"] = None  # never assume identity across providers
+                matches.append(parsed)
+    _tournament_events_cache[cache_key] = (time.monotonic(), matches)
+    return matches
+
+
+def fetch_team_info(competitor_id: str | int) -> dict[str, Any]:
+    """Raw SportyBet team profile for sr:competitor:<competitor_id>.
+
+    competitor_id here is SportyBet/Sportradar's own team id. It is NOT
+    confirmed to equal SofaScore's team id for the same team -- callers
+    using a SofaScore id as a guess must verify the returned team name
+    before trusting any data keyed off it.
+    """
+    url = SPORTYBET_TEAM_INFO_URL.format(competitor_id=competitor_id)
+    try:
+        data = _get_with_retry(url, {}, max_retries=2)
+    except Exception:
+        return {}
+    return data.get("data") or {} if isinstance(data, dict) else {}
+
+
+def _unwrap_team_list(payload: Any) -> list[dict]:
+    """Unwrap the nested shapes SportyBet's team endpoints use.
+
+    Confirmed live via curl (2026-09-06) for /teams/{id}/fixtures: the
+    outer "data" is {"flag", "hasNextPage", "data": [...]} -- the actual
+    match list sits under a SECOND nested "data" key, not "events"/"list"/
+    "posts" as originally guessed. Checking all of them keeps this working
+    if /results or /news turn out to use a different one of those names.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "events", "list", "posts"):
+            inner = payload.get(key)
+            if isinstance(inner, list):
+                return inner
+    return []
+
+
+def _parse_team_fixture(item: dict) -> dict:
+    """Normalize one /teams/{id}/fixtures or /results entry.
+
+    Confirmed live via curl (2026-09-06): this endpoint's match shape is
+    flat fixtureXxx fields plus nested homeTeam/awayTeam/tournament dicts
+    -- NOT the same shape _parse_event() expects from pcEvents /
+    wapConfigurableEventsByOrder, so it needs its own normalizer.
+    """
+    home_team = item.get("homeTeam") or {}
+    away_team = item.get("awayTeam") or {}
+    tournament = item.get("tournament") or {}
+    home_name = item.get("fixtureHomeTeamName") or home_team.get("name")
+    away_name = item.get("fixtureAwayTeamName") or away_team.get("name")
+    return {
+        "id": item.get("eventId"),
+        "name": f"{home_name} vs {away_name}",
+        "home_team": home_name,
+        "away_team": away_name,
+        "team_ids": {
+            "home": item.get("fixtureHomeTeamId") or home_team.get("id"),
+            "away": item.get("fixtureAwayTeamId") or away_team.get("id"),
+        },
+        "tournament": item.get("fixtureTournamentName") or tournament.get("name"),
+        "tournament_id": item.get("fixtureTournamentId") or tournament.get("id"),
+        "start_time": item.get("fixtureStartTime"),
+        "status": item.get("eventStatus"),
+        "match_status": item.get("eventMatchStatus"),
+        "score": item.get("eventScore"),
+        "raw_event": item,
+    }
+
+
+def _team_endpoint(
+    url_template: str,
+    competitor_id: str | int,
+    tournament_ids: list[str] | None,
+    size: int,
+    parser: Any = None,
+) -> list[dict]:
+    url = url_template.format(competitor_id=competitor_id)
+    params: dict[str, Any] = {"size": size}
+    if tournament_ids:
+        params["tournamentIds"] = ",".join(f"sr:tournament:{t}" if not str(t).startswith("sr:") else str(t) for t in tournament_ids)
+    try:
+        data = _get_with_retry(url, params, max_retries=2)
+    except Exception:
+        return []
+    if isinstance(data, dict) and data.get("bizCode") not in (None, 10000):
+        # Confirmed live via curl (2026-09-06): SportyBet rejects /fixtures
+        # and /results calls that omit tournamentIds with HTTP 200 +
+        # bizCode 19000 "Invalid", data: {} -- NOT an empty-but-valid
+        # result. Without this check that looked identical to "team has
+        # no fixtures/results" to every caller, since _get_with_retry only
+        # raises on HTTP-level errors and treats this as a normal 200.
+        print(f"[sportybet] team endpoint rejected ({url}): bizCode={data.get('bizCode')} msg={data.get('message')}")
+        return []
+    payload = data.get("data") if isinstance(data, dict) else None
+    items = _unwrap_team_list(payload)
+    if parser:
+        return [parser(item) for item in items if isinstance(item, dict)]
+    return items
+
+
+def fetch_team_fixtures(competitor_id: str | int, tournament_ids: list[str] | None = None, size: int = 10) -> list[dict]:
+    """Upcoming matches for one SportyBet team id -- see fetch_team_info's
+    caveat about competitor_id not being a confirmed SofaScore-id match.
+
+    tournament_ids is effectively REQUIRED, not optional: confirmed live
+    via curl (2026-09-06) that SportyBet rejects this call with bizCode
+    19000 "Invalid" when it's omitted (e.g. GET .../fixtures?size=10 alone
+    fails; adding &tournamentIds=sr:tournament:17 succeeds). Callers must
+    pass the specific tournament(s) they care about."""
+    return _team_endpoint(SPORTYBET_TEAM_FIXTURES_URL, competitor_id, tournament_ids, size, parser=_parse_team_fixture)
+
+
+def fetch_team_results(competitor_id: str | int, tournament_ids: list[str] | None = None, size: int = 10) -> list[dict]:
+    """Past match results for one SportyBet team id.
+
+    Same tournament_ids requirement as fetch_team_fixtures -- confirmed
+    live via curl (2026-09-06): omitting it returns bizCode 19000
+    "Invalid", not an empty-but-valid result."""
+    return _team_endpoint(SPORTYBET_TEAM_RESULTS_URL, competitor_id, tournament_ids, size, parser=_parse_team_fixture)
+
+
+def _parse_team_news_item(item: dict) -> dict:
+    """Normalize one /teams/{id}/news entry.
+
+    Confirmed live via curl (2026-09-06): every sampled item was source
+    ``video`` -- a highlight-clip caption from a match already played, NOT
+    a text injury/transfer article. Several were tagged to this team only
+    because it was the opponent in that clip's match (e.g. a Real Madrid
+    player quote tagged "Espanyol" because Real Madrid played Espanyol).
+    ``tagged_teams`` is kept so callers can see every team a clip
+    references, not just assume it's really about the team it was fetched
+    for -- feeding this to an LLM without that context risks it reading a
+    stray opponent soundbite as this team's own squad news.
+    """
+    tags = item.get("tags") or {}
+    return {
+        "id": item.get("id"),
+        "source_type": item.get("source"),  # e.g. "video" -- not text-article by default
+        "title": item.get("title") or item.get("headline"),
+        "description": item.get("description"),
+        "byline": item.get("byLine"),
+        "published_time": item.get("publishedTime"),  # epoch ms
+        "tagged_teams": [t.get("name") for t in (tags.get("team") or []) if isinstance(t, dict) and t.get("name")],
+        "tagged_league": [t.get("name") for t in (tags.get("league") or []) if isinstance(t, dict) and t.get("name")],
+        "slug": item.get("slug"),
+        "raw_item": item,
+    }
+
+
+def fetch_team_news(competitor_id: str | int, size: int = 10) -> list[dict]:
+    """Team news/highlight items from SportyBet's own team page.
+
+    Raw provider content, mostly video-clip captions about matches already
+    played rather than forward-looking injury/lineup news -- see
+    _parse_team_news_item's docstring. Callers feeding this to the LLM must
+    label it as unverified reported content, note it may be about an
+    opponent rather than this team, and never treat it as established fact
+    (see app/enrichment/team_news.py)."""
+    return _team_endpoint(SPORTYBET_TEAM_NEWS_URL, competitor_id, None, size, parser=_parse_team_news_item)
 
 
 def fetch_live_matches_post() -> list[dict]:

@@ -166,7 +166,16 @@ def _sofa_event_to_buffer_doc(event: dict[str, Any], match_date: str) -> dict[st
         "sofascore_event": event,
         "sofascore_name": name,
         "source": "sofascore",
-        "sportybet_id": match_id,
+        # This whole pipeline exists for deployments where SportyBet's API
+        # is IP-blocked (see module docstring) -- there is never a real
+        # SportyBet event behind this doc. `sportybet_id` used to be set
+        # to `match_id` (the "sofa:<id>" string above), which is exactly
+        # the bug this project shipped live with: a SofaScore-derived id
+        # sitting in the field every other consumer reads expecting a
+        # real, bookable SportyBet event id. Confirmed live (2026-09-06)
+        # as a second, independent write site for that same bug, found
+        # while auditing match_buffer for it. None here, always.
+        "sportybet_id": None,
         "sportybet_name": name,
         "sofascore_match_status": "matched",
         "markets": [],
@@ -413,7 +422,15 @@ def enrich_sofa_pipeline(
 
             doc = {
                 **existing,
-                "sportybet_id": match_id,
+                # Same bug as _sofa_event_to_buffer_doc above, but worse
+                # here: `**existing` was spread first, so this used to
+                # unconditionally OVERWRITE a genuinely-correct sportybet_id
+                # (e.g. one a prior SportyBet merge had already attached)
+                # with the fake sofa-based match_id on every single enrich
+                # pass. Preserve whatever was already there instead of
+                # fabricating one -- this pipeline never has real SportyBet
+                # data of its own to contribute.
+                "sportybet_id": existing.get("sportybet_id"),
                 "sofascore_id": item.get("sofascore_id"),
                 "match_id": match_id,
                 "source": "sofascore",

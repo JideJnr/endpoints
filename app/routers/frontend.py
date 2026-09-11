@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+from app.auth.dependencies import require_admin
 from app.utils.match_helpers import _normalise_selection
 from app.storage.db import db_conn
 from app.storage.buffer import (
@@ -122,8 +123,8 @@ def get_similar_matches(
                     "draw_implied_pct": round(target_implied[1] * 100, 1),
                     "away_implied_pct": round(target_implied[2] * 100, 1),
                 }
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.debug("similar_matches: implied-odds calc failed for %s: %s", sportybet_id, exc)
         matches = find_similar_matches(doc, limit=limit)
     except Exception as exc:
         _logger.exception("Similar matches computation failed for %s", sportybet_id)
@@ -178,6 +179,7 @@ def get_match_sporty_info(sportybet_id: str):
     try:
         refresh = refresh_sporty_match_state(sportybet_id)
     except Exception as exc:
+        _logger.warning("sporty refresh failed for %s: %s", sportybet_id, exc)
         refresh = {"status": "error", "detail": str(exc)}
 
     return {
@@ -323,6 +325,7 @@ def get_sofascore_candidates(sportybet_id: str):
                         seen_ids.add(eid)
     except Exception as exc:
         # SofaScore unreachable / rate-limited — return empty list with a clear message
+        _logger.debug("sofascore candidates lookup failed for %s: %s", sportybet_id, exc)
         return {
             "status": "error",
             "sportybet_id": sportybet_id,
@@ -402,14 +405,16 @@ def match_sofascore_candidate(
     if is_live_match(doc):
         try:
             sofa = next((event for event in fetch_live_events() if str(event.get("id")) == str(sofa_id)), None)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("match_sofascore_candidate: live lookup failed for %s: %s", sofa_id, exc)
             sofa = None
     for target_date in dates:
         if sofa:
             break
         try:
             events = fetch_all_scheduled_events(target_date)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("match_sofascore_candidate: scheduled lookup failed for %s on %s: %s", sofa_id, target_date, exc)
             continue
         sofa = next((event for event in events if str(event.get("id")) == str(sofa_id)), None)
         if sofa:
@@ -477,6 +482,7 @@ def refresh_predictions_today():
         try:
             refresh_state[scope] = refresh_sporty_buffer_scope(scope)
         except Exception as exc:
+            _logger.warning("refresh_predictions_today: %s buffer refresh failed: %s", scope, exc)
             refresh_state[scope] = {"status": "error", "error": str(exc)}
 
     # 2. Re-enrich active buffered matches before predicting so odds/Sofa/detail stay in sync.
@@ -521,7 +527,8 @@ def refresh_predictions_today():
             skipped_inactive += 1 if "inactive" in str(exc).lower() else 0
             errors += 0 if "inactive" in str(exc).lower() else 1
             agent_runs.append({"match_id": match_id, "status": "failed", "message": str(exc)})
-        except Exception:
+        except Exception as exc:
+            _logger.warning("refresh_predictions_today: prediction failed for %s: %s", match_id, exc)
             errors += 1
 
     return {
@@ -574,7 +581,8 @@ def get_predictions_today():
                 try:
                     import json as _json
                     doc = _json.loads(row["raw_enriched"] or row["raw_sporty"] or "{}")
-                except Exception:
+                except Exception as exc:
+                    _logger.debug("get_predictions_today: raw doc parse failed for %s: %s", row["match_id"], exc)
                     doc = {"period": row["period"], "is_finished": bool(row["is_finished"])}
                 state = classify_match_state(doc)
                 buffer_status[str(row["match_id"])] = {
@@ -583,8 +591,8 @@ def get_predictions_today():
                     "is_finished": bool(row["is_finished"] or state.get("is_finished")),
                     "match_state": state,
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        _logger.warning("get_predictions_today: buffer_status enrichment failed: %s", exc)
 
     role_rows = _load_role_memory_rows()
 
@@ -632,8 +640,8 @@ def get_predictions_today():
                 _backfill_role_learning(p, regime_picks, mid, role_rows)
                 best = _learned_best_pick(regime_picks)
                 p["best_pick"] = best
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("get_predictions_today: regime/role attach failed for %s: %s", mid, exc)
 
         seen[mid] = p
     sorted_preds = sorted(
@@ -647,7 +655,8 @@ def get_predictions_today():
         from app.utils.portfolio import filter_correlated, portfolio_summary
         sorted_preds = filter_correlated(sorted_preds)
         summary = portfolio_summary(sorted_preds)
-    except Exception:
+    except Exception as exc:
+        _logger.warning("get_predictions_today: portfolio summary failed: %s", exc)
         summary = {}
 
     return {
@@ -780,8 +789,8 @@ def cleanup_finished_matches():
             from app.storage.buffer import _archive_finished_locally
             _archive_finished_locally(match_id)
             archived += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning("cleanup_finished_matches: local archive failed for %s: %s", match_id, exc)
 
     # Second pass: cleanup by period string + stale rows + 90+ + ghost
     result = cleanup_buffer()
@@ -892,8 +901,8 @@ def get_world_cup_special_settings():
 
 
 @router.post("/competition-special/world-cup/settings")
-def post_world_cup_special_settings(payload: dict[str, Any] = Body(...)):
-    """Enable/disable the World Cup special lane and adjust tournament ids/dates."""
+def post_world_cup_special_settings(payload: dict[str, Any] = Body(...), _admin: dict = Depends(require_admin)):
+    """Enable/disable the World Cup special lane and adjust tournament ids/dates. Admin only."""
     from app.competition.competition_special import update_competition_settings
 
     return {"status": "success", "settings": update_competition_settings("world-cup-2026", payload)}
@@ -904,8 +913,9 @@ def post_world_cup_special_sync(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     limit_days: int = Query(default=60, ge=1, le=90),
+    _admin: dict = Depends(require_admin),
 ):
-    """Pull the World Cup fixture list into the dedicated competition buffer."""
+    """Pull the World Cup fixture list into the dedicated competition buffer. Admin only."""
     from app.competition.competition_special import sync_competition_fixtures
 
     return sync_competition_fixtures(
@@ -920,8 +930,9 @@ def post_world_cup_special_sync(
 def post_world_cup_special_enrich_predict(
     limit: int = Query(default=12, ge=1, le=80),
     allow_repeat: bool = False,
+    _admin: dict = Depends(require_admin),
 ):
-    """Enrich World Cup rows from SofaScore and run the special prediction path."""
+    """Enrich World Cup rows from SofaScore and run the special prediction path. Admin only."""
     from app.competition.competition_special import enrich_predict_competition
 
     return enrich_predict_competition("world-cup-2026", limit=limit, allow_repeat=allow_repeat)
@@ -960,7 +971,10 @@ def get_competition_special_settings(competition_key: str):
 
 
 @router.post("/competition-special/{competition_key}/settings")
-def post_competition_special_settings(competition_key: str, payload: dict[str, Any] = Body(...)):
+def post_competition_special_settings(
+    competition_key: str, payload: dict[str, Any] = Body(...), _admin: dict = Depends(require_admin)
+):
+    """Admin only — see the matching isAdmin check in the frontend's competition detail page."""
     from app.competition.competition_special import update_competition_settings
 
     return {"status": "success", "settings": update_competition_settings(competition_key, payload)}
@@ -972,7 +986,9 @@ def post_competition_special_sync(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     limit_days: int = Query(default=7, ge=1, le=90),
+    _admin: dict = Depends(require_admin),
 ):
+    """Admin only."""
     from app.competition.competition_special import sync_competition_fixtures
 
     return sync_competition_fixtures(competition_key, start_date=start_date, end_date=end_date, limit_days=limit_days)
@@ -983,7 +999,9 @@ def post_competition_special_enrich_predict(
     competition_key: str,
     limit: int = Query(default=12, ge=1, le=80),
     allow_repeat: bool = False,
+    _admin: dict = Depends(require_admin),
 ):
+    """Admin only."""
     from app.competition.competition_special import enrich_predict_competition
 
     return enrich_predict_competition(competition_key, limit=limit, allow_repeat=allow_repeat)
@@ -1007,6 +1025,7 @@ def get_competition_special_status(competition_key: str):
 def get_competition_team_watchers(
     competition_key: str,
     limit: int = Query(default=80, ge=1, le=200),
+    _admin: dict = Depends(require_admin),
 ):
     from app.competition.competition_special import list_team_watchers
 
@@ -1014,16 +1033,22 @@ def get_competition_team_watchers(
 
 
 @router.get("/competition-special/{competition_key}/team-watchers/{team_id}")
-def get_competition_team_watcher(competition_key: str, team_id: str):
+def get_competition_team_watcher(competition_key: str, team_id: str, _admin: dict = Depends(require_admin)):
     from app.competition.competition_special import get_team_watcher
 
     return get_team_watcher(competition_key, team_id)
 
 
+# ── Team-watcher management — admin only ──────────────────────────────────────
+# This whole prefix backs the /team-watchers and
+# /competition/:competitionKey/team/:teamKey ops pages, which are
+# RequireAdmin-gated in the frontend. No other page calls these.
+
 @router.get("/team-watchers")
 def get_ai_team_watchers(
     limit: int = Query(default=100, ge=1, le=300),
     league_name: Optional[str] = None,
+    _admin: dict = Depends(require_admin),
 ):
     from app.team_watcher.team_watcher import list_watchers
 
@@ -1031,28 +1056,28 @@ def get_ai_team_watchers(
 
 
 @router.get("/team-watchers/inspect-sporty")
-def inspect_sporty_team_watcher_ids(limit: int = Query(default=20, ge=1, le=100)):
+def inspect_sporty_team_watcher_ids(limit: int = Query(default=20, ge=1, le=100), _admin: dict = Depends(require_admin)):
     from app.team_watcher.team_watcher import inspect_sporty_team_ids
 
     return inspect_sporty_team_ids(limit=limit)
 
 
 @router.get("/team-watchers/{team_key:path}")
-def get_ai_team_watcher(team_key: str, limit: int = Query(default=30, ge=1, le=100)):
+def get_ai_team_watcher(team_key: str, limit: int = Query(default=30, ge=1, le=100), _admin: dict = Depends(require_admin)):
     from app.team_watcher.team_watcher import get_watcher
 
     return get_watcher(team_key, limit=limit)
 
 
 @router.post("/team-watchers/backfill")
-def backfill_ai_team_watchers(limit: int = Query(default=200, ge=1, le=1000)):
+def backfill_ai_team_watchers(limit: int = Query(default=200, ge=1, le=1000), _admin: dict = Depends(require_admin)):
     from app.team_watcher.team_watcher import backfill_from_finished
 
     return backfill_from_finished(limit=limit)
 
 
 @router.post("/team-watchers/backfill-ids")
-def backfill_team_watcher_team_ids(limit: int = Query(default=5000, ge=1, le=10000)):
+def backfill_team_watcher_team_ids(limit: int = Query(default=5000, ge=1, le=10000), _admin: dict = Depends(require_admin)):
     """Backfill missing sporty_team_id and sofascore_team_id on existing team watcher rows.
     Scans the match buffer and finished match archive to re-observe matches involving
     teams with missing IDs. Safe to call multiple times — COALESCE logic never
@@ -1063,7 +1088,7 @@ def backfill_team_watcher_team_ids(limit: int = Query(default=5000, ge=1, le=100
 
 
 @router.post("/team-watchers/rebuild-profiles")
-def rebuild_ai_team_watcher_profiles(limit: int = Query(default=5000, ge=1, le=20000)):
+def rebuild_ai_team_watcher_profiles(limit: int = Query(default=5000, ge=1, le=20000), _admin: dict = Depends(require_admin)):
     """Rebuild profile_json for all watchers where it is still stored as '{}'."""
     from app.team_watcher.team_watcher import rebuild_all_profiles
 
@@ -1071,7 +1096,7 @@ def rebuild_ai_team_watcher_profiles(limit: int = Query(default=5000, ge=1, le=2
 
 
 @router.post("/team-watchers/rebuild-tournament-profiles")
-def rebuild_tournament_profiles(limit: int = Query(default=5000, ge=1, le=20000)):
+def rebuild_tournament_profiles(limit: int = Query(default=5000, ge=1, le=20000), _admin: dict = Depends(require_admin)):
     """Rebuild tournament-scoped profiles for all team-tournament combinations."""
     from app.team_watcher.team_watcher import rebuild_tournament_profiles
 
@@ -1079,7 +1104,7 @@ def rebuild_tournament_profiles(limit: int = Query(default=5000, ge=1, le=20000)
 
 
 @router.get("/team-watchers/{team_key:path}/tournaments")
-def get_team_tournaments(team_key: str):
+def get_team_tournaments(team_key: str, _admin: dict = Depends(require_admin)):
     """List all tournaments a team has cached profiles for."""
     import sqlite3
     from app.team_watcher.team_watcher import _get_tournament_profile, _resolve_watcher_row, init_team_watcher_tables
@@ -1120,7 +1145,7 @@ def get_team_tournaments(team_key: str):
 
 
 @router.get("/team-watchers/{team_key:path}/tournaments/{tournament_key}")
-def get_team_tournament_profile(team_key: str, tournament_key: str):
+def get_team_tournament_profile(team_key: str, tournament_key: str, _admin: dict = Depends(require_admin)):
     """Get the tournament-scoped profile for a specific team-tournament combination."""
     import sqlite3
     from app.team_watcher.team_watcher import _get_tournament_profile, _resolve_watcher_row, init_team_watcher_tables
@@ -1148,7 +1173,7 @@ def get_team_tournament_profile(team_key: str, tournament_key: str):
 
 
 @router.post("/team-watchers/regrade-void")
-def regrade_void_tw_predictions(limit: int = Query(default=2000, ge=1, le=10000)):
+def regrade_void_tw_predictions(limit: int = Query(default=2000, ge=1, le=10000), _admin: dict = Depends(require_admin)):
     """Regrade all TW predictions that were incorrectly stored as 'void' due
     to a bug in observe_match that omitted scores from the grading result dict.
     Safe to call multiple times — rows already corrected to win/loss are not touched."""
@@ -1158,7 +1183,7 @@ def regrade_void_tw_predictions(limit: int = Query(default=2000, ge=1, le=10000)
 
 
 @router.post("/team-watchers/observe-match/{match_id:path}")
-def observe_match_for_ai_team_watchers(match_id: str):
+def observe_match_for_ai_team_watchers(match_id: str, _admin: dict = Depends(require_admin)):
     from app.team_watcher.team_watcher import observe_finished_match_by_id
 
     return observe_finished_match_by_id(match_id)
@@ -1306,8 +1331,8 @@ def get_competition_analysis_history(
 
 
 @router.post("/competition-special/{competition_key}/analysis/trigger")
-def trigger_competition_analysis(competition_key: str):
-    """Manually trigger post-matchday LLM analysis for a competition."""
+def trigger_competition_analysis(competition_key: str, _admin: dict = Depends(require_admin)):
+    """Manually trigger post-matchday LLM analysis for a competition. Admin only."""
     _guard_competition_key(competition_key)
     from app.competition.competition_analyser import run_competition_analysis
 
@@ -1528,7 +1553,8 @@ def _engine_work_rows(limit: int = 3000) -> list[dict[str, Any]]:
         for row in conn.execute(query, (limit,)).fetchall():
             try:
                 signals = json.loads(row["signals_json"] or "[]")
-            except Exception:
+            except Exception as exc:
+                _logger.debug("_engine_work_rows: signals parse failed for %s: %s", row["match_id"] if "match_id" in row.keys() else "?", exc)
                 signals = []
             rows.append({**dict(row), "signals": signals})
     return rows
@@ -1583,13 +1609,13 @@ def _engine_projection(engine_id: str, limit: int = 3000) -> dict[str, Any]:
 
 
 @router.get("/engines/dashboard")
-def get_engines_dashboard(limit: int = Query(default=3000, ge=100, le=20000)):
+def get_engines_dashboard(limit: int = Query(default=3000, ge=100, le=20000), _admin: dict = Depends(require_admin)):
     projections = [_engine_projection(engine_id, limit=limit) for engine_id in ENGINE_CATALOG]
     return {"status": "success", "engines": projections, "source": "prediction_history"}
 
 
 @router.get("/engines/{engine_id}/work")
-def get_engine_work(engine_id: str, limit: int = Query(default=3000, ge=100, le=20000)):
+def get_engine_work(engine_id: str, limit: int = Query(default=3000, ge=100, le=20000), _admin: dict = Depends(require_admin)):
     return {"status": "success", **_engine_projection(engine_id, limit=limit), "source": "prediction_history"}
 
 
@@ -1717,7 +1743,8 @@ def grade_results(hours_back: int = 24):
             from app.monitoring.self_learner import _decision_signals_for_row
 
             signals = _decision_signals_for_row(row)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("grade_results: decision-signals computation failed for %s: %s", row["match_id"], exc)
             signals = json.loads(row["signals_json"]) if row["signals_json"] else []
         try:
             tournament = row["league_name"] or ""
@@ -1749,10 +1776,10 @@ def grade_results(hours_back: int = 24):
                         selection=row["selection"],
                         confidence=row["confidence"],
                     )
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as exc:
+                _logger.debug("grade_results: local signal-outcome store failed for %s: %s", row["match_id"], exc)
+        except Exception as exc:
+            _logger.warning("grade_results: post-grade processing failed for %s (still counted as graded): %s", row["match_id"], exc)
         graded += 1
 
     # archive buffer rows that now have a result
@@ -1776,8 +1803,8 @@ def grade_results(hours_back: int = 24):
         try:
             archive_finished_match_from_buffer(str(row["match_id"]))
             archived += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning("grade_results: buffer archive failed for %s: %s", row["match_id"], exc)
 
     sofascore = {"graded": 0, "skipped": 0, "dates": [], "errors": {}}
     # Collect distinct match dates from pending predictions rather than a fixed
@@ -1799,6 +1826,7 @@ def grade_results(hours_back: int = 24):
             sofascore["skipped"] += int(result.get("skipped") or 0)
             sofascore["dates"].append({"date": target_date, **result})
         except Exception as exc:
+            _logger.warning("grade_results: sofascore grading failed for %s: %s", target_date, exc)
             sofascore["errors"][target_date] = str(exc)
 
     overdue = grade_overdue_predictions(hours_after_kickoff=2, limit=500)
@@ -1808,6 +1836,7 @@ def grade_results(hours_back: int = 24):
         from app.storage.league_memory import grade_orphaned_predictions
         orphaned = grade_orphaned_predictions(limit=1000)
     except Exception as _exc:
+        _logger.warning("grade_results: orphaned-prediction grading failed: %s", _exc)
         orphaned = {"status": "error", "reason": str(_exc), "graded": 0}
 
     # AI analysis for graded matches
@@ -1822,8 +1851,8 @@ def grade_results(hours_back: int = 24):
                 continue
             _run_ai_analysis_on_graded_match(finished)
             ai_analysis_count += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("grade_results: AI analysis failed for a graded match: %s", exc)
 
     return {
         "status": "ok",
@@ -2005,7 +2034,8 @@ def get_signal_matches(
     for row in rows:
         try:
             context = json.loads(row["context_json"] or "{}")
-        except Exception:
+        except Exception as exc:
+            _logger.debug("get_signal_matches: context parse failed for %s: %s", row["match_id"], exc)
             context = {}
         signal_value = context.get("signal") if isinstance(context.get("signal"), dict) else {}
         if not signal_value:
@@ -2014,7 +2044,8 @@ def get_signal_matches(
             # pull it from there instead of losing decimal_odds/edge_percent.
             try:
                 signals_list = json.loads(row["signals_json"] or "[]")
-            except Exception:
+            except Exception as exc:
+                _logger.debug("get_signal_matches: signals parse failed for %s: %s", row["match_id"], exc)
                 signals_list = []
             for sig in signals_list:
                 if sig.get("name") == signal_name and isinstance(sig.get("value"), dict):
@@ -2065,6 +2096,7 @@ def get_model_explorer(
     selection_key: str = Query(default=""),
     min_samples: int = Query(default=1, ge=1, le=100),
     limit: int = Query(default=2000, ge=1, le=5000),
+    _admin: dict = Depends(require_admin),
 ):
     """Prediction history grouped by pick/model so the UI can rank by accuracy."""
     import json
@@ -2190,7 +2222,8 @@ def get_model_explorer(
         signals = json.loads(row["signals_json"] or "[]")
         try:
             context = json.loads(row["context_json"] or "{}")
-        except Exception:
+        except Exception as exc:
+            _logger.debug("get_model_explorer: context parse failed for %s: %s", row["match_id"], exc)
             context = {}
         market_intent = context.get("market_intent") if isinstance(context.get("market_intent"), dict) else classify_market_intent(row["pick_type"] or "", row["selection"] or "")
         raw_count += 1
@@ -2849,7 +2882,8 @@ def _archived_match_detail(match_id: str) -> dict[str, Any] | None:
     try:
         from app.storage.mongo_store import get_finished_match
         archived = get_finished_match(match_id)
-    except Exception:
+    except Exception as exc:
+        _logger.debug("_archived_match_detail: mongo lookup failed for %s: %s", match_id, exc)
         archived = None
     if not archived:
         archived = _local_finished_match(match_id)
@@ -2914,7 +2948,8 @@ def _local_finished_match(match_id: str) -> dict[str, Any] | None:
         doc["_id"] = str(match_id)
         doc["archive_source"] = "local_sqlite"
         return doc
-    except Exception:
+    except Exception as exc:
+        _logger.debug("_local_finished_match: lookup failed for %s: %s", match_id, exc)
         return None
 
 
@@ -2992,7 +3027,8 @@ def _history_match_detail(match_id: str) -> dict[str, Any] | None:
             "archive_source": "prediction_history",
             "raw": {"prediction_history": prediction},
         }
-    except Exception:
+    except Exception as exc:
+        _logger.debug("_history_match_detail: lookup failed for %s: %s", match_id, exc)
         return None
 
 
@@ -3010,8 +3046,8 @@ def _find_sofascore_event(
             match = next((event for event in fetch_live_events() if str(event.get("id")) == sofa_id), None)
             if match and is_usable_event_for_mode(match, live=True):
                 return match
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("_find_sofascore_event: live lookup failed for %s: %s", sofa_id, exc)
 
     dates = []
     for value in (match_date, dt.today().isoformat()):
@@ -3020,7 +3056,8 @@ def _find_sofascore_event(
     for target_date in dates:
         try:
             events = fetch_all_scheduled_events(target_date)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("_find_sofascore_event: scheduled lookup failed for %s on %s: %s", sofa_id, target_date, exc)
             continue
         match = next((event for event in events if str(event.get("id")) == sofa_id), None)
         if match and is_usable_event_for_mode(match, live=False):
@@ -3104,7 +3141,8 @@ def _candidate_score(event: dict[str, Any], doc: dict[str, Any]) -> float:
             },
             event,
         )
-    except Exception:
+    except Exception as exc:
+        _logger.debug("_candidate_score: primary scoring failed, using fuzzy fallback: %s", exc)
         sofa_name = event.get("name") or ""
         sporty_name = doc.get("sportybet_name") or doc.get("name") or ""
         direct = SequenceMatcher(None, sofa_name.lower(), sporty_name.lower()).ratio()
@@ -3175,7 +3213,8 @@ def _grade_signal_stats(graded: int) -> dict[str, Any]:
         stats = get_local_signal_stats(min_samples=3)
         top = stats.get("signals", [])[:5]
         return {"top_signals": top, "scope": "device"}
-    except Exception:
+    except Exception as exc:
+        _logger.warning("_grade_signal_stats: local signal stats failed: %s", exc)
         return {}
 
 
@@ -3219,9 +3258,9 @@ def get_brain_summary():
 
 
 @router.post("/analytics/brain/learn")
-def trigger_learning_cycle():
+def trigger_learning_cycle(_admin: dict = Depends(require_admin)):
     """
-    Manually trigger a self-learning cycle.
+    Manually trigger a self-learning cycle. Admin only.
     Normally runs automatically after every grading cycle (every 6 hours).
     Use this to force an immediate update after manual grading.
     """
@@ -3318,6 +3357,7 @@ def get_brain_health():
             "model_weights_tuned": len(summary.get("model_weights", [])),
         }
     except Exception as exc:
+        _logger.warning("get_brain_health: self_learner summary failed: %s", exc)
         health["self_learner"] = {"status": "error", "detail": str(exc)}
 
     try:
@@ -3329,6 +3369,7 @@ def get_brain_health():
             "source": "learned" if any(abs(float(weights.get(k, 0)) - v) > 0.001 for k, v in defaults.items()) else "default",
         }
     except Exception as exc:
+        _logger.warning("get_brain_health: ensemble weights failed: %s", exc)
         health["ensemble_weights"] = {"status": "error", "detail": str(exc)}
 
     try:
@@ -3340,6 +3381,7 @@ def get_brain_health():
             "total_entries": clv.get("total_entries"),
         }
     except Exception as exc:
+        _logger.warning("get_brain_health: clv summary failed: %s", exc)
         health["clv"] = {"status": "error", "detail": str(exc)}
 
     try:
@@ -3349,6 +3391,7 @@ def get_brain_health():
             "bands": len(cal) if isinstance(cal, list) else 0,
         }
     except Exception as exc:
+        _logger.warning("get_brain_health: calibration table failed: %s", exc)
         health["calibration"] = {"status": "error", "detail": str(exc)}
 
     # Overall brain score

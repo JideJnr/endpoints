@@ -251,6 +251,45 @@ def _ensure_competition_stat_profiles_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_social_posts_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists social_posts (
+            id integer primary key autoincrement,
+            platform text not null default 'x',
+            betbuilder_id integer,
+            match_ids_json text not null default '[]',
+            share_code text,
+            thread_json text not null default '[]',
+            post_ids_json text not null default '[]',
+            status text not null default 'pending',
+            dry_run integer not null default 1,
+            error text,
+            posted_at text,
+            created_at text not null default current_timestamp
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_social_posts_status on social_posts(status)")
+    conn.execute("create index if not exists idx_social_posts_created on social_posts(created_at)")
+
+
+def _ensure_users_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists users (
+            id integer primary key autoincrement,
+            email text not null unique,
+            password_hash text not null,
+            password_salt text not null,
+            display_name text not null default '',
+            role text not null default 'user',
+            created_at text not null default current_timestamp,
+            last_login_at text
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_users_role on users(role)")
 
 
 # Backward-compatible underscore alias
@@ -657,6 +696,8 @@ def _init_db_unlocked() -> None:
             )
             """
         )
+        _ensure_social_posts_table(conn)
+        _ensure_users_table(conn)
         conn.execute(
             """
             create table if not exists engine_state (
@@ -977,6 +1018,8 @@ def _init_db() -> None:
                 _ensure_specialist_performance_table(conn)
                 _ensure_prediction_loss_analysis_table(conn)
                 _ensure_competition_stat_profiles_table(conn)
+                _ensure_social_posts_table(conn)
+                _ensure_users_table(conn)
             _DB_SCHEMA_READY = True
             return
         try:

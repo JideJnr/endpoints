@@ -3,6 +3,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # Hardcoded fallback weights — overridden by learned weights when enough data exists
 #
@@ -63,8 +67,8 @@ def _get_weights() -> dict[str, float]:
                 _cached_weights = learned
                 _weights_are_learned = True
                 return _cached_weights
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("ensemble: learned weights lookup failed, using base weights: %s", exc)
         _cached_weights = dict(_BASE_WEIGHTS)
         _weights_are_learned = False
     return _cached_weights
@@ -320,5 +324,49 @@ def ensemble_prediction(
         "weights_source": weights_source,
         "models_used": models_used,
     }
+    # A 1X2 winner alone is not a complete football prediction.  The goal
+    # models already supply score grids, so keep their correlated forecasts in
+    # one family here as well.  This avoids the old UI/API behaviour where a
+    # Poisson scoreline sat beside an unrelated ensemble winner.
+    scoreline = _goal_family_scoreline(poisson, dixon)
+    if scoreline:
+        result.update(scoreline)
     result.update(diversity)
     return result
+
+
+def _goal_family_scoreline(
+    poisson: dict[str, Any] | None,
+    dixon: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Blend Poisson/Dixon-Coles score grids without double-counting them.
+
+    The two are variants of the same goal-rate evidence, therefore each gets
+    an equal share of one goal-model family, rather than becoming two votes.
+    """
+    grids: list[dict[str, float]] = []
+    for model in (poisson, dixon):
+        if not isinstance(model, dict) or model.get("error"):
+            continue
+        grid: dict[str, float] = {}
+        for item in model.get("top_scorelines") or []:
+            if not isinstance(item, dict) or not item.get("score"):
+                continue
+            try:
+                grid[str(item["score"])] = float(str(item.get("probability") or 0).rstrip("%"))
+            except (TypeError, ValueError):
+                continue
+        if grid:
+            grids.append(grid)
+    if not grids:
+        return {}
+    combined: dict[str, float] = {}
+    for grid in grids:
+        for score, probability in grid.items():
+            combined[score] = combined.get(score, 0.0) + probability / len(grids)
+    ranked = sorted(combined.items(), key=lambda item: item[1], reverse=True)
+    score, probability = ranked[0]
+    return {
+        "most_likely_scoreline": {"score": score, "probability": round(probability, 2), "source": "goal_model_family"},
+        "top_scorelines": [{"score": s, "probability": round(p, 2)} for s, p in ranked[:5]],
+    }

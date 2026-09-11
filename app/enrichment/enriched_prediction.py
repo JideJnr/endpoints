@@ -114,13 +114,28 @@ def _apply_feature_importance(signals: list[dict[str, Any]], league: str = "") -
 
 
 def _aggregator_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert internal signal shape into SignalAggregator input shape."""
+    """Convert internal signals without discarding model distributions.
+
+    Non-model signals are still represented by their directional impact. Model
+    signals retain their full probability triple so the final winner is chosen
+    from model-plus-signal probabilities, not an after-the-fact confidence
+    adjustment.
+    """
     converted: list[dict[str, Any]] = []
     for signal in signals or []:
         name = str(signal.get("name") or signal.get("signal_name") or "")
         if not name or name == "signal_aggregator":
             continue
-        value = signal.get("impact")
+        raw_value = signal.get("value")
+        is_model_signal = name in {
+            "goal_model_family", "poisson_model", "dixon_coles_model",
+            "elo_model", "ensemble_model",
+        } or (
+            isinstance(raw_value, dict)
+            and isinstance(raw_value.get("probabilities"), dict)
+            and any(key in raw_value["probabilities"] for key in ("home_win", "away_win"))
+        )
+        value = raw_value if is_model_signal else signal.get("impact")
         if value is None:
             value = signal.get("value") or signal.get("signal_value") or 0
         converted.append({
@@ -192,8 +207,7 @@ def _apply_preselection_learning(
         return {"applied": False, "reason": "empty_ensemble_probabilities"}
     outcomes = {key: value / total * 100.0 for key, value in outcomes.items()}
     ranked = sorted(outcomes.values(), reverse=True)
-    if len(ranked) >= 2 and ranked[0] - ranked[1] >= 12.0:
-        return {"applied": False, "reason": "clear_model_favourite", "probabilities": outcomes}
+    clear_model_favourite = len(ranked) >= 2 and ranked[0] - ranked[1] >= 12.0
 
     league = doc.get("tournament") or doc.get("category") or "__global__"
     if isinstance(league, dict):
@@ -208,6 +222,18 @@ def _apply_preselection_learning(
         "draw": float(context.get("draw_prob") or 0.0) * 100.0,
         "away_win": float(context.get("away_prob") or 0.0) * 100.0,
     }
+    # The aggregator now contains the model prior plus learned, independent
+    # signal evidence.  Make that combined distribution the actual decision
+    # surface.  Previously this function could only move a close ensemble
+    # call by a tiny post-hoc adjustment, so models and signals still stood
+    # alone in the final selection.
+    model_aware_context = bool(context.get("model_sources"))
+    if model_aware_context and sum(aggregator_probs.values()) > 0:
+        outcomes = aggregator_probs
+    elif clear_model_favourite:
+        # Preserve the conservative legacy behaviour when a caller supplies
+        # no model-bearing signals (important for partial/fallback paths).
+        return {"applied": False, "reason": "clear_model_favourite", "probabilities": outcomes}
     directional_count = sum(
         1 for sig in _aggregator_signals(signals)
         if _normalize_aggregator_signal(str(sig.get("name") or ""), sig.get("value")).get("direction")
@@ -215,7 +241,7 @@ def _apply_preselection_learning(
     # The aggregator's league distribution is only trusted when it is backed
     # by per-league history (rather than its generic 45/30/25 fallback) and
     # there are several independent directional observations.
-    if context.get("base_probs_source") == "learned" and directional_count >= 3:
+    if not model_aware_context and context.get("base_probs_source") == "learned" and directional_count >= 3:
         for key in outcomes:
             outcomes[key] = outcomes[key] * 0.90 + aggregator_probs[key] * 0.10
 
@@ -243,6 +269,9 @@ def _apply_preselection_learning(
     ensemble["confidence"] = adjusted[max(adjusted, key=adjusted.get)]
     ensemble["preselection_learning"] = {
         "applied": True,
+        "decision_source": "model_signal_combination" if model_aware_context else "legacy_signal_adjustment",
+        "model_sources": context.get("model_sources") or [],
+        "signal_blend_weight": context.get("signal_blend_weight") or 0.0,
         "signal_aggregator_used": context.get("base_probs_source") == "learned" and directional_count >= 3,
         "aggregator_base_probs_source": context.get("base_probs_source"),
         "directional_signal_count": directional_count,
@@ -943,10 +972,36 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
             MAX_LEAGUE_ADJUSTMENT = 10
             try:
                 from app.monitoring.self_learner import get_league_accuracy
-                _league_key = doc.get("tournament") or doc.get("category") or ""
-                if isinstance(_league_key, dict):
-                    _league_key = _league_key.get("name") or ""
-                _lacc = get_league_accuracy(str(_league_key))
+                # league_accuracy.league_key is built (self_learner.py) by
+                # slugifying prediction_history.league_name, which is
+                # ALWAYS stored as "<country> <bare league name>" (e.g.
+                # "Italy Serie A", "Belgium Pro League" -- confirmed
+                # 2026-09-09 while fixing the same-shaped bug in
+                # league_strength.py). The old `doc.get("tournament") or
+                # doc.get("category")` here used whichever was truthy as
+                # the WHOLE key -- doc.get("category") is actually this
+                # match's COUNTRY (see the identical extraction at line
+                # ~2040/~3412 below), never a league name, and even
+                # doc.get("tournament") alone is just the bare league name
+                # with no country -- so the slug built here almost never
+                # matched a real league_accuracy row (confirmed live:
+                # this adjustment fired 0 times across 421 recent graded
+                # picks). Rebuilding it the same "<country> <league>" way
+                # fixes that for the common case; a handful of
+                # sponsor-branded league names (same short list documented
+                # in league_strength.py's _ALIASES) may still miss -- not
+                # fixed here, matches that module's known limitation.
+                _tournament_part = doc.get("tournament") or ""
+                if isinstance(_tournament_part, dict):
+                    _tournament_part = _tournament_part.get("name") or ""
+                _country_part = doc.get("category") or doc.get("country") or ""
+                if isinstance(_country_part, dict):
+                    _country_part = _country_part.get("name") or ""
+                _league_key = (
+                    f"{_country_part} {_tournament_part}".strip()
+                    if _country_part else str(_tournament_part)
+                )
+                _lacc = get_league_accuracy(_league_key)
                 if _lacc.get("known"):
                     for _lt in (_lacc.get("by_pick_type") or []):
                         if _lt.get("pick_type") in (pick.get("type"), "__all__"):
@@ -1028,6 +1083,17 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                 "league_samples":      (pick.get("calibration") or {}).get("league_samples"),
             }
             # ── Calibration gap monitoring ─────────────────────────────────────
+            # This used to only ever log the severe/moderate finding as a
+            # signal for later learning -- pick["confidence"] was already set
+            # above (before this block ran) and was never actually reduced by
+            # it. Confirmed live (2026-09-06) on a real published pick: this
+            # check correctly computed "raw confidence 68% is severely
+            # overconfident, history says ~50%" but still shipped a 76%
+            # confidence pick (other additive adjustments below had already
+            # pushed it up further), which then lost. Applying the same -8/-4
+            # impact used in the signal itself keeps this consistent with how
+            # every other signal here nudges confidence, instead of the
+            # finding only ever reaching the audit log.
             try:
                 from app.enrichment.confidence_calibrator import compute_calibration_gap
                 gap_info = compute_calibration_gap(pick.get("type") or "match_result", raw_conf)
@@ -1039,6 +1105,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                         "impact": -8,
                         "reason": f"Confidence {raw_conf}% exceeds historical win rate by {gap_info['gap']} points",
                     })
+                    pick["confidence"] = max(1, min(99, int(pick["confidence"]) - 8))
                 elif gap_info.get("gap_severity") == "moderate":
                     signals.append({
                         "name": "calibration_gap_moderate",
@@ -1046,6 +1113,7 @@ def predict_enriched_match(doc: dict[str, Any]) -> dict[str, Any]:
                         "impact": -4,
                         "reason": f"Confidence {raw_conf}% exceeds historical win rate by {gap_info['gap']} points",
                     })
+                    pick["confidence"] = max(1, min(99, int(pick["confidence"]) - 4))
             except Exception as exc:
                 from app.utils.health_counters import record_health_event
                 record_health_event("calibration_gap_error", str(exc))
@@ -2357,6 +2425,67 @@ def _draw_exclusion_fallback(ensemble: dict[str, Any]) -> dict[str, Any] | None:
     return pick
 
 
+def _team_fixture_load(provider_context: dict[str, Any] | None, match_start_ts: float | None) -> dict[str, Any]:
+    """Rest days and recent fixture congestion, computed from a team's FULL
+    cross-competition schedule (SofaScore/SportyBet team endpoints -- see
+    team_watcher.py's _fetch_provider_context), not just the matches this
+    app happens to track.
+
+    This is the one genuinely new thing provider_context can tell the
+    engine that local team_watcher match history structurally cannot: our
+    own history only has matches THIS app ingested (curated top-30 +
+    observed fixtures), so a team that played an untracked cup tie or
+    international game 2 days ago would look fully rested here otherwise.
+    The provider endpoints see every competition the team plays in.
+    """
+    if not isinstance(provider_context, dict) or not match_start_ts:
+        return {"available": False}
+    events: list[dict] = []
+    sofa = provider_context.get("sofascore")
+    if isinstance(sofa, dict):
+        events.extend(sofa.get("recent_results") or [])
+    sporty = provider_context.get("sportybet")
+    if isinstance(sporty, dict):
+        events.extend(sporty.get("recent_results") or [])
+
+    finished_ts: list[float] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        ts = ev.get("start_timestamp") or ev.get("startTimestamp") or ev.get("fixtureStartTime")
+        if not ts:
+            continue
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            continue
+        # SofaScore timestamps are seconds; SportyBet's fixtureStartTime is
+        # milliseconds like the rest of its payloads -- normalize both to
+        # seconds before comparing against match_start_ts (also seconds).
+        if ts > 1e12:
+            ts /= 1000.0
+        if ts >= match_start_ts:
+            continue  # only matches strictly BEFORE this one count as "recent"
+        status = ev.get("status") if isinstance(ev.get("status"), dict) else {}
+        status_type = str(status.get("type") or ev.get("eventStatus") or ev.get("eventMatchStatus") or "").lower()
+        if status_type and status_type not in ("finished", "ended", "ft", "result"):
+            continue
+        finished_ts.append(ts)
+
+    if not finished_ts:
+        return {"available": False}
+    finished_ts.sort()
+    last_match_ts = finished_ts[-1]
+    rest_days = round((match_start_ts - last_match_ts) / 86400, 1)
+    week_ago = match_start_ts - 7 * 86400
+    matches_last_7_days = sum(1 for ts in finished_ts if ts >= week_ago)
+    return {
+        "available": True,
+        "rest_days": rest_days,
+        "matches_last_7_days": matches_last_7_days,
+    }
+
+
 def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | None:
     """
     Turns app/competition/competition_special.py's per-match competition
@@ -2409,6 +2538,15 @@ def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | No
     table = intelligence.get("table") or {}
     strength = intelligence.get("team_strength") or {}
     watchers = intelligence.get("team_watchers") or {}
+    # NOTE: "team_watchers" above is the older, table-position-only object
+    # (_team_watcher_context). "ai_team_watchers" is the richer one that
+    # actually carries provider_context (SofaScore/SportyBet team endpoint
+    # data, see team_watcher.py::_fetch_provider_context) -- confirmed live
+    # (2026-09-06) that this signal was never reading it, so that data
+    # never reached this engine despite being fetched and stored correctly.
+    ai_watchers = intelligence.get("ai_team_watchers") or {}
+    home_watcher_row = ai_watchers.get("home") if isinstance(ai_watchers.get("home"), dict) else {}
+    away_watcher_row = ai_watchers.get("away") if isinstance(ai_watchers.get("away"), dict) else {}
 
     contribution = 0.0
     used: list[str] = []
@@ -2435,6 +2573,37 @@ def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | No
             contribution += edge * 0.15
             used.append("watcher")
 
+    # Cross-competition rest/congestion edge -- see _team_fixture_load's
+    # docstring for why this is genuinely new information, not a duplicate
+    # of the local-history "form"/"watcher" edges above.
+    fixture_load_value: dict[str, Any] | None = None
+    try:
+        match_start_ts = _safe_num(doc.get("start_time"))
+        match_start_ts = (match_start_ts / 1000.0) if match_start_ts else None
+        home_load = _team_fixture_load(home_watcher_row.get("provider_context"), match_start_ts)
+        away_load = _team_fixture_load(away_watcher_row.get("provider_context"), match_start_ts)
+        if home_load.get("available") and away_load.get("available"):
+            rest_diff = _safe_num(home_load.get("rest_days")) - _safe_num(away_load.get("rest_days"))
+            congestion_diff = _safe_num(away_load.get("matches_last_7_days")) - _safe_num(home_load.get("matches_last_7_days"))
+            # Both terms are "positive favors home": more home rest, or more
+            # away fatigue (more games in the last 7 days), each nudge home.
+            # Small weights -- this is a fatigue tiebreaker, not a primary
+            # driver, and hasn't accumulated graded history yet to be
+            # calibrated by self_learner the way the other terms have.
+            fixture_edge = (rest_diff * 0.3) + (congestion_diff * 0.8)
+            fixture_edge = max(-3.0, min(3.0, fixture_edge))
+            if abs(fixture_edge) >= 0.3:
+                contribution += fixture_edge
+                used.append("fixture_load")
+                fixture_load_value = {
+                    "home": home_load,
+                    "away": away_load,
+                    "edge": round(fixture_edge, 2),
+                }
+    except Exception as exc:
+        from app.utils.health_counters import record_health_event
+        record_health_event("enriched_prediction", "fixture_load_signal_error", exc)
+
     if not used:
         return None
 
@@ -2458,6 +2627,7 @@ def _competition_intelligence_signal(doc: dict[str, Any]) -> dict[str, Any] | No
             "form_leader": strength.get("leader"),
             "watcher_edge": watchers.get("edge"),
             "watcher_leader": watchers.get("leader"),
+            "fixture_load": fixture_load_value,
             "direction": "home" if impact > 0 else "away",
         },
         "impact": round(impact, 2),
@@ -4478,7 +4648,20 @@ def _rules_side_edge(rules: dict[str, Any]) -> float:
 
 
 def _rules_side_signal_total(rules: dict[str, Any]) -> float:
-    """Aggregate side-specific signals: positive means home, negative means away."""
+    """Aggregate side-specific signals: positive means home, negative means away.
+
+    This total feeds _double_chance_conflict_penalty, whose whole job is to
+    catch "our own strongest evidence disagrees with this double-chance
+    pick" before it publishes. "red_card_state" was missing from this list
+    (confirmed live 2026-09-06 on a match where the home side had a full
+    man advantage yet the system still published "Away or Draw" and lost) —
+    it's a genuinely directional signal (see prediction_agent.py's
+    _red_card_signal, now correctly signed +home/-away) and belongs here.
+    "goal_pressure" is deliberately NOT included: it measures how many goals
+    a match is likely to produce (used for over/under and nil-nil calls,
+    see NOISY_SUPPORT_SIGNALS above), not which side is favoured, so summing
+    it into a home/away total would be meaningless.
+    """
     side_signal_names = {
         "recent_history_edge",
         "avg_rating_edge",
@@ -4489,6 +4672,7 @@ def _rules_side_signal_total(rules: dict[str, Any]) -> float:
         "common_opponent_edge",
         "market_steam",
         "venue_form_edge",
+        "red_card_state",
     }
     edge = 0.0
     for signal in rules.get("signals") or []:
@@ -5585,5 +5769,3 @@ class EnrichedPrediction:
             ValueError: when the document is not yet ready (missing data fields).
         """
         return predict_enriched_match(self._doc)
-
-

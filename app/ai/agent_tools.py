@@ -29,6 +29,10 @@ from app.data_clients.sportybet_client import (
     fetch_live_and_upcoming_matches_post,
 )
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 
 def get_scheduled_matches(date: str) -> dict:
@@ -36,6 +40,7 @@ def get_scheduled_matches(date: str) -> dict:
     try:
         return {"status": "success", "events": fetch_all_scheduled_events(date)}
     except Exception as exc:
+        logger.warning("agent_tools.get_scheduled_matches failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -51,6 +56,7 @@ def get_event_detail(event_id: int, date: str) -> dict:
             return {"status": "error", "detail": f"Event {event_id} not found on {date}"}
         return {"status": "success", **fetch_event_detail(event)}
     except Exception as exc:
+        logger.warning("agent_tools.get_event_detail failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -60,6 +66,7 @@ def get_team_history(team_id: int, page: int = 0) -> dict:
     try:
         return {"status": "success", **fetch_team_history(team_id, page)}
     except Exception as exc:
+        logger.warning("agent_tools.get_team_history failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -70,6 +77,7 @@ def get_standings(tournament_id: int, season_id: int) -> dict:
         rows = fetch_standings(tournament_id, season_id)
         return {"status": "success", "standings": rows}
     except Exception as exc:
+        logger.warning("agent_tools.get_standings failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -79,6 +87,7 @@ def get_event_h2h(event_id: int) -> dict:
     try:
         return {"status": "success", **fetch_h2h(event_id)}
     except Exception as exc:
+        logger.warning("agent_tools.get_event_h2h failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -88,6 +97,7 @@ def get_pregame_form(event_id: int) -> dict:
     try:
         return {"status": "success", **fetch_pregame_form(event_id)}
     except Exception as exc:
+        logger.warning("agent_tools.get_pregame_form failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -97,6 +107,7 @@ def get_event_odds(event_id: int) -> dict:
     try:
         return {"status": "success", "markets": fetch_odds(event_id)}
     except Exception as exc:
+        logger.warning("agent_tools.get_event_odds failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -106,6 +117,7 @@ def get_featured_odds(event_id: int) -> dict:
     try:
         return {"status": "success", **fetch_odds_featured(event_id)}
     except Exception as exc:
+        logger.warning("agent_tools.get_featured_odds failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -116,6 +128,7 @@ def get_live_matches() -> dict:
         matches = fetch_live_matches_post()
         return {"status": "success", "count": len(matches), "matches": matches}
     except Exception as exc:
+        logger.warning("agent_tools.get_live_matches failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -126,6 +139,7 @@ def get_all_sportybet_matches() -> dict:
         matches = fetch_live_and_upcoming_matches_post()
         return {"status": "success", "count": len(matches), "matches": matches}
     except Exception as exc:
+        logger.warning("agent_tools.get_all_sportybet_matches failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -138,6 +152,7 @@ def poisson_model(home_team_id: int, away_team_id: int) -> dict:
     try:
         return {"status": "success", **run_poisson(home_team_id, away_team_id)}
     except Exception as exc:
+        logger.warning("agent_tools.poisson_model failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -149,6 +164,7 @@ def get_odds_movement(sportybet_id: str) -> dict:
     try:
         return {"status": "success", **get_movement(sportybet_id)}
     except Exception as exc:
+        logger.warning("agent_tools.get_odds_movement failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -158,6 +174,7 @@ def get_all_odds_movements(match_date: str) -> dict:
     try:
         return {"status": "success", "movements": get_all_movements(match_date)}
     except Exception as exc:
+        logger.warning("agent_tools.get_all_odds_movements failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 
@@ -171,6 +188,7 @@ def strength_of_schedule(home_team_id: int, away_team_id: int) -> dict:
     try:
         return {"status": "success", **compare_schedules(home_team_id, away_team_id)}
     except Exception as exc:
+        logger.warning("agent_tools.strength_of_schedule failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
 

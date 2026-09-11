@@ -90,7 +90,8 @@ def _learned_league_goal_timing_adjustment(match: dict[str, Any] | None) -> floa
         return 0.0
     try:
         mem_signal = late_goal_memory_signal(match)
-    except Exception:
+    except Exception as exc:
+        _pa_logger.warning("late-goal memory signal failed: %s", exc)
         return 0.0
     if not mem_signal:
         return 0.0
@@ -274,8 +275,8 @@ def predict_sofascore_event(
         if tw and tw.get("value", {}).get("available"):
             home_power += float(tw.get("impact") or 0)
             signals.append(tw)
-    except Exception:
-        pass
+    except Exception as exc:
+        _pa_logger.warning("team_watch_signal failed: %s", exc)
     if abs(home_power) >= 8:
         side = _side_name(home if home_power > 0 else away, event, "home" if home_power > 0 else "away")
         picks.append(_pick("match_result", f"{side} Win", 55 + min(abs(home_power), 25), "stronger side has a decisive edge"))
@@ -312,7 +313,8 @@ def predict_sofascore_event(
                 ))
             else:
                 picks.append(_pick("no_bet", "No strong bet", 50, "signal aggregator could not produce a directional pick with sufficient confidence"))
-        except Exception:
+        except Exception as exc:
+            _pa_logger.warning("signal aggregator directional pick failed: %s", exc)
             picks.append(_pick("no_bet", "No strong bet", 50, "signal aggregator failed — no directional pick available"))
 
     goal_pressure = _goal_pressure(home_form, away_form, event, signals)
@@ -371,7 +373,7 @@ def predict_sofascore_event(
     red_card_signal = _red_card_signal(event, home_power)
     if red_card_signal:
         picks.append(red_card_signal)
-        signals.append({"name": "red_card_state", "value": red_card_signal["selection"], "impact": 10})
+        signals.append({"name": "red_card_state", "value": red_card_signal["selection"], "impact": red_card_signal.get("side_impact", 10)})
 
     if not picks:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available data"))
@@ -432,7 +434,7 @@ def predict_sporty_match(match: dict[str, Any]) -> dict[str, Any]:
     red_card_pick = _red_card_signal(match, _sporty_market_edge(odds))
     if red_card_pick:
         picks.append(red_card_pick)
-        signals.append({"name": "red_card_state", "value": red_card_pick["selection"], "impact": 10})
+        signals.append({"name": "red_card_state", "value": red_card_pick["selection"], "impact": red_card_pick.get("side_impact", 10)})
 
     if not picks:
         picks.append(_pick("no_bet", "No strong bet", 50, "not enough edge from available live data"))
@@ -764,7 +766,8 @@ def _event_date(event: dict[str, Any]) -> str:
             t /= 1000
         from datetime import datetime, timezone
         return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%d %b %Y")
-    except Exception:
+    except Exception as exc:
+        _pa_logger.debug("_event_date: could not parse timestamp %r: %s", ts, exc)
         return str(ts)[:10]
 
 
@@ -777,13 +780,14 @@ def _event_datetime(event: dict[str, Any]) -> datetime | None:
         if value > 1e10:
             value /= 1000
         return datetime.fromtimestamp(value, tz=timezone.utc)
-    except Exception:
-        pass
+    except Exception as exc:
+        _pa_logger.debug("_event_datetime: numeric parse failed for %r: %s", ts, exc)
     try:
         text = str(ts).replace("Z", "+00:00")
         parsed = datetime.fromisoformat(text)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except Exception:
+    except Exception as exc:
+        _pa_logger.debug("_event_datetime: iso parse failed for %r: %s", ts, exc)
         return None
 
 
@@ -1306,10 +1310,26 @@ def _red_card_signal(match: dict[str, Any], edge: float) -> dict[str, Any] | Non
     if home_red == away_red:
         return None
     if home_red > away_red:
+        # Home has MORE red cards -> home is down a man -> away benefits.
         selection = "Away team pressure after home red card" if edge <= 8 else "Favorite weakened by red card, avoid home win"
+        side_impact = -10
     else:
+        # Away has MORE red cards -> away is down a man -> home benefits.
         selection = "Home team pressure after away red card" if edge >= -8 else "Underdog weakened by red card, favorite protection"
-    return _pick("red_card", selection, 63, "red card changes win probability and goal pressure")
+        side_impact = 10
+    pick = _pick("red_card", selection, 63, "red card changes win probability and goal pressure")
+    # side_impact is signed (+home / -away) so callers building a directional
+    # "red_card_state" signal (see enriched_prediction.py::_rules_side_signal_total)
+    # can trust the sign, not just the free-text "selection" description.
+    # Previously every caller hardcoded impact=10 regardless of which branch
+    # fired above, so a red card that actually favored the AWAY team still
+    # got recorded as a +10 (home-favoring) number -- confirmed live on a
+    # real match (2026-09-06) where this signal read "impact": 10 while its
+    # own selection text said the home side benefited, coincidentally correct
+    # that one time only because sign was never actually derived from the
+    # branch taken.
+    pick["side_impact"] = side_impact
+    return pick
 
 
 def _late_goal_memory_boost(memory_signal: dict[str, Any] | None, signals: list[dict[str, Any]]) -> int:
@@ -1378,7 +1398,8 @@ def _is_high_late_goal_league(name: str | None) -> bool:
 
         learned = get_tournament_priority(name or "")
         return bool(learned.get("known") and int(learned.get("priority", 4)) <= 3)
-    except Exception:
+    except Exception as exc:
+        _pa_logger.debug("_is_high_late_goal_league: priority lookup failed for %r: %s", name, exc)
         return False
 
 

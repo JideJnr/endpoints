@@ -46,15 +46,23 @@ def analyse_schedule(team_id: int, last_n: int = 10) -> dict[str, Any]:
         raw_t = event.get("tournament") or {}
         tournament = raw_t if isinstance(raw_t, dict) else {}
         t_name = tournament.get("name") or (raw_t if isinstance(raw_t, str) else "")
-        tier = _league_tier(t_name)
+        league_score = _league_score(t_name)
+        tier = _tier_from_score(league_score)
         tiers.append(tier)
         standing = _opponent_standing(opponent_id, tournament.get("tournament_id"), event.get("season_id"))
         bucket = _opponent_bucket(standing.get("position"), standing.get("total_teams"))
-        weight = OPPONENT_WEIGHT[bucket]
+        # Base weight reflects where the opponent sits in THEIR OWN division's
+        # table (top/upper/lower/bottom). That alone can't tell a Division 1
+        # mid-table side from a Division 4 table-topper, so it's scaled by the
+        # division's actual strength (20-98 catalogue/ELO score, ~0.2-0.98x).
+        # A "top of a weak league" win no longer outweighs an "average side in
+        # a strong league" win.
+        base_weight = OPPONENT_WEIGHT[bucket]
+        weight = round(base_weight * (league_score / 100), 3)
 
         if result == "W":
             weighted_score += 3 * weight
-            if bucket in ("top", "upper"):
+            if bucket in ("top", "upper") and league_score >= 45:
                 quality_wins += 1
         elif result == "D":
             weighted_score += weight
@@ -69,6 +77,7 @@ def analyse_schedule(team_id: int, last_n: int = 10) -> dict[str, Any]:
             "opponent_position": standing.get("position"),
             "opponent_bucket": bucket,
             "league_tier": tier,
+            "league_score": league_score,
             "weight": weight,
         })
 
@@ -160,11 +169,15 @@ def _opponent_bucket(position: int | None, total_teams: int | None) -> str:
     return "bottom"
 
 
-def _league_tier(name: str) -> int:
-    """Map a league name to a difficulty tier (1=elite … 4=low) via league_strength_score."""
+def _league_score(name: str) -> int:
+    """Return the actual league strength score (20-98) for *name* via league_strength_score."""
     from app.competition.league_strength import league_strength_score
 
-    score = league_strength_score(name).get("score", 55)
+    return league_strength_score(name).get("score", 55)
+
+
+def _tier_from_score(score: int) -> int:
+    """Map a league strength score to a difficulty tier (1=elite … 4=low), for display only."""
     if score >= 77:
         return 1
     if score >= 61:

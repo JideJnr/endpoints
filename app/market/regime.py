@@ -4,6 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class Regime:
@@ -71,7 +75,8 @@ def get_regime(tournament: str | None, category: str | None = None) -> Regime:
         if not learned.get("known"):
             return _tier(3)
         priority = int(learned.get("priority", 4))
-    except Exception:
+    except Exception as exc:
+        logger.warning("regime: could not read learned tournament priority for %r/%r: %s", tournament, category, exc)
         return _tier(3)
 
     if priority <= 1:
@@ -97,7 +102,8 @@ def _tier(n: int) -> Regime:
     try:
         from app.monitoring.learned_parameters import get_market_regime_params
         params = get_market_regime_params().get(n) or {}
-    except Exception:
+    except Exception as exc:
+        logger.warning("regime: could not read learned regime params for tier %s: %s", n, exc)
         params = {}
     if not params.get("min_confidence"):
         return Regime(

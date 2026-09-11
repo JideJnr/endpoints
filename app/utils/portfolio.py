@@ -36,6 +36,10 @@ from typing import Any
 
 from app.utils.match_helpers import _normalise_selection
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # ── Limits ────────────────────────────────────────────────────────────────────
 
 MAX_PER_DIRECTION  = 4   # max picks with same selection direction (Home/Away/Draw/Over/Under)
@@ -181,7 +185,8 @@ def _start_time(pick: dict) -> float | None:
             from datetime import datetime, timezone
             dt = datetime.fromisoformat(str(val).replace('Z', '+00:00')).astimezone(timezone.utc)
             return dt.timestamp()
-        except Exception:
+        except Exception as exc:
+            logger.debug("portfolio: timestamp parse failed: %s", exc)
             continue
     return None
 
@@ -197,7 +202,8 @@ def _time_window(timestamp: float) -> str:
         if hour < 17:
             return 'afternoon'
         return 'evening'
-    except Exception:
+    except Exception as exc:
+        logger.debug("portfolio: time-of-day parse failed: %s", exc)
         return 'unknown'
 
 

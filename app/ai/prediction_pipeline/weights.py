@@ -14,6 +14,10 @@ from typing import Any
 
 from app.storage.db import db_conn, _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 SPECIALIST_NAMES = [
     "H2H Analyst",
     "Common Opponent Analyst",
@@ -119,8 +123,8 @@ def grade_specialist_contributions(
         try:
             record_specialist_outcome(name, result, league=league, pick_type=pick_type)
             credited += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("weights: recording specialist outcome failed for %s: %s", name, exc)
     return credited
 
 

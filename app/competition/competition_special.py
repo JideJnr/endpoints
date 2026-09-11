@@ -2015,6 +2015,22 @@ def _match_importance_context(key: str, event: dict[str, Any]) -> dict[str, Any]
 def _score_value(value: Any) -> str:
     return "" if value is None else str(value)
 
+
+# A SofaScore-derived match_id (see _main_buffer_match_id) is never a real,
+# bookable SportyBet event id. _mirror_competition_event_to_main_buffer used
+# to check only "sportybet_id is not null" when deciding whether a row was
+# genuinely linked -- once a row's sportybet_id was ever set to one of these
+# placeholder strings (from any source), every later mirror pass treated it
+# as a real link, re-stamped data_source='both', and preserved the bad value
+# forever via coalesce(). Confirmed live (2026-09-06): 59 match_buffer rows
+# stuck exactly this way, ingested_at refreshing every cycle. Used in place
+# of a bare "is not null" check everywhere below.
+_REAL_SPORTYBET_ID_SQL = (
+    "(sportybet_id is not null and sportybet_id != ''"
+    " and sportybet_id not like 'sofascore:%' and sportybet_id not like 'sofa:%')"
+)
+
+
 def _mirror_competition_event_to_main_buffer(
     conn: sqlite3.Connection,
     key: str,
@@ -2041,10 +2057,10 @@ def _mirror_competition_event_to_main_buffer(
     # that order, retain its real event id and raw market shape instead of
     # replacing it with the SofaScore proxy.
     linked = conn.execute(
-        """select sportybet_id, raw_sporty, raw_enriched
+        f"""select sportybet_id, raw_sporty, raw_enriched
            from match_buffer
            where sofascore_id = ? and match_id != ?
-             and sportybet_id is not null and sportybet_id != ''
+             and {_REAL_SPORTYBET_ID_SQL}
            order by ingested_at desc limit 1""",
         (str(event.get("id") or ""), match_id),
     ).fetchone()
@@ -2067,8 +2083,19 @@ def _mirror_competition_event_to_main_buffer(
     # every candidate row on every SportyBet ingest.
     home_team_id = str((event.get("home_team") or {}).get("id") or "") or None
     away_team_id = str((event.get("away_team") or {}).get("id") or "") or None
+    # Same genuine-id guard as _REAL_SPORTYBET_ID_SQL, qualified for use
+    # against the EXISTING row inside ON CONFLICT ... DO UPDATE SET (a bare
+    # "sportybet_id" there is ambiguous between the existing row and
+    # `excluded`). Every "is not null" check below used to accept a
+    # sofascore-shaped placeholder as if it were a real link -- that's the
+    # actual mechanism that kept 59 already-bad rows re-stamped as
+    # data_source='both' forever, confirmed live (2026-09-06).
+    _real_mb_id = (
+        "(match_buffer.sportybet_id is not null and match_buffer.sportybet_id != ''"
+        " and match_buffer.sportybet_id not like 'sofascore:%' and match_buffer.sportybet_id not like 'sofa:%')"
+    )
     conn.execute(
-        """
+        f"""
         insert into match_buffer (
             match_id, match_date, tournament, category, name, start_time, period,
             score_home, score_away, is_live, is_finished, ingested_at,
@@ -2089,13 +2116,16 @@ def _mirror_competition_event_to_main_buffer(
             is_finished = excluded.is_finished,
             ingested_at = excluded.ingested_at,
             data_source = case
-                when match_buffer.sportybet_id is not null then 'both'
+                when {_real_mb_id} then 'both'
                 else excluded.data_source
             end,
-            sportybet_id = coalesce(match_buffer.sportybet_id, excluded.sportybet_id),
+            sportybet_id = case
+                when {_real_mb_id} then match_buffer.sportybet_id
+                else excluded.sportybet_id
+            end,
             sofascore_id = excluded.sofascore_id,
             sofascore_only = case
-                when match_buffer.sportybet_id is not null then 0
+                when {_real_mb_id} then 0
                 else excluded.sofascore_only
             end,
             -- Do NOT null this out. A row that was already merged with a
@@ -2106,11 +2136,11 @@ def _mirror_competition_event_to_main_buffer(
             -- silently undoing the merge and causing SportyBet's next
             -- ingest to recreate a duplicate row (see buffer.py re-split fix).
             raw_sporty = case
-                when match_buffer.sportybet_id is not null then match_buffer.raw_sporty
+                when {_real_mb_id} then match_buffer.raw_sporty
                 else excluded.raw_sporty
             end,
             raw_enriched = case
-                when match_buffer.sportybet_id is not null then match_buffer.raw_enriched
+                when {_real_mb_id} then match_buffer.raw_enriched
                 else coalesce(excluded.raw_enriched, match_buffer.raw_enriched)
             end,
             enriched_at = coalesce(excluded.enriched_at, match_buffer.enriched_at),

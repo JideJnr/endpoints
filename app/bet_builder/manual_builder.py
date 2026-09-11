@@ -104,6 +104,7 @@ def run_manual_bet(
     try:
         synthesis = rank_picks_deterministic(analyses, target_odds=target_odds, max_total_odds=_max)
     except Exception as exc:
+        logger.warning("manual builder: synthesis failed: %s", exc)
         return {
             "status": "synthesis_failed",
             "message": str(exc),
@@ -140,6 +141,7 @@ def run_manual_bet(
     try:
         booking_payload = build_booking_payload(selections, stake=stake, force_refresh=False)
     except Exception as exc:
+        logger.warning("manual builder: booking failed: %s", exc)
         return {
             "status": "booking_failed",
             "message": str(exc),
@@ -166,6 +168,7 @@ def run_manual_bet(
         try:
             result["share_code"] = request_share_code(booking_payload)
         except Exception as exc:
+            logger.warning("manual builder: share code request failed: %s", exc)
             result["share_code_error"] = str(exc)
     return result
 

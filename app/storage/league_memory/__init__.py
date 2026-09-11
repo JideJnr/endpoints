@@ -29,6 +29,7 @@ from .crud import (  # noqa: F401
     run_memory_maintenance,
     record_prediction,
     record_deferred_prediction_decision,
+    cleanup_leaked_sportybet_ids,
     store_local_signal_outcomes,
     list_memory_matches,
     list_duplicate_matches,

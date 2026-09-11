@@ -56,6 +56,10 @@ from app.storage.db import db_conn
 from app.storage.db import DB_PATH, _conn
 from app.storage.league_memory import _init_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Learned risk-outcome rows are trusted only while reasonably fresh.
 #
 # rebuild_risk_controls() is the sole writer of the risk_outcomes table and
@@ -84,7 +88,8 @@ def _risk_row_is_stale(last_updated: Any, max_age_days: int = RISK_CONTROLS_MAX_
             row_dt = row_dt.replace(tzinfo=timezone.utc)
         age_days = (datetime.now(timezone.utc) - row_dt.astimezone(timezone.utc)).days
         return age_days > max_age_days
-    except Exception:
+    except Exception as exc:
+        logger.debug("risk_learner: could not parse last_updated %r, treating row as stale: %s", last_updated, exc)
         return True
 
 
@@ -473,6 +478,7 @@ def rebuild_risk_controls() -> dict[str, Any]:
     stats: dict[BucketKey, dict[str, Any]] = {}
 
     processed = 0
+    skipped = 0
     for row in rows:
         try:
             audit = _parse_json(row["audit_json"]) or {}
@@ -515,8 +521,16 @@ def rebuild_risk_controls() -> dict[str, Any]:
                 bucket["clv_count"] += 1
 
             processed += 1
-        except Exception:
+        except Exception as exc:
+            skipped += 1
+            logger.debug("risk_learner: skipping a row while rebuilding risk controls: %s", exc)
             continue
+
+    if skipped:
+        logger.warning(
+            "risk_learner: skipped %s of %s rows while rebuilding risk controls (see debug log for details)",
+            skipped, processed + skipped,
+        )
 
     now = datetime.now(timezone.utc).isoformat()
 
